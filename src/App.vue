@@ -4,6 +4,9 @@ import { useI18n } from "vue-i18n";
 import { invoke } from "@tauri-apps/api/core";
 import SettingsPanel from "./components/SettingsPanel.vue";
 import UsagePanel from "./components/UsagePanel.vue";
+import MiniPanel from "./components/MiniPanel.vue";
+
+const isMini = window.location.hash === "#mini";
 
 export interface UsageTier {
     percent_used: number;
@@ -119,6 +122,12 @@ async function fetchUsage() {
             orgId: orgId.value,
         });
 
+        if (usage.value) {
+            await invoke("update_tray", {
+                percent: usage.value.five_hour.percent_used,
+            }).catch(() => {});
+        }
+
         if (autoStartSession.value && usage.value) {
             const fh = usage.value.five_hour;
             const sessionAlreadyActive =
@@ -176,7 +185,25 @@ async function handleManualStart() {
     await triggerAutoStart();
 }
 
+async function toggleMini() {
+    const { WebviewWindow } = await import("@tauri-apps/api/webviewWindow");
+    const mini = await WebviewWindow.getByLabel("mini");
+    if (!mini) return;
+    if (await mini.isVisible()) {
+        await mini.hide();
+    } else {
+        await mini.show();
+        await mini.setFocus();
+    }
+}
+
 onMounted(async () => {
+    if (!isMini) {
+        const { listen } = await import("@tauri-apps/api/event");
+        listen("open-settings", () => {
+            showSettings.value = true;
+        });
+    }
     await loadSettings();
     if (configured.value) {
         startPolling();
@@ -191,7 +218,8 @@ onUnmounted(() => {
 </script>
 
 <template>
-    <div class="flyout accent-claude">
+    <MiniPanel v-if="isMini" />
+    <div v-else class="flyout accent-claude">
         <!-- Header -->
         <div class="fly-hd">
             <div class="fly-hd-left">
@@ -212,6 +240,17 @@ onUnmounted(() => {
                 </div>
             </div>
             <div class="fly-hd-right">
+                <button
+                    class="icon-btn"
+                    @click="toggleMini"
+                    title="Mini widget"
+                    v-if="!showSettings && configured"
+                >
+                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+                        <rect x="1" y="5" width="14" height="8" rx="2" stroke-linecap="round"/>
+                        <line x1="5" y1="9" x2="11" y2="9" stroke-linecap="round"/>
+                    </svg>
+                </button>
                 <button
                     class="icon-btn"
                     :class="{ spin: loading }"

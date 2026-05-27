@@ -75,8 +75,10 @@ function formatReset(resetAt: string | null): string {
 }
 
 function tierClass(percent: number): string {
-  if (percent < 80) return "success";
-  return "warn";
+  if (percent < 25) return "tier-green";
+  if (percent < 50) return "tier-yellow";
+  if (percent < 75) return "tier-orange";
+  return "tier-red";
 }
 
 const fiveHour = computed(() => props.usage.five_hour);

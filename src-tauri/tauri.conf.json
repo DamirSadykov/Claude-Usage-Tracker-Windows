@@ -22,6 +22,19 @@
         "center": true,
         "visible": true,
         "skipTaskbar": false
+      },
+      {
+        "label": "mini",
+        "url": "index.html#mini",
+        "title": "",
+        "width": 180,
+        "height": 80,
+        "resizable": false,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "visible": false,
+        "skipTaskbar": true,
+        "transparent": false
       }
     ],
     "trayIcon": {
