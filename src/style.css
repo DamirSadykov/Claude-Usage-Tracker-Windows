@@ -1,0 +1,768 @@
+:root {
+    --win-radius: 8px;
+    --flyout-radius: 8px;
+    --card-radius: 6px;
+    --accent: #4cc2ff; /* Win11 default accent (blue) */
+    --accent-soft: rgba(76, 194, 255, 0.18);
+    --success: #6ccb5f;
+    --warning: #f7a440;
+    --text: #ffffff;
+    --text-2: rgba(255, 255, 255, 0.78);
+    --text-3: rgba(255, 255, 255, 0.55);
+    --text-4: rgba(255, 255, 255, 0.38);
+    --card-bg: #2b2b2b; /* Win11 mica layer */
+    --card-bg-hover: #323232;
+    --flyout-bg: #1c1c1c; /* Win11 base layer */
+    --stroke: rgba(255, 255, 255, 0.06);
+    --stroke-strong: rgba(255, 255, 255, 0.1);
+    --track: rgba(255, 255, 255, 0.08);
+
+    --segoe: "Segoe UI Variable", "Segoe UI", Inter, system-ui, sans-serif;
+}
+
+html,
+body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    font-family: var(--segoe);
+    color: var(--text);
+    background: #000;
+    overflow: hidden;
+}
+body,
+#app {
+    height: 100%;
+}
+
+::-webkit-scrollbar {
+    width: 6px;
+}
+::-webkit-scrollbar-track {
+    background: transparent;
+}
+::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.1);
+    border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.2);
+}
+*,
+*::before,
+*::after {
+    box-sizing: border-box;
+}
+
+/* ─── Desktop scene ──────────────────────────────────────── */
+.desktop {
+    position: fixed;
+    inset: 0;
+    background: radial-gradient(
+        1200px 800px at 70% 30%,
+        #2a3a78 0%,
+        #1a2452 40%,
+        #0a0f2a 75%,
+        #050813 100%
+    );
+    overflow: hidden;
+}
+.desktop::before {
+    /* soft Win11-y bloom highlights */
+    content: "";
+    position: absolute;
+    inset: 0;
+    background:
+        radial-gradient(
+            600px 400px at 22% 80%,
+            rgba(91, 151, 255, 0.25),
+            transparent 60%
+        ),
+        radial-gradient(
+            900px 600px at 85% 18%,
+            rgba(124, 77, 255, 0.18),
+            transparent 60%
+        ),
+        radial-gradient(
+            400px 300px at 50% 50%,
+            rgba(255, 255, 255, 0.04),
+            transparent 70%
+        );
+    pointer-events: none;
+}
+.desktop::after {
+    /* subtle bloom/particles texture */
+    content: "";
+    position: absolute;
+    inset: 0;
+    background-image:
+        radial-gradient(
+            1px 1px at 20% 30%,
+            rgba(255, 255, 255, 0.4),
+            transparent
+        ),
+        radial-gradient(
+            1px 1px at 70% 65%,
+            rgba(255, 255, 255, 0.3),
+            transparent
+        ),
+        radial-gradient(
+            1px 1px at 40% 80%,
+            rgba(255, 255, 255, 0.35),
+            transparent
+        ),
+        radial-gradient(
+            1px 1px at 85% 20%,
+            rgba(255, 255, 255, 0.25),
+            transparent
+        );
+    pointer-events: none;
+    opacity: 0.8;
+}
+
+/* ─── Taskbar ─────────────────────────────────────────────── */
+.taskbar {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: 48px;
+    background: rgba(28, 28, 28, 0.78);
+    backdrop-filter: blur(40px) saturate(160%);
+    -webkit-backdrop-filter: blur(40px) saturate(160%);
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 8px 0 8px;
+    z-index: 10;
+}
+.tb-center {
+    display: flex;
+    gap: 4px;
+    align-items: center;
+    flex: 1;
+    justify-content: center;
+}
+.tb-app {
+    width: 40px;
+    height: 40px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 4px;
+    color: var(--text-2);
+    cursor: default;
+    position: relative;
+    transition: background 120ms ease;
+}
+.tb-app:hover {
+    background: rgba(255, 255, 255, 0.06);
+}
+.tb-app.active::after {
+    content: "";
+    position: absolute;
+    bottom: 2px;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 16px;
+    height: 3px;
+    border-radius: 2px;
+    background: var(--accent);
+}
+.tb-app.active {
+    background: rgba(255, 255, 255, 0.04);
+}
+
+.tb-tray {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    color: var(--text-2);
+    padding-right: 4px;
+}
+.tb-tray-btn {
+    height: 32px;
+    padding: 0 8px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    border-radius: 4px;
+    cursor: default;
+    font-size: 11px;
+    transition: background 120ms;
+    position: relative;
+}
+.tb-tray-btn:hover {
+    background: rgba(255, 255, 255, 0.06);
+}
+.tb-tray-btn.has-flyout::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: 4px;
+    background: rgba(255, 255, 255, 0.08);
+}
+.tb-clock {
+    text-align: right;
+    line-height: 1.15;
+    font-size: 11px;
+    color: var(--text);
+    padding: 0 12px 0 6px;
+    cursor: default;
+    border-radius: 4px;
+    height: 40px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+}
+.tb-clock:hover {
+    background: rgba(255, 255, 255, 0.06);
+}
+.tb-clock .d {
+    color: var(--text-2);
+    font-size: 11px;
+}
+
+/* ─── Flyout ──────────────────────────────────────────────── */
+.flyout-wrap {
+    position: absolute;
+    right: 12px;
+    bottom: 60px;
+    z-index: 20;
+    animation: rise 360ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+@keyframes rise {
+    from {
+        transform: translateY(14px);
+        opacity: 0;
+    }
+    to {
+        transform: translateY(0);
+        opacity: 1;
+    }
+}
+
+.flyout {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    background:
+        linear-gradient(
+            180deg,
+            rgba(255, 255, 255, 0.02),
+            rgba(255, 255, 255, 0) 30%
+        ),
+        var(--flyout-bg);
+    border: 1px solid rgba(255, 255, 255, 0.07);
+    border-radius: var(--flyout-radius);
+    box-shadow:
+        0 1px 0 rgba(255, 255, 255, 0.05) inset,
+        0 32px 64px rgba(0, 0, 0, 0.55),
+        0 8px 18px rgba(0, 0, 0, 0.4);
+    overflow: hidden;
+    backdrop-filter: blur(40px) saturate(140%);
+    -webkit-backdrop-filter: blur(40px) saturate(140%);
+}
+
+/* Header */
+.fly-hd {
+    padding: 14px 14px 12px;
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+}
+.fly-hd-left {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 0;
+}
+.app-pick {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    color: var(--text);
+    padding: 4px 8px 4px 6px;
+    margin-left: -6px;
+    border-radius: 4px;
+    cursor: default;
+    transition: background 120ms;
+}
+.app-pick:hover {
+    background: rgba(255, 255, 255, 0.05);
+}
+.app-pick svg {
+    opacity: 0.6;
+}
+.app-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 12px;
+    color: var(--text-3);
+    padding-left: 2px;
+}
+.dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--success);
+    box-shadow: 0 0 8px rgba(108, 203, 95, 0.6);
+}
+.fly-hd-right {
+    display: flex;
+    gap: 2px;
+}
+.icon-btn {
+    width: 32px;
+    height: 32px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 4px;
+    border: none;
+    background: none;
+    padding: 0;
+    color: var(--text-2);
+    cursor: default;
+    transition: background 120ms;
+}
+.icon-btn:hover {
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--text);
+}
+.icon-btn:active {
+    background: rgba(255, 255, 255, 0.03);
+}
+.icon-btn.spin svg {
+    animation: spin 600ms ease;
+}
+@keyframes spin {
+    from {
+        transform: rotate(0);
+    }
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+.hr {
+    height: 1px;
+    background: var(--stroke);
+    margin: 0 14px;
+}
+
+/* Cards */
+.cards {
+    padding: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    overflow-y: auto;
+    flex: 1;
+    min-height: 0;
+}
+.card {
+    background: var(--card-bg);
+    border: 1px solid var(--stroke);
+    border-radius: var(--card-radius);
+    padding: 12px 14px 12px;
+    transition:
+        background 120ms,
+        border-color 120ms;
+    cursor: default;
+}
+.card:hover {
+    background: var(--card-bg-hover);
+    border-color: var(--stroke-strong);
+}
+
+.card-row {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 10px;
+}
+.card-title {
+    font-size: 14px;
+    font-weight: 600;
+    letter-spacing: -0.005em;
+    color: var(--text);
+    line-height: 1.2;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+.card-sub {
+    font-size: 11.5px;
+    color: var(--text-3);
+    margin-top: 2px;
+    line-height: 1.35;
+}
+.pct {
+    font-size: 18px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+    letter-spacing: -0.01em;
+}
+.pct.success {
+    color: var(--success);
+}
+.pct.warn {
+    color: var(--warning);
+}
+.pct.muted {
+    color: var(--success);
+}
+
+.bar {
+    margin-top: 10px;
+    height: 4px;
+    width: 100%;
+    background: var(--track);
+    border-radius: 999px;
+    overflow: hidden;
+    position: relative;
+}
+.bar > i {
+    display: block;
+    height: 100%;
+    border-radius: 999px;
+    position: relative;
+}
+.bar.success > i {
+    background: linear-gradient(90deg, #5bb656, #6ccb5f);
+}
+.bar.warn > i {
+    background: linear-gradient(90deg, #ef9326, #f7a440);
+}
+.bar > .tick {
+    position: absolute;
+    top: -1px;
+    bottom: -1px;
+    width: 2px;
+    background: rgba(255, 255, 255, 0.45);
+    border-radius: 1px;
+}
+.meta-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-top: 10px;
+    font-size: 11.5px;
+    color: var(--text-3);
+    font-variant-numeric: tabular-nums;
+}
+.meta-row .right {
+    color: var(--text-2);
+}
+
+.badge {
+    font-size: 10.5px;
+    font-weight: 500;
+    color: var(--text-2);
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    padding: 2px 8px;
+    border-radius: 999px;
+    line-height: 1.5;
+    letter-spacing: 0;
+}
+
+/* Chart card */
+.chart-card {
+    padding: 12px 14px 10px;
+}
+.chart {
+    margin-top: 8px;
+    height: 116px;
+    position: relative;
+}
+.chart-grid {
+    position: absolute;
+    left: 28px;
+    right: 0;
+    top: 0;
+    bottom: 18px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+}
+.chart-grid .gl {
+    border-top: 1px dashed rgba(255, 255, 255, 0.06);
+    height: 1px;
+}
+.y-axis {
+    position: absolute;
+    left: 0;
+    top: -6px;
+    bottom: 18px;
+    width: 28px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    font-size: 10px;
+    color: var(--text-4);
+    font-variant-numeric: tabular-nums;
+}
+.bars {
+    position: absolute;
+    left: 28px;
+    right: 0;
+    top: 0;
+    bottom: 18px;
+    display: grid;
+    grid-template-columns: repeat(10, 1fr);
+    align-items: end;
+    gap: 4px;
+    padding: 0 2px;
+}
+.bars .b {
+    background: linear-gradient(180deg, #f7a440, #d97a1f);
+    border-radius: 2px 2px 0 0;
+    min-height: 0;
+    width: 100%;
+    transition: filter 120ms;
+}
+.bars .b:hover {
+    filter: brightness(1.18);
+}
+.x-axis {
+    position: absolute;
+    left: 28px;
+    right: 0;
+    bottom: 0;
+    height: 14px;
+    display: grid;
+    grid-template-columns: repeat(10, 1fr);
+    gap: 4px;
+    padding: 0 2px;
+    font-size: 10px;
+    color: var(--text-4);
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+}
+.chart-foot {
+    margin-top: 4px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 11.5px;
+    color: var(--text-3);
+}
+.chart-foot .right {
+    color: var(--text);
+    font-weight: 500;
+}
+
+/* Footer */
+.fly-foot {
+    padding: 8px 14px 12px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 10.5px;
+    color: var(--text-4);
+    letter-spacing: 0;
+}
+.fly-foot .seg {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+}
+.pulse {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 0 0 var(--accent-soft);
+    animation: pulse 2.4s ease-out infinite;
+}
+@keyframes pulse {
+    0% {
+        box-shadow: 0 0 0 0 rgba(76, 194, 255, 0.4);
+    }
+    70% {
+        box-shadow: 0 0 0 8px rgba(76, 194, 255, 0);
+    }
+    100% {
+        box-shadow: 0 0 0 0 rgba(76, 194, 255, 0);
+    }
+}
+
+/* Tooltip on tray icon */
+.tray-tip {
+    position: absolute;
+    bottom: 100%;
+    right: 0;
+    transform: translateY(-10px);
+    background: #2b2b2b;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    color: var(--text);
+    font-size: 11px;
+    padding: 6px 10px;
+    border-radius: 4px;
+    white-space: nowrap;
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.4);
+    opacity: 0;
+    pointer-events: none;
+    transition:
+        opacity 160ms,
+        transform 160ms;
+}
+.tb-tray-btn:hover .tray-tip {
+    opacity: 1;
+    transform: translateY(-6px);
+}
+
+/* Window-style chrome (variant) */
+.flyout.windowed {
+    border-radius: 8px;
+}
+.win-titlebar {
+    height: 32px;
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
+    padding-right: 0;
+    border-bottom: 1px solid var(--stroke);
+}
+.win-btn {
+    width: 46px;
+    height: 32px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-2);
+    cursor: default;
+}
+.win-btn:hover {
+    background: rgba(255, 255, 255, 0.06);
+}
+.win-btn.close:hover {
+    background: #c42b1c;
+    color: white;
+}
+
+/* Density variants */
+.density-compact .card {
+    padding: 10px 12px;
+}
+.density-compact .cards {
+    gap: 4px;
+    padding: 8px;
+}
+.density-compact .pct {
+    font-size: 16px;
+}
+.density-compact .card-title {
+    font-size: 13px;
+}
+
+.density-comfy .card {
+    padding: 14px 16px 14px;
+}
+.density-comfy .cards {
+    gap: 8px;
+    padding: 12px;
+}
+
+/* Accent override */
+.accent-blue {
+    --accent: #4cc2ff;
+    --accent-soft: rgba(76, 194, 255, 0.18);
+}
+.accent-purple {
+    --accent: #b388ff;
+    --accent-soft: rgba(179, 136, 255, 0.18);
+}
+.accent-claude {
+    --accent: #d97757;
+    --accent-soft: rgba(217, 119, 87, 0.18);
+}
+.accent-mint {
+    --accent: #6ee7b7;
+    --accent-soft: rgba(110, 231, 183, 0.18);
+}
+
+/* Hint banner */
+.hint {
+    position: absolute;
+    left: 18px;
+    bottom: 60px;
+    color: rgba(255, 255, 255, 0.5);
+    font-size: 11px;
+    letter-spacing: 0.02em;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    background: rgba(0, 0, 0, 0.35);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 6px;
+    backdrop-filter: blur(20px);
+}
+.kbd {
+    font-family: var(--segoe);
+    font-size: 10px;
+    padding: 1px 5px;
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    border-bottom-width: 2px;
+    border-radius: 3px;
+    background: rgba(255, 255, 255, 0.04);
+    color: var(--text-2);
+}
+
+/* ─── Buttons ────────────────────────────────────────────── */
+.btn-primary {
+    padding: 8px 20px;
+    border: none;
+    border-radius: var(--card-radius);
+    background: var(--accent);
+    color: white;
+    font-size: 13px;
+    font-weight: 500;
+    font-family: var(--segoe);
+    cursor: pointer;
+    transition: filter 120ms;
+}
+.btn-primary:hover {
+    filter: brightness(1.15);
+}
+.btn-primary:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+}
+
+.btn-secondary {
+    padding: 6px 14px;
+    border: 1px solid var(--stroke-strong);
+    border-radius: var(--card-radius);
+    background: transparent;
+    color: var(--text-2);
+    font-size: 12px;
+    font-family: var(--segoe);
+    cursor: pointer;
+    transition: background 120ms;
+}
+.btn-secondary:hover {
+    background: var(--card-bg);
+}
+
+/* ─── Spinner ────────────────────────────────────────────── */
+.spinner {
+    width: 24px;
+    height: 24px;
+    border: 2px solid var(--stroke-strong);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    margin: 0 auto;
+}

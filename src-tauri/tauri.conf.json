@@ -1,0 +1,48 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nicegui/nicegui-tauri/v2/src-tauri/tauri.conf.json",
+  "productName": "Claude Usage Tracker",
+  "version": "0.1.0",
+  "identifier": "com.claude-usage-tracker.app",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Claude Usage Tracker",
+        "width": 380,
+        "height": 520,
+        "resizable": false,
+        "decorations": true,
+        "center": true,
+        "visible": true,
+        "skipTaskbar": false
+      }
+    ],
+    "trayIcon": {
+      "id": "main-tray",
+      "iconPath": "icons/icon.png",
+      "iconAsTemplate": false,
+      "tooltip": "Claude Usage Tracker"
+    },
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico"
+    ]
+  },
+  "plugins": {}
+}

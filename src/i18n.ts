@@ -1,0 +1,91 @@
+import { createI18n } from "vue-i18n";
+
+const messages = {
+  en: {
+    trackingActive: "Tracking active",
+    refresh: "Refresh",
+    back: "Back",
+    settings: "Settings",
+    configureClaude: "Configure Claude connection",
+    configure: "Configure",
+    retry: "Retry",
+    loading: "Loading…",
+    save: "Save",
+    sessionKey: "Session Key",
+    sessionKeyPlaceholder: "Paste sessionKey from claude.ai cookie",
+    sessionKeyHint: "Cookie → claude.ai → sessionKey",
+    orgId: "Organization ID",
+    orgIdPlaceholder: "Organization UUID",
+    orgIdHint: "claude.ai/api/organizations → uuid",
+    refreshInterval: "Refresh interval",
+    autoStartSession: "Auto-start session",
+    autoStartDesc: "Creates a chat in a separate project on reset",
+    language: "Language",
+    session5h: "Session (5h)",
+    weekly7d: "Weekly (7d)",
+    opusWeekly: "Opus (weekly)",
+    limit: "LIMIT",
+    noActiveSession: "No active session",
+    resetDone: "Reset!",
+    resetsIn: "Resets in {time} ({date})",
+    today: "Today",
+    sessionActive: "Session active",
+    startSession: "Start session",
+    creatingProject: "Creating project…",
+    checkingSession: "Checking session…",
+    error: "Error",
+    sessionAlreadyActive: "Session already active",
+    sessionStarted: "Session started",
+  },
+  ru: {
+    trackingActive: "Отслеживание активно",
+    refresh: "Обновить",
+    back: "Назад",
+    settings: "Настройки",
+    configureClaude: "Настройте подключение к Claude",
+    configure: "Настроить",
+    retry: "Повторить",
+    loading: "Загрузка данных…",
+    save: "Сохранить",
+    sessionKey: "Session Key",
+    sessionKeyPlaceholder: "Вставьте sessionKey из cookie claude.ai",
+    sessionKeyHint: "Cookie → claude.ai → sessionKey",
+    orgId: "Organization ID",
+    orgIdPlaceholder: "UUID организации",
+    orgIdHint: "claude.ai/api/organizations → uuid",
+    refreshInterval: "Интервал обновления",
+    autoStartSession: "Автостарт сессии",
+    autoStartDesc: "При сбросе создаст чат в отдельном проекте",
+    language: "Язык",
+    session5h: "Сессия (5ч)",
+    weekly7d: "Неделя (7д)",
+    opusWeekly: "Opus (неделя)",
+    limit: "ЛИМИТ",
+    noActiveSession: "Нет активной сессии",
+    resetDone: "Сброс!",
+    resetsIn: "Сброс через {time} ({date})",
+    today: "Сегодня",
+    sessionActive: "Сессия активна",
+    startSession: "Запустить сессию",
+    creatingProject: "Создаю проект…",
+    checkingSession: "Проверяю сессию…",
+    error: "Ошибка",
+    sessionAlreadyActive: "Сессия уже активна",
+    sessionStarted: "Сессия запущена",
+  },
+};
+
+function detectLocale(): "en" | "ru" {
+  const lang = navigator.language.toLowerCase();
+  if (lang.startsWith("ru")) return "ru";
+  return "en";
+}
+
+const i18n = createI18n({
+  legacy: false,
+  locale: detectLocale(),
+  fallbackLocale: "en",
+  messages,
+});
+
+export default i18n;
