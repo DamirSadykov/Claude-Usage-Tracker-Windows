@@ -5,6 +5,7 @@ import { invoke } from "@tauri-apps/api/core";
 import SettingsPanel from "./components/SettingsPanel.vue";
 import UsagePanel from "./components/UsagePanel.vue";
 import MiniPanel from "./components/MiniPanel.vue";
+import AnalyticsPanel from "./components/AnalyticsPanel.vue";
 import {
     DEFAULT_THRESHOLDS,
     normalize,
@@ -67,11 +68,13 @@ const alertTypes = ref<AlertTypes>(defaultAlertTypes());
 const quietHoursEnabled = ref(false);
 const quietHoursStart = ref("23:00");
 const quietHoursEnd = ref("08:00");
+const ccAnalyticsEnabled = ref(false);
 const usage = ref<UsageData | null>(null);
 const levels = ref<UsageLevels | null>(null);
 const error = ref("");
 const loading = ref(false);
 const showSettings = ref(false);
+const showAnalytics = ref(false);
 const autoStartStatus = ref("");
 const configured = computed(() => sessionKey.value && orgId.value);
 
@@ -112,6 +115,8 @@ async function loadSettings() {
             (await store.get<string>("quietHoursStart")) ?? "23:00";
         quietHoursEnd.value =
             (await store.get<string>("quietHoursEnd")) ?? "08:00";
+        ccAnalyticsEnabled.value =
+            (await store.get<boolean>("ccAnalyticsEnabled")) ?? false;
         const savedLocale = await store.get<string>("locale");
         if (savedLocale) locale.value = savedLocale;
     } catch {
@@ -136,6 +141,7 @@ async function saveSettings() {
     await store.set("quietHoursEnabled", quietHoursEnabled.value);
     await store.set("quietHoursStart", quietHoursStart.value);
     await store.set("quietHoursEnd", quietHoursEnd.value);
+    await store.set("ccAnalyticsEnabled", ccAnalyticsEnabled.value);
     await store.set("locale", locale.value);
     await store.save();
 }
@@ -158,6 +164,7 @@ function buildConfig() {
         quiet_hours_end: quietHoursEnd.value,
         alert_tiers: alertTiers.value,
         alert_types: alertTypes.value,
+        cc_analytics_enabled: ccAnalyticsEnabled.value,
     };
 }
 
@@ -250,6 +257,7 @@ async function handleSave(settings: {
     quietHoursEnd: string;
     alertTiers: AlertTiers;
     alertTypes: AlertTypes;
+    ccAnalyticsEnabled: boolean;
     locale: string;
 }) {
     sessionKey.value = settings.sessionKey;
@@ -265,12 +273,20 @@ async function handleSave(settings: {
     quietHoursEnd.value = settings.quietHoursEnd;
     alertTiers.value = normalizeAlertTiers(settings.alertTiers);
     alertTypes.value = normalizeAlertTypes(settings.alertTypes);
+    ccAnalyticsEnabled.value = settings.ccAnalyticsEnabled;
     locale.value = settings.locale;
     // The backend re-arms its alert engine on disable (see `configure`).
     await saveSettings();
 
     showSettings.value = false;
+    // Analytics is unavailable once the opt-in is turned off.
+    if (!ccAnalyticsEnabled.value) showAnalytics.value = false;
     await applyConfig();
+}
+
+function toggleAnalytics() {
+    showAnalytics.value = !showAnalytics.value;
+    if (showAnalytics.value) showSettings.value = false;
 }
 
 async function handleManualStart() {
@@ -403,7 +419,22 @@ onUnmounted(() => {
                 </button>
                 <button
                     class="icon-btn"
-                    @click="showSettings = !showSettings"
+                    :class="{ active: showAnalytics }"
+                    @click="toggleAnalytics"
+                    :title="t('analytics')"
+                    v-if="!showSettings && configured && ccAnalyticsEnabled"
+                >
+                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+                        <path d="M2 14V2" stroke-linecap="round"/>
+                        <path d="M2 14h12" stroke-linecap="round"/>
+                        <rect x="4" y="8" width="2.5" height="4" rx="0.5"/>
+                        <rect x="7.5" y="5" width="2.5" height="7" rx="0.5"/>
+                        <rect x="11" y="9" width="2.5" height="3" rx="0.5"/>
+                    </svg>
+                </button>
+                <button
+                    class="icon-btn"
+                    @click="showSettings = !showSettings; showAnalytics = false"
                     :title="showSettings ? t('back') : t('settings')"
                 >
                     <svg
@@ -455,9 +486,13 @@ onUnmounted(() => {
             :quiet-hours-enabled="quietHoursEnabled"
             :quiet-hours-start="quietHoursStart"
             :quiet-hours-end="quietHoursEnd"
+            :cc-analytics-enabled="ccAnalyticsEnabled"
             :locale="locale"
             @save="handleSave"
         />
+
+        <!-- Analytics -->
+        <AnalyticsPanel v-else-if="showAnalytics" :active="showAnalytics" />
 
         <!-- Usage -->
         <template v-else>

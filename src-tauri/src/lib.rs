@@ -1,4 +1,5 @@
 mod alerts;
+mod cc;
 mod stats;
 mod usage;
 
@@ -257,6 +258,45 @@ async fn get_latest_snapshots(
     stats.latest(count).map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn ingest_cc_usage(
+    stats: tauri::State<'_, Arc<StatsDb>>,
+    config: tauri::State<'_, Mutex<AppConfig>>,
+) -> Result<usize, String> {
+    // Privacy gate: never touch ~/.claude unless the user opted in.
+    if !config.lock().unwrap().cc_analytics_enabled {
+        return Ok(0);
+    }
+    let base = cc::claude_dir().ok_or("Cannot resolve Claude config directory")?;
+    let db = stats.inner().clone();
+    // Disk-heavy walk/parse — keep it off the async runtime threads.
+    tauri::async_runtime::spawn_blocking(move || cc::ingest(&base, &db))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn get_analytics(
+    from: String,
+    to: String,
+    stats: tauri::State<'_, Arc<StatsDb>>,
+) -> Result<stats::Analytics, String> {
+    stats.analytics(&from, &to).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_analytics_compare(
+    cur_from: String,
+    cur_to: String,
+    prev_from: String,
+    prev_to: String,
+    stats: tauri::State<'_, Arc<StatsDb>>,
+) -> Result<stats::PeriodCompare, String> {
+    stats
+        .analytics_compare(&cur_from, &cur_to, &prev_from, &prev_to)
+        .map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -373,6 +413,9 @@ pub fn run() {
             get_usage_delta,
             get_usage_snapshots,
             get_latest_snapshots,
+            ingest_cc_usage,
+            get_analytics,
+            get_analytics_compare,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

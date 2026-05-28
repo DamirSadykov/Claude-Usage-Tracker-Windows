@@ -75,6 +75,10 @@ pub struct AppConfig {
     pub quiet_hours_end: String,
     pub alert_tiers: AlertTiers,
     pub alert_types: AlertTypes,
+    // Opt-in: read local Claude Code transcripts for token/cost analytics. Off
+    // by default — reads ~/.claude and must be explicitly enabled by the user.
+    #[serde(default)]
+    pub cc_analytics_enabled: bool,
 }
 
 impl Default for AppConfig {
@@ -94,6 +98,7 @@ impl Default for AppConfig {
             quiet_hours_end: "08:00".to_string(),
             alert_tiers: AlertTiers::default(),
             alert_types: AlertTypes::default(),
+            cc_analytics_enabled: false,
         }
     }
 }
