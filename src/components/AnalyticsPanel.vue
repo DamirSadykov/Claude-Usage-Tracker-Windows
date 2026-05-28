@@ -279,14 +279,14 @@ function renderCharts() {
           x: {
             stacked: !isCost,
             grid: { display: false },
-            ticks: { color: tickColor, font: { size: 11 } },
+            ticks: { color: tickColor, font: { size: 12 } },
           },
           y: {
             stacked: !isCost,
             grid: { color: gridColor },
             ticks: {
               color: tickColor,
-              font: { size: 11 },
+              font: { size: 12 },
               callback: (v) => (isCost ? "$" + v : fmtTokens(Number(v))),
             },
           },
@@ -523,7 +523,7 @@ onUnmounted(() => {
 .stat-val.up { color: #f87171; }
 .stat-val.down { color: #6ccb5f; }
 .stat-lbl {
-  font-size: 11.5px;
+  font-size: 12px;
   color: var(--text-4);
   margin-top: 3px;
   text-transform: uppercase;
@@ -623,7 +623,7 @@ onUnmounted(() => {
 }
 .heat-day {
   width: 30px;
-  font-size: 11.5px;
+  font-size: 12px;
   color: var(--text-4);
   flex-shrink: 0;
 }
@@ -641,7 +641,7 @@ onUnmounted(() => {
   display: flex;
   justify-content: space-between;
   margin-left: 36px;
-  font-size: 10.5px;
+  font-size: 12px;
   color: var(--text-4);
 }
 

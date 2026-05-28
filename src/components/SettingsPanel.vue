@@ -447,7 +447,7 @@ function handleSave() {
 }
 
 .cc-note-row {
-  font-size: 11px;
+  font-size: 13px;
   line-height: 1.4;
   color: var(--text-4);
   padding-left: 14px;
@@ -467,7 +467,7 @@ function handleSave() {
 }
 
 .field-label {
-  font-size: 11.5px;
+  font-size: 12px;
   font-weight: 600;
   color: var(--text-3);
   text-transform: uppercase;
@@ -498,7 +498,7 @@ function handleSave() {
 }
 
 .field-hint {
-  font-size: 11px;
+  font-size: 13px;
   color: var(--text-4);
   margin-top: 6px;
 }

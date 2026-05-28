@@ -96,7 +96,7 @@ onUnmounted(() => {
 }
 
 .label {
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 600;
   color: rgba(255, 255, 255, 0.5);
   width: 20px;
@@ -138,7 +138,7 @@ onUnmounted(() => {
 
 .loading {
   color: rgba(255, 255, 255, 0.3);
-  font-size: 11px;
+  font-size: 12px;
   text-align: center;
   pointer-events: none;
 }
