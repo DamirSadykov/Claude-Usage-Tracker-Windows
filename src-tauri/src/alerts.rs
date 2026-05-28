@@ -79,6 +79,15 @@ pub struct AppConfig {
     // by default — reads ~/.claude and must be explicitly enabled by the user.
     #[serde(default)]
     pub cc_analytics_enabled: bool,
+    // Self-set daily budget. Unit is implied by `cc_analytics_enabled`:
+    // dollars (CC cost) when on, percent of the weekly limit when off.
+    #[serde(default)]
+    pub daily_budget_enabled: bool,
+    #[serde(default)]
+    pub daily_budget: f64,
+    // Snooze: while `now < muted_until`, alerts are queued like quiet hours.
+    #[serde(default)]
+    pub notifications_muted_until: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -99,6 +108,9 @@ impl Default for AppConfig {
             alert_tiers: AlertTiers::default(),
             alert_types: AlertTypes::default(),
             cc_analytics_enabled: false,
+            daily_budget_enabled: false,
+            daily_budget: 0.0,
+            notifications_muted_until: None,
         }
     }
 }
@@ -172,6 +184,8 @@ pub enum AlertEvent {
     Reset { tier: String },
     /// Session is forecast to end within the configured window. `eta_minutes` raw.
     Forecast { eta_minutes: f64 },
+    /// Today's consumption reached the self-set daily budget. `unit` = "usd"|"pct".
+    Budget { spent: f64, budget: f64, unit: String },
     /// Aggregated alerts that were suppressed during quiet hours.
     CatchUp { count: usize, items: Vec<AlertEvent> },
 }
@@ -188,6 +202,7 @@ struct TierState {
 pub struct AlertEngine {
     tiers: HashMap<String, TierState>,
     fired_forecast: bool,
+    fired_budget: bool,
     primed: bool,
     pending: Vec<AlertEvent>,
 }
@@ -202,6 +217,7 @@ impl AlertEngine {
     pub fn reset(&mut self) {
         self.tiers.clear();
         self.fired_forecast = false;
+        self.fired_budget = false;
         self.primed = false;
         self.pending.clear();
     }
@@ -215,26 +231,35 @@ impl AlertEngine {
         cfg: &AppConfig,
         now_min: u32,
         delta: Option<&UsageDelta>,
+        today_spent: Option<f64>,
+        muted: bool,
     ) -> Vec<AlertEvent> {
         let mut out = Vec::new();
         if !cfg.notifications_enabled {
             return out;
         }
 
-        self.flush_pending(cfg, now_min, &mut out);
+        // Single suppression gate: quiet hours OR an active snooze. Anything
+        // dispatched while suppressed is queued and flushed (as catch-up) once
+        // both windows are clear.
+        let suppressed = (cfg.quiet_hours_enabled
+            && in_quiet_hours(&cfg.quiet_hours_start, &cfg.quiet_hours_end, now_min))
+            || muted;
+
+        self.flush_pending(suppressed, &mut out);
 
         if cfg.alert_tiers.five_hour {
-            self.eval_tier("five_hour", Some(&usage.five_hour), cfg, now_min, &mut out);
+            self.eval_tier("five_hour", Some(&usage.five_hour), cfg, suppressed, &mut out);
         }
         if cfg.alert_tiers.seven_day {
-            self.eval_tier("seven_day", Some(&usage.seven_day), cfg, now_min, &mut out);
+            self.eval_tier("seven_day", Some(&usage.seven_day), cfg, suppressed, &mut out);
         }
         if cfg.alert_tiers.seven_day_opus {
             self.eval_tier(
                 "seven_day_opus",
                 usage.seven_day_opus.as_ref(),
                 cfg,
-                now_min,
+                suppressed,
                 &mut out,
             );
         }
@@ -243,7 +268,7 @@ impl AlertEngine {
                 "seven_day_sonnet",
                 usage.seven_day_sonnet.as_ref(),
                 cfg,
-                now_min,
+                suppressed,
                 &mut out,
             );
         }
@@ -254,7 +279,7 @@ impl AlertEngine {
                     reset_at: None,
                     is_limited: eu.utilization >= 100.0,
                 };
-                self.eval_tier("extra_usage", Some(&synth), cfg, now_min, &mut out);
+                self.eval_tier("extra_usage", Some(&synth), cfg, suppressed, &mut out);
             }
         }
 
@@ -265,10 +290,48 @@ impl AlertEngine {
         }
 
         if cfg.alert_tiers.five_hour && cfg.alert_types.forecast {
-            self.eval_forecast(usage, cfg, now_min, delta, &mut out);
+            self.eval_forecast(usage, cfg, suppressed, delta, &mut out);
         }
 
+        self.eval_budget(cfg, today_spent, suppressed, &mut out);
+
         out
+    }
+
+    /// Fires once when today's consumption crosses the daily budget; re-arms
+    /// when the spend drops back below it (i.e. the day rolls over).
+    fn eval_budget(
+        &mut self,
+        cfg: &AppConfig,
+        today_spent: Option<f64>,
+        suppressed: bool,
+        out: &mut Vec<AlertEvent>,
+    ) {
+        if !cfg.daily_budget_enabled || cfg.daily_budget <= 0.0 {
+            return;
+        }
+        let spent = match today_spent {
+            Some(s) => s,
+            None => return,
+        };
+        if spent < cfg.daily_budget {
+            self.fired_budget = false;
+            return;
+        }
+        if self.fired_budget {
+            return;
+        }
+        self.fired_budget = true;
+        let unit = if cfg.cc_analytics_enabled { "usd" } else { "pct" };
+        self.dispatch(
+            AlertEvent::Budget {
+                spent,
+                budget: cfg.daily_budget,
+                unit: unit.to_string(),
+            },
+            suppressed,
+            out,
+        );
     }
 
     fn eval_tier(
@@ -276,7 +339,7 @@ impl AlertEngine {
         key: &str,
         cur: Option<&UsageTier>,
         cfg: &AppConfig,
-        now_min: u32,
+        suppressed: bool,
         out: &mut Vec<AlertEvent>,
     ) {
         let cur = match cur {
@@ -353,7 +416,7 @@ impl AlertEngine {
             self.fired_forecast = false;
         }
         if let Some(ev) = event {
-            self.dispatch(ev, cfg, now_min, out);
+            self.dispatch(ev, suppressed, out);
         }
     }
 
@@ -361,7 +424,7 @@ impl AlertEngine {
         &mut self,
         usage: &UsageData,
         cfg: &AppConfig,
-        now_min: u32,
+        suppressed: bool,
         delta: Option<&UsageDelta>,
         out: &mut Vec<AlertEvent>,
     ) {
@@ -393,14 +456,12 @@ impl AlertEngine {
         let eta = (100.0 - fh.percent_used) / rate;
         if eta <= cfg.forecast_minutes {
             self.fired_forecast = true;
-            self.dispatch(AlertEvent::Forecast { eta_minutes: eta }, cfg, now_min, out);
+            self.dispatch(AlertEvent::Forecast { eta_minutes: eta }, suppressed, out);
         }
     }
 
-    fn dispatch(&mut self, ev: AlertEvent, cfg: &AppConfig, now_min: u32, out: &mut Vec<AlertEvent>) {
-        if cfg.quiet_hours_enabled
-            && in_quiet_hours(&cfg.quiet_hours_start, &cfg.quiet_hours_end, now_min)
-        {
+    fn dispatch(&mut self, ev: AlertEvent, suppressed: bool, out: &mut Vec<AlertEvent>) {
+        if suppressed {
             self.pending.push(ev);
             if self.pending.len() > MAX_PENDING {
                 self.pending.remove(0);
@@ -410,13 +471,11 @@ impl AlertEngine {
         out.push(ev);
     }
 
-    fn flush_pending(&mut self, cfg: &AppConfig, now_min: u32, out: &mut Vec<AlertEvent>) {
+    fn flush_pending(&mut self, suppressed: bool, out: &mut Vec<AlertEvent>) {
         if self.pending.is_empty() {
             return;
         }
-        if cfg.quiet_hours_enabled
-            && in_quiet_hours(&cfg.quiet_hours_start, &cfg.quiet_hours_end, now_min)
-        {
+        if suppressed {
             return;
         }
         if self.pending.len() == 1 {
@@ -467,7 +526,7 @@ mod tests {
 
     /// Prime then run one more cycle — the priming pass swallows the first state.
     fn prime(eng: &mut AlertEngine, u: &UsageData, c: &AppConfig) {
-        let _ = eng.evaluate(u, c, 0, None);
+        let _ = eng.evaluate(u, c, 0, None, None, false);
     }
 
     // --- bucketing ---
@@ -511,7 +570,7 @@ mod tests {
         let mut eng = AlertEngine::new();
         let c = cfg();
         let u = usage(tier(80.0, Some("r"), false), tier(0.0, None, false));
-        let out = eng.evaluate(&u, &c, 0, None);
+        let out = eng.evaluate(&u, &c, 0, None, None, false);
         assert!(out.is_empty(), "priming pass must emit nothing");
     }
 
@@ -526,7 +585,7 @@ mod tests {
 
         // cross into orange (>=50)
         let u1 = usage(tier(55.0, Some("r"), false), tier(0.0, None, false));
-        let out = eng.evaluate(&u1, &c, 0, None);
+        let out = eng.evaluate(&u1, &c, 0, None, None, false);
         assert_eq!(
             out,
             vec![AlertEvent::Threshold {
@@ -537,7 +596,7 @@ mod tests {
 
         // same bucket again → silent
         let u2 = usage(tier(60.0, Some("r"), false), tier(0.0, None, false));
-        assert!(eng.evaluate(&u2, &c, 0, None).is_empty());
+        assert!(eng.evaluate(&u2, &c, 0, None, None, false).is_empty());
     }
 
     #[test]
@@ -548,7 +607,7 @@ mod tests {
         prime(&mut eng, &u0, &c);
 
         let u1 = usage(tier(100.0, Some("r"), true), tier(0.0, None, false));
-        let out = eng.evaluate(&u1, &c, 0, None);
+        let out = eng.evaluate(&u1, &c, 0, None, None, false);
         assert_eq!(
             out,
             vec![AlertEvent::Limit {
@@ -556,7 +615,7 @@ mod tests {
             }]
         );
         // doesn't re-fire
-        assert!(eng.evaluate(&u1, &c, 0, None).is_empty());
+        assert!(eng.evaluate(&u1, &c, 0, None, None, false).is_empty());
     }
 
     // --- reset ---
@@ -569,7 +628,7 @@ mod tests {
         prime(&mut eng, &u0, &c);
 
         let u1 = usage(tier(0.0, None, false), tier(0.0, None, false));
-        let out = eng.evaluate(&u1, &c, 0, None);
+        let out = eng.evaluate(&u1, &c, 0, None, None, false);
         assert_eq!(
             out,
             vec![AlertEvent::Reset {
@@ -579,7 +638,7 @@ mod tests {
 
         // after reset, climbing again fires threshold (re-armed)
         let u2 = usage(tier(30.0, Some("r2"), false), tier(0.0, None, false));
-        let out2 = eng.evaluate(&u2, &c, 0, None);
+        let out2 = eng.evaluate(&u2, &c, 0, None, None, false);
         assert_eq!(
             out2,
             vec![AlertEvent::Threshold {
@@ -603,7 +662,7 @@ mod tests {
             ..usage(tier(0.0, None, false), tier(0.0, None, false))
         };
         prime(&mut eng, &mk(80.0), &c);
-        let out = eng.evaluate(&mk(0.0), &c, 0, None);
+        let out = eng.evaluate(&mk(0.0), &c, 0, None, None, false);
         assert!(out.is_empty(), "extra_usage reset must be silent");
     }
 
@@ -617,7 +676,7 @@ mod tests {
         let u0 = usage(tier(10.0, Some("r"), false), tier(0.0, None, false));
         prime(&mut eng, &u0, &c);
         let u1 = usage(tier(80.0, Some("r"), false), tier(0.0, None, false));
-        assert!(eng.evaluate(&u1, &c, 0, None).is_empty());
+        assert!(eng.evaluate(&u1, &c, 0, None, None, false).is_empty());
     }
 
     #[test]
@@ -628,7 +687,7 @@ mod tests {
         let u0 = usage(tier(0.0, None, false), tier(10.0, Some("r"), false));
         prime(&mut eng, &u0, &c);
         let u1 = usage(tier(0.0, None, false), tier(80.0, Some("r"), false));
-        assert!(eng.evaluate(&u1, &c, 0, None).is_empty());
+        assert!(eng.evaluate(&u1, &c, 0, None, None, false).is_empty());
     }
 
     #[test]
@@ -642,7 +701,7 @@ mod tests {
 
         // 60% — below session(80) so no 5h alert, but above weekly orange(50)
         let u1 = usage(tier(60.0, Some("r"), false), tier(60.0, Some("r"), false));
-        let out = eng.evaluate(&u1, &c, 0, None);
+        let out = eng.evaluate(&u1, &c, 0, None, None, false);
         assert_eq!(
             out,
             vec![AlertEvent::Threshold {
@@ -684,17 +743,17 @@ mod tests {
         // 50%/60min = 0.833 %/min; remaining 50% → eta ~60min. Too far.
         let far = delta("2026-01-01T00:00:00Z", "2026-01-01T01:00:00Z", 50.0);
         let u1 = usage(tier(50.0, Some("r"), false), tier(0.0, None, false));
-        assert!(eng.evaluate(&u1, &c, 0, Some(&far)).is_empty());
+        assert!(eng.evaluate(&u1, &c, 0, Some(&far), None, false).is_empty());
 
         // steep: 80% over 60min → 1.333 %/min; remaining 40% → eta 30min ≤ 30.
         let mut eng2 = AlertEngine::new();
         prime(&mut eng2, &u0, &c);
         let steep = delta("2026-01-01T00:00:00Z", "2026-01-01T01:00:00Z", 80.0);
         let u2 = usage(tier(60.0, Some("r"), false), tier(0.0, None, false));
-        let out = eng2.evaluate(&u2, &c, 0, Some(&steep));
+        let out = eng2.evaluate(&u2, &c, 0, Some(&steep), None, false);
         assert!(matches!(out.as_slice(), [AlertEvent::Forecast { .. }]));
         // fires only once
-        assert!(eng2.evaluate(&u2, &c, 0, Some(&steep)).is_empty());
+        assert!(eng2.evaluate(&u2, &c, 0, Some(&steep), None, false).is_empty());
     }
 
     #[test]
@@ -706,13 +765,13 @@ mod tests {
         let u1 = usage(tier(60.0, Some("r"), false), tier(0.0, None, false));
 
         // no delta
-        assert!(eng.evaluate(&u1, &c, 0, None).is_empty());
+        assert!(eng.evaluate(&u1, &c, 0, None, None, false).is_empty());
         // span too short (5min)
         let short = delta("2026-01-01T00:00:00Z", "2026-01-01T00:05:00Z", 50.0);
-        assert!(eng.evaluate(&u1, &c, 0, Some(&short)).is_empty());
+        assert!(eng.evaluate(&u1, &c, 0, Some(&short), None, false).is_empty());
         // rate too low (1% over 60min)
         let flat = delta("2026-01-01T00:00:00Z", "2026-01-01T01:00:00Z", 1.0);
-        assert!(eng.evaluate(&u1, &c, 0, Some(&flat)).is_empty());
+        assert!(eng.evaluate(&u1, &c, 0, Some(&flat), None, false).is_empty());
     }
 
     // --- quiet hours / catch-up ---
@@ -729,11 +788,11 @@ mod tests {
 
         // during quiet hours (02:00) — one threshold gets queued, not emitted
         let u1 = usage(tier(80.0, Some("r"), false), tier(0.0, None, false));
-        let out = eng.evaluate(&u1, &c, 2 * 60, None);
+        let out = eng.evaluate(&u1, &c, 2 * 60, None, None, false);
         assert!(out.is_empty());
 
         // later, outside quiet hours (10:00) — single pending flushes directly
-        let out2 = eng.evaluate(&u1, &c, 10 * 60, None);
+        let out2 = eng.evaluate(&u1, &c, 10 * 60, None, None, false);
         assert_eq!(
             out2,
             vec![AlertEvent::Threshold {
@@ -755,9 +814,9 @@ mod tests {
 
         // two tiers cross during quiet hours
         let u1 = usage(tier(80.0, Some("r"), false), tier(80.0, Some("r"), false));
-        assert!(eng.evaluate(&u1, &c, 2 * 60, None).is_empty());
+        assert!(eng.evaluate(&u1, &c, 2 * 60, None, None, false).is_empty());
 
-        let out = eng.evaluate(&u1, &c, 10 * 60, None);
+        let out = eng.evaluate(&u1, &c, 10 * 60, None, None, false);
         match out.as_slice() {
             [AlertEvent::CatchUp { count, items }] => {
                 assert_eq!(*count, 2);
@@ -765,5 +824,93 @@ mod tests {
             }
             other => panic!("expected catch-up, got {:?}", other),
         }
+    }
+
+    // --- daily budget ---
+
+    fn budget_cfg(enabled: bool, budget: f64, cc: bool) -> AppConfig {
+        let mut c = cfg();
+        c.daily_budget_enabled = enabled;
+        c.daily_budget = budget;
+        c.cc_analytics_enabled = cc;
+        c
+    }
+
+    #[test]
+    fn budget_fires_once_and_rearms() {
+        let mut eng = AlertEngine::new();
+        let c = budget_cfg(true, 10.0, true);
+        let u = usage(tier(0.0, None, false), tier(0.0, None, false));
+        prime(&mut eng, &u, &c);
+
+        // below budget → silent
+        assert!(eng.evaluate(&u, &c, 0, None, Some(5.0), false).is_empty());
+
+        // crosses budget → one Budget event in dollars
+        let out = eng.evaluate(&u, &c, 0, None, Some(12.0), false);
+        assert_eq!(
+            out,
+            vec![AlertEvent::Budget {
+                spent: 12.0,
+                budget: 10.0,
+                unit: "usd".into()
+            }]
+        );
+
+        // still over → no repeat
+        assert!(eng.evaluate(&u, &c, 0, None, Some(15.0), false).is_empty());
+
+        // day rolls over (spend resets below budget) → re-arm, then fire again
+        assert!(eng.evaluate(&u, &c, 0, None, Some(1.0), false).is_empty());
+        let out2 = eng.evaluate(&u, &c, 0, None, Some(11.0), false);
+        assert!(matches!(out2.as_slice(), [AlertEvent::Budget { .. }]));
+    }
+
+    #[test]
+    fn budget_unit_is_pct_without_cc() {
+        let mut eng = AlertEngine::new();
+        let c = budget_cfg(true, 15.0, false);
+        let u = usage(tier(0.0, None, false), tier(0.0, None, false));
+        prime(&mut eng, &u, &c);
+        let out = eng.evaluate(&u, &c, 0, None, Some(20.0), false);
+        assert_eq!(
+            out,
+            vec![AlertEvent::Budget {
+                spent: 20.0,
+                budget: 15.0,
+                unit: "pct".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn budget_disabled_is_silent() {
+        let mut eng = AlertEngine::new();
+        let c = budget_cfg(false, 10.0, true);
+        let u = usage(tier(0.0, None, false), tier(0.0, None, false));
+        prime(&mut eng, &u, &c);
+        assert!(eng.evaluate(&u, &c, 0, None, Some(99.0), false).is_empty());
+    }
+
+    #[test]
+    fn budget_muted_then_catches_up() {
+        let mut eng = AlertEngine::new();
+        let c = budget_cfg(true, 10.0, true);
+        let u = usage(tier(0.0, None, false), tier(0.0, None, false));
+        prime(&mut eng, &u, &c);
+
+        // muted → queued, nothing emitted now
+        assert!(eng.evaluate(&u, &c, 0, None, Some(12.0), true).is_empty());
+
+        // unmuted → single pending flushes directly
+        let out = eng.evaluate(&u, &c, 0, None, Some(12.0), false);
+        assert_eq!(
+            out,
+            vec![AlertEvent::Budget {
+                spent: 12.0,
+                budget: 10.0,
+                unit: "usd".into()
+            }]
+        );
     }
 }

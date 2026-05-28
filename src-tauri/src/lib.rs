@@ -113,6 +113,45 @@ fn compute_levels(u: &UsageData, cfg: &AppConfig) -> UsageLevels {
     }
 }
 
+// --- Daily budget & snooze helpers ---
+
+/// Start of the current local day, expressed as a UTC RFC3339 string (matches
+/// how snapshots/cc_usage timestamps are stored).
+fn local_midnight_rfc3339() -> String {
+    let today = chrono::Local::now().date_naive();
+    let midnight = today.and_hms_opt(0, 0, 0).unwrap();
+    midnight
+        .and_local_timezone(chrono::Local)
+        .single()
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .unwrap_or_else(chrono::Utc::now)
+        .to_rfc3339()
+}
+
+/// Consumption since local midnight, in the unit implied by `cc_analytics_enabled`:
+/// dollars (CC cost) when on, percent of the weekly limit when off. `None` when
+/// the budget is disabled.
+fn today_spent_for(stats: &StatsDb, cfg: &AppConfig, usage: &UsageData, now: &str) -> Option<f64> {
+    if !cfg.daily_budget_enabled {
+        return None;
+    }
+    let from = local_midnight_rfc3339();
+    if cfg.cc_analytics_enabled {
+        stats.cost_in(&from, now).ok()
+    } else {
+        let current = usage.seven_day.percent_used;
+        let baseline = stats.seven_day_baseline(&from, now).ok().flatten().unwrap_or(current);
+        Some((current - baseline).max(0.0))
+    }
+}
+
+fn is_muted(muted_until: Option<&str>, now: chrono::DateTime<chrono::Utc>) -> bool {
+    match muted_until.and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()) {
+        Some(until) => now < until.with_timezone(&chrono::Utc),
+        None => false,
+    }
+}
+
 // --- Background polling loop: the single owner of business logic ---
 
 async fn run_cycle(app: &AppHandle, cfg: &AppConfig, auto_started: &mut bool) {
@@ -146,12 +185,17 @@ async fn run_cycle(app: &AppHandle, cfg: &AppConfig, auto_started: &mut bool) {
     );
 
     if cfg.notifications_enabled {
-        let delta = app.try_state::<Arc<StatsDb>>().and_then(|s| {
-            let now = chrono::Utc::now();
+        let now = chrono::Utc::now();
+        let stats = app.try_state::<Arc<StatsDb>>();
+        let delta = stats.as_ref().and_then(|s| {
             let from = (now - chrono::Duration::hours(1)).to_rfc3339();
             let to = now.to_rfc3339();
             s.compute_delta(&from, &to).ok().flatten()
         });
+        let today_spent = stats
+            .as_ref()
+            .and_then(|s| today_spent_for(s, cfg, &usage, &now.to_rfc3339()));
+        let muted = is_muted(cfg.notifications_muted_until.as_deref(), now);
         let now_min = {
             let n = chrono::Local::now();
             n.hour() * 60 + n.minute()
@@ -159,7 +203,7 @@ async fn run_cycle(app: &AppHandle, cfg: &AppConfig, auto_started: &mut bool) {
         let events = {
             let eng = app.state::<Mutex<AlertEngine>>();
             let mut e = eng.lock().unwrap();
-            e.evaluate(&usage, cfg, now_min, delta.as_ref())
+            e.evaluate(&usage, cfg, now_min, delta.as_ref(), today_spent, muted)
         };
         for ev in events {
             let _ = app.emit("alert", ev);
