@@ -226,4 +226,133 @@ impl StatsDb {
             params![before],
         )
     }
+
+    /// Insert a snapshot with an explicit timestamp. Test-only — production code
+    /// records "now"; tests need deterministic ordering and delta windows.
+    #[cfg(test)]
+    fn insert_at(&self, ts: &str, five: f64, seven: f64, opus: Option<f64>) {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO usage_snapshots (timestamp, five_hour_pct, seven_day_pct, opus_pct)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![ts, five, seven, opus],
+        )
+        .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mem_db() -> StatsDb {
+        StatsDb::open(Path::new(":memory:")).unwrap()
+    }
+
+    #[test]
+    fn migration_sets_user_version() {
+        let db = mem_db();
+        let conn = db.conn.lock().unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn migrate_is_idempotent() {
+        // Running migrate twice on the same connection must not error or regress.
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn query_range_is_ordered_and_bounded() {
+        let db = mem_db();
+        db.insert_at("2026-01-01T00:00:00Z", 10.0, 1.0, None);
+        db.insert_at("2026-01-01T02:00:00Z", 30.0, 3.0, None);
+        db.insert_at("2026-01-01T01:00:00Z", 20.0, 2.0, None);
+
+        let rows = db
+            .query_range("2026-01-01T00:30:00Z", "2026-01-01T02:30:00Z")
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].five_hour_pct, 20.0); // ascending by timestamp
+        assert_eq!(rows[1].five_hour_pct, 30.0);
+    }
+
+    #[test]
+    fn compute_delta_first_to_last() {
+        let db = mem_db();
+        db.insert_at("2026-01-01T00:00:00Z", 10.0, 1.0, Some(5.0));
+        db.insert_at("2026-01-01T01:00:00Z", 45.0, 4.0, Some(9.0));
+
+        let d = db
+            .compute_delta("2026-01-01T00:00:00Z", "2026-01-01T02:00:00Z")
+            .unwrap()
+            .unwrap();
+        assert_eq!(d.five_hour_delta, 35.0);
+        assert_eq!(d.seven_day_delta, 3.0);
+        assert_eq!(d.opus_delta, Some(4.0));
+        assert_eq!(d.from_timestamp, "2026-01-01T00:00:00Z");
+        assert_eq!(d.to_timestamp, "2026-01-01T01:00:00Z");
+    }
+
+    #[test]
+    fn compute_delta_none_with_single_snapshot() {
+        let db = mem_db();
+        db.insert_at("2026-01-01T00:00:00Z", 10.0, 1.0, None);
+        let d = db
+            .compute_delta("2026-01-01T00:00:00Z", "2026-01-01T02:00:00Z")
+            .unwrap();
+        assert!(d.is_none(), "a single snapshot yields no delta");
+    }
+
+    #[test]
+    fn cleanup_before_removes_old_rows() {
+        let db = mem_db();
+        db.insert_at("2026-01-01T00:00:00Z", 10.0, 1.0, None);
+        db.insert_at("2026-01-05T00:00:00Z", 20.0, 2.0, None);
+        let removed = db.cleanup_before("2026-01-03T00:00:00Z").unwrap();
+        assert_eq!(removed, 1);
+        let rows = db
+            .query_range("2026-01-01T00:00:00Z", "2026-01-31T00:00:00Z")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].five_hour_pct, 20.0);
+    }
+
+    #[test]
+    fn record_snapshot_roundtrip() {
+        let db = mem_db();
+        let data = UsageData {
+            five_hour: crate::usage::UsageTier {
+                percent_used: 42.0,
+                reset_at: Some("2026-01-01T00:00:00Z".into()),
+                is_limited: false,
+            },
+            seven_day: crate::usage::UsageTier {
+                percent_used: 7.0,
+                reset_at: None,
+                is_limited: false,
+            },
+            seven_day_opus: None,
+            seven_day_sonnet: None,
+            extra_usage: Some(crate::usage::ExtraUsage {
+                used_credits: 8.88,
+                monthly_limit: 30.0,
+                utilization: 29.6,
+                currency: "USD".into(),
+            }),
+            prepaid_balance: Some(85.0),
+            prepaid_currency: Some("USD".into()),
+        };
+        db.record_snapshot(&data).unwrap();
+        let rows = db.latest(10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].five_hour_pct, 42.0);
+        assert_eq!(rows[0].extra_used, Some(8.88));
+        assert_eq!(rows[0].prepaid_balance, Some(85.0));
+    }
 }
