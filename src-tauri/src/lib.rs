@@ -3,15 +3,16 @@ mod cc;
 mod stats;
 mod usage;
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::Timelike;
 use serde::Serialize;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconEvent},
-    AppHandle, Emitter, Manager, WindowEvent,
+    AppHandle, Emitter, Manager, PhysicalPosition, WebviewWindow, WindowEvent,
 };
 use tauri_plugin_autostart::MacosLauncher;
 use tokio::sync::Notify;
@@ -33,6 +34,46 @@ fn tray_icon_for(percent: f64, thresholds: &[f64]) -> Vec<u8> {
         _ => TRAY_CRIT,
     };
     image::load_from_memory(png).unwrap().to_rgba8().into_raw()
+}
+
+// --- Popup flyout positioning & toggle ---
+
+// A tray click while the flyout is open first blurs the window (auto-hide
+// fires), so the click's Up event then sees it hidden and would re-show it.
+// We record the auto-hide time and ignore re-opens within this window.
+const REOPEN_DEBOUNCE_MS: u64 = 350;
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+// Place the flyout centred above the tray click, clamped to the monitor.
+fn position_flyout(window: &WebviewWindow, anchor: PhysicalPosition<f64>) {
+    let Ok(size) = window.outer_size() else {
+        return;
+    };
+    let mut x = anchor.x as i32 - size.width as i32 / 2;
+    let mut y = anchor.y as i32 - size.height as i32 - 8;
+    if let Ok(Some(monitor)) = window.current_monitor() {
+        let mp = monitor.position();
+        let ms = monitor.size();
+        let max_x = (mp.x + ms.width as i32 - size.width as i32).max(mp.x);
+        let max_y = (mp.y + ms.height as i32 - size.height as i32).max(mp.y);
+        x = x.clamp(mp.x, max_x);
+        y = y.clamp(mp.y, max_y);
+    }
+    let _ = window.set_position(PhysicalPosition::new(x, y));
+}
+
+fn show_flyout(window: &WebviewWindow, anchor: Option<PhysicalPosition<f64>>) {
+    if let Some(a) = anchor {
+        position_flyout(window, a);
+    }
+    let _ = window.show();
+    let _ = window.set_focus();
 }
 
 // --- Event payloads pushed to the frontend ---
@@ -332,6 +373,9 @@ pub fn run() {
             let notify = Arc::new(Notify::new());
             app.manage(notify.clone());
 
+            // Shared time of the last auto-hide, used to debounce tray re-opens.
+            let last_hide = Arc::new(AtomicU64::new(0));
+
             // Tray menu
             let show = MenuItem::with_id(app, "show", "Open", true, None::<&str>)?;
             let settings = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
@@ -344,14 +388,12 @@ pub fn run() {
                 tray.on_menu_event(move |app, event| match event.id.as_ref() {
                     "show" => {
                         if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.set_focus();
+                            show_flyout(&window, None);
                         }
                     }
                     "settings" => {
                         if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.set_focus();
+                            show_flyout(&window, None);
                             let _ = window.emit("open-settings", ());
                         }
                     }
@@ -370,10 +412,12 @@ pub fn run() {
                     }
                     _ => {}
                 });
-                tray.on_tray_icon_event(|tray, event| {
+                let tray_last_hide = last_hide.clone();
+                tray.on_tray_icon_event(move |tray, event| {
                     if let TrayIconEvent::Click {
                         button: MouseButton::Left,
                         button_state: MouseButtonState::Up,
+                        position,
                         ..
                     } = event
                     {
@@ -381,22 +425,34 @@ pub fn run() {
                             if window.is_visible().unwrap_or(false) {
                                 let _ = window.hide();
                             } else {
-                                let _ = window.show();
-                                let _ = window.set_focus();
+                                // Skip the re-open if the window was just auto-hidden
+                                // by this same click stealing focus.
+                                let since = now_ms()
+                                    .saturating_sub(tray_last_hide.load(Ordering::Relaxed));
+                                if since > REOPEN_DEBOUNCE_MS {
+                                    show_flyout(&window, Some(position));
+                                }
                             }
                         }
                     }
                 });
             }
 
-            // Hide window on close instead of quitting
+            // Flyout behaviour: hide on close request, and auto-hide when the
+            // window loses focus (a click anywhere outside it).
             if let Some(window) = app.get_webview_window("main") {
                 let w = window.clone();
-                window.on_window_event(move |event| {
-                    if let WindowEvent::CloseRequested { api, .. } = event {
+                let win_last_hide = last_hide.clone();
+                window.on_window_event(move |event| match event {
+                    WindowEvent::CloseRequested { api, .. } => {
                         api.prevent_close();
                         let _ = w.hide();
                     }
+                    WindowEvent::Focused(false) => {
+                        win_last_hide.store(now_ms(), Ordering::Relaxed);
+                        let _ = w.hide();
+                    }
+                    _ => {}
                 });
             }
 
