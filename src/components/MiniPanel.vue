@@ -2,6 +2,7 @@
 import { ref, onMounted, onUnmounted } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { tierLevel, normalize, DEFAULT_THRESHOLDS } from "../thresholds";
 
 interface UsageTier {
   percent_used: number;
@@ -28,15 +29,25 @@ interface UsageData {
 
 const usage = ref<UsageData | null>(null);
 const error = ref("");
+const thresholds = ref<number[]>([...DEFAULT_THRESHOLDS]);
 let timer: ReturnType<typeof setInterval> | null = null;
+let unlistenThresholds: (() => void) | null = null;
 let sessionKey = "";
 let orgId = "";
+let refreshSec = 60;
 
 async function loadSettings() {
   const { load } = await import("@tauri-apps/plugin-store");
   const store = await load("settings.json");
   sessionKey = (await store.get<string>("sessionKey")) ?? "";
   orgId = (await store.get<string>("orgId")) ?? "";
+  refreshSec = (await store.get<number>("refreshInterval")) ?? 60;
+  thresholds.value = normalize(await store.get<number[]>("thresholds"));
+
+  // React to threshold edits made in the main window (shared store, cross-window event).
+  unlistenThresholds = await store.onKeyChange<number[]>("thresholds", (val) => {
+    thresholds.value = normalize(val ?? null);
+  });
 }
 
 async function fetchData() {
@@ -51,11 +62,9 @@ async function fetchData() {
   }
 }
 
+const MINI_CLASSES = ["t-green", "t-yellow", "t-orange", "t-red"];
 function tierClass(p: number) {
-  if (p < 25) return "t-green";
-  if (p < 50) return "t-yellow";
-  if (p < 75) return "t-orange";
-  return "t-red";
+  return MINI_CLASSES[tierLevel(p, thresholds.value)];
 }
 
 async function startDrag() {
@@ -65,11 +74,12 @@ async function startDrag() {
 onMounted(async () => {
   await loadSettings();
   await fetchData();
-  timer = setInterval(fetchData, 60000);
+  timer = setInterval(fetchData, refreshSec * 1000);
 });
 
 onUnmounted(() => {
   if (timer) clearInterval(timer);
+  if (unlistenThresholds) unlistenThresholds();
 });
 </script>
 

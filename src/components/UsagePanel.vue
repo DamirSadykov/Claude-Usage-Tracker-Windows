@@ -2,15 +2,19 @@
 import { computed, ref, onMounted, onUnmounted } from "vue";
 import { useI18n } from "vue-i18n";
 import type { UsageData } from "../App.vue";
+import { tierLevel } from "../thresholds";
 
 const { t, locale } = useI18n();
 
 const props = defineProps<{
   usage: UsageData;
   loading: boolean;
+  thresholds: number[];
   autoStartEnabled: boolean;
   autoStartStatus: string;
 }>();
+
+const TIER_CLASSES = ["tier-green", "tier-yellow", "tier-orange", "tier-red"];
 
 defineEmits<{
   refresh: [];
@@ -75,10 +79,7 @@ function formatReset(resetAt: string | null): string {
 }
 
 function tierClass(percent: number): string {
-  if (percent < 25) return "tier-green";
-  if (percent < 50) return "tier-yellow";
-  if (percent < 75) return "tier-orange";
-  return "tier-red";
+  return TIER_CLASSES[tierLevel(percent, props.thresholds)];
 }
 
 const fiveHour = computed(() => props.usage.five_hour);

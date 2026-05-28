@@ -16,12 +16,19 @@ static TRAY_WARN: &[u8] = include_bytes!("../icons/tray-warn.png");
 static TRAY_HIGH: &[u8] = include_bytes!("../icons/tray-high.png");
 static TRAY_CRIT: &[u8] = include_bytes!("../icons/tray-crit.png");
 
-fn tray_icon_for(percent: f64) -> Vec<u8> {
-    let png = if percent < 25.0 {
+fn tray_icon_for(percent: f64, thresholds: &[f64]) -> Vec<u8> {
+    let t = if thresholds.len() >= 3 {
+        let mut s = [thresholds[0], thresholds[1], thresholds[2]];
+        s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        s
+    } else {
+        [25.0, 50.0, 75.0]
+    };
+    let png = if percent < t[0] {
         TRAY_OK
-    } else if percent < 50.0 {
+    } else if percent < t[1] {
         TRAY_WARN
-    } else if percent < 75.0 {
+    } else if percent < t[2] {
         TRAY_HIGH
     } else {
         TRAY_CRIT
@@ -47,8 +54,12 @@ async fn fetch_usage(
 }
 
 #[tauri::command]
-async fn update_tray(app: tauri::AppHandle, percent: f64) -> Result<(), String> {
-    let rgba = tray_icon_for(percent);
+async fn update_tray(
+    app: tauri::AppHandle,
+    percent: f64,
+    thresholds: Vec<f64>,
+) -> Result<(), String> {
+    let rgba = tray_icon_for(percent, &thresholds);
     let icon = tauri::image::Image::new_owned(rgba, 32, 32);
 
     if let Some(tray) = app.tray_by_id("main-tray") {

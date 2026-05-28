@@ -5,6 +5,7 @@ import { invoke } from "@tauri-apps/api/core";
 import SettingsPanel from "./components/SettingsPanel.vue";
 import UsagePanel from "./components/UsagePanel.vue";
 import MiniPanel from "./components/MiniPanel.vue";
+import { DEFAULT_THRESHOLDS, normalize } from "./thresholds";
 
 const isMini = window.location.hash === "#mini";
 
@@ -38,6 +39,12 @@ const orgId = ref("");
 const refreshInterval = ref(60);
 const autoStartSession = ref(false);
 const projectId = ref("");
+const thresholds = ref<number[]>([...DEFAULT_THRESHOLDS]);
+const notificationsEnabled = ref(false);
+const notifyForecastMinutes = ref(30);
+const quietHoursEnabled = ref(false);
+const quietHoursStart = ref("23:00");
+const quietHoursEnd = ref("08:00");
 const usage = ref<UsageData | null>(null);
 const error = ref("");
 const loading = ref(false);
@@ -59,6 +66,17 @@ async function loadSettings() {
         autoStartSession.value =
             (await store.get<boolean>("autoStartSession")) ?? false;
         projectId.value = (await store.get<string>("projectId")) ?? "";
+        thresholds.value = normalize(await store.get<number[]>("thresholds"));
+        notificationsEnabled.value =
+            (await store.get<boolean>("notificationsEnabled")) ?? false;
+        notifyForecastMinutes.value =
+            (await store.get<number>("notifyForecastMinutes")) ?? 30;
+        quietHoursEnabled.value =
+            (await store.get<boolean>("quietHoursEnabled")) ?? false;
+        quietHoursStart.value =
+            (await store.get<string>("quietHoursStart")) ?? "23:00";
+        quietHoursEnd.value =
+            (await store.get<string>("quietHoursEnd")) ?? "08:00";
         const savedLocale = await store.get<string>("locale");
         if (savedLocale) locale.value = savedLocale;
     } catch {
@@ -74,6 +92,12 @@ async function saveSettings() {
     await store.set("refreshInterval", refreshInterval.value);
     await store.set("autoStartSession", autoStartSession.value);
     await store.set("projectId", projectId.value);
+    await store.set("thresholds", thresholds.value);
+    await store.set("notificationsEnabled", notificationsEnabled.value);
+    await store.set("notifyForecastMinutes", notifyForecastMinutes.value);
+    await store.set("quietHoursEnabled", quietHoursEnabled.value);
+    await store.set("quietHoursStart", quietHoursStart.value);
+    await store.set("quietHoursEnd", quietHoursEnd.value);
     await store.set("locale", locale.value);
     await store.save();
 }
@@ -136,7 +160,20 @@ async function fetchUsage() {
         if (usage.value) {
             await invoke("update_tray", {
                 percent: usage.value.five_hour.percent_used,
+                thresholds: thresholds.value,
             }).catch(() => {});
+        }
+
+        if (notificationsEnabled.value && usage.value) {
+            const { checkAlerts } = await import("./alerts");
+            await checkAlerts(usage.value, {
+                enabled: notificationsEnabled.value,
+                thresholds: thresholds.value,
+                forecastMinutes: notifyForecastMinutes.value,
+                quietHoursEnabled: quietHoursEnabled.value,
+                quietHoursStart: quietHoursStart.value,
+                quietHoursEnd: quietHoursEnd.value,
+            });
         }
 
         if (autoStartSession.value && usage.value) {
@@ -177,14 +214,33 @@ async function handleSave(settings: {
     orgId: string;
     refreshInterval: number;
     autoStartSession: boolean;
+    thresholds: number[];
+    notificationsEnabled: boolean;
+    notifyForecastMinutes: number;
+    quietHoursEnabled: boolean;
+    quietHoursStart: string;
+    quietHoursEnd: string;
     locale: string;
 }) {
+    const wasEnabled = notificationsEnabled.value;
     sessionKey.value = settings.sessionKey;
     orgId.value = settings.orgId;
     refreshInterval.value = settings.refreshInterval;
     autoStartSession.value = settings.autoStartSession;
+    thresholds.value = normalize(settings.thresholds);
+    notificationsEnabled.value = settings.notificationsEnabled;
+    notifyForecastMinutes.value = settings.notifyForecastMinutes;
+    quietHoursEnabled.value = settings.quietHoursEnabled;
+    quietHoursStart.value = settings.quietHoursStart;
+    quietHoursEnd.value = settings.quietHoursEnd;
     locale.value = settings.locale;
     await saveSettings();
+
+    if (wasEnabled && !settings.notificationsEnabled) {
+        const { resetAlertState } = await import("./alerts");
+        resetAlertState();
+    }
+
     showSettings.value = false;
     startPolling();
 }
@@ -327,6 +383,12 @@ onUnmounted(() => {
             :org-id="orgId"
             :refresh-interval="refreshInterval"
             :auto-start-session="autoStartSession"
+            :thresholds="thresholds"
+            :notifications-enabled="notificationsEnabled"
+            :notify-forecast-minutes="notifyForecastMinutes"
+            :quiet-hours-enabled="quietHoursEnabled"
+            :quiet-hours-start="quietHoursStart"
+            :quiet-hours-end="quietHoursEnd"
             :locale="locale"
             @save="handleSave"
         />
@@ -378,6 +440,7 @@ onUnmounted(() => {
                 v-else-if="usage"
                 :usage="usage"
                 :loading="loading"
+                :thresholds="thresholds"
                 :auto-start-enabled="autoStartSession"
                 :auto-start-status="autoStartStatus"
                 @refresh="fetchUsage"
