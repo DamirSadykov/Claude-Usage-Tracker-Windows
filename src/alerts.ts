@@ -5,18 +5,20 @@ import {
   sendNotification,
 } from "@tauri-apps/plugin-notification";
 import i18n from "./i18n";
-import { tierLevel, normalize } from "./thresholds";
-import type { AlertTierKey, AlertTiers } from "./thresholds";
+import { tierLevel, normalize, thresholdsForTier } from "./thresholds";
+import type { AlertTierKey, AlertTiers, AlertTypes } from "./thresholds";
 import type { UsageData, UsageTier } from "./App.vue";
 
 export interface AlertSettings {
   enabled: boolean;
-  thresholds: number[];
+  sessionThresholds: number[];
+  weeklyThresholds: number[];
   forecastMinutes: number;
   quietHoursEnabled: boolean;
   quietHoursStart: string;
   quietHoursEnd: string;
   tiers: AlertTiers;
+  types: AlertTypes;
 }
 
 interface UsageDelta {
@@ -128,7 +130,8 @@ function tierLabel(key: TierKey): string {
 function evalTier(key: TierKey, cur: UsageTier | null, s: AlertSettings): void {
   if (!cur) return;
   const f = getFlags(key);
-  const level = tierLevel(cur.percent_used, s.thresholds);
+  const th = thresholdsForTier(key, s.sessionThresholds, s.weeklyThresholds);
+  const level = tierLevel(cur.percent_used, th);
 
   // First sighting (startup, or tier appeared) → prime, don't fire.
   if (f.prevPercent === null) {
@@ -151,23 +154,27 @@ function evalTier(key: TierKey, cur: UsageTier | null, s: AlertSettings): void {
     f.firedLimit = false;
     if (key === "five_hour") firedForecast = false;
     // Extra usage resets monthly — re-arm silently, no "you can work again" toast.
-    if (key !== "extra_usage") {
+    if (key !== "extra_usage" && s.types.reset) {
       dispatch(t("alertResetTitle"), t("alertResetBody", { tier: tierLabel(key) }), s);
     }
   } else if ((cur.is_limited || cur.percent_used >= 100) && !f.firedLimit) {
-    // Limit takes precedence.
+    // Limit takes precedence (counts as a threshold-type alert).
     f.firedLimit = true;
     f.firedLevel = 3;
-    dispatch(t("alertLimitTitle"), t("alertLimitBody", { tier: tierLabel(key) }), s);
+    if (s.types.threshold) {
+      dispatch(t("alertLimitTitle"), t("alertLimitBody", { tier: tierLabel(key) }), s);
+    }
   } else if (level > f.firedLevel) {
     // Crossed up into a higher colour bucket — notify once per bucket.
     f.firedLevel = level;
-    const reached = normalize(s.thresholds)[level - 1];
-    dispatch(
-      t("alertThresholdTitle"),
-      t("alertThresholdBody", { tier: tierLabel(key), pct: reached.toFixed(0) }),
-      s,
-    );
+    if (s.types.threshold) {
+      const reached = normalize(th)[level - 1];
+      dispatch(
+        t("alertThresholdTitle"),
+        t("alertThresholdBody", { tier: tierLabel(key), pct: reached.toFixed(0) }),
+        s,
+      );
+    }
   }
 
   f.prevPercent = cur.percent_used;
@@ -234,7 +241,7 @@ export async function checkAlerts(usage: UsageData, s: AlertSettings): Promise<v
     return; // first pass only primes tier state (and forecast baseline)
   }
 
-  if (s.tiers.five_hour) await evalForecast(usage, s);
+  if (s.tiers.five_hour && s.types.forecast) await evalForecast(usage, s);
 }
 
 export function resetAlertState(): void {

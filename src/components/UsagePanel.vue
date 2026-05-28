@@ -9,7 +9,8 @@ const { t, locale } = useI18n();
 const props = defineProps<{
   usage: UsageData;
   loading: boolean;
-  thresholds: number[];
+  sessionThresholds: number[];
+  weeklyThresholds: number[];
   autoStartEnabled: boolean;
   autoStartStatus: string;
 }>();
@@ -78,8 +79,13 @@ function formatReset(resetAt: string | null): string {
   return t("resetsIn", { time, date });
 }
 
-function tierClass(percent: number): string {
-  return TIER_CLASSES[tierLevel(percent, props.thresholds)];
+function tierClass(percent: number, weekly = true): string {
+  return TIER_CLASSES[
+    tierLevel(percent, weekly ? props.weeklyThresholds : props.sessionThresholds)
+  ];
+}
+function sessionClass(percent: number): string {
+  return tierClass(percent, false);
 }
 
 const fiveHour = computed(() => props.usage.five_hour);
@@ -106,11 +112,11 @@ const prepaidBalance = computed(() => props.usage.prepaid_balance);
           </div>
           <div class="card-sub">{{ formatReset(fiveHour.reset_at) }}</div>
         </div>
-        <div class="pct" :class="tierClass(fiveHour.percent_used)">
+        <div class="pct" :class="sessionClass(fiveHour.percent_used)">
           {{ fiveHour.percent_used.toFixed(1) }}%
         </div>
       </div>
-      <div class="bar" :class="tierClass(fiveHour.percent_used)">
+      <div class="bar" :class="sessionClass(fiveHour.percent_used)">
         <i :style="{ width: Math.min(fiveHour.percent_used, 100) + '%' }"></i>
       </div>
     </div>

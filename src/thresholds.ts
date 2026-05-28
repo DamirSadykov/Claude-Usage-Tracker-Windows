@@ -52,3 +52,33 @@ export function normalizeAlertTiers(v: Partial<AlertTiers> | null | undefined): 
   }
   return d;
 }
+
+// The 5-hour session has its own thresholds; every other (weekly-ish) tier
+// shares the weekly set. The tray icon follows the session thresholds.
+export function thresholdsForTier(
+  key: AlertTierKey,
+  session: number[],
+  weekly: number[],
+): number[] {
+  return key === "five_hour" ? session : weekly;
+}
+
+// Per-notification-type toggles (independent of the per-tier toggles).
+export const ALERT_TYPE_KEYS = ["threshold", "reset", "forecast"] as const;
+
+export type AlertTypeKey = (typeof ALERT_TYPE_KEYS)[number];
+
+export type AlertTypes = Record<AlertTypeKey, boolean>;
+
+export function defaultAlertTypes(): AlertTypes {
+  return { threshold: true, reset: true, forecast: true };
+}
+
+export function normalizeAlertTypes(v: Partial<AlertTypes> | null | undefined): AlertTypes {
+  const d = defaultAlertTypes();
+  if (!v) return d;
+  for (const k of ALERT_TYPE_KEYS) {
+    if (typeof v[k] === "boolean") d[k] = v[k] as boolean;
+  }
+  return d;
+}

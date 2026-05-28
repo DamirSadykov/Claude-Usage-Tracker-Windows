@@ -29,9 +29,10 @@ interface UsageData {
 
 const usage = ref<UsageData | null>(null);
 const error = ref("");
-const thresholds = ref<number[]>([...DEFAULT_THRESHOLDS]);
+const sessionThresholds = ref<number[]>([...DEFAULT_THRESHOLDS]);
+const weeklyThresholds = ref<number[]>([...DEFAULT_THRESHOLDS]);
 let timer: ReturnType<typeof setInterval> | null = null;
-let unlistenThresholds: (() => void) | null = null;
+const unlisteners: Array<() => void> = [];
 let sessionKey = "";
 let orgId = "";
 let refreshSec = 60;
@@ -42,12 +43,19 @@ async function loadSettings() {
   sessionKey = (await store.get<string>("sessionKey")) ?? "";
   orgId = (await store.get<string>("orgId")) ?? "";
   refreshSec = (await store.get<number>("refreshInterval")) ?? 60;
-  thresholds.value = normalize(await store.get<number[]>("thresholds"));
+  const legacy = await store.get<number[]>("thresholds");
+  sessionThresholds.value = normalize((await store.get<number[]>("thresholdsSession")) ?? legacy);
+  weeklyThresholds.value = normalize((await store.get<number[]>("thresholdsWeekly")) ?? legacy);
 
   // React to threshold edits made in the main window (shared store, cross-window event).
-  unlistenThresholds = await store.onKeyChange<number[]>("thresholds", (val) => {
-    thresholds.value = normalize(val ?? null);
-  });
+  unlisteners.push(
+    await store.onKeyChange<number[]>("thresholdsSession", (val) => {
+      sessionThresholds.value = normalize(val ?? null);
+    }),
+    await store.onKeyChange<number[]>("thresholdsWeekly", (val) => {
+      weeklyThresholds.value = normalize(val ?? null);
+    }),
+  );
 }
 
 async function fetchData() {
@@ -63,8 +71,11 @@ async function fetchData() {
 }
 
 const MINI_CLASSES = ["t-green", "t-yellow", "t-orange", "t-red"];
-function tierClass(p: number) {
-  return MINI_CLASSES[tierLevel(p, thresholds.value)];
+function sessionClass(p: number) {
+  return MINI_CLASSES[tierLevel(p, sessionThresholds.value)];
+}
+function weeklyClass(p: number) {
+  return MINI_CLASSES[tierLevel(p, weeklyThresholds.value)];
 }
 
 async function startDrag() {
@@ -79,7 +90,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   if (timer) clearInterval(timer);
-  if (unlistenThresholds) unlistenThresholds();
+  unlisteners.forEach((u) => u());
 });
 </script>
 
@@ -88,13 +99,13 @@ onUnmounted(() => {
     <template v-if="usage">
       <div class="row">
         <span class="label">5h</span>
-        <div class="track"><i :class="tierClass(usage.five_hour.percent_used)" :style="{ width: Math.min(usage.five_hour.percent_used, 100) + '%' }"></i></div>
-        <span class="val" :class="tierClass(usage.five_hour.percent_used)">{{ usage.five_hour.percent_used.toFixed(0) }}%</span>
+        <div class="track"><i :class="sessionClass(usage.five_hour.percent_used)" :style="{ width: Math.min(usage.five_hour.percent_used, 100) + '%' }"></i></div>
+        <span class="val" :class="sessionClass(usage.five_hour.percent_used)">{{ usage.five_hour.percent_used.toFixed(0) }}%</span>
       </div>
       <div class="row">
         <span class="label">7d</span>
-        <div class="track"><i :class="tierClass(usage.seven_day.percent_used)" :style="{ width: Math.min(usage.seven_day.percent_used, 100) + '%' }"></i></div>
-        <span class="val" :class="tierClass(usage.seven_day.percent_used)">{{ usage.seven_day.percent_used.toFixed(0) }}%</span>
+        <div class="track"><i :class="weeklyClass(usage.seven_day.percent_used)" :style="{ width: Math.min(usage.seven_day.percent_used, 100) + '%' }"></i></div>
+        <span class="val" :class="weeklyClass(usage.seven_day.percent_used)">{{ usage.seven_day.percent_used.toFixed(0) }}%</span>
       </div>
     </template>
     <div v-else class="loading">{{ error || '...' }}</div>
