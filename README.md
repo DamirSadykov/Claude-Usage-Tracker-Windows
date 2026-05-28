@@ -1,5 +1,7 @@
 # Claude Usage Tracker for Windows
 
+[![CI](https://github.com/DamirSadykov/Claude-Usage-Tracker-Windows/actions/workflows/ci.yml/badge.svg)](https://github.com/DamirSadykov/Claude-Usage-Tracker-Windows/actions/workflows/ci.yml)
+
 <p align="center">
   <img src="src-tauri/assets/mark-512.png" width="128" height="128" alt="Claude Usage Tracker">
 </p>
