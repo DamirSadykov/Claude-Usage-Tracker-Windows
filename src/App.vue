@@ -252,7 +252,6 @@ async function handleSave(settings: {
     alertTypes: AlertTypes;
     locale: string;
 }) {
-    const wasEnabled = notificationsEnabled.value;
     sessionKey.value = settings.sessionKey;
     orgId.value = settings.orgId;
     refreshInterval.value = settings.refreshInterval;
@@ -267,8 +266,7 @@ async function handleSave(settings: {
     alertTiers.value = normalizeAlertTiers(settings.alertTiers);
     alertTypes.value = normalizeAlertTypes(settings.alertTypes);
     locale.value = settings.locale;
-    // wasEnabled retained for clarity; the backend re-arms its engine on disable.
-    void wasEnabled;
+    // The backend re-arms its alert engine on disable (see `configure`).
     await saveSettings();
 
     showSettings.value = false;
