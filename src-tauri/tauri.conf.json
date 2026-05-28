@@ -15,13 +15,14 @@
       {
         "label": "main",
         "title": "Claude Usage Tracker",
-        "width": 380,
-        "height": 520,
+        "width": 440,
+        "height": 680,
         "resizable": false,
-        "decorations": true,
+        "decorations": false,
+        "alwaysOnTop": true,
         "center": true,
         "visible": true,
-        "skipTaskbar": false
+        "skipTaskbar": true
       },
       {
         "label": "mini",

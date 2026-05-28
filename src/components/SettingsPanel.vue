@@ -56,6 +56,7 @@ const props = defineProps<{
   quietHoursEnd: string;
   alertTiers: AlertTiers;
   alertTypes: AlertTypes;
+  ccAnalyticsEnabled: boolean;
   locale: string;
 }>();
 
@@ -74,6 +75,7 @@ const emit = defineEmits<{
     quietHoursEnd: string;
     alertTiers: AlertTiers;
     alertTypes: AlertTypes;
+    ccAnalyticsEnabled: boolean;
     locale: string;
   }];
 }>();
@@ -95,6 +97,7 @@ const localQuietStart = ref(props.quietHoursStart);
 const localQuietEnd = ref(props.quietHoursEnd);
 const localTiers = ref<AlertTiers>(normalizeAlertTiers(props.alertTiers));
 const localTypes = ref<AlertTypes>(normalizeAlertTypes(props.alertTypes));
+const localCc = ref(props.ccAnalyticsEnabled);
 const localLocale = ref(props.locale);
 
 watch(() => props.sessionKey, (v) => (localSessionKey.value = v));
@@ -117,6 +120,7 @@ watch(() => props.quietHoursStart, (v) => (localQuietStart.value = v));
 watch(() => props.quietHoursEnd, (v) => (localQuietEnd.value = v));
 watch(() => props.alertTiers, (v) => (localTiers.value = normalizeAlertTiers(v)));
 watch(() => props.alertTypes, (v) => (localTypes.value = normalizeAlertTypes(v)));
+watch(() => props.ccAnalyticsEnabled, (v) => (localCc.value = v));
 watch(() => props.locale, (v) => (localLocale.value = v));
 
 // Keep each threshold triple strictly ascending with a 1% gap so the colour
@@ -153,6 +157,7 @@ function handleSave() {
     quietHoursEnd: localQuietEnd.value,
     alertTiers: { ...localTiers.value },
     alertTypes: { ...localTypes.value },
+    ccAnalyticsEnabled: localCc.value,
     locale: localLocale.value,
   });
 }
@@ -370,6 +375,22 @@ function handleSave() {
         </div>
       </template>
 
+      <!-- Claude Code analytics (opt-in, off by default) -->
+      <div class="card toggle-card" @click="localCc = !localCc">
+        <div style="flex: 1; min-width: 0">
+          <div class="card-title" style="font-size: 13px">{{ t('ccAnalytics') }}</div>
+          <div class="card-sub">{{ t('ccAnalyticsDesc') }}</div>
+        </div>
+        <div class="toggle" :class="{ on: localCc }">
+          <div class="toggle-knob"></div>
+        </div>
+      </div>
+      <div v-if="localCc" class="card cc-note">
+        <div class="cc-note-row">{{ t('ccAnalyticsReads') }}</div>
+        <div class="cc-note-row">{{ t('ccAnalyticsData') }}</div>
+        <div class="cc-note-row">{{ t('ccAnalyticsLocal') }}</div>
+      </div>
+
       <!-- Updates -->
       <div class="card">
         <div class="card-row" style="align-items: center">
@@ -486,13 +507,34 @@ function handleSave() {
   cursor: pointer;
 }
 
+.cc-note {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.cc-note-row {
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--text-4);
+  padding-left: 14px;
+  position: relative;
+}
+
+.cc-note-row::before {
+  content: "•";
+  position: absolute;
+  left: 2px;
+  color: var(--text-3);
+}
+
 .tier-name {
   font-size: 13px;
   color: var(--text-2);
 }
 
 .field-label {
-  font-size: 11.5px;
+  font-size: 12px;
   font-weight: 600;
   color: var(--text-3);
   text-transform: uppercase;
@@ -523,7 +565,7 @@ function handleSave() {
 }
 
 .field-hint {
-  font-size: 11px;
+  font-size: 13px;
   color: var(--text-4);
   margin-top: 6px;
 }
