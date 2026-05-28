@@ -155,6 +155,58 @@ function toggleToken(k: TokenKey) {
   if (props.active) renderCharts();
 }
 
+// Time chart granularity: per-day or aggregated into weeks (Monday-anchored).
+type Gran = "day" | "week";
+const granularity = ref<Gran>("day");
+
+interface ChartPoint {
+  label: string;
+  input: number;
+  output: number;
+  cache_create: number;
+  cache_read: number;
+  cost: number;
+}
+
+function mondayOf(dateStr: string): string {
+  const dt = new Date(dateStr + "T00:00:00");
+  const offset = (dt.getDay() + 6) % 7; // 0 = Monday
+  dt.setDate(dt.getDate() - offset);
+  const m = String(dt.getMonth() + 1).padStart(2, "0");
+  const d = String(dt.getDate()).padStart(2, "0");
+  return `${dt.getFullYear()}-${m}-${d}`;
+}
+
+// Daily points, optionally rolled up into weekly buckets for the chart.
+const chartPoints = computed<ChartPoint[]>(() => {
+  const daily = data.value?.daily ?? [];
+  if (granularity.value === "day") {
+    return daily.map((p) => ({
+      label: p.date.slice(5),
+      input: p.input,
+      output: p.output,
+      cache_create: p.cache_create,
+      cache_read: p.cache_read,
+      cost: p.cost,
+    }));
+  }
+  const weeks = new Map<string, ChartPoint>();
+  for (const p of daily) {
+    const wk = mondayOf(p.date);
+    let a = weeks.get(wk);
+    if (!a) {
+      a = { label: wk.slice(5), input: 0, output: 0, cache_create: 0, cache_read: 0, cost: 0 };
+      weeks.set(wk, a);
+    }
+    a.input += p.input;
+    a.output += p.output;
+    a.cache_create += p.cache_create;
+    a.cache_read += p.cache_read;
+    a.cost += p.cost;
+  }
+  return [...weeks.entries()].sort((x, y) => (x[0] < y[0] ? -1 : 1)).map(([, v]) => v);
+});
+
 // --- weekday/heatmap helpers ---
 // strftime %w: 0=Sun..6=Sat. Display Monday-first.
 const WEEKDAY_ORDER = [1, 2, 3, 4, 5, 6, 0];
@@ -215,11 +267,13 @@ async function load() {
     const from = isoDaysAgo(rangeDays.value);
     const to = new Date().toISOString();
     data.value = await invoke<Analytics>("get_analytics", { from, to });
+    // Compare the selected window against the immediately preceding one of equal
+    // length (7d→prior 7d, 30d→prior 30d), not a fixed week.
     compare.value = await invoke<PeriodCompare>("get_analytics_compare", {
-      curFrom: isoDaysAgo(7),
+      curFrom: from,
       curTo: to,
-      prevFrom: isoDaysAgo(14),
-      prevTo: isoDaysAgo(7),
+      prevFrom: isoDaysAgo(rangeDays.value * 2),
+      prevTo: from,
     });
     await nextTick();
     renderCharts();
@@ -236,15 +290,16 @@ function renderCharts() {
   const gridColor = "rgba(255,255,255,0.06)";
   const tickColor = "rgba(255,255,255,0.45)";
 
-  // Daily chart: single cost bar, or stacked token-type bars.
+  // Time chart: single cost bar, or stacked token-type bars (per day or week).
   if (dailyCanvas.value) {
     dailyChart?.destroy();
-    const labels = d.daily.map((p) => p.date.slice(5)); // MM-DD
+    const pts = chartPoints.value;
+    const labels = pts.map((p) => p.label);
     const isCost = metric.value === "cost";
     const datasets = isCost
       ? [
           {
-            data: d.daily.map((p) => p.cost),
+            data: pts.map((p) => p.cost),
             backgroundColor: "#d97757",
             borderRadius: 3,
             maxBarThickness: 26,
@@ -252,7 +307,7 @@ function renderCharts() {
         ]
       : TOKEN_TYPES.filter((tt) => !hiddenTokens.value.has(tt.key)).map((tt) => ({
           label: t(TOKEN_LABEL[tt.key]),
-          data: d.daily.map((p) => p[tt.key]),
+          data: pts.map((p) => p[tt.key]),
           backgroundColor: tt.color,
           stack: "tok",
           maxBarThickness: 26,
@@ -341,6 +396,9 @@ watch(
     if (a) load();
   },
 );
+watch(granularity, () => {
+  if (props.active) renderCharts();
+});
 watch(locale, () => {
   if (props.active) renderCharts();
 });
@@ -395,9 +453,15 @@ onUnmounted(() => {
         </div>
       </div>
 
-      <!-- Daily chart -->
+      <!-- Usage over time (day / week) -->
       <div class="block">
-        <div class="block-title">{{ t('analyticsDaily') }}</div>
+        <div class="block-head">
+          <div class="block-title">{{ t('analyticsUsage') }}</div>
+          <div class="seg seg-sm">
+            <button :class="{ on: granularity === 'day' }" @click="granularity = 'day'">{{ t('granDay') }}</button>
+            <button :class="{ on: granularity === 'week' }" @click="granularity = 'week'">{{ t('granWeek') }}</button>
+          </div>
+        </div>
         <div class="chart-wrap"><canvas ref="dailyCanvas"></canvas></div>
       </div>
 
@@ -541,6 +605,16 @@ onUnmounted(() => {
   color: var(--text-3);
   text-transform: uppercase;
   letter-spacing: 0.04em;
+}
+.block-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.seg-sm button {
+  padding: 4px 10px;
+  font-size: 12px;
 }
 .chart-wrap {
   height: 160px;
