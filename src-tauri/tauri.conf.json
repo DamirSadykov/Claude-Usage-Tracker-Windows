@@ -18,10 +18,11 @@
         "width": 380,
         "height": 520,
         "resizable": false,
-        "decorations": true,
+        "decorations": false,
+        "alwaysOnTop": true,
         "center": true,
         "visible": true,
-        "skipTaskbar": false
+        "skipTaskbar": true
       },
       {
         "label": "mini",
