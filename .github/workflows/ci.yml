@@ -15,29 +15,55 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Detect relevant changes
+        uses: dorny/paths-filter@v3
+        id: changes
+        with:
+          filters: |
+            code:
+              - 'src/**'
+              - 'src-tauri/**'
+              - 'package.json'
+              - 'package-lock.json'
+              - 'tsconfig*.json'
+              - 'vite.config.ts'
+              - 'index.html'
+              - '.github/workflows/ci.yml'
+
       - name: Setup Node.js
+        if: steps.changes.outputs.code == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
 
       - name: Setup Rust
+        if: steps.changes.outputs.code == 'true'
         uses: dtolnay/rust-toolchain@stable
 
       - name: Rust cache
+        if: steps.changes.outputs.code == 'true'
         uses: swatinem/rust-cache@v2
         with:
           workspaces: src-tauri -> target
 
       - name: Install dependencies
+        if: steps.changes.outputs.code == 'true'
         run: npm ci
 
       - name: Frontend unit tests
+        if: steps.changes.outputs.code == 'true'
         run: npm test
 
       - name: Frontend typecheck and build
+        if: steps.changes.outputs.code == 'true'
         run: npm run build
 
       - name: Rust tests
+        if: steps.changes.outputs.code == 'true'
         working-directory: src-tauri
         run: cargo test
+
+      - name: No code changes
+        if: steps.changes.outputs.code != 'true'
+        run: echo "No code-affecting changes - skipping build and tests."
