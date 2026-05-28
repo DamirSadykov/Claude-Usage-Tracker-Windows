@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Default permissions for the app",
-  "windows": ["main"],
+  "windows": ["main", "mini"],
   "permissions": [
     "core:default",
     "core:window:default",
@@ -14,6 +14,7 @@
     "core:window:allow-set-position",
     "core:window:allow-set-size",
     "core:window:allow-is-visible",
+    "core:window:allow-start-dragging",
     "autostart:default",
     "store:default",
     "notification:default",

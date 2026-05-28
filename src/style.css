@@ -412,11 +412,17 @@ body,
     line-height: 1;
     letter-spacing: -0.01em;
 }
-.pct.success {
-    color: var(--success);
+.pct.tier-green {
+    color: #6ccb5f;
 }
-.pct.warn {
-    color: var(--warning);
+.pct.tier-yellow {
+    color: #ffc107;
+}
+.pct.tier-orange {
+    color: #d97757;
+}
+.pct.tier-red {
+    color: #f87171;
 }
 .pct.muted {
     color: var(--success);
@@ -437,11 +443,17 @@ body,
     border-radius: 999px;
     position: relative;
 }
-.bar.success > i {
+.bar.tier-green > i {
     background: linear-gradient(90deg, #5bb656, #6ccb5f);
 }
-.bar.warn > i {
-    background: linear-gradient(90deg, #ef9326, #f7a440);
+.bar.tier-yellow > i {
+    background: linear-gradient(90deg, #eab308, #ffc107);
+}
+.bar.tier-orange > i {
+    background: linear-gradient(90deg, #c96a4a, #d97757);
+}
+.bar.tier-red > i {
+    background: linear-gradient(90deg, #ef4444, #f87171);
 }
 .bar > .tick {
     position: absolute;

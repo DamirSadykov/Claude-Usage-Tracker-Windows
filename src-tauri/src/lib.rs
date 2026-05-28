@@ -3,16 +3,45 @@ mod usage;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconEvent},
-    Manager, WindowEvent,
+    Emitter, Manager, WindowEvent,
 };
 use tauri_plugin_autostart::MacosLauncher;
 use usage::{ProjectInfo, SessionStartResult, UsageData};
+
+static TRAY_OK: &[u8] = include_bytes!("../icons/tray-ok.png");
+static TRAY_WARN: &[u8] = include_bytes!("../icons/tray-warn.png");
+static TRAY_HIGH: &[u8] = include_bytes!("../icons/tray-high.png");
+static TRAY_CRIT: &[u8] = include_bytes!("../icons/tray-crit.png");
+
+fn tray_icon_for(percent: f64) -> Vec<u8> {
+    let png = if percent < 25.0 {
+        TRAY_OK
+    } else if percent < 50.0 {
+        TRAY_WARN
+    } else if percent < 75.0 {
+        TRAY_HIGH
+    } else {
+        TRAY_CRIT
+    };
+    image::load_from_memory(png).unwrap().to_rgba8().into_raw()
+}
 
 #[tauri::command]
 async fn fetch_usage(session_key: String, org_id: String) -> Result<UsageData, String> {
     usage::fetch_usage(&session_key, &org_id)
         .await
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn update_tray(app: tauri::AppHandle, percent: f64) -> Result<(), String> {
+    let rgba = tray_icon_for(percent);
+    let icon = tauri::image::Image::new_owned(rgba, 32, 32);
+
+    if let Some(tray) = app.tray_by_id("main-tray") {
+        tray.set_icon(Some(icon)).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -55,8 +84,10 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let show = MenuItem::with_id(app, "show", "Open", true, None::<&str>)?;
+            let settings = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
+            let mini = MenuItem::with_id(app, "mini", "Mini widget", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show, &quit])?;
+            let menu = Menu::with_items(app, &[&show, &settings, &mini, &quit])?;
 
             if let Some(tray) = app.tray_by_id("main-tray") {
                 tray.set_menu(Some(menu))?;
@@ -65,6 +96,23 @@ pub fn run() {
                         if let Some(window) = app.get_webview_window("main") {
                             let _ = window.show();
                             let _ = window.set_focus();
+                        }
+                    }
+                    "settings" => {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                            let _ = window.emit("open-settings", ());
+                        }
+                    }
+                    "mini" => {
+                        if let Some(window) = app.get_webview_window("mini") {
+                            if window.is_visible().unwrap_or(false) {
+                                let _ = window.hide();
+                            } else {
+                                let _ = window.show();
+                                let _ = window.set_focus();
+                            }
                         }
                     }
                     "quit" => {
@@ -106,6 +154,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             fetch_usage,
+            update_tray,
             open_claude,
             ensure_project,
             start_session
