@@ -1,21 +1,24 @@
 <script setup lang="ts">
 import { computed, ref, onMounted, onUnmounted } from "vue";
 import { useI18n } from "vue-i18n";
-import type { UsageData } from "../App.vue";
-import { tierLevel } from "../thresholds";
+import type { UsageData, UsageLevels } from "../App.vue";
 
 const { t, locale } = useI18n();
 
 const props = defineProps<{
   usage: UsageData;
+  levels: UsageLevels;
   loading: boolean;
-  sessionThresholds: number[];
-  weeklyThresholds: number[];
   autoStartEnabled: boolean;
   autoStartStatus: string;
 }>();
 
 const TIER_CLASSES = ["tier-green", "tier-yellow", "tier-orange", "tier-red"];
+
+// Colour buckets are computed by the backend and arrive in `levels`.
+function lvlClass(level: number | null): string {
+  return TIER_CLASSES[level ?? 0];
+}
 
 defineEmits<{
   refresh: [];
@@ -79,15 +82,6 @@ function formatReset(resetAt: string | null): string {
   return t("resetsIn", { time, date });
 }
 
-function tierClass(percent: number, weekly = true): string {
-  return TIER_CLASSES[
-    tierLevel(percent, weekly ? props.weeklyThresholds : props.sessionThresholds)
-  ];
-}
-function sessionClass(percent: number): string {
-  return tierClass(percent, false);
-}
-
 const fiveHour = computed(() => props.usage.five_hour);
 const sevenDay = computed(() => props.usage.seven_day);
 const opusDay = computed(() => props.usage.seven_day_opus);
@@ -112,11 +106,11 @@ const prepaidBalance = computed(() => props.usage.prepaid_balance);
           </div>
           <div class="card-sub">{{ formatReset(fiveHour.reset_at) }}</div>
         </div>
-        <div class="pct" :class="sessionClass(fiveHour.percent_used)">
+        <div class="pct" :class="lvlClass(levels.five_hour)">
           {{ fiveHour.percent_used.toFixed(1) }}%
         </div>
       </div>
-      <div class="bar" :class="sessionClass(fiveHour.percent_used)">
+      <div class="bar" :class="lvlClass(levels.five_hour)">
         <i :style="{ width: Math.min(fiveHour.percent_used, 100) + '%' }"></i>
       </div>
     </div>
@@ -131,11 +125,11 @@ const prepaidBalance = computed(() => props.usage.prepaid_balance);
           </div>
           <div class="card-sub">{{ formatReset(sevenDay.reset_at) }}</div>
         </div>
-        <div class="pct" :class="tierClass(sevenDay.percent_used)">
+        <div class="pct" :class="lvlClass(levels.seven_day)">
           {{ sevenDay.percent_used.toFixed(1) }}%
         </div>
       </div>
-      <div class="bar" :class="tierClass(sevenDay.percent_used)">
+      <div class="bar" :class="lvlClass(levels.seven_day)">
         <i :style="{ width: Math.min(sevenDay.percent_used, 100) + '%' }"></i>
       </div>
     </div>
@@ -150,11 +144,11 @@ const prepaidBalance = computed(() => props.usage.prepaid_balance);
           </div>
           <div class="card-sub">{{ formatReset(opusDay.reset_at) }}</div>
         </div>
-        <div class="pct" :class="tierClass(opusDay.percent_used)">
+        <div class="pct" :class="lvlClass(levels.seven_day_opus)">
           {{ opusDay.percent_used.toFixed(1) }}%
         </div>
       </div>
-      <div class="bar" :class="tierClass(opusDay.percent_used)">
+      <div class="bar" :class="lvlClass(levels.seven_day_opus)">
         <i :style="{ width: Math.min(opusDay.percent_used, 100) + '%' }"></i>
       </div>
     </div>
@@ -169,11 +163,11 @@ const prepaidBalance = computed(() => props.usage.prepaid_balance);
           </div>
           <div class="card-sub">{{ formatReset(sonnetDay.reset_at) }}</div>
         </div>
-        <div class="pct" :class="tierClass(sonnetDay.percent_used)">
+        <div class="pct" :class="lvlClass(levels.seven_day_sonnet)">
           {{ sonnetDay.percent_used.toFixed(1) }}%
         </div>
       </div>
-      <div class="bar" :class="tierClass(sonnetDay.percent_used)">
+      <div class="bar" :class="lvlClass(levels.seven_day_sonnet)">
         <i :style="{ width: Math.min(sonnetDay.percent_used, 100) + '%' }"></i>
       </div>
     </div>
@@ -187,11 +181,11 @@ const prepaidBalance = computed(() => props.usage.prepaid_balance);
             {{ extraUsage.used_credits.toFixed(2) }} / {{ extraUsage.monthly_limit.toFixed(2) }} {{ extraUsage.currency }}
           </div>
         </div>
-        <div class="pct" :class="tierClass(extraUsage.utilization)">
+        <div class="pct" :class="lvlClass(levels.extra_usage)">
           {{ extraUsage.utilization.toFixed(1) }}%
         </div>
       </div>
-      <div class="bar" :class="tierClass(extraUsage.utilization)">
+      <div class="bar" :class="lvlClass(levels.extra_usage)">
         <i :style="{ width: Math.min(extraUsage.utilization, 100) + '%' }"></i>
       </div>
     </div>

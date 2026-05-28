@@ -14,6 +14,8 @@ import {
     normalizeAlertTypes,
 } from "./thresholds";
 import type { AlertTiers, AlertTypes } from "./thresholds";
+import { localizeAlert } from "./alertFormat";
+import type { AlertEvent } from "./alertFormat";
 
 const isMini = window.location.hash === "#mini";
 
@@ -40,6 +42,15 @@ export interface UsageData {
     prepaid_currency: string | null;
 }
 
+// Colour buckets (0..3) computed by the backend, one per tier.
+export interface UsageLevels {
+    five_hour: number;
+    seven_day: number;
+    seven_day_opus: number | null;
+    seven_day_sonnet: number | null;
+    extra_usage: number | null;
+}
+
 const { t, locale } = useI18n();
 
 const sessionKey = ref("");
@@ -57,14 +68,15 @@ const quietHoursEnabled = ref(false);
 const quietHoursStart = ref("23:00");
 const quietHoursEnd = ref("08:00");
 const usage = ref<UsageData | null>(null);
+const levels = ref<UsageLevels | null>(null);
 const error = ref("");
 const loading = ref(false);
 const showSettings = ref(false);
 const autoStartStatus = ref("");
 const configured = computed(() => sessionKey.value && orgId.value);
 
-let timer: ReturnType<typeof setInterval> | null = null;
-let autoStartAttempted = false;
+const unlisteners: Array<() => void> = [];
+let permissionOk: boolean | null = null;
 
 async function loadSettings() {
     try {
@@ -128,6 +140,58 @@ async function saveSettings() {
     await store.save();
 }
 
+// Push the current settings to the Rust polling loop. The backend owns the
+// fetch cadence, tray updates and alerting; the frontend only configures it.
+function buildConfig() {
+    return {
+        session_key: sessionKey.value,
+        org_id: orgId.value,
+        refresh_interval: refreshInterval.value,
+        auto_start_session: autoStartSession.value,
+        project_id: projectId.value,
+        session_thresholds: normalize(sessionThresholds.value),
+        weekly_thresholds: normalize(weeklyThresholds.value),
+        notifications_enabled: notificationsEnabled.value,
+        forecast_minutes: notifyForecastMinutes.value,
+        quiet_hours_enabled: quietHoursEnabled.value,
+        quiet_hours_start: quietHoursStart.value,
+        quiet_hours_end: quietHoursEnd.value,
+        alert_tiers: alertTiers.value,
+        alert_types: alertTypes.value,
+    };
+}
+
+async function applyConfig() {
+    if (!configured.value) return;
+    loading.value = true;
+    await invoke("configure", { config: buildConfig() });
+}
+
+async function ensurePermission(): Promise<boolean> {
+    if (permissionOk !== null) return permissionOk;
+    const { isPermissionGranted, requestPermission } = await import(
+        "@tauri-apps/plugin-notification"
+    );
+    let granted = await isPermissionGranted();
+    if (!granted) granted = (await requestPermission()) === "granted";
+    permissionOk = granted;
+    return granted;
+}
+
+async function toast(a: AlertEvent) {
+    if (!(await ensurePermission())) return;
+    const { sendNotification } = await import("@tauri-apps/plugin-notification");
+    const { title, body } = localizeAlert(t, a);
+    sendNotification({ title, body });
+}
+
+async function refresh() {
+    if (!configured.value) return;
+    loading.value = true;
+    await invoke("refresh_now");
+}
+
+// Manual "Start session" button (auto-start is handled by the backend loop).
 async function ensureProject(): Promise<string> {
     if (projectId.value) return projectId.value;
     autoStartStatus.value = t("creatingProject");
@@ -140,6 +204,7 @@ async function ensureProject(): Promise<string> {
     );
     projectId.value = result.uuid;
     await saveSettings();
+    await applyConfig();
     autoStartStatus.value = "";
     return result.uuid;
 }
@@ -148,7 +213,7 @@ interface StartResult {
     conversation_id: string | null;
     project_id: string;
     skipped: boolean;
-    skipped_reason: string;
+    reason: string;
 }
 
 async function triggerAutoStart() {
@@ -160,81 +225,14 @@ async function triggerAutoStart() {
             orgId: orgId.value,
             projectId: pid,
         });
-        if (result.skipped) {
-            autoStartStatus.value = t("sessionAlreadyActive");
-        } else {
-            autoStartStatus.value = t("sessionStarted");
-        }
+        autoStartStatus.value = result.skipped
+            ? t("sessionAlreadyActive")
+            : t("sessionStarted");
         setTimeout(() => {
             autoStartStatus.value = "";
         }, 5000);
     } catch (e) {
         autoStartStatus.value = t("error") + ": " + String(e);
-    }
-}
-
-async function fetchUsage() {
-    if (!sessionKey.value || !orgId.value) return;
-    loading.value = true;
-    error.value = "";
-    try {
-        usage.value = await invoke<UsageData>("fetch_usage", {
-            sessionKey: sessionKey.value,
-            orgId: orgId.value,
-        });
-
-        if (usage.value) {
-            await invoke("update_tray", {
-                percent: usage.value.five_hour.percent_used,
-                thresholds: sessionThresholds.value,
-            }).catch(() => {});
-        }
-
-        if (notificationsEnabled.value && usage.value) {
-            const { checkAlerts } = await import("./alerts");
-            await checkAlerts(usage.value, {
-                enabled: notificationsEnabled.value,
-                sessionThresholds: sessionThresholds.value,
-                weeklyThresholds: weeklyThresholds.value,
-                forecastMinutes: notifyForecastMinutes.value,
-                quietHoursEnabled: quietHoursEnabled.value,
-                quietHoursStart: quietHoursStart.value,
-                quietHoursEnd: quietHoursEnd.value,
-                tiers: alertTiers.value,
-                types: alertTypes.value,
-            });
-        }
-
-        if (autoStartSession.value && usage.value) {
-            const fh = usage.value.five_hour;
-            const sessionActive = fh.percent_used > 0 || fh.reset_at !== null;
-
-            if (sessionActive) {
-                autoStartAttempted = false;
-            } else if (!autoStartAttempted) {
-                autoStartAttempted = true;
-                await triggerAutoStart();
-            }
-        }
-    } catch (e) {
-        error.value = String(e);
-    } finally {
-        loading.value = false;
-    }
-}
-
-function startPolling() {
-    stopPolling();
-    if (configured.value) {
-        fetchUsage();
-        timer = setInterval(fetchUsage, refreshInterval.value * 1000);
-    }
-}
-
-function stopPolling() {
-    if (timer) {
-        clearInterval(timer);
-        timer = null;
     }
 }
 
@@ -269,15 +267,12 @@ async function handleSave(settings: {
     alertTiers.value = normalizeAlertTiers(settings.alertTiers);
     alertTypes.value = normalizeAlertTypes(settings.alertTypes);
     locale.value = settings.locale;
+    // wasEnabled retained for clarity; the backend re-arms its engine on disable.
+    void wasEnabled;
     await saveSettings();
 
-    if (wasEnabled && !settings.notificationsEnabled) {
-        const { resetAlertState } = await import("./alerts");
-        resetAlertState();
-    }
-
     showSettings.value = false;
-    startPolling();
+    await applyConfig();
 }
 
 async function handleManualStart() {
@@ -297,22 +292,57 @@ async function toggleMini() {
 }
 
 onMounted(async () => {
-    if (!isMini) {
-        const { listen } = await import("@tauri-apps/api/event");
-        listen("open-settings", () => {
-            showSettings.value = true;
-        });
-    }
+    if (isMini) return; // the mini window self-initializes via MiniPanel
+
     await loadSettings();
+
+    const { listen } = await import("@tauri-apps/api/event");
+    unlisteners.push(
+        await listen<{ usage: UsageData; levels: UsageLevels }>(
+            "usage-updated",
+            (e) => {
+                usage.value = e.payload.usage;
+                levels.value = e.payload.levels;
+                error.value = "";
+                loading.value = false;
+            },
+        ),
+        await listen<string>("usage-error", (e) => {
+            error.value = String(e.payload);
+            loading.value = false;
+        }),
+        await listen<AlertEvent>("alert", (e) => {
+            void toast(e.payload);
+        }),
+        await listen<string>("project-resolved", async (e) => {
+            projectId.value = String(e.payload);
+            await saveSettings();
+        }),
+        await listen<boolean>("auto-start-result", (e) => {
+            autoStartStatus.value = e.payload
+                ? t("sessionAlreadyActive")
+                : t("sessionStarted");
+            setTimeout(() => {
+                autoStartStatus.value = "";
+            }, 5000);
+        }),
+        await listen<string>("auto-start-error", (e) => {
+            autoStartStatus.value = t("error") + ": " + String(e.payload);
+        }),
+        await listen("open-settings", () => {
+            showSettings.value = true;
+        }),
+    );
+
     if (configured.value) {
-        startPolling();
+        await applyConfig();
     } else {
         showSettings.value = true;
     }
 });
 
 onUnmounted(() => {
-    stopPolling();
+    unlisteners.forEach((u) => u());
 });
 </script>
 
@@ -353,7 +383,7 @@ onUnmounted(() => {
                 <button
                     class="icon-btn"
                     :class="{ spin: loading }"
-                    @click="fetchUsage"
+                    @click="refresh"
                     :title="t('refresh')"
                     v-if="!showSettings && configured"
                 >
@@ -466,7 +496,7 @@ onUnmounted(() => {
                     </p>
                     <button
                         class="btn-secondary"
-                        @click="fetchUsage"
+                        @click="refresh"
                         style="margin-top: 10px; width: 100%"
                     >
                         {{ t("retry") }}
@@ -475,14 +505,13 @@ onUnmounted(() => {
             </div>
 
             <UsagePanel
-                v-else-if="usage"
+                v-else-if="usage && levels"
                 :usage="usage"
+                :levels="levels"
                 :loading="loading"
-                :session-thresholds="sessionThresholds"
-                :weekly-thresholds="weeklyThresholds"
                 :auto-start-enabled="autoStartSession"
                 :auto-start-status="autoStartStatus"
-                @refresh="fetchUsage"
+                @refresh="refresh"
                 @manual-start="handleManualStart"
             />
 

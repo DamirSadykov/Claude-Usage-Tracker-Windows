@@ -127,7 +127,17 @@ pub async fn fetch_usage(
     }
     let api: ApiResponse = usage_resp.json().await?;
 
-    // Credit values from the API are in cents — convert to currency units.
+    let prepaid: Option<ApiPrepaidCredits> = match credits_resp {
+        Ok(r) if r.status().is_success() => r.json().await.ok(),
+        _ => None,
+    };
+
+    Ok(build_usage(api, prepaid))
+}
+
+/// Pure mapping from API shapes to `UsageData`. Credit values from the API are
+/// in cents, so they're divided by 100; tier utilization is already a percent.
+fn build_usage(api: ApiResponse, prepaid: Option<ApiPrepaidCredits>) -> UsageData {
     let extra_usage = api.extra_usage.and_then(|e| {
         if e.is_enabled {
             Some(ExtraUsage {
@@ -141,16 +151,15 @@ pub async fn fetch_usage(
         }
     });
 
-    let prepaid: Option<ApiPrepaidCredits> = match credits_resp {
-        Ok(r) if r.status().is_success() => r.json().await.ok(),
-        _ => None,
-    };
     let (prepaid_balance, prepaid_currency) = match prepaid {
-        Some(p) => (Some(p.amount / 100.0), Some(p.currency.unwrap_or_else(|| "USD".to_string()))),
+        Some(p) => (
+            Some(p.amount / 100.0),
+            Some(p.currency.unwrap_or_else(|| "USD".to_string())),
+        ),
         None => (None, None),
     };
 
-    Ok(UsageData {
+    UsageData {
         five_hour: api.five_hour.map(map_tier).unwrap_or(DEFAULT_TIER),
         seven_day: api.seven_day.map(map_tier).unwrap_or(DEFAULT_TIER),
         seven_day_opus: api.seven_day_opus.map(map_tier),
@@ -158,7 +167,7 @@ pub async fn fetch_usage(
         extra_usage,
         prepaid_balance,
         prepaid_currency,
-    })
+    }
 }
 
 // --- Project & session auto-start ---
@@ -334,4 +343,67 @@ pub async fn start_session(
         skipped: false,
         reason: "started".to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(api_json: &str, credits_json: Option<&str>) -> UsageData {
+        let api: ApiResponse = serde_json::from_str(api_json).unwrap();
+        let prepaid = credits_json.map(|c| serde_json::from_str(c).unwrap());
+        build_usage(api, prepaid)
+    }
+
+    #[test]
+    fn maps_tiers_and_converts_extra_cents() {
+        let json = r#"{
+            "five_hour": { "utilization": 19.0, "resets_at": "2026-01-01T00:00:00Z", "is_limited": false },
+            "seven_day": { "utilization": 9.0, "resets_at": null, "is_limited": false },
+            "seven_day_sonnet": { "utilization": 0.0 },
+            "extra_usage": { "is_enabled": true, "monthly_limit": 3000, "used_credits": 888, "utilization": 29.6, "currency": "USD" }
+        }"#;
+        let credits = r#"{ "amount": 8500, "currency": "USD" }"#;
+        let u = parse(json, Some(credits));
+
+        assert_eq!(u.five_hour.percent_used, 19.0);
+        assert_eq!(u.five_hour.reset_at.as_deref(), Some("2026-01-01T00:00:00Z"));
+        assert_eq!(u.seven_day.percent_used, 9.0);
+        assert!(u.seven_day_opus.is_none());
+        assert_eq!(u.seven_day_sonnet.as_ref().unwrap().percent_used, 0.0);
+
+        let e = u.extra_usage.unwrap();
+        assert_eq!(e.used_credits, 8.88); // cents → dollars
+        assert_eq!(e.monthly_limit, 30.0);
+        assert_eq!(e.utilization, 29.6); // already a percent
+        assert_eq!(e.currency, "USD");
+
+        assert_eq!(u.prepaid_balance, Some(85.0)); // 8500 cents
+        assert_eq!(u.prepaid_currency.as_deref(), Some("USD"));
+    }
+
+    #[test]
+    fn missing_tiers_default_and_disabled_extra_is_none() {
+        let json = r#"{
+            "extra_usage": { "is_enabled": false, "monthly_limit": 3000, "used_credits": 0, "utilization": 0 }
+        }"#;
+        let u = parse(json, None);
+
+        assert_eq!(u.five_hour.percent_used, 0.0);
+        assert!(u.five_hour.reset_at.is_none());
+        assert_eq!(u.seven_day.percent_used, 0.0);
+        assert!(u.extra_usage.is_none(), "disabled extra usage → None");
+        assert!(u.prepaid_balance.is_none());
+    }
+
+    #[test]
+    fn extra_without_currency_defaults_usd() {
+        let json = r#"{
+            "five_hour": { "utilization": 5.0 },
+            "seven_day": { "utilization": 5.0 },
+            "extra_usage": { "is_enabled": true, "monthly_limit": 1000, "used_credits": 100, "utilization": 10.0 }
+        }"#;
+        let u = parse(json, None);
+        assert_eq!(u.extra_usage.unwrap().currency, "USD");
+    }
 }
