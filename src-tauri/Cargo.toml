@@ -2,8 +2,9 @@
 name = "claude-usage-tracker"
 version = "0.1.0"
 description = "Claude AI Usage Tracker for Windows"
-authors = ["you"]
+authors = ["Damir Sadykov <damir.it.work@gmail.com>"]
 edition = "2021"
+license = "Apache-2.0"
 
 [lib]
 name = "claude_usage_tracker_lib"
