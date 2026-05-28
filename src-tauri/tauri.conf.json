@@ -65,7 +65,7 @@
       "endpoints": [
         "https://github.com/DamirSadykov/Claude-Usage-Tracker-Windows/releases/latest/download/latest.json"
       ],
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDJERDQxNDNFNDNGNTFDRDEKUldUUkhQVkRQaFRVTFNPdVg2NEM3aUp1SElOcWlJRUk2YVE2aUpDZHFSakI4STBFaUx2eTlWOUwK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDI2OTAzMzYyRjZGQ0Y1RUUKUldUdTlmejJZak9RSmhBWGEyVkl1UndaK3ZBM1JrN2pBNzJncWx3VVdRQU9mbENKR0JLeCtqNmMK",
       "windows": {
         "installMode": "passive"
       }
