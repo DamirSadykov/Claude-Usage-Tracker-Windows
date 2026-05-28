@@ -1,4 +1,4 @@
-use reqwest::header::{HeaderMap, HeaderValue, COOKIE, CONTENT_TYPE, ACCEPT};
+use reqwest::header::{HeaderMap, HeaderValue, COOKIE, CONTENT_TYPE, ACCEPT, USER_AGENT, REFERER};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -56,6 +56,10 @@ pub async fn fetch_usage(
         COOKIE,
         HeaderValue::from_str(&format!("sessionKey={}", session_key))?,
     );
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    headers.insert(USER_AGENT, HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"));
+    headers.insert(REFERER, HeaderValue::from_static("https://claude.ai"));
+    headers.insert("Origin", HeaderValue::from_static("https://claude.ai"));
     headers.insert("anthropic-client-sha", HeaderValue::from_static("unknown"));
     headers.insert(
         "anthropic-client-version",
@@ -129,6 +133,9 @@ fn build_headers(session_key: &str) -> Result<HeaderMap, Box<dyn std::error::Err
     headers.insert(COOKIE, HeaderValue::from_str(&format!("sessionKey={}", session_key))?);
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    headers.insert(USER_AGENT, HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"));
+    headers.insert(REFERER, HeaderValue::from_static("https://claude.ai"));
+    headers.insert("Origin", HeaderValue::from_static("https://claude.ai"));
     headers.insert("anthropic-client-sha", HeaderValue::from_static("unknown"));
     headers.insert("anthropic-client-version", HeaderValue::from_static("unknown"));
     Ok(headers)
@@ -200,6 +207,20 @@ struct ConversationCreated {
     uuid: String,
 }
 
+fn gen_uuid() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let seed = t.as_nanos();
+    format!(
+        "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
+        (seed & 0xFFFFFFFF) as u32,
+        ((seed >> 32) & 0xFFFF) as u16,
+        ((seed >> 48) & 0x0FFF) as u16,
+        (0x8000 | ((seed >> 60) & 0x3FFF)) as u16,
+        ((seed >> 74) ^ (seed & 0xFFFFFFFFFFFF)) as u64 & 0xFFFFFFFFFFFF,
+    )
+}
+
 pub async fn start_session(
     session_key: &str,
     org_id: &str,
@@ -218,14 +239,17 @@ pub async fn start_session(
     let client = reqwest::Client::new();
     let headers = build_headers(session_key)?;
 
+    let conv_uuid = gen_uuid();
+
+    // 1. Create conversation (like Mac: uuid + name, with project)
     let conv_url = format!(
         "https://claude.ai/api/organizations/{}/chat_conversations",
         org_id
     );
     let conv_body = serde_json::json!({
+        "uuid": conv_uuid,
         "name": "",
-        "project_uuid": project_id,
-        "model": "claude-sonnet-4-20250514"
+        "project_uuid": project_id
     });
     let resp = client
         .post(&conv_url)
@@ -240,23 +264,38 @@ pub async fn start_session(
     }
     let conv: ConversationCreated = resp.json().await?;
 
+    // 2. Send minimal message with cheapest model (Haiku)
     let msg_url = format!(
         "https://claude.ai/api/organizations/{}/chat_conversations/{}/completion",
         org_id, conv.uuid
     );
     let msg_body = serde_json::json!({
-        "prompt": "ping",
-        "timezone": "Europe/Moscow",
-        "model": "claude-sonnet-4-20250514",
-        "attachments": [],
-        "files": []
+        "prompt": "Hi",
+        "model": "claude-haiku-4-5-20251001",
+        "timezone": "UTC"
     });
-    let _resp = client
+    let resp = client
         .post(&msg_url)
-        .headers(headers)
+        .headers(headers.clone())
         .json(&msg_body)
         .send()
         .await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("Send message error {}: {}", status, text).into());
+    }
+
+    // 3. Delete conversation to keep history clean (incognito, like Mac)
+    let del_url = format!(
+        "https://claude.ai/api/organizations/{}/chat_conversations/{}",
+        org_id, conv.uuid
+    );
+    let _ = client
+        .delete(&del_url)
+        .headers(headers)
+        .send()
+        .await;
 
     Ok(SessionStartResult {
         conversation_id: Some(conv.uuid),

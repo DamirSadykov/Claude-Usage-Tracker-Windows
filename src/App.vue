@@ -32,7 +32,7 @@ const autoStartStatus = ref("");
 const configured = computed(() => sessionKey.value && orgId.value);
 
 let timer: ReturnType<typeof setInterval> | null = null;
-let prevWasLimited = false;
+let autoStartAttempted = false;
 
 async function loadSettings() {
     try {
@@ -121,17 +121,14 @@ async function fetchUsage() {
 
         if (autoStartSession.value && usage.value) {
             const fh = usage.value.five_hour;
-            const sessionAlreadyActive =
-                fh.percent_used > 0 || fh.reset_at !== null;
+            const sessionActive = fh.percent_used > 0 || fh.reset_at !== null;
 
-            if (!sessionAlreadyActive) {
-                const wasLimited = prevWasLimited;
-                if (wasLimited) {
-                    await triggerAutoStart();
-                }
+            if (sessionActive) {
+                autoStartAttempted = false;
+            } else if (!autoStartAttempted) {
+                autoStartAttempted = true;
+                await triggerAutoStart();
             }
-
-            prevWasLimited = fh.is_limited;
         }
     } catch (e) {
         error.value = String(e);
@@ -208,7 +205,7 @@ onUnmounted(() => {
                 </div>
                 <div class="app-status" v-if="usage && !showSettings">
                     <span class="dot"></span>
-                    <span>{{ t('trackingActive') }}</span>
+                    <span>{{ t("trackingActive") }}</span>
                 </div>
             </div>
             <div class="fly-hd-right">
@@ -292,14 +289,14 @@ onUnmounted(() => {
                 style="padding: 32px 14px; text-align: center"
             >
                 <p style="color: var(--text-3); font-size: 13px">
-                    {{ t('configureClaude') }}
+                    {{ t("configureClaude") }}
                 </p>
                 <button
                     class="btn-primary"
                     @click="showSettings = true"
                     style="margin-top: 12px"
                 >
-                    {{ t('configure') }}
+                    {{ t("configure") }}
                 </button>
             </div>
 
@@ -322,7 +319,7 @@ onUnmounted(() => {
                         @click="fetchUsage"
                         style="margin-top: 10px; width: 100%"
                     >
-                        {{ t('retry') }}
+                        {{ t("retry") }}
                     </button>
                 </div>
             </div>
@@ -350,7 +347,7 @@ onUnmounted(() => {
                         margin-top: 12px;
                     "
                 >
-                    {{ t('loading') }}
+                    {{ t("loading") }}
                 </p>
             </div>
         </template>
