@@ -9,6 +9,7 @@ import {
   normalizeAlertTypes,
 } from "../thresholds";
 import type { AlertTiers, AlertTierKey, AlertTypes, AlertTypeKey } from "../thresholds";
+import { useUpdater } from "../updater";
 
 const TIER_LABELS: Record<AlertTierKey, string> = {
   five_hour: "session5h",
@@ -25,6 +26,21 @@ const TYPE_LABELS: Record<AlertTypeKey, string> = {
 };
 
 const { t } = useI18n();
+
+const {
+  currentVersion,
+  availableVersion,
+  status: updateStatus,
+  autoInstall: updateAutoInstall,
+  checkHours: updateCheckHours,
+  checkForUpdate,
+  saveUpdaterSettings,
+} = useUpdater();
+
+function toggleAutoInstall() {
+  updateAutoInstall.value = !updateAutoInstall.value;
+  void saveUpdaterSettings();
+}
 
 const props = defineProps<{
   sessionKey: string;
@@ -374,6 +390,57 @@ function handleSave() {
         <div class="cc-note-row">{{ t('ccAnalyticsData') }}</div>
         <div class="cc-note-row">{{ t('ccAnalyticsLocal') }}</div>
       </div>
+
+      <!-- Updates -->
+      <div class="card">
+        <div class="card-row" style="align-items: center">
+          <div class="field-label" style="margin-bottom: 0">{{ t('updates') }}</div>
+          <span class="pct muted" style="font-size: 13px">v{{ currentVersion }}</span>
+        </div>
+        <button
+          type="button"
+          class="btn-check"
+          :disabled="updateStatus === 'checking' || updateStatus === 'downloading'"
+          @click="checkForUpdate(false)"
+        >
+          {{ updateStatus === 'checking' ? t('checkingUpdates') : t('checkForUpdates') }}
+        </button>
+        <div v-if="updateStatus === 'uptodate'" class="field-hint">{{ t('upToDate') }}</div>
+        <div v-else-if="updateStatus === 'available'" class="field-hint">
+          {{ t('updateAvailable', { version: availableVersion }) }}
+        </div>
+        <div v-else-if="updateStatus === 'error'" class="field-hint" style="color: #f87171">
+          {{ t('updateError') }}
+        </div>
+      </div>
+
+      <!-- Auto-install updates toggle -->
+      <div class="card toggle-card" @click="toggleAutoInstall()">
+        <div style="flex: 1; min-width: 0">
+          <div class="card-title" style="font-size: 13px">{{ t('autoInstallUpdates') }}</div>
+          <div class="card-sub">{{ t('autoInstallUpdatesDesc') }}</div>
+        </div>
+        <div class="toggle" :class="{ on: updateAutoInstall }">
+          <div class="toggle-knob"></div>
+        </div>
+      </div>
+
+      <!-- Update check interval -->
+      <div class="card">
+        <div class="card-row" style="align-items: center">
+          <div class="field-label" style="margin-bottom: 0">{{ t('updateCheckInterval') }}</div>
+          <span class="pct muted" style="font-size: 14px">{{ updateCheckHours }} {{ t('hoursShort') }}</span>
+        </div>
+        <input
+          v-model.number="updateCheckHours"
+          type="range"
+          class="field-range"
+          min="1"
+          max="48"
+          step="1"
+          @change="saveUpdaterSettings()"
+        />
+      </div>
     </div>
 
     <div style="padding: 8px 10px 12px">
@@ -619,6 +686,31 @@ function handleSave() {
 
 .save-btn:disabled {
   opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.btn-check {
+  width: 100%;
+  margin-top: 4px;
+  padding: 7px;
+  border: 1px solid var(--stroke-strong);
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-2);
+  font-size: 12.5px;
+  font-weight: 500;
+  font-family: var(--segoe);
+  cursor: pointer;
+  transition: background 120ms, border-color 120ms;
+}
+
+.btn-check:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.btn-check:disabled {
+  opacity: 0.5;
   cursor: not-allowed;
 }
 </style>
