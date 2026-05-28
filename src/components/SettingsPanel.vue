@@ -1,6 +1,16 @@
 <script setup lang="ts">
 import { ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
+import { ALERT_TIER_KEYS, normalizeAlertTiers } from "../thresholds";
+import type { AlertTiers, AlertTierKey } from "../thresholds";
+
+const TIER_LABELS: Record<AlertTierKey, string> = {
+  five_hour: "session5h",
+  seven_day: "weekly7d",
+  seven_day_opus: "opusWeekly",
+  seven_day_sonnet: "sonnetWeekly",
+  extra_usage: "extraUsage",
+};
 
 const { t } = useI18n();
 
@@ -15,6 +25,7 @@ const props = defineProps<{
   quietHoursEnabled: boolean;
   quietHoursStart: string;
   quietHoursEnd: string;
+  alertTiers: AlertTiers;
   locale: string;
 }>();
 
@@ -30,6 +41,7 @@ const emit = defineEmits<{
     quietHoursEnabled: boolean;
     quietHoursStart: string;
     quietHoursEnd: string;
+    alertTiers: AlertTiers;
     locale: string;
   }];
 }>();
@@ -46,6 +58,7 @@ const localForecast = ref(props.notifyForecastMinutes);
 const localQuiet = ref(props.quietHoursEnabled);
 const localQuietStart = ref(props.quietHoursStart);
 const localQuietEnd = ref(props.quietHoursEnd);
+const localTiers = ref<AlertTiers>(normalizeAlertTiers(props.alertTiers));
 const localLocale = ref(props.locale);
 
 watch(() => props.sessionKey, (v) => (localSessionKey.value = v));
@@ -61,6 +74,7 @@ watch(() => props.notifyForecastMinutes, (v) => (localForecast.value = v));
 watch(() => props.quietHoursEnabled, (v) => (localQuiet.value = v));
 watch(() => props.quietHoursStart, (v) => (localQuietStart.value = v));
 watch(() => props.quietHoursEnd, (v) => (localQuietEnd.value = v));
+watch(() => props.alertTiers, (v) => (localTiers.value = normalizeAlertTiers(v)));
 watch(() => props.locale, (v) => (localLocale.value = v));
 
 // Keep thresholds strictly ascending with a 1% gap so the colour bands can't
@@ -90,6 +104,7 @@ function handleSave() {
     quietHoursEnabled: localQuiet.value,
     quietHoursStart: localQuietStart.value,
     quietHoursEnd: localQuietEnd.value,
+    alertTiers: { ...localTiers.value },
     locale: localLocale.value,
   });
 }
@@ -209,6 +224,22 @@ function handleSave() {
 
       <!-- Notification settings (shown when enabled) -->
       <template v-if="localNotify">
+        <!-- Per-tier toggles -->
+        <div class="card">
+          <div class="field-label">{{ t('alertTiersTitle') }}</div>
+          <div
+            v-for="key in ALERT_TIER_KEYS"
+            :key="key"
+            class="tier-row"
+            @click="localTiers[key] = !localTiers[key]"
+          >
+            <span class="tier-name">{{ t(TIER_LABELS[key]) }}</span>
+            <div class="toggle" :class="{ on: localTiers[key] }">
+              <div class="toggle-knob"></div>
+            </div>
+          </div>
+        </div>
+
         <!-- Forecast minutes -->
         <div class="card">
           <div class="card-row" style="align-items: center">
@@ -306,6 +337,20 @@ function handleSave() {
   width: 36px;
   text-align: right;
   flex-shrink: 0;
+}
+
+.tier-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 0;
+  cursor: pointer;
+}
+
+.tier-name {
+  font-size: 13px;
+  color: var(--text-2);
 }
 
 .field-label {

@@ -5,7 +5,8 @@ import { invoke } from "@tauri-apps/api/core";
 import SettingsPanel from "./components/SettingsPanel.vue";
 import UsagePanel from "./components/UsagePanel.vue";
 import MiniPanel from "./components/MiniPanel.vue";
-import { DEFAULT_THRESHOLDS, normalize } from "./thresholds";
+import { DEFAULT_THRESHOLDS, normalize, defaultAlertTiers, normalizeAlertTiers } from "./thresholds";
+import type { AlertTiers } from "./thresholds";
 
 const isMini = window.location.hash === "#mini";
 
@@ -42,6 +43,7 @@ const projectId = ref("");
 const thresholds = ref<number[]>([...DEFAULT_THRESHOLDS]);
 const notificationsEnabled = ref(false);
 const notifyForecastMinutes = ref(30);
+const alertTiers = ref<AlertTiers>(defaultAlertTiers());
 const quietHoursEnabled = ref(false);
 const quietHoursStart = ref("23:00");
 const quietHoursEnd = ref("08:00");
@@ -71,6 +73,9 @@ async function loadSettings() {
             (await store.get<boolean>("notificationsEnabled")) ?? false;
         notifyForecastMinutes.value =
             (await store.get<number>("notifyForecastMinutes")) ?? 30;
+        alertTiers.value = normalizeAlertTiers(
+            await store.get<Partial<AlertTiers>>("alertTiers"),
+        );
         quietHoursEnabled.value =
             (await store.get<boolean>("quietHoursEnabled")) ?? false;
         quietHoursStart.value =
@@ -95,6 +100,7 @@ async function saveSettings() {
     await store.set("thresholds", thresholds.value);
     await store.set("notificationsEnabled", notificationsEnabled.value);
     await store.set("notifyForecastMinutes", notifyForecastMinutes.value);
+    await store.set("alertTiers", alertTiers.value);
     await store.set("quietHoursEnabled", quietHoursEnabled.value);
     await store.set("quietHoursStart", quietHoursStart.value);
     await store.set("quietHoursEnd", quietHoursEnd.value);
@@ -173,6 +179,7 @@ async function fetchUsage() {
                 quietHoursEnabled: quietHoursEnabled.value,
                 quietHoursStart: quietHoursStart.value,
                 quietHoursEnd: quietHoursEnd.value,
+                tiers: alertTiers.value,
             });
         }
 
@@ -220,6 +227,7 @@ async function handleSave(settings: {
     quietHoursEnabled: boolean;
     quietHoursStart: string;
     quietHoursEnd: string;
+    alertTiers: AlertTiers;
     locale: string;
 }) {
     const wasEnabled = notificationsEnabled.value;
@@ -233,6 +241,7 @@ async function handleSave(settings: {
     quietHoursEnabled.value = settings.quietHoursEnabled;
     quietHoursStart.value = settings.quietHoursStart;
     quietHoursEnd.value = settings.quietHoursEnd;
+    alertTiers.value = normalizeAlertTiers(settings.alertTiers);
     locale.value = settings.locale;
     await saveSettings();
 
@@ -386,6 +395,7 @@ onUnmounted(() => {
             :thresholds="thresholds"
             :notifications-enabled="notificationsEnabled"
             :notify-forecast-minutes="notifyForecastMinutes"
+            :alert-tiers="alertTiers"
             :quiet-hours-enabled="quietHoursEnabled"
             :quiet-hours-start="quietHoursStart"
             :quiet-hours-end="quietHoursEnd"

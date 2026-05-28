@@ -6,6 +6,7 @@ import {
 } from "@tauri-apps/plugin-notification";
 import i18n from "./i18n";
 import { tierLevel, normalize } from "./thresholds";
+import type { AlertTierKey, AlertTiers } from "./thresholds";
 import type { UsageData, UsageTier } from "./App.vue";
 
 export interface AlertSettings {
@@ -15,6 +16,7 @@ export interface AlertSettings {
   quietHoursEnabled: boolean;
   quietHoursStart: string;
   quietHoursEnd: string;
+  tiers: AlertTiers;
 }
 
 interface UsageDelta {
@@ -26,11 +28,7 @@ interface UsageDelta {
   sonnet_delta: number | null;
 }
 
-type TierKey =
-  | "five_hour"
-  | "seven_day"
-  | "seven_day_opus"
-  | "seven_day_sonnet";
+type TierKey = AlertTierKey;
 
 interface TierFlags {
   firedLevel: number; // highest colour level already notified (0..3), -1 = none
@@ -44,6 +42,7 @@ const TIER_LABEL: Record<TierKey, string> = {
   seven_day: "weekly7d",
   seven_day_opus: "opusWeekly",
   seven_day_sonnet: "sonnetWeekly",
+  extra_usage: "extraUsage",
 };
 
 const LOOKBACK_MS = 3_600_000; // 1h window for the forecast delta
@@ -151,7 +150,10 @@ function evalTier(key: TierKey, cur: UsageTier | null, s: AlertSettings): void {
     f.firedLevel = level;
     f.firedLimit = false;
     if (key === "five_hour") firedForecast = false;
-    dispatch(t("alertResetTitle"), t("alertResetBody", { tier: tierLabel(key) }), s);
+    // Extra usage resets monthly — re-arm silently, no "you can work again" toast.
+    if (key !== "extra_usage") {
+      dispatch(t("alertResetTitle"), t("alertResetBody", { tier: tierLabel(key) }), s);
+    }
   } else if ((cur.is_limited || cur.percent_used >= 100) && !f.firedLimit) {
     // Limit takes precedence.
     f.firedLimit = true;
@@ -214,17 +216,25 @@ export async function checkAlerts(usage: UsageData, s: AlertSettings): Promise<v
 
   flushPending(s);
 
-  evalTier("five_hour", usage.five_hour, s);
-  evalTier("seven_day", usage.seven_day, s);
-  evalTier("seven_day_opus", usage.seven_day_opus, s);
-  evalTier("seven_day_sonnet", usage.seven_day_sonnet, s);
+  if (s.tiers.five_hour) evalTier("five_hour", usage.five_hour, s);
+  if (s.tiers.seven_day) evalTier("seven_day", usage.seven_day, s);
+  if (s.tiers.seven_day_opus) evalTier("seven_day_opus", usage.seven_day_opus, s);
+  if (s.tiers.seven_day_sonnet) evalTier("seven_day_sonnet", usage.seven_day_sonnet, s);
+  if (s.tiers.extra_usage && usage.extra_usage) {
+    const eu = usage.extra_usage;
+    evalTier(
+      "extra_usage",
+      { percent_used: eu.utilization, reset_at: null, is_limited: eu.utilization >= 100 },
+      s,
+    );
+  }
 
   if (!primed) {
     primed = true;
     return; // first pass only primes tier state (and forecast baseline)
   }
 
-  await evalForecast(usage, s);
+  if (s.tiers.five_hour) await evalForecast(usage, s);
 }
 
 export function resetAlertState(): void {

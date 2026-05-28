@@ -20,3 +20,35 @@ export function tierLevel(pct: number, th: number[]): number {
   if (pct < c) return 2;
   return 3;
 }
+
+// Tiers that can raise alerts, and per-tier enable flags.
+export const ALERT_TIER_KEYS = [
+  "five_hour",
+  "seven_day",
+  "seven_day_opus",
+  "seven_day_sonnet",
+  "extra_usage",
+] as const;
+
+export type AlertTierKey = (typeof ALERT_TIER_KEYS)[number];
+
+export type AlertTiers = Record<AlertTierKey, boolean>;
+
+export function defaultAlertTiers(): AlertTiers {
+  return {
+    five_hour: true,
+    seven_day: true,
+    seven_day_opus: true,
+    seven_day_sonnet: true,
+    extra_usage: true,
+  };
+}
+
+export function normalizeAlertTiers(v: Partial<AlertTiers> | null | undefined): AlertTiers {
+  const d = defaultAlertTiers();
+  if (!v) return d;
+  for (const k of ALERT_TIER_KEYS) {
+    if (typeof v[k] === "boolean") d[k] = v[k] as boolean;
+  }
+  return d;
+}
