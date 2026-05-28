@@ -2,15 +2,20 @@
 import { computed, ref, onMounted, onUnmounted } from "vue";
 import { useI18n } from "vue-i18n";
 import type { UsageData } from "../App.vue";
+import { tierLevel } from "../thresholds";
 
 const { t, locale } = useI18n();
 
 const props = defineProps<{
   usage: UsageData;
   loading: boolean;
+  sessionThresholds: number[];
+  weeklyThresholds: number[];
   autoStartEnabled: boolean;
   autoStartStatus: string;
 }>();
+
+const TIER_CLASSES = ["tier-green", "tier-yellow", "tier-orange", "tier-red"];
 
 defineEmits<{
   refresh: [];
@@ -74,19 +79,25 @@ function formatReset(resetAt: string | null): string {
   return t("resetsIn", { time, date });
 }
 
-function tierClass(percent: number): string {
-  if (percent < 25) return "tier-green";
-  if (percent < 50) return "tier-yellow";
-  if (percent < 75) return "tier-orange";
-  return "tier-red";
+function tierClass(percent: number, weekly = true): string {
+  return TIER_CLASSES[
+    tierLevel(percent, weekly ? props.weeklyThresholds : props.sessionThresholds)
+  ];
+}
+function sessionClass(percent: number): string {
+  return tierClass(percent, false);
 }
 
 const fiveHour = computed(() => props.usage.five_hour);
 const sevenDay = computed(() => props.usage.seven_day);
 const opusDay = computed(() => props.usage.seven_day_opus);
+const sonnetDay = computed(() => props.usage.seven_day_sonnet);
 const sessionActive = computed(
   () => fiveHour.value.percent_used > 0 || fiveHour.value.reset_at !== null
 );
+
+const extraUsage = computed(() => props.usage.extra_usage);
+const prepaidBalance = computed(() => props.usage.prepaid_balance);
 </script>
 
 <template>
@@ -101,11 +112,11 @@ const sessionActive = computed(
           </div>
           <div class="card-sub">{{ formatReset(fiveHour.reset_at) }}</div>
         </div>
-        <div class="pct" :class="tierClass(fiveHour.percent_used)">
+        <div class="pct" :class="sessionClass(fiveHour.percent_used)">
           {{ fiveHour.percent_used.toFixed(1) }}%
         </div>
       </div>
-      <div class="bar" :class="tierClass(fiveHour.percent_used)">
+      <div class="bar" :class="sessionClass(fiveHour.percent_used)">
         <i :style="{ width: Math.min(fiveHour.percent_used, 100) + '%' }"></i>
       </div>
     </div>
@@ -145,6 +156,55 @@ const sessionActive = computed(
       </div>
       <div class="bar" :class="tierClass(opusDay.percent_used)">
         <i :style="{ width: Math.min(opusDay.percent_used, 100) + '%' }"></i>
+      </div>
+    </div>
+
+    <!-- Sonnet 7-day -->
+    <div v-if="sonnetDay" class="card">
+      <div class="card-row">
+        <div>
+          <div class="card-title">
+            {{ t('sonnetWeekly') }}
+            <span v-if="sonnetDay.is_limited" class="badge" style="color: #f87171">{{ t('limit') }}</span>
+          </div>
+          <div class="card-sub">{{ formatReset(sonnetDay.reset_at) }}</div>
+        </div>
+        <div class="pct" :class="tierClass(sonnetDay.percent_used)">
+          {{ sonnetDay.percent_used.toFixed(1) }}%
+        </div>
+      </div>
+      <div class="bar" :class="tierClass(sonnetDay.percent_used)">
+        <i :style="{ width: Math.min(sonnetDay.percent_used, 100) + '%' }"></i>
+      </div>
+    </div>
+
+    <!-- Extra usage (overage credits) -->
+    <div v-if="extraUsage" class="card">
+      <div class="card-row">
+        <div>
+          <div class="card-title">{{ t('extraUsage') }}</div>
+          <div class="card-sub">
+            {{ extraUsage.used_credits.toFixed(2) }} / {{ extraUsage.monthly_limit.toFixed(2) }} {{ extraUsage.currency }}
+          </div>
+        </div>
+        <div class="pct" :class="tierClass(extraUsage.utilization)">
+          {{ extraUsage.utilization.toFixed(1) }}%
+        </div>
+      </div>
+      <div class="bar" :class="tierClass(extraUsage.utilization)">
+        <i :style="{ width: Math.min(extraUsage.utilization, 100) + '%' }"></i>
+      </div>
+    </div>
+
+    <!-- Prepaid credit balance -->
+    <div v-if="prepaidBalance !== null" class="card">
+      <div class="card-row">
+        <div>
+          <div class="card-title">{{ t('creditBalance') }}</div>
+        </div>
+        <div class="pct muted">
+          {{ prepaidBalance.toFixed(2) }} {{ usage.prepaid_currency }}
+        </div>
       </div>
     </div>
 

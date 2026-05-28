@@ -1,4 +1,7 @@
+mod stats;
 mod usage;
+
+use std::sync::Arc;
 
 use tauri::{
     menu::{Menu, MenuItem},
@@ -13,12 +16,19 @@ static TRAY_WARN: &[u8] = include_bytes!("../icons/tray-warn.png");
 static TRAY_HIGH: &[u8] = include_bytes!("../icons/tray-high.png");
 static TRAY_CRIT: &[u8] = include_bytes!("../icons/tray-crit.png");
 
-fn tray_icon_for(percent: f64) -> Vec<u8> {
-    let png = if percent < 25.0 {
+fn tray_icon_for(percent: f64, thresholds: &[f64]) -> Vec<u8> {
+    let t = if thresholds.len() >= 3 {
+        let mut s = [thresholds[0], thresholds[1], thresholds[2]];
+        s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        s
+    } else {
+        [25.0, 50.0, 75.0]
+    };
+    let png = if percent < t[0] {
         TRAY_OK
-    } else if percent < 50.0 {
+    } else if percent < t[1] {
         TRAY_WARN
-    } else if percent < 75.0 {
+    } else if percent < t[2] {
         TRAY_HIGH
     } else {
         TRAY_CRIT
@@ -27,15 +37,29 @@ fn tray_icon_for(percent: f64) -> Vec<u8> {
 }
 
 #[tauri::command]
-async fn fetch_usage(session_key: String, org_id: String) -> Result<UsageData, String> {
-    usage::fetch_usage(&session_key, &org_id)
+async fn fetch_usage(
+    session_key: String,
+    org_id: String,
+    stats: tauri::State<'_, Arc<stats::StatsDb>>,
+) -> Result<UsageData, String> {
+    let data = usage::fetch_usage(&session_key, &org_id)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+
+    if let Err(e) = stats.record_snapshot(&data) {
+        eprintln!("Failed to record snapshot: {}", e);
+    }
+
+    Ok(data)
 }
 
 #[tauri::command]
-async fn update_tray(app: tauri::AppHandle, percent: f64) -> Result<(), String> {
-    let rgba = tray_icon_for(percent);
+async fn update_tray(
+    app: tauri::AppHandle,
+    percent: f64,
+    thresholds: Vec<f64>,
+) -> Result<(), String> {
+    let rgba = tray_icon_for(percent, &thresholds);
     let icon = tauri::image::Image::new_owned(rgba, 32, 32);
 
     if let Some(tray) = app.tray_by_id("main-tray") {
@@ -67,6 +91,32 @@ async fn start_session(
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn get_usage_delta(
+    from: String,
+    to: String,
+    stats: tauri::State<'_, Arc<stats::StatsDb>>,
+) -> Result<Option<stats::UsageDelta>, String> {
+    stats.compute_delta(&from, &to).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_usage_snapshots(
+    from: String,
+    to: String,
+    stats: tauri::State<'_, Arc<stats::StatsDb>>,
+) -> Result<Vec<stats::UsageSnapshot>, String> {
+    stats.query_range(&from, &to).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_latest_snapshots(
+    count: u32,
+    stats: tauri::State<'_, Arc<stats::StatsDb>>,
+) -> Result<Vec<stats::UsageSnapshot>, String> {
+    stats.latest(count).map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -83,6 +133,23 @@ pub fn run() {
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
+            // Initialize stats database
+            let app_data_dir = app
+                .path()
+                .app_data_dir()
+                .expect("Failed to get app data dir");
+            std::fs::create_dir_all(&app_data_dir).ok();
+            let db_path = app_data_dir.join("usage_stats.db");
+            let stats_db = Arc::new(
+                stats::StatsDb::open(&db_path).expect("Failed to open stats DB"),
+            );
+
+            let cutoff = chrono::Utc::now() - chrono::Duration::days(30);
+            stats_db.cleanup_before(&cutoff.to_rfc3339()).ok();
+
+            app.manage(stats_db);
+
+            // Tray menu
             let show = MenuItem::with_id(app, "show", "Open", true, None::<&str>)?;
             let settings = MenuItem::with_id(app, "settings", "Settings", true, None::<&str>)?;
             let mini = MenuItem::with_id(app, "mini", "Mini widget", true, None::<&str>)?;
@@ -157,7 +224,10 @@ pub fn run() {
             update_tray,
             open_claude,
             ensure_project,
-            start_session
+            start_session,
+            get_usage_delta,
+            get_usage_snapshots,
+            get_latest_snapshots,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

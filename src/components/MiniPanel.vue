@@ -2,6 +2,7 @@
 import { ref, onMounted, onUnmounted } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { tierLevel, normalize, DEFAULT_THRESHOLDS } from "../thresholds";
 
 interface UsageTier {
   percent_used: number;
@@ -9,23 +10,52 @@ interface UsageTier {
   is_limited: boolean;
 }
 
+interface ExtraUsage {
+  used_credits: number;
+  monthly_limit: number;
+  utilization: number;
+  currency: string;
+}
+
 interface UsageData {
   five_hour: UsageTier;
   seven_day: UsageTier;
   seven_day_opus: UsageTier | null;
+  seven_day_sonnet: UsageTier | null;
+  extra_usage: ExtraUsage | null;
+  prepaid_balance: number | null;
+  prepaid_currency: string | null;
 }
 
 const usage = ref<UsageData | null>(null);
 const error = ref("");
+const sessionThresholds = ref<number[]>([...DEFAULT_THRESHOLDS]);
+const weeklyThresholds = ref<number[]>([...DEFAULT_THRESHOLDS]);
 let timer: ReturnType<typeof setInterval> | null = null;
+const unlisteners: Array<() => void> = [];
 let sessionKey = "";
 let orgId = "";
+let refreshSec = 60;
 
 async function loadSettings() {
   const { load } = await import("@tauri-apps/plugin-store");
   const store = await load("settings.json");
   sessionKey = (await store.get<string>("sessionKey")) ?? "";
   orgId = (await store.get<string>("orgId")) ?? "";
+  refreshSec = (await store.get<number>("refreshInterval")) ?? 60;
+  const legacy = await store.get<number[]>("thresholds");
+  sessionThresholds.value = normalize((await store.get<number[]>("thresholdsSession")) ?? legacy);
+  weeklyThresholds.value = normalize((await store.get<number[]>("thresholdsWeekly")) ?? legacy);
+
+  // React to threshold edits made in the main window (shared store, cross-window event).
+  unlisteners.push(
+    await store.onKeyChange<number[]>("thresholdsSession", (val) => {
+      sessionThresholds.value = normalize(val ?? null);
+    }),
+    await store.onKeyChange<number[]>("thresholdsWeekly", (val) => {
+      weeklyThresholds.value = normalize(val ?? null);
+    }),
+  );
 }
 
 async function fetchData() {
@@ -40,11 +70,12 @@ async function fetchData() {
   }
 }
 
-function tierClass(p: number) {
-  if (p < 25) return "t-green";
-  if (p < 50) return "t-yellow";
-  if (p < 75) return "t-orange";
-  return "t-red";
+const MINI_CLASSES = ["t-green", "t-yellow", "t-orange", "t-red"];
+function sessionClass(p: number) {
+  return MINI_CLASSES[tierLevel(p, sessionThresholds.value)];
+}
+function weeklyClass(p: number) {
+  return MINI_CLASSES[tierLevel(p, weeklyThresholds.value)];
 }
 
 async function startDrag() {
@@ -54,11 +85,12 @@ async function startDrag() {
 onMounted(async () => {
   await loadSettings();
   await fetchData();
-  timer = setInterval(fetchData, 60000);
+  timer = setInterval(fetchData, refreshSec * 1000);
 });
 
 onUnmounted(() => {
   if (timer) clearInterval(timer);
+  unlisteners.forEach((u) => u());
 });
 </script>
 
@@ -67,13 +99,13 @@ onUnmounted(() => {
     <template v-if="usage">
       <div class="row">
         <span class="label">5h</span>
-        <div class="track"><i :class="tierClass(usage.five_hour.percent_used)" :style="{ width: Math.min(usage.five_hour.percent_used, 100) + '%' }"></i></div>
-        <span class="val" :class="tierClass(usage.five_hour.percent_used)">{{ usage.five_hour.percent_used.toFixed(0) }}%</span>
+        <div class="track"><i :class="sessionClass(usage.five_hour.percent_used)" :style="{ width: Math.min(usage.five_hour.percent_used, 100) + '%' }"></i></div>
+        <span class="val" :class="sessionClass(usage.five_hour.percent_used)">{{ usage.five_hour.percent_used.toFixed(0) }}%</span>
       </div>
       <div class="row">
         <span class="label">7d</span>
-        <div class="track"><i :class="tierClass(usage.seven_day.percent_used)" :style="{ width: Math.min(usage.seven_day.percent_used, 100) + '%' }"></i></div>
-        <span class="val" :class="tierClass(usage.seven_day.percent_used)">{{ usage.seven_day.percent_used.toFixed(0) }}%</span>
+        <div class="track"><i :class="weeklyClass(usage.seven_day.percent_used)" :style="{ width: Math.min(usage.seven_day.percent_used, 100) + '%' }"></i></div>
+        <span class="val" :class="weeklyClass(usage.seven_day.percent_used)">{{ usage.seven_day.percent_used.toFixed(0) }}%</span>
       </div>
     </template>
     <div v-else class="loading">{{ error || '...' }}</div>

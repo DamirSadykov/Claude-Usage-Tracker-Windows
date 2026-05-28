@@ -1,6 +1,28 @@
 <script setup lang="ts">
 import { ref, watch } from "vue";
+import type { Ref } from "vue";
 import { useI18n } from "vue-i18n";
+import {
+  ALERT_TIER_KEYS,
+  ALERT_TYPE_KEYS,
+  normalizeAlertTiers,
+  normalizeAlertTypes,
+} from "../thresholds";
+import type { AlertTiers, AlertTierKey, AlertTypes, AlertTypeKey } from "../thresholds";
+
+const TIER_LABELS: Record<AlertTierKey, string> = {
+  five_hour: "session5h",
+  seven_day: "weekly7d",
+  seven_day_opus: "opusWeekly",
+  seven_day_sonnet: "sonnetWeekly",
+  extra_usage: "extraUsage",
+};
+
+const TYPE_LABELS: Record<AlertTypeKey, string> = {
+  threshold: "alertTypeThreshold",
+  reset: "alertTypeReset",
+  forecast: "alertTypeForecast",
+};
 
 const { t } = useI18n();
 
@@ -9,6 +31,15 @@ const props = defineProps<{
   orgId: string;
   refreshInterval: number;
   autoStartSession: boolean;
+  sessionThresholds: number[];
+  weeklyThresholds: number[];
+  notificationsEnabled: boolean;
+  notifyForecastMinutes: number;
+  quietHoursEnabled: boolean;
+  quietHoursStart: string;
+  quietHoursEnd: string;
+  alertTiers: AlertTiers;
+  alertTypes: AlertTypes;
   locale: string;
 }>();
 
@@ -18,6 +49,15 @@ const emit = defineEmits<{
     orgId: string;
     refreshInterval: number;
     autoStartSession: boolean;
+    sessionThresholds: number[];
+    weeklyThresholds: number[];
+    notificationsEnabled: boolean;
+    notifyForecastMinutes: number;
+    quietHoursEnabled: boolean;
+    quietHoursStart: string;
+    quietHoursEnd: string;
+    alertTiers: AlertTiers;
+    alertTypes: AlertTypes;
     locale: string;
   }];
 }>();
@@ -26,12 +66,61 @@ const localSessionKey = ref(props.sessionKey);
 const localOrgId = ref(props.orgId);
 const localInterval = ref(props.refreshInterval);
 const localAutoStart = ref(props.autoStartSession);
+const localS1 = ref(props.sessionThresholds[0] ?? 25);
+const localS2 = ref(props.sessionThresholds[1] ?? 50);
+const localS3 = ref(props.sessionThresholds[2] ?? 75);
+const localW1 = ref(props.weeklyThresholds[0] ?? 25);
+const localW2 = ref(props.weeklyThresholds[1] ?? 50);
+const localW3 = ref(props.weeklyThresholds[2] ?? 75);
+const localNotify = ref(props.notificationsEnabled);
+const localForecast = ref(props.notifyForecastMinutes);
+const localQuiet = ref(props.quietHoursEnabled);
+const localQuietStart = ref(props.quietHoursStart);
+const localQuietEnd = ref(props.quietHoursEnd);
+const localTiers = ref<AlertTiers>(normalizeAlertTiers(props.alertTiers));
+const localTypes = ref<AlertTypes>(normalizeAlertTypes(props.alertTypes));
 const localLocale = ref(props.locale);
 
 watch(() => props.sessionKey, (v) => (localSessionKey.value = v));
 watch(() => props.orgId, (v) => (localOrgId.value = v));
 watch(() => props.autoStartSession, (v) => (localAutoStart.value = v));
+watch(() => props.sessionThresholds, (v) => {
+  localS1.value = v[0] ?? 25;
+  localS2.value = v[1] ?? 50;
+  localS3.value = v[2] ?? 75;
+});
+watch(() => props.weeklyThresholds, (v) => {
+  localW1.value = v[0] ?? 25;
+  localW2.value = v[1] ?? 50;
+  localW3.value = v[2] ?? 75;
+});
+watch(() => props.notificationsEnabled, (v) => (localNotify.value = v));
+watch(() => props.notifyForecastMinutes, (v) => (localForecast.value = v));
+watch(() => props.quietHoursEnabled, (v) => (localQuiet.value = v));
+watch(() => props.quietHoursStart, (v) => (localQuietStart.value = v));
+watch(() => props.quietHoursEnd, (v) => (localQuietEnd.value = v));
+watch(() => props.alertTiers, (v) => (localTiers.value = normalizeAlertTiers(v)));
+watch(() => props.alertTypes, (v) => (localTypes.value = normalizeAlertTypes(v)));
 watch(() => props.locale, (v) => (localLocale.value = v));
+
+// Keep each threshold triple strictly ascending with a 1% gap so the colour
+// bands can't overlap. Fixed slider scale (5..99) + clamping — dynamic min/max
+// would make neighbouring thumbs visually drift when their range changes.
+const GAP = 1;
+function useAscending(t1: Ref<number>, t2: Ref<number>, t3: Ref<number>) {
+  watch(t1, (v) => {
+    if (v >= t2.value) t1.value = t2.value - GAP;
+  });
+  watch(t2, (v) => {
+    if (v <= t1.value) t2.value = t1.value + GAP;
+    else if (v >= t3.value) t2.value = t3.value - GAP;
+  });
+  watch(t3, (v) => {
+    if (v <= t2.value) t3.value = t2.value + GAP;
+  });
+}
+useAscending(localS1, localS2, localS3);
+useAscending(localW1, localW2, localW3);
 
 function handleSave() {
   emit("save", {
@@ -39,6 +128,15 @@ function handleSave() {
     orgId: localOrgId.value.trim(),
     refreshInterval: localInterval.value,
     autoStartSession: localAutoStart.value,
+    sessionThresholds: [localS1.value, localS2.value, localS3.value],
+    weeklyThresholds: [localW1.value, localW2.value, localW3.value],
+    notificationsEnabled: localNotify.value,
+    notifyForecastMinutes: localForecast.value,
+    quietHoursEnabled: localQuiet.value,
+    quietHoursStart: localQuietStart.value,
+    quietHoursEnd: localQuietEnd.value,
+    alertTiers: { ...localTiers.value },
+    alertTypes: { ...localTypes.value },
     locale: localLocale.value,
   });
 }
@@ -120,6 +218,141 @@ function handleSave() {
           <div class="toggle-knob"></div>
         </div>
       </div>
+
+      <!-- Session (5h) thresholds — also drive the tray icon colour -->
+      <div class="card">
+        <div class="field-label">{{ t('thresholdsSession') }}</div>
+        <div class="thr-row">
+          <span class="thr-dot tier-yellow"></span>
+          <span class="thr-label">{{ t('thresholdYellow') }}</span>
+          <input v-model.number="localS1" type="range" class="field-range thr-range" min="5" max="99" step="1" />
+          <span class="thr-val">{{ localS1 }}%</span>
+        </div>
+        <div class="thr-row">
+          <span class="thr-dot tier-orange"></span>
+          <span class="thr-label">{{ t('thresholdOrange') }}</span>
+          <input v-model.number="localS2" type="range" class="field-range thr-range" min="5" max="99" step="1" />
+          <span class="thr-val">{{ localS2 }}%</span>
+        </div>
+        <div class="thr-row">
+          <span class="thr-dot tier-red"></span>
+          <span class="thr-label">{{ t('thresholdRed') }}</span>
+          <input v-model.number="localS3" type="range" class="field-range thr-range" min="5" max="99" step="1" />
+          <span class="thr-val">{{ localS3 }}%</span>
+        </div>
+        <div class="field-hint">{{ t('thresholdsSessionDesc') }}</div>
+      </div>
+
+      <!-- Weekly thresholds (7d / Opus / Sonnet / extra) -->
+      <div class="card">
+        <div class="field-label">{{ t('thresholdsWeekly') }}</div>
+        <div class="thr-row">
+          <span class="thr-dot tier-yellow"></span>
+          <span class="thr-label">{{ t('thresholdYellow') }}</span>
+          <input v-model.number="localW1" type="range" class="field-range thr-range" min="5" max="99" step="1" />
+          <span class="thr-val">{{ localW1 }}%</span>
+        </div>
+        <div class="thr-row">
+          <span class="thr-dot tier-orange"></span>
+          <span class="thr-label">{{ t('thresholdOrange') }}</span>
+          <input v-model.number="localW2" type="range" class="field-range thr-range" min="5" max="99" step="1" />
+          <span class="thr-val">{{ localW2 }}%</span>
+        </div>
+        <div class="thr-row">
+          <span class="thr-dot tier-red"></span>
+          <span class="thr-label">{{ t('thresholdRed') }}</span>
+          <input v-model.number="localW3" type="range" class="field-range thr-range" min="5" max="99" step="1" />
+          <span class="thr-val">{{ localW3 }}%</span>
+        </div>
+      </div>
+
+      <!-- Notifications toggle -->
+      <div class="card toggle-card" @click="localNotify = !localNotify">
+        <div style="flex: 1; min-width: 0">
+          <div class="card-title" style="font-size: 13px">{{ t('notifications') }}</div>
+          <div class="card-sub">{{ t('notificationsDesc') }}</div>
+        </div>
+        <div class="toggle" :class="{ on: localNotify }">
+          <div class="toggle-knob"></div>
+        </div>
+      </div>
+
+      <!-- Notification settings (shown when enabled) -->
+      <template v-if="localNotify">
+        <!-- Per-type toggles -->
+        <div class="card">
+          <div class="field-label">{{ t('alertTypesTitle') }}</div>
+          <div
+            v-for="key in ALERT_TYPE_KEYS"
+            :key="key"
+            class="tier-row"
+            @click="localTypes[key] = !localTypes[key]"
+          >
+            <span class="tier-name">{{ t(TYPE_LABELS[key]) }}</span>
+            <div class="toggle" :class="{ on: localTypes[key] }">
+              <div class="toggle-knob"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Per-tier toggles -->
+        <div class="card">
+          <div class="field-label">{{ t('alertTiersTitle') }}</div>
+          <div
+            v-for="key in ALERT_TIER_KEYS"
+            :key="key"
+            class="tier-row"
+            @click="localTiers[key] = !localTiers[key]"
+          >
+            <span class="tier-name">{{ t(TIER_LABELS[key]) }}</span>
+            <div class="toggle" :class="{ on: localTiers[key] }">
+              <div class="toggle-knob"></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Forecast minutes -->
+        <div class="card">
+          <div class="card-row" style="align-items: center">
+            <div class="field-label" style="margin-bottom: 0">{{ t('notifyForecast') }}</div>
+            <span class="pct muted" style="font-size: 14px">{{ localForecast }} {{ t('minutesShort') }}</span>
+          </div>
+          <input
+            v-model.number="localForecast"
+            type="range"
+            class="field-range"
+            min="5"
+            max="120"
+            step="5"
+          />
+          <div class="field-hint">{{ t('notifyForecastDesc') }}</div>
+        </div>
+
+        <!-- Quiet hours toggle -->
+        <div class="card toggle-card" @click="localQuiet = !localQuiet">
+          <div style="flex: 1; min-width: 0">
+            <div class="card-title" style="font-size: 13px">{{ t('quietHours') }}</div>
+            <div class="card-sub">{{ t('quietHoursDesc') }}</div>
+          </div>
+          <div class="toggle" :class="{ on: localQuiet }">
+            <div class="toggle-knob"></div>
+          </div>
+        </div>
+
+        <!-- Quiet hours window -->
+        <div v-if="localQuiet" class="card">
+          <div class="card-row" style="align-items: center; gap: 12px">
+            <div style="flex: 1">
+              <div class="field-label">{{ t('quietHoursStart') }}</div>
+              <input v-model="localQuietStart" type="time" class="field-input" />
+            </div>
+            <div style="flex: 1">
+              <div class="field-label">{{ t('quietHoursEnd') }}</div>
+              <input v-model="localQuietEnd" type="time" class="field-input" />
+            </div>
+          </div>
+        </div>
+      </template>
     </div>
 
     <div style="padding: 8px 10px 12px">
@@ -136,6 +369,59 @@ function handleSave() {
   flex-direction: column;
   flex: 1;
   min-height: 0;
+}
+
+.thr-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.thr-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.thr-dot.tier-yellow { background: #ffc107; }
+.thr-dot.tier-orange { background: #d97757; }
+.thr-dot.tier-red { background: #f87171; }
+
+.thr-label {
+  font-size: 12px;
+  color: var(--text-3);
+  width: 64px;
+  flex-shrink: 0;
+}
+
+.thr-range {
+  flex: 1;
+  margin-top: 0;
+}
+
+.thr-val {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-2);
+  width: 36px;
+  text-align: right;
+  flex-shrink: 0;
+}
+
+.tier-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 0;
+  cursor: pointer;
+}
+
+.tier-name {
+  font-size: 13px;
+  color: var(--text-2);
 }
 
 .field-label {
