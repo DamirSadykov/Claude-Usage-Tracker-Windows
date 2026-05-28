@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch } from "vue";
+import { ref, watch, onMounted } from "vue";
 import type { Ref } from "vue";
 import { useI18n } from "vue-i18n";
 import {
@@ -41,6 +41,34 @@ function toggleAutoInstall() {
   updateAutoInstall.value = !updateAutoInstall.value;
   void saveUpdaterSettings();
 }
+
+// Launch-on-login is backed by the OS registry (plugin-autostart writes the
+// HKCU Run key), so the registry is the source of truth — reflect it instead
+// of persisting a copy in settings.json.
+const loginAutostart = ref(false);
+
+async function refreshAutostart() {
+  try {
+    const { isEnabled } = await import("@tauri-apps/plugin-autostart");
+    loginAutostart.value = await isEnabled();
+  } catch {
+    // running outside Tauri
+  }
+}
+
+async function toggleAutostart() {
+  const target = !loginAutostart.value;
+  try {
+    const { enable, disable } = await import("@tauri-apps/plugin-autostart");
+    if (target) await enable();
+    else await disable();
+  } catch {
+    // ignore — refreshAutostart reflects the real state
+  }
+  await refreshAutostart();
+}
+
+onMounted(refreshAutostart);
 
 const props = defineProps<{
   sessionKey: string;
@@ -226,6 +254,17 @@ function handleSave() {
               @click="localLocale = 'ru'"
             >RU</button>
           </div>
+        </div>
+      </div>
+
+      <!-- Launch on Windows login (backed by the OS registry) -->
+      <div class="card toggle-card" @click="toggleAutostart()">
+        <div style="flex: 1; min-width: 0">
+          <div class="card-title" style="font-size: 13px">{{ t('launchOnLogin') }}</div>
+          <div class="card-sub">{{ t('launchOnLoginDesc') }}</div>
+        </div>
+        <div class="toggle" :class="{ on: loginAutostart }">
+          <div class="toggle-knob"></div>
         </div>
       </div>
 

@@ -458,6 +458,16 @@ pub fn run() {
                 });
             }
 
+            // The main window is `visible: true`, so a normal launch shows it
+            // unchanged. When the OS starts us at login (autostart passes
+            // --autostarted) hide it so we come up silently in the tray.
+            let autostarted = std::env::args().any(|a| a == "--autostarted");
+            if autostarted {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.hide();
+                }
+            }
+
             spawn_poll_loop(app.handle().clone(), notify);
 
             Ok(())
