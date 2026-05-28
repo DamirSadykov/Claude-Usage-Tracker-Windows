@@ -9,6 +9,7 @@ Thumbs.db
 .env
 .env.*
 settings.json
+settings.local.json
 *.key
 *.pem
 
