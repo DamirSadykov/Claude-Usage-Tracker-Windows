@@ -122,6 +122,28 @@ function modelColor(label: string): string {
   return MODEL_COLORS[fam] ?? "#9aa0a6";
 }
 
+// Token components. cache_read is muted — it's the cheap per-turn re-read of
+// the cached context and typically dwarfs everything else.
+type TokenKey = "input" | "output" | "cache_create" | "cache_read";
+const TOKEN_TYPES: { key: TokenKey; color: string }[] = [
+  { key: "input", color: "#d97757" },
+  { key: "output", color: "#6ccb5f" },
+  { key: "cache_create", color: "#5b9bd5" },
+  { key: "cache_read", color: "#9aa0a6" },
+];
+const TOKEN_LABEL: Record<TokenKey, string> = {
+  input: "tokInput",
+  output: "tokOutput",
+  cache_create: "tokCacheCreate",
+  cache_read: "tokCacheRead",
+};
+
+const tokenBreakdown = computed(() => {
+  const tot = data.value?.totals;
+  if (!tot) return [];
+  return TOKEN_TYPES.map((tt) => ({ key: tt.key, color: tt.color, value: tot[tt.key] }));
+});
+
 // --- weekday/heatmap helpers ---
 // strftime %w: 0=Sun..6=Sat. Display Monday-first.
 const WEEKDAY_ORDER = [1, 2, 3, 4, 5, 6, 0];
@@ -203,22 +225,31 @@ function renderCharts() {
   const gridColor = "rgba(255,255,255,0.06)";
   const tickColor = "rgba(255,255,255,0.45)";
 
-  // Daily bar chart
+  // Daily chart: single cost bar, or stacked token-type bars.
   if (dailyCanvas.value) {
     dailyChart?.destroy();
-    dailyChart = new Chart(dailyCanvas.value, {
-      type: "bar",
-      data: {
-        labels: d.daily.map((p) => p.date.slice(5)), // MM-DD
-        datasets: [
+    const labels = d.daily.map((p) => p.date.slice(5)); // MM-DD
+    const isCost = metric.value === "cost";
+    const datasets = isCost
+      ? [
           {
-            data: d.daily.map((p) => metricVal(p.total_tokens, p.cost)),
+            data: d.daily.map((p) => p.cost),
             backgroundColor: "#d97757",
             borderRadius: 3,
             maxBarThickness: 26,
           },
-        ],
-      },
+        ]
+      : TOKEN_TYPES.map((tt) => ({
+          label: t(TOKEN_LABEL[tt.key]),
+          data: d.daily.map((p) => p[tt.key]),
+          backgroundColor: tt.color,
+          stack: "tok",
+          maxBarThickness: 26,
+        }));
+
+    dailyChart = new Chart(dailyCanvas.value, {
+      type: "bar",
+      data: { labels, datasets },
       options: {
         responsive: true,
         maintainAspectRatio: false,
@@ -227,21 +258,25 @@ function renderCharts() {
           tooltip: {
             callbacks: {
               label: (ctx) =>
-                metric.value === "cost"
+                isCost
                   ? fmtCost(ctx.parsed.y ?? 0)
-                  : fmtTokens(ctx.parsed.y ?? 0) + " tok",
+                  : `${ctx.dataset.label}: ${fmtTokens(ctx.parsed.y ?? 0)}`,
             },
           },
         },
         scales: {
-          x: { grid: { display: false }, ticks: { color: tickColor, font: { size: 9 } } },
+          x: {
+            stacked: !isCost,
+            grid: { display: false },
+            ticks: { color: tickColor, font: { size: 9 } },
+          },
           y: {
+            stacked: !isCost,
             grid: { color: gridColor },
             ticks: {
               color: tickColor,
               font: { size: 9 },
-              callback: (v) =>
-                metric.value === "cost" ? "$" + v : fmtTokens(Number(v)),
+              callback: (v) => (isCost ? "$" + v : fmtTokens(Number(v))),
             },
           },
         },
@@ -353,6 +388,19 @@ onUnmounted(() => {
       <div class="block">
         <div class="block-title">{{ t('analyticsDaily') }}</div>
         <div class="chart-wrap"><canvas ref="dailyCanvas"></canvas></div>
+      </div>
+
+      <!-- Token breakdown (tokens mode) — makes the cache_read share explicit -->
+      <div class="block" v-if="metric === 'tokens'">
+        <div class="block-title">{{ t('tokBreakdown') }}</div>
+        <div class="legend">
+          <div v-for="b in tokenBreakdown" :key="b.key" class="legend-item">
+            <span class="dot" :style="{ background: b.color }"></span>
+            <span class="legend-name">{{ t(TOKEN_LABEL[b.key]) }}</span>
+            <span class="legend-val">{{ fmtTokens(b.value) }}</span>
+          </div>
+        </div>
+        <div class="tok-note">{{ t('tokCacheNote') }}</div>
       </div>
 
       <!-- Model breakdown -->
@@ -516,6 +564,13 @@ onUnmounted(() => {
 .legend-val {
   color: var(--text-3);
   font-variant-numeric: tabular-nums;
+}
+
+.tok-note {
+  font-size: 10.5px;
+  line-height: 1.4;
+  color: var(--text-4);
+  margin-top: 2px;
 }
 
 .heatmap {
