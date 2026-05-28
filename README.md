@@ -1,7 +1,7 @@
 # Claude Usage Tracker for Windows
 
 <p align="center">
-  <img src="src-tauri/icons/mark-512.png" width="128" height="128" alt="Claude Usage Tracker">
+  <img src="src-tauri/assets/mark-512.png" width="128" height="128" alt="Claude Usage Tracker">
 </p>
 
 A Windows alternative to [Claude Usage Tracker](https://github.com/hamed-elfayome/Claude-Usage-Tracker) (macOS, Swift) — a native app for real-time monitoring of Claude AI usage limits.
