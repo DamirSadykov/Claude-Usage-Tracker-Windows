@@ -9,10 +9,21 @@ interface UsageTier {
   is_limited: boolean;
 }
 
+interface ExtraUsage {
+  used_credits: number;
+  monthly_limit: number;
+  utilization: number;
+  currency: string;
+}
+
 interface UsageData {
   five_hour: UsageTier;
   seven_day: UsageTier;
   seven_day_opus: UsageTier | null;
+  seven_day_sonnet: UsageTier | null;
+  extra_usage: ExtraUsage | null;
+  prepaid_balance: number | null;
+  prepaid_currency: string | null;
 }
 
 const usage = ref<UsageData | null>(null);

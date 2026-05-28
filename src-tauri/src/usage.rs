@@ -6,6 +6,10 @@ pub struct UsageData {
     pub five_hour: UsageTier,
     pub seven_day: UsageTier,
     pub seven_day_opus: Option<UsageTier>,
+    pub seven_day_sonnet: Option<UsageTier>,
+    pub extra_usage: Option<ExtraUsage>,
+    pub prepaid_balance: Option<f64>,
+    pub prepaid_currency: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -15,18 +19,32 @@ pub struct UsageTier {
     pub is_limited: bool,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ExtraUsage {
+    pub used_credits: f64,
+    pub monthly_limit: f64,
+    pub utilization: f64,
+    pub currency: String,
+}
+
+// --- API response structs ---
+
 #[derive(Debug, Deserialize)]
 struct ApiResponse {
     #[serde(default)]
-    five_hour: Option<ApiFiveHour>,
+    five_hour: Option<ApiTier>,
     #[serde(default)]
-    seven_day: Option<ApiSevenDay>,
+    seven_day: Option<ApiTier>,
     #[serde(default)]
-    seven_day_opus: Option<ApiSevenDay>,
+    seven_day_opus: Option<ApiTier>,
+    #[serde(default)]
+    seven_day_sonnet: Option<ApiTier>,
+    #[serde(default)]
+    extra_usage: Option<ApiExtraUsage>,
 }
 
 #[derive(Debug, Deserialize)]
-struct ApiFiveHour {
+struct ApiTier {
     #[serde(default)]
     utilization: f64,
     #[serde(default)]
@@ -36,81 +54,110 @@ struct ApiFiveHour {
 }
 
 #[derive(Debug, Deserialize)]
-struct ApiSevenDay {
+struct ApiExtraUsage {
+    #[serde(default)]
+    is_enabled: bool,
+    #[serde(default)]
+    monthly_limit: f64,
+    #[serde(default)]
+    used_credits: f64,
     #[serde(default)]
     utilization: f64,
     #[serde(default)]
-    resets_at: Option<String>,
-    #[serde(default)]
-    is_limited: bool,
+    currency: Option<String>,
 }
 
-pub async fn fetch_usage(
-    session_key: &str,
-    org_id: &str,
-) -> Result<UsageData, Box<dyn std::error::Error + Send + Sync>> {
-    let url = format!("https://claude.ai/api/organizations/{}/usage", org_id);
+#[derive(Debug, Deserialize)]
+struct ApiPrepaidCredits {
+    #[serde(default)]
+    amount: f64,
+    #[serde(default)]
+    currency: Option<String>,
+}
 
+// --- Shared helpers ---
+
+fn build_headers(session_key: &str) -> Result<HeaderMap, Box<dyn std::error::Error + Send + Sync>> {
     let mut headers = HeaderMap::new();
-    headers.insert(
-        COOKIE,
-        HeaderValue::from_str(&format!("sessionKey={}", session_key))?,
-    );
+    headers.insert(COOKIE, HeaderValue::from_str(&format!("sessionKey={}", session_key))?);
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
     headers.insert(USER_AGENT, HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"));
     headers.insert(REFERER, HeaderValue::from_static("https://claude.ai"));
     headers.insert("Origin", HeaderValue::from_static("https://claude.ai"));
     headers.insert("anthropic-client-sha", HeaderValue::from_static("unknown"));
-    headers.insert(
-        "anthropic-client-version",
-        HeaderValue::from_static("unknown"),
+    headers.insert("anthropic-client-version", HeaderValue::from_static("unknown"));
+    Ok(headers)
+}
+
+fn map_tier(t: ApiTier) -> UsageTier {
+    UsageTier {
+        percent_used: t.utilization,
+        reset_at: t.resets_at,
+        is_limited: t.is_limited,
+    }
+}
+
+const DEFAULT_TIER: UsageTier = UsageTier {
+    percent_used: 0.0,
+    reset_at: None,
+    is_limited: false,
+};
+
+// --- Fetch usage ---
+
+pub async fn fetch_usage(
+    session_key: &str,
+    org_id: &str,
+) -> Result<UsageData, Box<dyn std::error::Error + Send + Sync>> {
+    let client = reqwest::Client::new();
+    let headers = build_headers(session_key)?;
+
+    let usage_url = format!("https://claude.ai/api/organizations/{}/usage", org_id);
+    let credits_url = format!("https://claude.ai/api/organizations/{}/prepaid/credits", org_id);
+
+    let (usage_resp, credits_resp) = tokio::join!(
+        client.get(&usage_url).headers(headers.clone()).send(),
+        client.get(&credits_url).headers(headers).send(),
     );
 
-    let client = reqwest::Client::new();
-    let resp = client.get(&url).headers(headers).send().await?;
-
-    if !resp.status().is_success() {
-        return Err(format!("API error: {}", resp.status()).into());
+    let usage_resp = usage_resp?;
+    if !usage_resp.status().is_success() {
+        return Err(format!("API error: {}", usage_resp.status()).into());
     }
+    let api: ApiResponse = usage_resp.json().await?;
 
-    let api: ApiResponse = resp.json().await?;
-
-    let five_hour = api
-        .five_hour
-        .map(|f| UsageTier {
-            percent_used: f.utilization,
-            reset_at: f.resets_at,
-            is_limited: f.is_limited,
-        })
-        .unwrap_or(UsageTier {
-            percent_used: 0.0,
-            reset_at: None,
-            is_limited: false,
-        });
-
-    let seven_day = api
-        .seven_day
-        .map(|s| UsageTier {
-            percent_used: s.utilization,
-            reset_at: s.resets_at,
-            is_limited: s.is_limited,
-        })
-        .unwrap_or(UsageTier {
-            percent_used: 0.0,
-            reset_at: None,
-            is_limited: false,
-        });
-
-    let seven_day_opus = api.seven_day_opus.map(|s| UsageTier {
-        percent_used: s.utilization,
-        reset_at: s.resets_at,
-        is_limited: s.is_limited,
+    // Credit values from the API are in cents — convert to currency units.
+    let extra_usage = api.extra_usage.and_then(|e| {
+        if e.is_enabled {
+            Some(ExtraUsage {
+                used_credits: e.used_credits / 100.0,
+                monthly_limit: e.monthly_limit / 100.0,
+                utilization: e.utilization,
+                currency: e.currency.unwrap_or_else(|| "USD".to_string()),
+            })
+        } else {
+            None
+        }
     });
 
+    let prepaid: Option<ApiPrepaidCredits> = match credits_resp {
+        Ok(r) if r.status().is_success() => r.json().await.ok(),
+        _ => None,
+    };
+    let (prepaid_balance, prepaid_currency) = match prepaid {
+        Some(p) => (Some(p.amount / 100.0), Some(p.currency.unwrap_or_else(|| "USD".to_string()))),
+        None => (None, None),
+    };
+
     Ok(UsageData {
-        five_hour,
-        seven_day,
-        seven_day_opus,
+        five_hour: api.five_hour.map(map_tier).unwrap_or(DEFAULT_TIER),
+        seven_day: api.seven_day.map(map_tier).unwrap_or(DEFAULT_TIER),
+        seven_day_opus: api.seven_day_opus.map(map_tier),
+        seven_day_sonnet: api.seven_day_sonnet.map(map_tier),
+        extra_usage,
+        prepaid_balance,
+        prepaid_currency,
     })
 }
 
@@ -126,19 +173,6 @@ pub struct ProjectInfo {
 struct ProjectListItem {
     uuid: String,
     name: String,
-}
-
-fn build_headers(session_key: &str) -> Result<HeaderMap, Box<dyn std::error::Error + Send + Sync>> {
-    let mut headers = HeaderMap::new();
-    headers.insert(COOKIE, HeaderValue::from_str(&format!("sessionKey={}", session_key))?);
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
-    headers.insert(USER_AGENT, HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"));
-    headers.insert(REFERER, HeaderValue::from_static("https://claude.ai"));
-    headers.insert("Origin", HeaderValue::from_static("https://claude.ai"));
-    headers.insert("anthropic-client-sha", HeaderValue::from_static("unknown"));
-    headers.insert("anthropic-client-version", HeaderValue::from_static("unknown"));
-    Ok(headers)
 }
 
 const TRACKER_PROJECT_NAME: &str = "Usage Tracker - Auto Session";
@@ -241,7 +275,6 @@ pub async fn start_session(
 
     let conv_uuid = gen_uuid();
 
-    // 1. Create conversation (like Mac: uuid + name, with project)
     let conv_url = format!(
         "https://claude.ai/api/organizations/{}/chat_conversations",
         org_id
@@ -264,7 +297,6 @@ pub async fn start_session(
     }
     let conv: ConversationCreated = resp.json().await?;
 
-    // 2. Send minimal message with cheapest model (Haiku)
     let msg_url = format!(
         "https://claude.ai/api/organizations/{}/chat_conversations/{}/completion",
         org_id, conv.uuid
@@ -286,7 +318,6 @@ pub async fn start_session(
         return Err(format!("Send message error {}: {}", status, text).into());
     }
 
-    // 3. Delete conversation to keep history clean (incognito, like Mac)
     let del_url = format!(
         "https://claude.ai/api/organizations/{}/chat_conversations/{}",
         org_id, conv.uuid

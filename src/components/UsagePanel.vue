@@ -84,9 +84,13 @@ function tierClass(percent: number): string {
 const fiveHour = computed(() => props.usage.five_hour);
 const sevenDay = computed(() => props.usage.seven_day);
 const opusDay = computed(() => props.usage.seven_day_opus);
+const sonnetDay = computed(() => props.usage.seven_day_sonnet);
 const sessionActive = computed(
   () => fiveHour.value.percent_used > 0 || fiveHour.value.reset_at !== null
 );
+
+const extraUsage = computed(() => props.usage.extra_usage);
+const prepaidBalance = computed(() => props.usage.prepaid_balance);
 </script>
 
 <template>
@@ -145,6 +149,55 @@ const sessionActive = computed(
       </div>
       <div class="bar" :class="tierClass(opusDay.percent_used)">
         <i :style="{ width: Math.min(opusDay.percent_used, 100) + '%' }"></i>
+      </div>
+    </div>
+
+    <!-- Sonnet 7-day -->
+    <div v-if="sonnetDay" class="card">
+      <div class="card-row">
+        <div>
+          <div class="card-title">
+            {{ t('sonnetWeekly') }}
+            <span v-if="sonnetDay.is_limited" class="badge" style="color: #f87171">{{ t('limit') }}</span>
+          </div>
+          <div class="card-sub">{{ formatReset(sonnetDay.reset_at) }}</div>
+        </div>
+        <div class="pct" :class="tierClass(sonnetDay.percent_used)">
+          {{ sonnetDay.percent_used.toFixed(1) }}%
+        </div>
+      </div>
+      <div class="bar" :class="tierClass(sonnetDay.percent_used)">
+        <i :style="{ width: Math.min(sonnetDay.percent_used, 100) + '%' }"></i>
+      </div>
+    </div>
+
+    <!-- Extra usage (overage credits) -->
+    <div v-if="extraUsage" class="card">
+      <div class="card-row">
+        <div>
+          <div class="card-title">{{ t('extraUsage') }}</div>
+          <div class="card-sub">
+            {{ extraUsage.used_credits.toFixed(2) }} / {{ extraUsage.monthly_limit.toFixed(2) }} {{ extraUsage.currency }}
+          </div>
+        </div>
+        <div class="pct" :class="tierClass(extraUsage.utilization)">
+          {{ extraUsage.utilization.toFixed(1) }}%
+        </div>
+      </div>
+      <div class="bar" :class="tierClass(extraUsage.utilization)">
+        <i :style="{ width: Math.min(extraUsage.utilization, 100) + '%' }"></i>
+      </div>
+    </div>
+
+    <!-- Prepaid credit balance -->
+    <div v-if="prepaidBalance !== null" class="card">
+      <div class="card-row">
+        <div>
+          <div class="card-title">{{ t('creditBalance') }}</div>
+        </div>
+        <div class="pct muted">
+          {{ prepaidBalance.toFixed(2) }} {{ usage.prepaid_currency }}
+        </div>
       </div>
     </div>
 
