@@ -144,6 +144,17 @@ const tokenBreakdown = computed(() => {
   return TOKEN_TYPES.map((tt) => ({ key: tt.key, color: tt.color, value: tot[tt.key] }));
 });
 
+// Token types the user has hidden from the daily chart (e.g. mute cache_read
+// to see the rest at a usable scale).
+const hiddenTokens = ref<Set<TokenKey>>(new Set());
+function toggleToken(k: TokenKey) {
+  const next = new Set(hiddenTokens.value);
+  if (next.has(k)) next.delete(k);
+  else next.add(k);
+  hiddenTokens.value = next;
+  if (props.active) renderCharts();
+}
+
 // --- weekday/heatmap helpers ---
 // strftime %w: 0=Sun..6=Sat. Display Monday-first.
 const WEEKDAY_ORDER = [1, 2, 3, 4, 5, 6, 0];
@@ -239,7 +250,7 @@ function renderCharts() {
             maxBarThickness: 26,
           },
         ]
-      : TOKEN_TYPES.map((tt) => ({
+      : TOKEN_TYPES.filter((tt) => !hiddenTokens.value.has(tt.key)).map((tt) => ({
           label: t(TOKEN_LABEL[tt.key]),
           data: d.daily.map((p) => p[tt.key]),
           backgroundColor: tt.color,
@@ -268,14 +279,14 @@ function renderCharts() {
           x: {
             stacked: !isCost,
             grid: { display: false },
-            ticks: { color: tickColor, font: { size: 9 } },
+            ticks: { color: tickColor, font: { size: 11 } },
           },
           y: {
             stacked: !isCost,
             grid: { color: gridColor },
             ticks: {
               color: tickColor,
-              font: { size: 9 },
+              font: { size: 11 },
               callback: (v) => (isCost ? "$" + v : fmtTokens(Number(v))),
             },
           },
@@ -390,15 +401,22 @@ onUnmounted(() => {
         <div class="chart-wrap"><canvas ref="dailyCanvas"></canvas></div>
       </div>
 
-      <!-- Token breakdown (tokens mode) — makes the cache_read share explicit -->
+      <!-- Token breakdown (tokens mode) — rows toggle their layer in the chart -->
       <div class="block" v-if="metric === 'tokens'">
         <div class="block-title">{{ t('tokBreakdown') }}</div>
         <div class="legend">
-          <div v-for="b in tokenBreakdown" :key="b.key" class="legend-item">
+          <button
+            v-for="b in tokenBreakdown"
+            :key="b.key"
+            type="button"
+            class="legend-item legend-toggle"
+            :class="{ off: hiddenTokens.has(b.key) }"
+            @click="toggleToken(b.key)"
+          >
             <span class="dot" :style="{ background: b.color }"></span>
             <span class="legend-name">{{ t(TOKEN_LABEL[b.key]) }}</span>
             <span class="legend-val">{{ fmtTokens(b.value) }}</span>
-          </div>
+          </button>
         </div>
         <div class="tok-note">{{ t('tokCacheNote') }}</div>
       </div>
@@ -448,10 +466,10 @@ onUnmounted(() => {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: 10px;
+  padding: 12px;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 16px;
 }
 
 .controls {
@@ -463,15 +481,15 @@ onUnmounted(() => {
 .seg {
   display: flex;
   border: 1px solid var(--stroke-strong);
-  border-radius: 5px;
+  border-radius: 6px;
   overflow: hidden;
 }
 .seg button {
-  padding: 5px 12px;
+  padding: 7px 15px;
   border: none;
   background: transparent;
   color: var(--text-3);
-  font-size: 12px;
+  font-size: 14px;
   font-family: var(--segoe);
   cursor: pointer;
   transition: background 120ms, color 120ms;
@@ -493,11 +511,11 @@ onUnmounted(() => {
   background: var(--card-bg, rgba(255, 255, 255, 0.03));
   border: 1px solid var(--stroke-strong);
   border-radius: 8px;
-  padding: 8px 10px;
+  padding: 10px 10px;
   text-align: center;
 }
 .stat-val {
-  font-size: 15px;
+  font-size: 19px;
   font-weight: 600;
   color: var(--text);
   font-variant-numeric: tabular-nums;
@@ -505,9 +523,9 @@ onUnmounted(() => {
 .stat-val.up { color: #f87171; }
 .stat-val.down { color: #6ccb5f; }
 .stat-lbl {
-  font-size: 10px;
+  font-size: 11.5px;
   color: var(--text-4);
-  margin-top: 2px;
+  margin-top: 3px;
   text-transform: uppercase;
   letter-spacing: 0.03em;
 }
@@ -515,17 +533,17 @@ onUnmounted(() => {
 .block {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
 }
 .block-title {
-  font-size: 11.5px;
+  font-size: 13px;
   font-weight: 600;
   color: var(--text-3);
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
 .chart-wrap {
-  height: 140px;
+  height: 160px;
   position: relative;
 }
 
@@ -535,25 +553,25 @@ onUnmounted(() => {
   gap: 14px;
 }
 .donut-wrap {
-  width: 110px;
-  height: 110px;
+  width: 124px;
+  height: 124px;
   flex-shrink: 0;
 }
 .legend {
   flex: 1;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 7px;
 }
 .legend-item {
   display: flex;
   align-items: center;
-  gap: 8px;
-  font-size: 12px;
+  gap: 9px;
+  font-size: 14px;
 }
 .legend-item .dot {
-  width: 9px;
-  height: 9px;
+  width: 11px;
+  height: 11px;
   border-radius: 2px;
   flex-shrink: 0;
 }
@@ -566,9 +584,29 @@ onUnmounted(() => {
   font-variant-numeric: tabular-nums;
 }
 
+/* Clickable token-type rows that toggle their layer in the daily chart. */
+.legend-toggle {
+  background: none;
+  border: none;
+  padding: 2px 0;
+  font-family: var(--segoe);
+  text-align: left;
+  cursor: pointer;
+  transition: opacity 120ms;
+}
+.legend-toggle:hover {
+  opacity: 0.85;
+}
+.legend-toggle.off {
+  opacity: 0.4;
+}
+.legend-toggle.off .legend-name {
+  text-decoration: line-through;
+}
+
 .tok-note {
-  font-size: 10.5px;
-  line-height: 1.4;
+  font-size: 12px;
+  line-height: 1.45;
   color: var(--text-4);
   margin-top: 2px;
 }
@@ -584,8 +622,8 @@ onUnmounted(() => {
   gap: 6px;
 }
 .heat-day {
-  width: 28px;
-  font-size: 10px;
+  width: 30px;
+  font-size: 11.5px;
   color: var(--text-4);
   flex-shrink: 0;
 }
@@ -602,8 +640,8 @@ onUnmounted(() => {
 .heat-axis {
   display: flex;
   justify-content: space-between;
-  margin-left: 34px;
-  font-size: 9px;
+  margin-left: 36px;
+  font-size: 10.5px;
   color: var(--text-4);
 }
 
@@ -613,7 +651,7 @@ onUnmounted(() => {
   align-items: center;
   justify-content: center;
   color: var(--text-4);
-  font-size: 13px;
+  font-size: 15px;
   padding: 40px 0;
 }
 </style>
