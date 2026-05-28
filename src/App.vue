@@ -16,6 +16,7 @@ import {
 import type { AlertTiers, AlertTypes } from "./thresholds";
 import { localizeAlert } from "./alertFormat";
 import type { AlertEvent } from "./alertFormat";
+import { useUpdater, initUpdater } from "./updater";
 
 const isMini = window.location.hash === "#mini";
 
@@ -52,6 +53,15 @@ export interface UsageLevels {
 }
 
 const { t, locale } = useI18n();
+
+const {
+    status: updateStatus,
+    availableVersion,
+    progress: updateProgress,
+    installUpdate,
+    relaunchApp,
+    dismissUpdate,
+} = useUpdater();
 
 const sessionKey = ref("");
 const orgId = ref("");
@@ -337,6 +347,8 @@ onMounted(async () => {
     } else {
         showSettings.value = true;
     }
+
+    void initUpdater();
 });
 
 onUnmounted(() => {
@@ -439,6 +451,49 @@ onUnmounted(() => {
 
         <div class="hr"></div>
 
+        <!-- Update banner -->
+        <div
+            v-if="updateStatus === 'available'"
+            class="update-banner"
+        >
+            <span class="update-text">{{
+                t("updateAvailable", { version: availableVersion })
+            }}</span>
+            <div class="update-actions">
+                <button class="update-btn ghost" @click="dismissUpdate">
+                    {{ t("updateLater") }}
+                </button>
+                <button class="update-btn" @click="installUpdate">
+                    {{ t("updateNow") }}
+                </button>
+            </div>
+        </div>
+        <div
+            v-else-if="updateStatus === 'downloading'"
+            class="update-banner"
+        >
+            <span class="update-text">{{
+                t("updateDownloading", { pct: updateProgress })
+            }}</span>
+            <div class="update-progress">
+                <div
+                    class="update-progress-fill"
+                    :style="{ width: updateProgress + '%' }"
+                ></div>
+            </div>
+        </div>
+        <div
+            v-else-if="updateStatus === 'ready'"
+            class="update-banner"
+        >
+            <span class="update-text">{{ t("updateReady") }}</span>
+            <div class="update-actions">
+                <button class="update-btn" @click="relaunchApp">
+                    {{ t("restartNow") }}
+                </button>
+            </div>
+        </div>
+
         <!-- Settings -->
         <SettingsPanel
             v-if="showSettings"
@@ -532,3 +587,65 @@ onUnmounted(() => {
         </template>
     </div>
 </template>
+
+<style scoped>
+.update-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+    padding: 8px 12px;
+    margin: 8px 10px 0;
+    border: 1px solid var(--accent);
+    border-radius: var(--card-radius);
+    background: rgba(217, 119, 87, 0.12);
+}
+
+.update-text {
+    font-size: 12px;
+    color: var(--text-2);
+}
+
+.update-actions {
+    display: flex;
+    gap: 6px;
+}
+
+.update-btn {
+    padding: 4px 12px;
+    border: none;
+    border-radius: 4px;
+    background: var(--accent);
+    color: white;
+    font-size: 12px;
+    font-weight: 500;
+    font-family: var(--segoe);
+    cursor: pointer;
+    transition: filter 120ms;
+}
+
+.update-btn:hover {
+    filter: brightness(1.15);
+}
+
+.update-btn.ghost {
+    background: transparent;
+    color: var(--text-3);
+    border: 1px solid var(--stroke-strong);
+}
+
+.update-progress {
+    width: 100%;
+    height: 4px;
+    border-radius: 2px;
+    background: var(--stroke-strong);
+    overflow: hidden;
+}
+
+.update-progress-fill {
+    height: 100%;
+    background: var(--accent);
+    transition: width 150ms;
+}
+</style>

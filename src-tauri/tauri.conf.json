@@ -50,6 +50,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -57,5 +58,16 @@
       "icons/icon.ico"
     ]
   },
-  "plugins": {}
+  "plugins": {
+    "updater": {
+      "active": true,
+      "endpoints": [
+        "https://github.com/DamirSadykov/Claude-Usage-Tracker-Windows/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDJERDQxNDNFNDNGNTFDRDEKUldUUkhQVkRQaFRVTFNPdVg2NEM3aUp1SElOcWlJRUk2YVE2aUpDZHFSakI4STBFaUx2eTlWOUwK",
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  }
 }
