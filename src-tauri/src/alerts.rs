@@ -59,6 +59,10 @@ impl Default for AlertTypes {
     }
 }
 
+fn default_forecast_window() -> u64 {
+    60
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct AppConfig {
     pub session_key: String,
@@ -70,6 +74,10 @@ pub struct AppConfig {
     pub weekly_thresholds: Vec<f64>,
     pub notifications_enabled: bool,
     pub forecast_minutes: f64,
+    // Sliding window (minutes) for the burn-rate average behind the exhaustion
+    // forecast (issue #7) and the forecast alert's delta.
+    #[serde(default = "default_forecast_window")]
+    pub forecast_window_min: u64,
     pub quiet_hours_enabled: bool,
     pub quiet_hours_start: String,
     pub quiet_hours_end: String,
@@ -102,6 +110,7 @@ impl Default for AppConfig {
             weekly_thresholds: DEFAULT_THRESHOLDS.to_vec(),
             notifications_enabled: false,
             forecast_minutes: 30.0,
+            forecast_window_min: default_forecast_window(),
             quiet_hours_enabled: false,
             quiet_hours_start: "23:00".to_string(),
             quiet_hours_end: "08:00".to_string(),

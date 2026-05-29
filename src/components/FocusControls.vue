@@ -138,6 +138,10 @@ function stopFocus(completed: boolean) {
 <style scoped>
 .focus-controls {
   padding-top: 0;
+  /* Sit at natural height pinned to the bottom; let the usage list above take
+     the remaining space and scroll, instead of splitting the flyout 50/50. */
+  flex: none;
+  overflow-y: visible;
 }
 .focus-card {
   display: flex;
