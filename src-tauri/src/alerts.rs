@@ -204,7 +204,6 @@ struct TierState {
     fired_level: i8, // highest colour level already notified (0..3), -1 = none
     fired_limit: bool,
     prev_percent: Option<f64>,
-    prev_reset_at: Option<String>,
 }
 
 #[derive(Default)]
@@ -365,7 +364,6 @@ impl AlertEngine {
         // First sighting (startup, or tier appeared) → prime, don't fire.
         if st.prev_percent.is_none() {
             st.prev_percent = Some(cur.percent_used);
-            st.prev_reset_at = cur.reset_at.clone();
             st.fired_level = level as i8;
             if cur.is_limited || cur.percent_used >= 100.0 {
                 st.fired_limit = true;
@@ -375,10 +373,12 @@ impl AlertEngine {
         }
 
         let prev = st.prev_percent.unwrap();
-        let was_active = prev > 0.0 || st.prev_reset_at.is_some();
-        let did_reset = was_active
-            && cur.percent_used <= RESET_EPSILON
-            && (prev > RESET_EPSILON || cur.reset_at != st.prev_reset_at);
+        // A reset = a tier we'd seen consumed (prev above the floor) is now fresh.
+        // We deliberately do NOT treat a change of `reset_at` alone as a reset:
+        // the reported window can drift between polls while the tier sits near 0%
+        // (right after a reset, before any usage), which fired duplicate
+        // "you can work again" alerts.
+        let did_reset = prev > RESET_EPSILON && cur.percent_used <= RESET_EPSILON;
 
         let mut event: Option<AlertEvent> = None;
         let mut clear_forecast = false;
@@ -418,7 +418,6 @@ impl AlertEngine {
         }
 
         st.prev_percent = Some(cur.percent_used);
-        st.prev_reset_at = cur.reset_at.clone();
         self.tiers.insert(key.to_string(), st);
 
         if clear_forecast {
@@ -654,6 +653,33 @@ mod tests {
                 tier: "five_hour".into(),
                 pct: 25.0
             }]
+        );
+    }
+
+    #[test]
+    fn reset_fires_once_even_if_reset_at_drifts() {
+        // After a reset the tier sits near 0% while the API may report a new
+        // `reset_at` each poll. That drift must NOT re-fire the reset alert.
+        let mut eng = AlertEngine::new();
+        let c = cfg();
+        let u0 = usage(tier(18.0, Some("r1"), false), tier(0.0, None, false));
+        prime(&mut eng, &u0, &c);
+
+        // window expires → fresh session, new reset_at → single reset
+        let u1 = usage(tier(0.0, Some("r2"), false), tier(0.0, None, false));
+        let out = eng.evaluate(&u1, &c, 0, None, None, false);
+        assert_eq!(
+            out,
+            vec![AlertEvent::Reset {
+                tier: "five_hour".into()
+            }]
+        );
+
+        // still fresh (0%) but reset_at drifted again → must stay silent
+        let u2 = usage(tier(0.0, Some("r3"), false), tier(0.0, None, false));
+        assert!(
+            eng.evaluate(&u2, &c, 0, None, None, false).is_empty(),
+            "reset_at drift at ~0% must not re-fire the reset alert"
         );
     }
 
