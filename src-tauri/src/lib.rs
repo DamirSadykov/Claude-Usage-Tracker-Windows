@@ -20,7 +20,6 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconEvent},
     AppHandle, Emitter, Manager, PhysicalPosition, WebviewWindow, WindowEvent,
 };
-use tauri_plugin_autostart::MacosLauncher;
 use tokio::sync::Notify;
 
 use alerts::{tier_level, AlertEngine, AppConfig};
@@ -648,10 +647,6 @@ pub fn run() {
                 let _ = window.set_focus();
             }
         }))
-        .plugin(tauri_plugin_autostart::init(
-            MacosLauncher::LaunchAgent,
-            Some(vec!["--autostarted"]),
-        ))
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -785,16 +780,6 @@ pub fn run() {
                     }
                     _ => {}
                 });
-            }
-
-            // The main window is `visible: true`, so a normal launch shows it
-            // unchanged. When the OS starts us at login (autostart passes
-            // --autostarted) hide it so we come up silently in the tray.
-            let autostarted = std::env::args().any(|a| a == "--autostarted");
-            if autostarted {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.hide();
-                }
             }
 
             spawn_poll_loop(app.handle().clone(), notify);

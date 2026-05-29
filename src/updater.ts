@@ -19,7 +19,6 @@ const availableVersion = ref("");
 const notes = ref("");
 const progress = ref(0); // 0..100
 const errorMessage = ref("");
-const autoInstall = ref(false);
 const checkHours = ref(6);
 
 // The Update handle returned by check(), kept until installed.
@@ -35,7 +34,6 @@ async function loadStore() {
 
 export async function saveUpdaterSettings() {
     const store = await loadStore();
-    await store.set("updateAutoInstall", autoInstall.value);
     await store.set("updateCheckHours", checkHours.value);
     await store.save();
     schedulePeriodic();
@@ -97,7 +95,6 @@ export async function checkForUpdate(silent = false) {
             availableVersion.value = update.version;
             notes.value = update.body ?? "";
             status.value = "available";
-            if (autoInstall.value) await installUpdate();
         } else {
             pending = null;
             status.value = silent ? "idle" : "uptodate";
@@ -140,8 +137,6 @@ export async function initUpdater() {
     }
     try {
         const store = await loadStore();
-        autoInstall.value =
-            (await store.get<boolean>("updateAutoInstall")) ?? false;
         checkHours.value = (await store.get<number>("updateCheckHours")) ?? 6;
     } catch {
         // first run
@@ -158,7 +153,6 @@ export function useUpdater() {
         notes,
         progress,
         errorMessage,
-        autoInstall,
         checkHours,
         checkForUpdate,
         installUpdate,
