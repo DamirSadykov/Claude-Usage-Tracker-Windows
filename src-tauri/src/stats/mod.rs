@@ -298,8 +298,15 @@ mod tests {
     #[test]
     fn analytics_aggregates_models_and_totals() {
         let db = mem_db();
+        // m1 carries cache tokens so total_tokens exercises all four columns
+        // (input + output + cache_create + cache_read), not just input+output.
+        let m1 = CcUsageRow {
+            cache_create: 10,
+            cache_read: 20,
+            ..cc_row("m1", "2026-01-01T10:00:00Z", "claude-opus-4-7", 100, 50, 1.0, "s1")
+        };
         db.cc_upsert(&[
-            cc_row("m1", "2026-01-01T10:00:00Z", "claude-opus-4-7", 100, 50, 1.0, "s1"),
+            m1,
             cc_row("m2", "2026-01-01T12:00:00Z", "claude-opus-4-7", 100, 50, 1.0, "s1"),
             cc_row("m3", "2026-01-02T10:00:00Z", "claude-sonnet-4-5", 200, 80, 0.4, "s2"),
         ])
@@ -307,23 +314,25 @@ mod tests {
 
         let a = db.analytics("2026-01-01T00:00:00Z", "2026-01-03T00:00:00Z").unwrap();
 
-        // totals: tokens = (100+50)*2 + (200+80) = 580 ; cost = 2.4 ; 3 msgs, 2 sessions
-        assert_eq!(a.totals.total_tokens, 580);
+        // totals: tokens = (100+50+10+20) + (100+50) + (200+80) = 610 ; cost = 2.4
+        assert_eq!(a.totals.total_tokens, 610);
+        assert_eq!(a.totals.cache_create, 10);
+        assert_eq!(a.totals.cache_read, 20);
         assert!((a.totals.cost - 2.4).abs() < 1e-9);
         assert_eq!(a.totals.messages, 3);
         assert_eq!(a.totals.sessions, 2);
 
-        // by_model ordered by tokens desc: opus (300) before sonnet (280)
+        // by_model ordered by tokens desc: opus (330) before sonnet (280)
         assert_eq!(a.by_model.len(), 2);
         assert_eq!(a.by_model[0].model, "claude-opus-4-7");
-        assert_eq!(a.by_model[0].total_tokens, 300);
+        assert_eq!(a.by_model[0].total_tokens, 330);
         assert_eq!(a.by_model[0].messages, 2);
         assert_eq!(a.by_model[1].model, "claude-sonnet-4-5");
 
         // daily has at least the two days (local bucketing may shift the boundary)
         assert!(a.daily.len() >= 1);
         let daily_total: i64 = a.daily.iter().map(|d| d.total_tokens).sum();
-        assert_eq!(daily_total, 580);
+        assert_eq!(daily_total, 610);
     }
 
     #[test]
