@@ -42,8 +42,8 @@ onMounted(async () => {
       levels.value = e.payload.levels;
       error.value = "";
     }),
-    await listen<string>("usage-error", (e) => {
-      error.value = String(e.payload);
+    await listen<{ message: string; reportable: boolean }>("usage-error", (e) => {
+      error.value = String(e.payload?.message ?? e.payload);
     }),
   );
 });
