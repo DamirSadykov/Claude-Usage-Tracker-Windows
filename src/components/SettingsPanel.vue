@@ -190,9 +190,8 @@ useAscending(localW1, localW2, localW3);
 
 function applySuggestion() {
   if (props.suggestedBudget === null) return;
-  localBudget.value = localCc.value
-    ? Math.round(props.suggestedBudget * 100) / 100
-    : Math.round(props.suggestedBudget * 10) / 10;
+  // Budget is a whole number (the input only accepts integers).
+  localBudget.value = Math.round(props.suggestedBudget);
 }
 
 function handleSave() {
@@ -213,7 +212,7 @@ function handleSave() {
     alertTypes: { ...localTypes.value },
     ccAnalyticsEnabled: localCc.value,
     dailyBudgetEnabled: localBudgetEnabled.value,
-    dailyBudget: localBudget.value,
+    dailyBudget: Math.round(localBudget.value) || 0,
     locale: localLocale.value,
   });
 }
@@ -573,7 +572,7 @@ function handleSave() {
           type="number"
           class="field-input"
           min="0"
-          :step="localCc ? 1 : 5"
+          step="1"
         />
         <div
           v-if="suggestedBudget !== null && localCc === ccAnalyticsEnabled"
@@ -582,8 +581,8 @@ function handleSave() {
           <span class="field-hint" style="margin: 0">
             {{ t('budgetSuggest', {
               value: localCc
-                ? '$' + suggestedBudget.toFixed(2)
-                : suggestedBudget.toFixed(1) + '%',
+                ? '$' + Math.round(suggestedBudget)
+                : Math.round(suggestedBudget) + '%',
             }) }}
           </span>
           <button type="button" class="suggest-btn" @click="applySuggestion">
