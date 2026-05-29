@@ -7,7 +7,12 @@ export type AlertEvent =
   | { kind: "limit"; tier: string }
   | { kind: "reset"; tier: string }
   | { kind: "forecast"; eta_minutes: number }
+  | { kind: "budget"; spent: number; budget: number; unit: string }
   | { kind: "catch_up"; count: number; items: AlertEvent[] };
+
+function fmtBudgetValue(value: number, unit: string): string {
+  return unit === "usd" ? "$" + value.toFixed(2) : value.toFixed(1) + "%";
+}
 
 export type Translate = (key: string, params?: Record<string, unknown>) => string;
 
@@ -50,6 +55,14 @@ export function localizeAlert(t: Translate, a: AlertEvent): { title: string; bod
       return {
         title: t("alertForecastTitle"),
         body: t("alertForecastBody", { time: formatEta(t, a.eta_minutes) }),
+      };
+    case "budget":
+      return {
+        title: t("alertBudgetTitle"),
+        body: t("alertBudgetBody", {
+          spent: fmtBudgetValue(a.spent, a.unit),
+          budget: fmtBudgetValue(a.budget, a.unit),
+        }),
       };
     case "catch_up": {
       const body =

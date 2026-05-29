@@ -11,6 +11,10 @@ const props = defineProps<{
   loading: boolean;
   autoStartEnabled: boolean;
   autoStartStatus: string;
+  dailyBudgetEnabled: boolean;
+  dailyBudget: number;
+  todaySpent: number | null;
+  budgetUnit: "usd" | "pct";
 }>();
 
 const TIER_CLASSES = ["tier-green", "tier-yellow", "tier-orange", "tier-red"];
@@ -18,6 +22,51 @@ const TIER_CLASSES = ["tier-green", "tier-yellow", "tier-orange", "tier-red"];
 // Colour buckets are computed by the backend and arrive in `levels`.
 function lvlClass(level: number | null): string {
   return TIER_CLASSES[level ?? 0];
+}
+
+const WEEK_MS = 7 * 86400000;
+
+// The "even-spend" pace: how much of the weekly limit should be used by now if
+// consumed linearly from the window start (reset_at − 7d) to reset_at.
+function idealPace(resetAt: string | null): number | null {
+  if (!resetAt) return null;
+  const end = new Date(resetAt).getTime();
+  const start = end - WEEK_MS;
+  const frac = (now.value - start) / WEEK_MS;
+  if (frac <= 0 || frac >= 1) return null;
+  return frac * 100;
+}
+
+const weeklyPace = computed(() => idealPace(sevenDay.value.reset_at));
+const opusPace = computed(() => idealPace(opusDay.value?.reset_at ?? null));
+const sonnetPace = computed(() => idealPace(sonnetDay.value?.reset_at ?? null));
+
+// Status of the weekly tier relative to the even-spend pace.
+const paceStatus = computed<{ key: string; cls: string } | null>(() => {
+  const ideal = weeklyPace.value;
+  if (ideal === null) return null;
+  const diff = sevenDay.value.percent_used - ideal;
+  if (diff > 5) return { key: "paceAhead", cls: "pace-warn" };
+  if (diff < -5) return { key: "paceBehind", cls: "pace-ok" };
+  return { key: "paceOnPace", cls: "pace-neutral" };
+});
+
+const budgetFraction = computed(() => {
+  if (!props.dailyBudget || props.todaySpent === null) return 0;
+  return props.todaySpent / props.dailyBudget;
+});
+
+function budgetLevel(frac: number): number {
+  if (frac < 0.5) return 0;
+  if (frac < 0.75) return 1;
+  if (frac < 1) return 2;
+  return 3;
+}
+
+function fmtBudget(value: number): string {
+  return props.budgetUnit === "usd"
+    ? "$" + value.toFixed(2)
+    : value.toFixed(1) + "%";
 }
 
 defineEmits<{
@@ -96,6 +145,27 @@ const prepaidBalance = computed(() => props.usage.prepaid_balance);
 
 <template>
   <div class="cards">
+    <!-- Daily budget -->
+    <div v-if="dailyBudgetEnabled && dailyBudget > 0" class="card">
+      <div class="card-row">
+        <div>
+          <div class="card-title">{{ t('dailyBudget') }}</div>
+          <div class="card-sub">
+            <template v-if="todaySpent !== null">
+              {{ t('budgetToday') }}: {{ fmtBudget(todaySpent) }} / {{ fmtBudget(dailyBudget) }}
+            </template>
+            <template v-else>{{ t('loading') }}</template>
+          </div>
+        </div>
+        <div class="pct" :class="lvlClass(budgetLevel(budgetFraction))">
+          {{ (budgetFraction * 100).toFixed(0) }}%
+        </div>
+      </div>
+      <div class="bar" :class="lvlClass(budgetLevel(budgetFraction))">
+        <i :style="{ width: Math.min(budgetFraction * 100, 100) + '%' }"></i>
+      </div>
+    </div>
+
     <!-- 5-hour session -->
     <div class="card">
       <div class="card-row">
@@ -131,6 +201,15 @@ const prepaidBalance = computed(() => props.usage.prepaid_balance);
       </div>
       <div class="bar" :class="lvlClass(levels.seven_day)">
         <i :style="{ width: Math.min(sevenDay.percent_used, 100) + '%' }"></i>
+        <span
+          v-if="weeklyPace !== null"
+          class="pace-tick"
+          :style="{ left: weeklyPace + '%' }"
+          :title="t('idealPace')"
+        ></span>
+      </div>
+      <div v-if="paceStatus" class="pace-row" :class="paceStatus.cls">
+        {{ t('idealPace') }}: {{ t(paceStatus.key) }}
       </div>
     </div>
 
@@ -150,6 +229,12 @@ const prepaidBalance = computed(() => props.usage.prepaid_balance);
       </div>
       <div class="bar" :class="lvlClass(levels.seven_day_opus)">
         <i :style="{ width: Math.min(opusDay.percent_used, 100) + '%' }"></i>
+        <span
+          v-if="opusPace !== null"
+          class="pace-tick"
+          :style="{ left: opusPace + '%' }"
+          :title="t('idealPace')"
+        ></span>
       </div>
     </div>
 
@@ -169,6 +254,12 @@ const prepaidBalance = computed(() => props.usage.prepaid_balance);
       </div>
       <div class="bar" :class="lvlClass(levels.seven_day_sonnet)">
         <i :style="{ width: Math.min(sonnetDay.percent_used, 100) + '%' }"></i>
+        <span
+          v-if="sonnetPace !== null"
+          class="pace-tick"
+          :style="{ left: sonnetPace + '%' }"
+          :title="t('idealPace')"
+        ></span>
       </div>
     </div>
 
