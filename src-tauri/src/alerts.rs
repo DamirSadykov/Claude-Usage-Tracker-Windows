@@ -96,6 +96,22 @@ pub struct AppConfig {
     // Snooze: while `now < muted_until`, alerts are queued like quiet hours.
     #[serde(default)]
     pub notifications_muted_until: Option<String>,
+    // Claude service-status indicator (status.claude.com). Independent of the
+    // usage poll loop and of `notifications_enabled`.
+    #[serde(default = "default_true")]
+    pub service_status_enabled: bool,
+    #[serde(default = "default_status_interval")]
+    pub service_status_interval: u64,
+    #[serde(default = "default_true")]
+    pub service_status_notify: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_status_interval() -> u64 {
+    90
 }
 
 impl Default for AppConfig {
@@ -120,6 +136,9 @@ impl Default for AppConfig {
             daily_budget_enabled: false,
             daily_budget: 0.0,
             notifications_muted_until: None,
+            service_status_enabled: true,
+            service_status_interval: 90,
+            service_status_notify: true,
         }
     }
 }

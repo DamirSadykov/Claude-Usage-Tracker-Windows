@@ -7,6 +7,7 @@ import UsagePanel from "./components/UsagePanel.vue";
 import MiniPanel from "./components/MiniPanel.vue";
 import AnalyticsPanel from "./components/AnalyticsPanel.vue";
 import FocusControls from "./components/FocusControls.vue";
+import ServiceStatusBar from "./components/ServiceStatusBar.vue";
 import {
     DEFAULT_THRESHOLDS,
     normalize,
@@ -98,6 +99,9 @@ const ccAnalyticsEnabled = ref(false);
 const dailyBudgetEnabled = ref(false);
 const dailyBudget = ref(0);
 const notificationsMutedUntil = ref<string | null>(null);
+const serviceStatusEnabled = ref(true);
+const serviceStatusInterval = ref(90);
+const serviceStatusNotify = ref(true);
 const todaySpent = ref<number | null>(null);
 const suggestedBudget = ref<number | null>(null);
 const budgetUnit = computed<"usd" | "pct">(() =>
@@ -159,6 +163,12 @@ async function loadSettings() {
         dailyBudget.value = (await store.get<number>("dailyBudget")) ?? 0;
         notificationsMutedUntil.value =
             (await store.get<string>("notificationsMutedUntil")) ?? null;
+        serviceStatusEnabled.value =
+            (await store.get<boolean>("serviceStatusEnabled")) ?? true;
+        serviceStatusInterval.value =
+            (await store.get<number>("serviceStatusInterval")) ?? 90;
+        serviceStatusNotify.value =
+            (await store.get<boolean>("serviceStatusNotify")) ?? true;
         const savedLocale = await store.get<string>("locale");
         if (savedLocale) locale.value = savedLocale;
     } catch {
@@ -188,6 +198,9 @@ async function saveSettings() {
     await store.set("dailyBudgetEnabled", dailyBudgetEnabled.value);
     await store.set("dailyBudget", dailyBudget.value);
     await store.set("notificationsMutedUntil", notificationsMutedUntil.value);
+    await store.set("serviceStatusEnabled", serviceStatusEnabled.value);
+    await store.set("serviceStatusInterval", serviceStatusInterval.value);
+    await store.set("serviceStatusNotify", serviceStatusNotify.value);
     await store.set("locale", locale.value);
     await store.save();
 }
@@ -215,6 +228,9 @@ function buildConfig() {
         daily_budget_enabled: dailyBudgetEnabled.value,
         daily_budget: dailyBudget.value,
         notifications_muted_until: notificationsMutedUntil.value,
+        service_status_enabled: serviceStatusEnabled.value,
+        service_status_interval: serviceStatusInterval.value,
+        service_status_notify: serviceStatusNotify.value,
     };
 }
 
@@ -244,6 +260,18 @@ async function notify(title: string, body: string) {
 async function toast(a: AlertEvent) {
     const { title, body } = localizeAlert(t, a);
     await notify(title, body);
+}
+
+// Service-status notifications come pre-decided by the backend (status change /
+// new incident); we only localize the wrapper title here.
+async function serviceToast(a: { kind: string; text: string }) {
+    const title =
+        a.kind === "resolved"
+            ? t("statusToastResolved")
+            : a.kind === "incident"
+              ? t("statusToastIncident")
+              : t("statusToastDegraded");
+    await notify(title, a.text);
 }
 
 // Consumption since local midnight, in the unit implied by ccAnalyticsEnabled
@@ -411,6 +439,9 @@ async function handleSave(settings: {
     ccAnalyticsEnabled: boolean;
     dailyBudgetEnabled: boolean;
     dailyBudget: number;
+    serviceStatusEnabled: boolean;
+    serviceStatusInterval: number;
+    serviceStatusNotify: boolean;
     locale: string;
 }) {
     sessionKey.value = settings.sessionKey;
@@ -430,6 +461,9 @@ async function handleSave(settings: {
     ccAnalyticsEnabled.value = settings.ccAnalyticsEnabled;
     dailyBudgetEnabled.value = settings.dailyBudgetEnabled;
     dailyBudget.value = settings.dailyBudget;
+    serviceStatusEnabled.value = settings.serviceStatusEnabled;
+    serviceStatusInterval.value = settings.serviceStatusInterval;
+    serviceStatusNotify.value = settings.serviceStatusNotify;
     locale.value = settings.locale;
     // The backend re-arms its alert engine on disable (see `configure`).
     await saveSettings();
@@ -489,6 +523,12 @@ onMounted(async () => {
         await listen<AlertEvent>("alert", (e) => {
             void toast(e.payload);
         }),
+        await listen<{ kind: string; indicator: string; text: string }>(
+            "service-alert",
+            (e) => {
+                void serviceToast(e.payload);
+            },
+        ),
         await listen<string>("project-resolved", async (e) => {
             projectId.value = String(e.payload);
             await saveSettings();
@@ -633,6 +673,9 @@ onUnmounted(() => {
 
         <div class="hr"></div>
 
+        <!-- Claude service status (status.claude.com) -->
+        <ServiceStatusBar v-if="serviceStatusEnabled" />
+
         <!-- Update banner -->
         <div
             v-if="updateStatus === 'available'"
@@ -697,6 +740,9 @@ onUnmounted(() => {
             :daily-budget-enabled="dailyBudgetEnabled"
             :daily-budget="dailyBudget"
             :suggested-budget="suggestedBudget"
+            :service-status-enabled="serviceStatusEnabled"
+            :service-status-interval="serviceStatusInterval"
+            :service-status-notify="serviceStatusNotify"
             :locale="locale"
             @save="handleSave"
         />
