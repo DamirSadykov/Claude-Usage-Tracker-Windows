@@ -263,7 +263,8 @@ async fn run_cycle(app: &AppHandle, cfg: &AppConfig, auto_started: &mut bool) {
         let now = chrono::Utc::now();
         let stats = app.try_state::<Arc<StatsDb>>();
         let delta = stats.as_ref().and_then(|s| {
-            let from = (now - chrono::Duration::hours(1)).to_rfc3339();
+            let from =
+                (now - chrono::Duration::minutes(cfg.forecast_window_min as i64)).to_rfc3339();
             let to = now.to_rfc3339();
             s.compute_delta(&from, &to).ok().flatten()
         });
@@ -436,6 +437,16 @@ async fn ingest_cc_usage(
 }
 
 #[tauri::command]
+async fn get_forecast(
+    window_min: u64,
+    stats: tauri::State<'_, Arc<StatsDb>>,
+) -> Result<stats::ForecastData, String> {
+    stats
+        .forecast(window_min as i64, chrono::Utc::now())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn get_analytics(
     from: String,
     to: String,
@@ -601,6 +612,7 @@ pub fn run() {
             get_usage_snapshots,
             get_latest_snapshots,
             ingest_cc_usage,
+            get_forecast,
             get_analytics,
             get_analytics_compare,
         ])

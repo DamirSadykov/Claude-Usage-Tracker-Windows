@@ -1,4 +1,4 @@
-use chrono::Utc;
+use chrono::{DateTime, Duration, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -95,6 +95,97 @@ pub struct UsageDelta {
     pub seven_day_delta: f64,
     pub opus_delta: Option<f64>,
     pub sonnet_delta: Option<f64>,
+}
+
+// --- Exhaustion forecast (issue #7) ---
+
+// Mirror of the burn-rate guards in `alerts.rs`. Duplicated on purpose: `stats`
+// is the lower layer and must not depend on `alerts` (which already depends on
+// `stats`). Keep the two in sync.
+const MIN_SPAN_MIN: f64 = 10.0; // need at least this much history to estimate a rate
+const MIN_RATE: f64 = 0.05; // %/min — below this is noise/flat, no ETA
+
+#[derive(Debug, Serialize, PartialEq)]
+pub struct TierForecast {
+    pub rate_per_hour: f64,            // measured burn, %/h (clamped ≥ 0)
+    pub eta_minutes: Option<f64>,      // minutes to 100% at the measured rate
+    pub allowed_per_hour: Option<f64>, // %/h you may still spend to last until reset
+    pub pace: String,                  // "idle" | "ok" | "warn"
+}
+
+impl TierForecast {
+    /// No snapshot / not enough history to estimate anything yet.
+    fn unknown() -> Self {
+        Self {
+            rate_per_hour: 0.0,
+            eta_minutes: None,
+            allowed_per_hour: None,
+            pace: "unknown".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct ForecastData {
+    pub five_hour: TierForecast,
+    pub seven_day: TierForecast,
+    pub extra_usage: Option<TierForecast>,
+}
+
+/// Pure forecast math for one tier. `span_min` is the history span backing the
+/// rate (None when there's too little to measure). `reset_at` drives the
+/// *allowed* pace (independent of history); the measured rate drives the ETA.
+fn tier_forecast(
+    current: f64,
+    reset_at: Option<&str>,
+    earliest: Option<f64>,
+    span_min: Option<f64>,
+    now: DateTime<Utc>,
+) -> TierForecast {
+    // Minutes until reset (positive only). Drives allowed pace + ahead/behind.
+    let time_to_reset_min = reset_at
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|r| (r.with_timezone(&Utc) - now).num_milliseconds() as f64 / 60000.0)
+        .filter(|&m| m > 0.0);
+
+    // Recommended pace to land exactly at 100% on reset — needs no history.
+    let allowed_per_hour = match time_to_reset_min {
+        Some(ttr) if current < 100.0 => Some((100.0 - current) / ttr * 60.0),
+        _ => None,
+    };
+
+    // Measured burn → ETA. Requires enough history and a non-trivial rate.
+    let rate_per_min = match (earliest, span_min) {
+        (Some(e), Some(s)) if s >= MIN_SPAN_MIN => Some((current - e) / s),
+        _ => None,
+    };
+    let rate_per_hour = rate_per_min.map(|r| r.max(0.0) * 60.0).unwrap_or(0.0);
+    let eta_minutes = match rate_per_min {
+        Some(r) if r >= MIN_RATE && current < 100.0 => Some((100.0 - current) / r),
+        _ => None,
+    };
+
+    let pace = if rate_per_min.is_none() {
+        // Too little history to measure a burn rate — say so, don't claim safety.
+        "unknown"
+    } else if let (Some(eta), Some(ttr)) = (eta_minutes, time_to_reset_min) {
+        // Measured rate gives an ETA: warn only if it lands before the reset.
+        if eta < ttr {
+            "warn"
+        } else {
+            "ok"
+        }
+    } else {
+        // Measured but flat (rate below noise), or no reset to race → will last.
+        "ok"
+    };
+
+    TierForecast {
+        rate_per_hour,
+        eta_minutes,
+        allowed_per_hour,
+        pace: pace.to_string(),
+    }
 }
 
 // --- Claude Code usage analytics (sourced from ~/.claude transcripts) ---
@@ -324,6 +415,71 @@ impl StatsDb {
         }
     }
 
+    /// Exhaustion forecast per tier, derived from the latest snapshot's current
+    /// values plus the burn rate over `[now − window_min, now]`. `now` is injected
+    /// so the math (window bound + time-to-reset) is deterministic under test.
+    pub fn forecast(
+        &self,
+        window_min: i64,
+        now: DateTime<Utc>,
+    ) -> Result<ForecastData, rusqlite::Error> {
+        // Current state = the most recent snapshot (recorded just before the
+        // usage-updated that triggers this call, so it matches the live cards).
+        let latest = match self.latest(1)?.into_iter().next() {
+            Some(s) => s,
+            None => {
+                return Ok(ForecastData {
+                    five_hour: TierForecast::unknown(),
+                    seven_day: TierForecast::unknown(),
+                    extra_usage: None,
+                })
+            }
+        };
+
+        // Earliest snapshot inside the averaging window, for the rate baseline.
+        let from = (now - Duration::minutes(window_min)).to_rfc3339();
+        let earliest: Option<(String, f64, f64, Option<f64>)> = {
+            let conn = self.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT timestamp, five_hour_pct, seven_day_pct, extra_pct
+                 FROM usage_snapshots WHERE timestamp >= ?1
+                 ORDER BY timestamp ASC LIMIT 1",
+                params![from],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?
+        };
+
+        // Span of measured history (None when the earliest == latest row).
+        let span_min = earliest.as_ref().and_then(|e| {
+            let a = DateTime::parse_from_rfc3339(&e.0).ok()?;
+            let b = DateTime::parse_from_rfc3339(&latest.timestamp).ok()?;
+            let s = (b - a).num_milliseconds() as f64 / 60000.0;
+            (s > 0.0).then_some(s)
+        });
+
+        Ok(ForecastData {
+            five_hour: tier_forecast(
+                latest.five_hour_pct,
+                latest.five_hour_reset.as_deref(),
+                earliest.as_ref().map(|e| e.1),
+                span_min,
+                now,
+            ),
+            seven_day: tier_forecast(
+                latest.seven_day_pct,
+                latest.seven_day_reset.as_deref(),
+                earliest.as_ref().map(|e| e.2),
+                span_min,
+                now,
+            ),
+            // Extra usage has no reset_at in snapshots → no allowed pace, ETA only.
+            extra_usage: latest.extra_pct.map(|cur| {
+                tier_forecast(cur, None, earliest.as_ref().and_then(|e| e.3), span_min, now)
+            }),
+        })
+    }
+
     pub fn latest(&self, count: u32) -> Result<Vec<UsageSnapshot>, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -518,6 +674,28 @@ impl StatsDb {
             "INSERT INTO usage_snapshots (timestamp, five_hour_pct, seven_day_pct, opus_pct)
              VALUES (?1, ?2, ?3, ?4)",
             params![ts, five, seven, opus],
+        )
+        .unwrap();
+    }
+
+    /// Test-only insert that also sets reset columns + extra_pct — the fields the
+    /// forecast reads beyond the plain `insert_at` set.
+    #[cfg(test)]
+    fn insert_full(
+        &self,
+        ts: &str,
+        five: f64,
+        five_reset: Option<&str>,
+        seven: f64,
+        seven_reset: Option<&str>,
+        extra: Option<f64>,
+    ) {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO usage_snapshots
+                (timestamp, five_hour_pct, five_hour_reset, seven_day_pct, seven_day_reset, extra_pct)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![ts, five, five_reset, seven, seven_reset, extra],
         )
         .unwrap();
     }
@@ -779,5 +957,108 @@ mod tests {
             .seven_day_baseline("2026-02-01T00:00:00Z", "2026-02-02T00:00:00Z")
             .unwrap()
             .is_none());
+    }
+
+    // --- exhaustion forecast (#7) ---
+
+    fn now_at(ts: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(ts).unwrap().with_timezone(&Utc)
+    }
+
+    #[test]
+    fn forecast_measures_rate_eta_and_warns() {
+        let db = mem_db();
+        let now = now_at("2026-01-01T01:00:00Z");
+        // 40→60% over 60min = 0.333%/min; remaining 40% → eta 120min.
+        db.insert_full("2026-01-01T00:00:00Z", 40.0, Some("2026-01-01T05:00:00Z"), 0.0, None, None);
+        db.insert_full("2026-01-01T01:00:00Z", 60.0, Some("2026-01-01T05:00:00Z"), 0.0, None, None);
+
+        let f = db.forecast(60, now).unwrap();
+        let fh = f.five_hour;
+        assert!((fh.rate_per_hour - 20.0).abs() < 1e-6, "rate {}", fh.rate_per_hour);
+        assert!((fh.eta_minutes.unwrap() - 120.0).abs() < 1e-6);
+        // reset is 240min away; allowed = 40%/240min·60 = 10%/h.
+        assert!((fh.allowed_per_hour.unwrap() - 10.0).abs() < 1e-6);
+        // eta (120) < time-to-reset (240) → will exhaust before reset.
+        assert_eq!(fh.pace, "warn");
+    }
+
+    #[test]
+    fn forecast_ok_when_eta_after_reset() {
+        let db = mem_db();
+        let now = now_at("2026-01-01T01:00:00Z");
+        // 50→56% over 60min = 0.1%/min; eta = 44/0.1 = 440min, reset only 60min away.
+        db.insert_full("2026-01-01T00:00:00Z", 50.0, Some("2026-01-01T02:00:00Z"), 0.0, None, None);
+        db.insert_full("2026-01-01T01:00:00Z", 56.0, Some("2026-01-01T02:00:00Z"), 0.0, None, None);
+
+        let fh = db.forecast(60, now).unwrap().five_hour;
+        assert!((fh.eta_minutes.unwrap() - 440.0).abs() < 1e-6);
+        assert_eq!(fh.pace, "ok");
+    }
+
+    #[test]
+    fn forecast_ok_when_rate_below_threshold() {
+        let db = mem_db();
+        let now = now_at("2026-01-01T01:00:00Z");
+        // 40→41% over 60min = 0.0167%/min < MIN_RATE → measured-but-flat → no ETA,
+        // pace "ok" (we did measure: it lasts), allowed still set.
+        db.insert_full("2026-01-01T00:00:00Z", 40.0, Some("2026-01-01T05:00:00Z"), 0.0, None, None);
+        db.insert_full("2026-01-01T01:00:00Z", 41.0, Some("2026-01-01T05:00:00Z"), 0.0, None, None);
+
+        let fh = db.forecast(60, now).unwrap().five_hour;
+        assert!(fh.eta_minutes.is_none());
+        assert!(fh.allowed_per_hour.is_some());
+        assert_eq!(fh.pace, "ok");
+    }
+
+    #[test]
+    fn forecast_unknown_when_span_too_short() {
+        let db = mem_db();
+        let now = now_at("2026-01-01T01:00:00Z");
+        // Only 5min of history (< MIN_SPAN_MIN) → rate unmeasurable → "unknown".
+        db.insert_full("2026-01-01T00:55:00Z", 40.0, Some("2026-01-01T05:00:00Z"), 0.0, None, None);
+        db.insert_full("2026-01-01T01:00:00Z", 60.0, Some("2026-01-01T05:00:00Z"), 0.0, None, None);
+
+        let fh = db.forecast(60, now).unwrap().five_hour;
+        assert!(fh.eta_minutes.is_none(), "span < MIN_SPAN_MIN must not yield an ETA");
+        assert_eq!(fh.pace, "unknown");
+    }
+
+    #[test]
+    fn forecast_allowed_without_measurable_history() {
+        let db = mem_db();
+        let now = now_at("2026-01-01T01:00:00Z");
+        // Single snapshot: no span → no rate → "unknown", but recommended pace is
+        // still derivable from the reset alone.
+        db.insert_full("2026-01-01T01:00:00Z", 50.0, Some("2026-01-01T05:00:00Z"), 0.0, None, None);
+
+        let fh = db.forecast(60, now).unwrap().five_hour;
+        assert!(fh.eta_minutes.is_none());
+        // 50% left over 240min → 12.5%/h.
+        assert!((fh.allowed_per_hour.unwrap() - 12.5).abs() < 1e-6);
+        assert_eq!(fh.pace, "unknown");
+    }
+
+    #[test]
+    fn forecast_extra_has_eta_but_no_allowed() {
+        let db = mem_db();
+        let now = now_at("2026-01-01T01:00:00Z");
+        // extra 10→30% over 60min → eta = 70/0.333 = 210min; no reset → no allowed pace.
+        db.insert_full("2026-01-01T00:00:00Z", 0.0, None, 0.0, None, Some(10.0));
+        db.insert_full("2026-01-01T01:00:00Z", 0.0, None, 0.0, None, Some(30.0));
+
+        let ex = db.forecast(60, now).unwrap().extra_usage.unwrap();
+        assert!((ex.eta_minutes.unwrap() - 210.0).abs() < 1e-6);
+        assert!(ex.allowed_per_hour.is_none(), "extra usage has no reset → no allowed pace");
+        assert_eq!(ex.pace, "ok");
+    }
+
+    #[test]
+    fn forecast_empty_db_is_unknown() {
+        let db = mem_db();
+        let f = db.forecast(60, now_at("2026-01-01T01:00:00Z")).unwrap();
+        assert_eq!(f.five_hour, TierForecast::unknown());
+        assert_eq!(f.seven_day, TierForecast::unknown());
+        assert!(f.extra_usage.is_none());
     }
 }

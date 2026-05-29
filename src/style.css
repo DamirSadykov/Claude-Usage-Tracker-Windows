@@ -473,6 +473,15 @@ body,
     box-shadow: 0 0 2px rgba(0, 0, 0, 0.5);
     border-radius: 1px;
 }
+/* Day boundaries on a 7-day bar — faint guides for even daily spend. */
+.bar > .day-seg {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 1px;
+    margin-left: -0.5px;
+    background: rgba(255, 255, 255, 0.12);
+}
 .pace-row {
     margin-top: 6px;
     font-size: 12px;

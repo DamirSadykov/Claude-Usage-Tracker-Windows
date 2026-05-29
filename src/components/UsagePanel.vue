@@ -1,13 +1,15 @@
 <script setup lang="ts">
 import { computed, ref, onMounted, onUnmounted } from "vue";
 import { useI18n } from "vue-i18n";
-import type { UsageData, UsageLevels } from "../App.vue";
+import type { UsageData, UsageLevels, ForecastData } from "../App.vue";
+import { formatEta } from "../alertFormat";
 
 const { t, locale } = useI18n();
 
 const props = defineProps<{
   usage: UsageData;
   levels: UsageLevels;
+  forecast: ForecastData | null;
   loading: boolean;
   autoStartEnabled: boolean;
   autoStartStatus: string;
@@ -41,15 +43,23 @@ const weeklyPace = computed(() => idealPace(sevenDay.value.reset_at));
 const opusPace = computed(() => idealPace(opusDay.value?.reset_at ?? null));
 const sonnetPace = computed(() => idealPace(sonnetDay.value?.reset_at ?? null));
 
-// Status of the weekly tier relative to the even-spend pace.
-const paceStatus = computed<{ key: string; cls: string } | null>(() => {
-  const ideal = weeklyPace.value;
-  if (ideal === null) return null;
-  const diff = sevenDay.value.percent_used - ideal;
-  if (diff > 5) return { key: "paceAhead", cls: "pace-warn" };
-  if (diff < -5) return { key: "paceBehind", cls: "pace-ok" };
-  return { key: "paceOnPace", cls: "pace-neutral" };
-});
+// --- Exhaustion forecast (issue #7) ---
+const fhForecast = computed(() => props.forecast?.five_hour ?? null);
+const weekForecast = computed(() => props.forecast?.seven_day ?? null);
+const extraForecast = computed(() => props.forecast?.extra_usage ?? null);
+
+function paceClass(pace: string): string {
+  return pace === "warn" ? "pace-warn" : pace === "ok" ? "pace-ok" : "pace-neutral";
+}
+
+function fmtRate(rate: number): string {
+  return rate.toFixed(rate < 1 ? 2 : 1) + "%";
+}
+
+// Project the measured ETA onto the wall clock for an absolute "runs out …" label.
+function etaDate(minutes: number): string {
+  return formatClock(new Date(now.value + minutes * 60000));
+}
 
 const budgetFraction = computed(() => {
   if (!props.dailyBudget || props.todaySpent === null) return 0;
@@ -105,14 +115,8 @@ function formatRelative(diff: number): string {
   return `${s}s`;
 }
 
-function formatReset(resetAt: string | null): string {
-  if (!resetAt) return t("noActiveSession");
-  const target = new Date(resetAt);
-  const diff = target.getTime() - now.value;
-  if (diff <= 0) return t("resetDone");
-
-  const time = formatRelative(diff);
-
+// Wall-clock label for an absolute time: "Today HH:MM" or "DD/MM, HH:MM".
+function formatClock(target: Date): string {
   const todayStart = new Date(now.value);
   todayStart.setHours(0, 0, 0, 0);
   const tomorrowStart = new Date(todayStart);
@@ -120,15 +124,20 @@ function formatReset(resetAt: string | null): string {
 
   const loc = locale.value === "ru" ? "ru-RU" : "en-US";
   const clock = target.toLocaleTimeString(loc, { hour: "2-digit", minute: "2-digit" });
-  let date: string;
   if (target >= todayStart && target < tomorrowStart) {
-    date = `${t("today")} ${clock}`;
-  } else {
-    const day = target.toLocaleDateString(loc, { day: "2-digit", month: "2-digit" });
-    date = `${day}, ${clock}`;
+    return `${t("today")} ${clock}`;
   }
+  const day = target.toLocaleDateString(loc, { day: "2-digit", month: "2-digit" });
+  return `${day}, ${clock}`;
+}
 
-  return t("resetsIn", { time, date });
+function formatReset(resetAt: string | null): string {
+  if (!resetAt) return t("noActiveSession");
+  const target = new Date(resetAt);
+  const diff = target.getTime() - now.value;
+  if (diff <= 0) return t("resetDone");
+
+  return t("resetsIn", { time: formatRelative(diff), date: formatClock(target) });
 }
 
 const fiveHour = computed(() => props.usage.five_hour);
@@ -183,6 +192,13 @@ const prepaidBalance = computed(() => props.usage.prepaid_balance);
       <div class="bar" :class="lvlClass(levels.five_hour)">
         <i :style="{ width: Math.min(fiveHour.percent_used, 100) + '%' }"></i>
       </div>
+      <div v-if="sessionActive && fhForecast" class="pace-row" :class="paceClass(fhForecast.pace)">
+        <template v-if="fhForecast.pace === 'warn' && fhForecast.eta_minutes !== null">
+          {{ t('etaSession', { time: formatEta(t, fhForecast.eta_minutes) }) }}
+        </template>
+        <template v-else-if="fhForecast.pace === 'unknown'">{{ t('etaCollecting') }}</template>
+        <template v-else>{{ t('etaSafe') }}</template>
+      </div>
     </div>
 
     <!-- 7-day weekly -->
@@ -201,6 +217,7 @@ const prepaidBalance = computed(() => props.usage.prepaid_balance);
       </div>
       <div class="bar" :class="lvlClass(levels.seven_day)">
         <i :style="{ width: Math.min(sevenDay.percent_used, 100) + '%' }"></i>
+        <span v-for="k in 6" :key="'wseg' + k" class="day-seg" :style="{ left: (k / 7 * 100) + '%' }"></span>
         <span
           v-if="weeklyPace !== null"
           class="pace-tick"
@@ -208,8 +225,11 @@ const prepaidBalance = computed(() => props.usage.prepaid_balance);
           :title="t('idealPace')"
         ></span>
       </div>
-      <div v-if="paceStatus" class="pace-row" :class="paceStatus.cls">
-        {{ t('idealPace') }}: {{ t(paceStatus.key) }}
+      <div v-if="weekForecast" class="pace-row" :class="paceClass(weekForecast.pace)">
+        <template v-if="weekForecast.pace === 'warn' && weekForecast.eta_minutes !== null">{{ t('etaExhaust', { date: etaDate(weekForecast.eta_minutes) }) }}</template>
+        <template v-else-if="weekForecast.pace === 'unknown'">{{ t('etaCollecting') }}</template>
+        <template v-else>{{ t('etaSafe') }}</template>
+        <template v-if="weekForecast.allowed_per_hour !== null"> · {{ t('allowedRate', { rate: fmtRate(weekForecast.allowed_per_hour) }) }}</template>
       </div>
     </div>
 
@@ -229,6 +249,7 @@ const prepaidBalance = computed(() => props.usage.prepaid_balance);
       </div>
       <div class="bar" :class="lvlClass(levels.seven_day_opus)">
         <i :style="{ width: Math.min(opusDay.percent_used, 100) + '%' }"></i>
+        <span v-for="k in 6" :key="'oseg' + k" class="day-seg" :style="{ left: (k / 7 * 100) + '%' }"></span>
         <span
           v-if="opusPace !== null"
           class="pace-tick"
@@ -254,6 +275,7 @@ const prepaidBalance = computed(() => props.usage.prepaid_balance);
       </div>
       <div class="bar" :class="lvlClass(levels.seven_day_sonnet)">
         <i :style="{ width: Math.min(sonnetDay.percent_used, 100) + '%' }"></i>
+        <span v-for="k in 6" :key="'sseg' + k" class="day-seg" :style="{ left: (k / 7 * 100) + '%' }"></span>
         <span
           v-if="sonnetPace !== null"
           class="pace-tick"
@@ -278,6 +300,9 @@ const prepaidBalance = computed(() => props.usage.prepaid_balance);
       </div>
       <div class="bar" :class="lvlClass(levels.extra_usage)">
         <i :style="{ width: Math.min(extraUsage.utilization, 100) + '%' }"></i>
+      </div>
+      <div v-if="extraForecast && extraForecast.eta_minutes !== null" class="pace-row pace-neutral">
+        {{ t('etaExhaust', { date: etaDate(extraForecast.eta_minutes) }) }}
       </div>
     </div>
 

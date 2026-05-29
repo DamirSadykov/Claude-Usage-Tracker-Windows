@@ -54,6 +54,20 @@ export interface UsageLevels {
     extra_usage: number | null;
 }
 
+// Exhaustion forecast per tier (issue #7), computed by the backend.
+export interface TierForecast {
+    rate_per_hour: number;
+    eta_minutes: number | null;
+    allowed_per_hour: number | null;
+    pace: "unknown" | "ok" | "warn";
+}
+
+export interface ForecastData {
+    five_hour: TierForecast;
+    seven_day: TierForecast;
+    extra_usage: TierForecast | null;
+}
+
 const { t, locale } = useI18n();
 
 const {
@@ -74,6 +88,7 @@ const sessionThresholds = ref<number[]>([...DEFAULT_THRESHOLDS]);
 const weeklyThresholds = ref<number[]>([...DEFAULT_THRESHOLDS]);
 const notificationsEnabled = ref(false);
 const notifyForecastMinutes = ref(30);
+const forecastWindowMinutes = ref(60);
 const alertTiers = ref<AlertTiers>(defaultAlertTiers());
 const alertTypes = ref<AlertTypes>(defaultAlertTypes());
 const quietHoursEnabled = ref(false);
@@ -90,6 +105,7 @@ const budgetUnit = computed<"usd" | "pct">(() =>
 );
 const usage = ref<UsageData | null>(null);
 const levels = ref<UsageLevels | null>(null);
+const forecast = ref<ForecastData | null>(null);
 const error = ref("");
 const loading = ref(false);
 const showSettings = ref(false);
@@ -122,6 +138,8 @@ async function loadSettings() {
             (await store.get<boolean>("notificationsEnabled")) ?? false;
         notifyForecastMinutes.value =
             (await store.get<number>("notifyForecastMinutes")) ?? 30;
+        forecastWindowMinutes.value =
+            (await store.get<number>("forecastWindowMinutes")) ?? 60;
         alertTiers.value = normalizeAlertTiers(
             await store.get<Partial<AlertTiers>>("alertTiers"),
         );
@@ -160,6 +178,7 @@ async function saveSettings() {
     await store.set("thresholdsWeekly", weeklyThresholds.value);
     await store.set("notificationsEnabled", notificationsEnabled.value);
     await store.set("notifyForecastMinutes", notifyForecastMinutes.value);
+    await store.set("forecastWindowMinutes", forecastWindowMinutes.value);
     await store.set("alertTiers", alertTiers.value);
     await store.set("alertTypes", alertTypes.value);
     await store.set("quietHoursEnabled", quietHoursEnabled.value);
@@ -186,6 +205,7 @@ function buildConfig() {
         weekly_thresholds: normalize(weeklyThresholds.value),
         notifications_enabled: notificationsEnabled.value,
         forecast_minutes: notifyForecastMinutes.value,
+        forecast_window_min: forecastWindowMinutes.value,
         quiet_hours_enabled: quietHoursEnabled.value,
         quiet_hours_start: quietHoursStart.value,
         quiet_hours_end: quietHoursEnd.value,
@@ -253,6 +273,22 @@ async function loadTodaySpent() {
         }
     } catch {
         todaySpent.value = null;
+    }
+}
+
+// Exhaustion forecast for the usage cards. Recomputed each poll over the
+// configured averaging window; the backend reads the latest snapshot.
+async function loadForecast() {
+    if (!configured.value) {
+        forecast.value = null;
+        return;
+    }
+    try {
+        forecast.value = await invoke<ForecastData>("get_forecast", {
+            windowMin: forecastWindowMinutes.value,
+        });
+    } catch {
+        forecast.value = null;
     }
 }
 
@@ -366,6 +402,7 @@ async function handleSave(settings: {
     weeklyThresholds: number[];
     notificationsEnabled: boolean;
     notifyForecastMinutes: number;
+    forecastWindowMinutes: number;
     quietHoursEnabled: boolean;
     quietHoursStart: string;
     quietHoursEnd: string;
@@ -384,6 +421,7 @@ async function handleSave(settings: {
     weeklyThresholds.value = normalize(settings.weeklyThresholds);
     notificationsEnabled.value = settings.notificationsEnabled;
     notifyForecastMinutes.value = settings.notifyForecastMinutes;
+    forecastWindowMinutes.value = settings.forecastWindowMinutes;
     quietHoursEnabled.value = settings.quietHoursEnabled;
     quietHoursStart.value = settings.quietHoursStart;
     quietHoursEnd.value = settings.quietHoursEnd;
@@ -401,6 +439,7 @@ async function handleSave(settings: {
     if (!ccAnalyticsEnabled.value) showAnalytics.value = false;
     await applyConfig();
     await loadTodaySpent();
+    await loadForecast();
 }
 
 function toggleAnalytics() {
@@ -440,6 +479,7 @@ onMounted(async () => {
                 loading.value = false;
                 void loadTodaySpent();
                 void loadSuggestion();
+                void loadForecast();
             },
         ),
         await listen<string>("usage-error", (e) => {
@@ -647,6 +687,7 @@ onUnmounted(() => {
             :weekly-thresholds="weeklyThresholds"
             :notifications-enabled="notificationsEnabled"
             :notify-forecast-minutes="notifyForecastMinutes"
+            :forecast-window-minutes="forecastWindowMinutes"
             :alert-tiers="alertTiers"
             :alert-types="alertTypes"
             :quiet-hours-enabled="quietHoursEnabled"
@@ -710,6 +751,7 @@ onUnmounted(() => {
                 <UsagePanel
                     :usage="usage"
                     :levels="levels"
+                    :forecast="forecast"
                     :loading="loading"
                     :auto-start-enabled="autoStartSession"
                     :auto-start-status="autoStartStatus"
