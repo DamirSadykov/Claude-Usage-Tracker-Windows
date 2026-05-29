@@ -1,5 +1,36 @@
+use log::{debug, warn};
 use reqwest::header::{HeaderMap, HeaderValue, COOKIE, CONTENT_TYPE, ACCEPT, USER_AGENT, REFERER};
 use serde::{Deserialize, Serialize};
+
+/// Human-readable classification of a reqwest failure. We never log the URL's
+/// query or the session key — only the failure mode — so logs are safe to share
+/// in a bug report.
+fn describe_net_error(e: &reqwest::Error) -> String {
+    let mut kinds = Vec::new();
+    if e.is_timeout() {
+        kinds.push("timeout");
+    }
+    if e.is_connect() {
+        kinds.push("connect");
+    }
+    if e.is_request() {
+        kinds.push("request");
+    }
+    if e.is_body() {
+        kinds.push("body");
+    }
+    if e.is_decode() {
+        kinds.push("decode");
+    }
+    if kinds.is_empty() {
+        kinds.push("other");
+    }
+    let status = e
+        .status()
+        .map(|s| format!(", status={}", s))
+        .unwrap_or_default();
+    format!("{}{}: {}", kinds.join("+"), status, e)
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UsageData {
@@ -43,33 +74,47 @@ struct ApiResponse {
     extra_usage: Option<ApiExtraUsage>,
 }
 
+/// Deserialize a scalar the API may send as an explicit `null`, falling back to
+/// `T::default()`. `#[serde(default)]` alone only covers a *missing* key, not a
+/// present `null` — and this API sends `null` liberally for inactive fields
+/// (e.g. `extra_usage.utilization` is `null` when extra usage is unused).
+fn null_default<'de, D, T>(de: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(de)?.unwrap_or_default())
+}
+
 #[derive(Debug, Deserialize)]
 struct ApiTier {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     utilization: f64,
     #[serde(default)]
     resets_at: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     is_limited: bool,
 }
 
 #[derive(Debug, Deserialize)]
 struct ApiExtraUsage {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     is_enabled: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     monthly_limit: f64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     used_credits: f64,
+    // `null` when extra usage is enabled but unused — kept as None and derived
+    // from used/limit in `build_usage` rather than defaulted blindly to 0.
     #[serde(default)]
-    utilization: f64,
+    utilization: Option<f64>,
     #[serde(default)]
     currency: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ApiPrepaidCredits {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     amount: f64,
     #[serde(default)]
     currency: Option<String>,
@@ -110,8 +155,27 @@ pub async fn fetch_usage(
     session_key: &str,
     org_id: &str,
 ) -> Result<UsageData, Box<dyn std::error::Error + Send + Sync>> {
+    // Diagnostics for the common "data won't fetch on another PC" report: we
+    // log whether the inputs are present and their lengths — never the values.
+    debug!(
+        "fetch_usage: org_id_len={}, session_key_len={}",
+        org_id.len(),
+        session_key.len()
+    );
+    if session_key.is_empty() || org_id.is_empty() {
+        warn!("fetch_usage: empty session_key or org_id");
+    }
+
     let client = reqwest::Client::new();
-    let headers = build_headers(session_key)?;
+    let headers = match build_headers(session_key) {
+        Ok(h) => h,
+        Err(e) => {
+            // Most likely a session key with characters that aren't valid in an
+            // HTTP header value (stray whitespace / non-ASCII from a bad paste).
+            warn!("fetch_usage: invalid request headers (check the session key): {}", e);
+            return Err(format!("Некорректный ключ сессии (заголовок запроса): {}", e).into());
+        }
+    };
 
     let usage_url = format!("https://claude.ai/api/organizations/{}/usage", org_id);
     let credits_url = format!("https://claude.ai/api/organizations/{}/prepaid/credits", org_id);
@@ -121,18 +185,71 @@ pub async fn fetch_usage(
         client.get(&credits_url).headers(headers).send(),
     );
 
-    let usage_resp = usage_resp?;
-    if !usage_resp.status().is_success() {
-        return Err(format!("API error: {}", usage_resp.status()).into());
+    let usage_resp = match usage_resp {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("fetch_usage: usage request failed ({})", describe_net_error(&e));
+            return Err(format!("Сетевая ошибка запроса usage: {}", describe_net_error(&e)).into());
+        }
+    };
+
+    let status = usage_resp.status();
+    if !status.is_success() {
+        let body = usage_resp.text().await.unwrap_or_default();
+        warn!(
+            "fetch_usage: usage API returned {} (body {} bytes): {}",
+            status,
+            body.len(),
+            snippet(&body)
+        );
+        let hint = match status.as_u16() {
+            401 | 403 => " — ключ сессии недействителен или истёк",
+            404 => " — проверьте Organization ID",
+            _ => "",
+        };
+        return Err(format!("API вернул {}{}", status, hint).into());
     }
-    let api: ApiResponse = usage_resp.json().await?;
+
+    // Read as text first so a non-JSON response (e.g. an HTML login page when the
+    // session cookie is rejected) shows up as a readable snippet in the log
+    // instead of an opaque "decode error".
+    let body = usage_resp
+        .text()
+        .await
+        .map_err(|e| format!("Не удалось прочитать тело ответа usage: {}", describe_net_error(&e)))?;
+    let api: ApiResponse = serde_json::from_str(&body).map_err(|e| {
+        warn!(
+            "fetch_usage: usage body is not the expected JSON ({} bytes): {}",
+            body.len(),
+            snippet(&body)
+        );
+        format!("Ответ usage — не ожидаемый JSON: {}", e)
+    })?;
+    debug!("fetch_usage: usage parsed OK ({} bytes)", body.len());
 
     let prepaid: Option<ApiPrepaidCredits> = match credits_resp {
         Ok(r) if r.status().is_success() => r.json().await.ok(),
-        _ => None,
+        Ok(r) => {
+            debug!("fetch_usage: credits API returned {} (ignored)", r.status());
+            None
+        }
+        Err(e) => {
+            debug!("fetch_usage: credits request failed, ignored ({})", describe_net_error(&e));
+            None
+        }
     };
 
     Ok(build_usage(api, prepaid))
+}
+
+/// First ~200 chars of a response body, single-lined, for safe logging.
+fn snippet(s: &str) -> String {
+    let one_line: String = s.chars().take(200).collect::<String>().replace('\n', " ");
+    if s.len() > 200 {
+        format!("{}…", one_line)
+    } else {
+        one_line
+    }
 }
 
 /// Pure mapping from API shapes to `UsageData`. Credit values from the API are
@@ -140,10 +257,19 @@ pub async fn fetch_usage(
 fn build_usage(api: ApiResponse, prepaid: Option<ApiPrepaidCredits>) -> UsageData {
     let extra_usage = api.extra_usage.and_then(|e| {
         if e.is_enabled {
+            // The API may omit/null `utilization` (enabled but unused); derive it
+            // from used/limit so a 0-balance account reads as 0%, not a crash.
+            let utilization = e.utilization.unwrap_or_else(|| {
+                if e.monthly_limit > 0.0 {
+                    e.used_credits / e.monthly_limit * 100.0
+                } else {
+                    0.0
+                }
+            });
             Some(ExtraUsage {
                 used_credits: e.used_credits / 100.0,
                 monthly_limit: e.monthly_limit / 100.0,
-                utilization: e.utilization,
+                utilization,
                 currency: e.currency.unwrap_or_else(|| "USD".to_string()),
             })
         } else {
@@ -394,6 +520,55 @@ mod tests {
         assert_eq!(u.seven_day.percent_used, 0.0);
         assert!(u.extra_usage.is_none(), "disabled extra usage → None");
         assert!(u.prepaid_balance.is_none());
+    }
+
+    #[test]
+    fn parses_real_response_with_null_extra_utilization_and_unknown_tiers() {
+        // Verbatim payload from a user whose fetch crashed at the
+        // `extra_usage.utilization: null` field (#473). Also exercises unknown
+        // tier keys the API added (oauth_apps/cowork/omelette/tangelo/…) which
+        // must be ignored, and a 0-balance enabled extra-usage account.
+        let json = r#"{
+            "five_hour": {"utilization":73.0,"resets_at":"2026-05-29T13:30:00.550752+00:00"},
+            "seven_day": {"utilization":14.0,"resets_at":"2026-06-01T03:00:00.550774+00:00"},
+            "seven_day_oauth_apps": null,
+            "seven_day_opus": null,
+            "seven_day_sonnet": {"utilization":0.0,"resets_at":null},
+            "seven_day_cowork": null,
+            "seven_day_omelette": null,
+            "tangelo": null,
+            "iguana_necktie": null,
+            "omelette_promotional": null,
+            "extra_usage": {"is_enabled":true,"monthly_limit":2000,"used_credits":0.0,"utilization":null,"currency":"USD","disabled_reason":null}
+        }"#;
+        let u = parse(json, None);
+
+        assert_eq!(u.five_hour.percent_used, 73.0);
+        assert_eq!(u.seven_day.percent_used, 14.0);
+        assert!(u.seven_day_opus.is_none());
+        assert_eq!(u.seven_day_sonnet.as_ref().unwrap().percent_used, 0.0);
+
+        // Enabled but unused: null utilization derived from used/limit → 0%.
+        let e = u.extra_usage.expect("enabled extra usage is present");
+        assert_eq!(e.used_credits, 0.0);
+        assert_eq!(e.monthly_limit, 20.0); // 2000 cents → dollars
+        assert_eq!(e.utilization, 0.0);
+        assert_eq!(e.currency, "USD");
+    }
+
+    #[test]
+    fn null_scalars_throughout_do_not_crash() {
+        // "Everything null" disabled-extra shape: every scalar arrives as null.
+        let json = r#"{
+            "five_hour": {"utilization":null,"resets_at":null,"is_limited":null},
+            "seven_day": {"utilization":null,"resets_at":null,"is_limited":null},
+            "extra_usage": {"is_enabled":null,"monthly_limit":null,"used_credits":null,"utilization":null,"currency":null}
+        }"#;
+        let u = parse(json, Some(r#"{ "amount": null, "currency": null }"#));
+        assert_eq!(u.five_hour.percent_used, 0.0);
+        assert!(!u.five_hour.is_limited);
+        assert!(u.extra_usage.is_none(), "is_enabled null → disabled → None");
+        assert_eq!(u.prepaid_balance, Some(0.0));
     }
 
     #[test]
