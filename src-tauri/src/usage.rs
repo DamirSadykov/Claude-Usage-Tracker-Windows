@@ -1,5 +1,36 @@
+use log::{debug, warn};
 use reqwest::header::{HeaderMap, HeaderValue, COOKIE, CONTENT_TYPE, ACCEPT, USER_AGENT, REFERER};
 use serde::{Deserialize, Serialize};
+
+/// Human-readable classification of a reqwest failure. We never log the URL's
+/// query or the session key — only the failure mode — so logs are safe to share
+/// in a bug report.
+fn describe_net_error(e: &reqwest::Error) -> String {
+    let mut kinds = Vec::new();
+    if e.is_timeout() {
+        kinds.push("timeout");
+    }
+    if e.is_connect() {
+        kinds.push("connect");
+    }
+    if e.is_request() {
+        kinds.push("request");
+    }
+    if e.is_body() {
+        kinds.push("body");
+    }
+    if e.is_decode() {
+        kinds.push("decode");
+    }
+    if kinds.is_empty() {
+        kinds.push("other");
+    }
+    let status = e
+        .status()
+        .map(|s| format!(", status={}", s))
+        .unwrap_or_default();
+    format!("{}{}: {}", kinds.join("+"), status, e)
+}
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UsageData {
@@ -110,8 +141,27 @@ pub async fn fetch_usage(
     session_key: &str,
     org_id: &str,
 ) -> Result<UsageData, Box<dyn std::error::Error + Send + Sync>> {
+    // Diagnostics for the common "data won't fetch on another PC" report: we
+    // log whether the inputs are present and their lengths — never the values.
+    debug!(
+        "fetch_usage: org_id_len={}, session_key_len={}",
+        org_id.len(),
+        session_key.len()
+    );
+    if session_key.is_empty() || org_id.is_empty() {
+        warn!("fetch_usage: empty session_key or org_id");
+    }
+
     let client = reqwest::Client::new();
-    let headers = build_headers(session_key)?;
+    let headers = match build_headers(session_key) {
+        Ok(h) => h,
+        Err(e) => {
+            // Most likely a session key with characters that aren't valid in an
+            // HTTP header value (stray whitespace / non-ASCII from a bad paste).
+            warn!("fetch_usage: invalid request headers (check the session key): {}", e);
+            return Err(format!("Некорректный ключ сессии (заголовок запроса): {}", e).into());
+        }
+    };
 
     let usage_url = format!("https://claude.ai/api/organizations/{}/usage", org_id);
     let credits_url = format!("https://claude.ai/api/organizations/{}/prepaid/credits", org_id);
@@ -121,18 +171,71 @@ pub async fn fetch_usage(
         client.get(&credits_url).headers(headers).send(),
     );
 
-    let usage_resp = usage_resp?;
-    if !usage_resp.status().is_success() {
-        return Err(format!("API error: {}", usage_resp.status()).into());
+    let usage_resp = match usage_resp {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("fetch_usage: usage request failed ({})", describe_net_error(&e));
+            return Err(format!("Сетевая ошибка запроса usage: {}", describe_net_error(&e)).into());
+        }
+    };
+
+    let status = usage_resp.status();
+    if !status.is_success() {
+        let body = usage_resp.text().await.unwrap_or_default();
+        warn!(
+            "fetch_usage: usage API returned {} (body {} bytes): {}",
+            status,
+            body.len(),
+            snippet(&body)
+        );
+        let hint = match status.as_u16() {
+            401 | 403 => " — ключ сессии недействителен или истёк",
+            404 => " — проверьте Organization ID",
+            _ => "",
+        };
+        return Err(format!("API вернул {}{}", status, hint).into());
     }
-    let api: ApiResponse = usage_resp.json().await?;
+
+    // Read as text first so a non-JSON response (e.g. an HTML login page when the
+    // session cookie is rejected) shows up as a readable snippet in the log
+    // instead of an opaque "decode error".
+    let body = usage_resp
+        .text()
+        .await
+        .map_err(|e| format!("Не удалось прочитать тело ответа usage: {}", describe_net_error(&e)))?;
+    let api: ApiResponse = serde_json::from_str(&body).map_err(|e| {
+        warn!(
+            "fetch_usage: usage body is not the expected JSON ({} bytes): {}",
+            body.len(),
+            snippet(&body)
+        );
+        format!("Ответ usage — не ожидаемый JSON: {}", e)
+    })?;
+    debug!("fetch_usage: usage parsed OK ({} bytes)", body.len());
 
     let prepaid: Option<ApiPrepaidCredits> = match credits_resp {
         Ok(r) if r.status().is_success() => r.json().await.ok(),
-        _ => None,
+        Ok(r) => {
+            debug!("fetch_usage: credits API returned {} (ignored)", r.status());
+            None
+        }
+        Err(e) => {
+            debug!("fetch_usage: credits request failed, ignored ({})", describe_net_error(&e));
+            None
+        }
     };
 
     Ok(build_usage(api, prepaid))
+}
+
+/// First ~200 chars of a response body, single-lined, for safe logging.
+fn snippet(s: &str) -> String {
+    let one_line: String = s.chars().take(200).collect::<String>().replace('\n', " ");
+    if s.len() > 200 {
+        format!("{}…", one_line)
+    } else {
+        one_line
+    }
 }
 
 /// Pure mapping from API shapes to `UsageData`. Credit values from the API are

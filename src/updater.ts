@@ -1,4 +1,5 @@
 import { ref } from "vue";
+import { logError, logInfo } from "./logging";
 
 // State machine for the in-app updater. Module-scoped refs make this a shared
 // singleton so the banner (App.vue) and the settings block (SettingsPanel.vue)
@@ -67,6 +68,7 @@ async function downloadAndInstall() {
     } catch (err) {
         status.value = "error";
         errorMessage.value = String(err);
+        void logError(`updater: download/install failed: ${String(err)}`);
     }
 }
 
@@ -90,6 +92,7 @@ export async function checkForUpdate(silent = false) {
         const { check } = await import("@tauri-apps/plugin-updater");
         const update = await check();
         if (update) {
+            void logInfo(`updater: update available ${update.version}`);
             pending = update as any;
             availableVersion.value = update.version;
             notes.value = update.body ?? "";
@@ -100,6 +103,7 @@ export async function checkForUpdate(silent = false) {
             status.value = silent ? "idle" : "uptodate";
         }
     } catch (err) {
+        void logError(`updater: check failed (silent=${silent}): ${String(err)}`);
         if (silent) {
             status.value = "idle";
         } else {

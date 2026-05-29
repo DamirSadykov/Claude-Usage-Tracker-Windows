@@ -111,8 +111,21 @@ const usage = ref<UsageData | null>(null);
 const levels = ref<UsageLevels | null>(null);
 const forecast = ref<ForecastData | null>(null);
 const error = ref("");
+const errorReportable = ref(false);
 const loading = ref(false);
 const showSettings = ref(false);
+
+interface DiagReport {
+    kind: string;
+    summary: string;
+    detail: string;
+    version: string;
+    os: string;
+    at: string;
+}
+// A pending diagnostic report (a crash from the previous run, or a frontend
+// error this session). Surfaced as a banner offering to file a GitHub issue.
+const diag = ref<DiagReport | null>(null);
 const showAnalytics = ref(false);
 const autoStartStatus = ref("");
 const configured = computed(() => sessionKey.value && orgId.value);
@@ -421,6 +434,33 @@ async function triggerAutoStart() {
     }
 }
 
+// --- Diagnostics / "Report a problem" ---
+
+async function reportProblem() {
+    try {
+        await invoke("report_issue");
+    } catch (e) {
+        console.error("report_issue failed", e);
+    }
+}
+
+async function openLog() {
+    try {
+        await invoke("open_log_dir");
+    } catch (e) {
+        console.error("open_log_dir failed", e);
+    }
+}
+
+async function dismissDiag() {
+    diag.value = null;
+    try {
+        await invoke("dismiss_diag");
+    } catch {
+        /* not under Tauri */
+    }
+}
+
 async function handleSave(settings: {
     sessionKey: string;
     orgId: string;
@@ -510,16 +550,21 @@ onMounted(async () => {
                 usage.value = e.payload.usage;
                 levels.value = e.payload.levels;
                 error.value = "";
+                errorReportable.value = false;
                 loading.value = false;
                 void loadTodaySpent();
                 void loadSuggestion();
                 void loadForecast();
             },
         ),
-        await listen<string>("usage-error", (e) => {
-            error.value = String(e.payload);
-            loading.value = false;
-        }),
+        await listen<{ message: string; reportable: boolean }>(
+            "usage-error",
+            (e) => {
+                error.value = String(e.payload?.message ?? e.payload);
+                errorReportable.value = e.payload?.reportable ?? false;
+                loading.value = false;
+            },
+        ),
         await listen<AlertEvent>("alert", (e) => {
             void toast(e.payload);
         }),
@@ -553,6 +598,14 @@ onMounted(async () => {
         await applyConfig();
     } else {
         showSettings.value = true;
+    }
+
+    // Surface a diagnostic report left by a crash on the previous run (or a
+    // frontend error), offering to file a pre-filled GitHub issue.
+    try {
+        diag.value = await invoke<DiagReport | null>("get_last_diag");
+    } catch {
+        /* not under Tauri */
     }
 
     void initUpdater();
@@ -719,6 +772,24 @@ onUnmounted(() => {
             </div>
         </div>
 
+        <!-- Diagnostic / crash report banner -->
+        <div v-if="diag" class="diag-banner">
+            <span class="diag-text">
+                {{ diag.kind === "panic" ? t("diagCrashed") : t("diagProblem") }}
+            </span>
+            <div class="diag-actions">
+                <button class="diag-btn ghost" @click="openLog">
+                    {{ t("openLog") }}
+                </button>
+                <button class="diag-btn ghost" @click="dismissDiag">
+                    {{ t("dismiss") }}
+                </button>
+                <button class="diag-btn" @click="reportProblem">
+                    {{ t("reportIssue") }}
+                </button>
+            </div>
+        </div>
+
         <!-- Settings -->
         <SettingsPanel
             v-if="showSettings"
@@ -789,6 +860,22 @@ onUnmounted(() => {
                         style="margin-top: 10px; width: 100%"
                     >
                         {{ t("retry") }}
+                    </button>
+                    <button
+                        v-if="errorReportable"
+                        class="btn-secondary"
+                        @click="reportProblem"
+                        style="margin-top: 8px; width: 100%"
+                    >
+                        {{ t("reportIssue") }}
+                    </button>
+                    <button
+                        v-if="errorReportable"
+                        class="link-btn"
+                        @click="openLog"
+                        style="margin-top: 8px"
+                    >
+                        {{ t("openLog") }}
                     </button>
                 </div>
             </div>
@@ -894,5 +981,68 @@ onUnmounted(() => {
     height: 100%;
     background: var(--accent);
     transition: width 150ms;
+}
+
+/* Diagnostic / crash report banner — red-tinted variant of the update banner. */
+.diag-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+    padding: 8px 12px;
+    margin: 8px 10px 0;
+    border: 1px solid rgba(248, 113, 113, 0.5);
+    border-radius: var(--card-radius);
+    background: rgba(248, 113, 113, 0.12);
+}
+
+.diag-text {
+    font-size: 12px;
+    color: var(--text-2);
+}
+
+.diag-actions {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+
+.diag-btn {
+    padding: 4px 12px;
+    border: none;
+    border-radius: 4px;
+    background: #f87171;
+    color: white;
+    font-size: 12px;
+    font-weight: 500;
+    font-family: var(--segoe);
+    cursor: pointer;
+    transition: filter 120ms;
+}
+
+.diag-btn:hover {
+    filter: brightness(1.15);
+}
+
+.diag-btn.ghost {
+    background: transparent;
+    color: var(--text-3);
+    border: 1px solid var(--stroke-strong);
+}
+
+.link-btn {
+    width: 100%;
+    background: transparent;
+    border: none;
+    color: var(--text-3);
+    font-size: 11px;
+    text-decoration: underline;
+    cursor: pointer;
+    font-family: var(--segoe);
+}
+
+.link-btn:hover {
+    color: var(--text-2);
 }
 </style>

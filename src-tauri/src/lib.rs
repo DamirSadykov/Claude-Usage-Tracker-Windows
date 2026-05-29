@@ -1,16 +1,19 @@
 pub mod alerts;
 pub mod cc;
 pub mod domain;
+pub mod report;
 pub mod stats;
 pub mod status;
 pub mod usage;
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::Timelike;
+use log::{error, info, warn};
 use serde::Serialize;
 use tauri::{
     menu::{Menu, MenuItem},
@@ -22,6 +25,7 @@ use tokio::sync::Notify;
 
 use alerts::{tier_level, AlertEngine, AppConfig};
 use domain::{compute_levels, is_muted, today_spent_for, UsageLevels};
+use report::{DiagReport, DiagStore};
 use stats::StatsDb;
 use usage::UsageData;
 
@@ -163,20 +167,62 @@ struct UsageUpdate {
     levels: UsageLevels,
 }
 
+/// An error surfaced to the frontend. `reportable` tells the UI it can offer the
+/// "Report a problem" button (a diagnostic report is waiting in `DiagStore`).
+#[derive(Serialize, Clone)]
+struct UsageError {
+    message: String,
+    reportable: bool,
+}
+
+// --- Diagnostics helpers ---
+
+fn log_file_path(app: &AppHandle) -> Option<PathBuf> {
+    app.path()
+        .app_log_dir()
+        .ok()
+        .map(|d| d.join(report::LOG_FILE_NAME))
+}
+
+/// Log the failure, build a diagnostic report (with the current log tail) and
+/// stash it so the frontend can turn it into a pre-filled GitHub issue.
+fn record_diag(app: &AppHandle, kind: &str, summary: &str, detail: String) {
+    error!(target: "diag", "[{}] {}", kind, detail);
+    let version = app.package_info().version.to_string();
+    let log_file = log_file_path(app);
+    let report = report::capture(kind, summary, detail, &version, log_file.as_deref());
+    if let Some(store) = app.try_state::<Arc<DiagStore>>() {
+        store.set(report);
+    }
+}
+
 // --- Background polling loop: the single owner of business logic ---
 
 async fn run_cycle(app: &AppHandle, cfg: &AppConfig, auto_started: &mut bool) {
     let usage = match usage::fetch_usage(&cfg.session_key, &cfg.org_id).await {
         Ok(u) => u,
         Err(e) => {
-            let _ = app.emit("usage-error", e.to_string());
+            let msg = e.to_string();
+            record_diag(
+                app,
+                "usage-fetch",
+                "Не удалось получить данные об использовании",
+                format!("fetch_usage failed: {}", msg),
+            );
+            let _ = app.emit(
+                "usage-error",
+                UsageError {
+                    message: msg,
+                    reportable: true,
+                },
+            );
             return;
         }
     };
 
     if let Some(stats) = app.try_state::<Arc<StatsDb>>() {
         if let Err(e) = stats.record_snapshot(&usage) {
-            eprintln!("Failed to record snapshot: {}", e);
+            warn!("Failed to record snapshot: {}", e);
         }
     }
 
@@ -246,6 +292,12 @@ async fn auto_start(app: &AppHandle, cfg: &AppConfig) {
                 let _ = app.emit("project-resolved", project_id.clone());
             }
             Err(e) => {
+                record_diag(
+                    app,
+                    "auto-start",
+                    "Не удалось создать/найти проект для авто-сессии",
+                    format!("ensure_project failed: {}", e),
+                );
                 let _ = app.emit("auto-start-error", e.to_string());
                 return;
             }
@@ -253,9 +305,16 @@ async fn auto_start(app: &AppHandle, cfg: &AppConfig) {
     }
     match usage::start_session(&cfg.session_key, &cfg.org_id, &project_id).await {
         Ok(r) => {
+            info!("Auto-start session: skipped={}", r.skipped);
             let _ = app.emit("auto-start-result", r.skipped);
         }
         Err(e) => {
+            record_diag(
+                app,
+                "auto-start",
+                "Не удалось запустить авто-сессию",
+                format!("start_session failed: {}", e),
+            );
             let _ = app.emit("auto-start-error", e.to_string());
         }
     }
@@ -368,6 +427,7 @@ fn spawn_status_loop(app: AppHandle) {
                     }
                     Err(e) => {
                         fail = fail.saturating_add(1);
+                        warn!("Service status fetch failed (attempt {}): {}", fail, e);
                         if let Some(st) = app.try_state::<Arc<Mutex<StatusState>>>() {
                             st.lock().unwrap().reachable = false;
                         }
@@ -525,9 +585,63 @@ async fn get_analytics_compare(
         .map_err(|e| e.to_string())
 }
 
+/// Returns the pending diagnostic report, if any, so the frontend can offer to
+/// file an issue. Does not clear it — the UI decides via `dismiss_diag`.
+#[tauri::command]
+fn get_last_diag(store: tauri::State<'_, Arc<DiagStore>>) -> Option<DiagReport> {
+    store.get()
+}
+
+#[tauri::command]
+fn dismiss_diag(store: tauri::State<'_, Arc<DiagStore>>) {
+    store.clear();
+}
+
+/// Opens a pre-filled GitHub "new issue" page built from the pending report.
+#[tauri::command]
+fn report_issue(store: tauri::State<'_, Arc<DiagStore>>) -> Result<(), String> {
+    let report = store.get().ok_or("Нет диагностического отчёта")?;
+    let url = report::build_issue_url(&report);
+    info!("Opening issue page for diag kind={}", report.kind);
+    open::that(url).map_err(|e| e.to_string())
+}
+
+/// Opens the folder containing the log file in the OS file manager.
+#[tauri::command]
+fn open_log_dir(app: AppHandle) -> Result<(), String> {
+    let dir = app.path().app_log_dir().map_err(|e| e.to_string())?;
+    open::that(dir).map_err(|e| e.to_string())
+}
+
+/// Records an unhandled frontend error as a diagnostic report (so a JS crash is
+/// reportable too) and logs it.
+#[tauri::command]
+fn report_frontend_error(app: AppHandle, summary: String, detail: String) {
+    record_diag(&app, "frontend", &summary, detail);
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    report::install_panic_hook();
+
     tauri::Builder::default()
+        .plugin(
+            tauri_plugin_log::Builder::new()
+                .targets([
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir {
+                        file_name: Some("claude-usage-tracker".into()),
+                    }),
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
+                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Webview),
+                ])
+                .level(log::LevelFilter::Info)
+                // Our own modules are chattier on purpose — they hold the
+                // diagnostics for "data won't fetch" reports.
+                .level_for("claude_usage_tracker_lib", log::LevelFilter::Debug)
+                .max_file_size(2 * 1024 * 1024)
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepOne)
+                .build(),
+        )
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
@@ -543,6 +657,22 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
+            let version = app.package_info().version.to_string();
+            info!("Claude Usage Tracker v{} starting", version);
+
+            // Diagnostics: route panics to a marker file in the log dir, and pick
+            // up any report left by a crash on the previous run.
+            let diag_store = Arc::new(DiagStore::default());
+            if let Ok(log_dir) = app.path().app_log_dir() {
+                std::fs::create_dir_all(&log_dir).ok();
+                report::set_panic_file(&log_dir);
+                if let Some(rep) = report::take_panic_report(&log_dir, &version) {
+                    warn!("Recovered a crash report from the previous run");
+                    diag_store.set(rep);
+                }
+            }
+            app.manage(diag_store);
+
             // Stats database
             let app_data_dir = app
                 .path()
@@ -550,7 +680,18 @@ pub fn run() {
                 .expect("Failed to get app data dir");
             std::fs::create_dir_all(&app_data_dir).ok();
             let db_path = app_data_dir.join("usage_stats.db");
-            let stats_db = Arc::new(StatsDb::open(&db_path).expect("Failed to open stats DB"));
+            let stats_db = match StatsDb::open(&db_path) {
+                Ok(db) => Arc::new(db),
+                Err(e) => {
+                    record_diag(
+                        app.handle(),
+                        "stats-db",
+                        "Не удалось открыть базу статистики",
+                        format!("StatsDb::open({:?}) failed: {}", db_path, e),
+                    );
+                    return Err(Box::new(e));
+                }
+            };
 
             let cutoff = chrono::Utc::now() - chrono::Duration::days(30);
             stats_db.cleanup_before(&cutoff.to_rfc3339()).ok();
@@ -676,6 +817,11 @@ pub fn run() {
             get_analytics_compare,
             get_service_status,
             open_status_page,
+            get_last_diag,
+            dismiss_diag,
+            report_issue,
+            open_log_dir,
+            report_frontend_error,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
