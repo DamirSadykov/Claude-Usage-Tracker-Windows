@@ -1,8 +1,10 @@
 mod alerts;
 mod cc;
 mod stats;
+mod status;
 mod usage;
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -342,7 +344,123 @@ fn spawn_poll_loop(app: AppHandle, notify: Arc<Notify>) {
     });
 }
 
+// --- Service status (status.claude.com) ---
+
+/// Last fetched service status, shared so a late-mounting frontend can pull the
+/// current value via `get_service_status` instead of waiting for the next emit.
+#[derive(Default)]
+struct StatusState {
+    last: Option<status::ServiceStatus>,
+    reachable: bool,
+}
+
+#[derive(Serialize, Clone)]
+struct StatusSnapshot {
+    status: Option<status::ServiceStatus>,
+    reachable: bool,
+}
+
+/// Pushed to the frontend when the overall status changes or an incident
+/// appears, so it can raise an OS notification (mirrors the `alert` flow).
+#[derive(Serialize, Clone)]
+struct ServiceAlert {
+    /// `degraded` | `resolved` | `incident`.
+    kind: String,
+    indicator: String,
+    text: String,
+}
+
+fn spawn_status_loop(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let mut etag: Option<String> = None;
+        let mut last_indicator: Option<String> = None;
+        let mut known_incidents: HashSet<String> = HashSet::new();
+        let mut first = true;
+        let mut fail: u32 = 0;
+
+        loop {
+            let cfg = { app.state::<Mutex<AppConfig>>().lock().unwrap().clone() };
+            let base = cfg.service_status_interval.clamp(30, 600);
+            let mut sleep = base;
+
+            if cfg.service_status_enabled {
+                match status::fetch_status(etag.as_deref()).await {
+                    Ok(status::StatusFetch::Modified { status: s, etag: new_etag }) => {
+                        fail = 0;
+                        if let Some(tag) = new_etag {
+                            etag = Some(tag);
+                        }
+
+                        if let Some(st) = app.try_state::<Arc<Mutex<StatusState>>>() {
+                            let mut g = st.lock().unwrap();
+                            g.last = Some(s.clone());
+                            g.reachable = true;
+                        }
+
+                        // Notify on a real change only — never on the first fetch.
+                        if cfg.service_status_notify && !first {
+                            if last_indicator.as_deref() != Some(s.indicator.as_str()) {
+                                let kind = if s.indicator == "none" { "resolved" } else { "degraded" };
+                                let _ = app.emit(
+                                    "service-alert",
+                                    ServiceAlert {
+                                        kind: kind.to_string(),
+                                        indicator: s.indicator.clone(),
+                                        text: s.description.clone(),
+                                    },
+                                );
+                            }
+                            for inc in &s.incidents {
+                                if !known_incidents.contains(&inc.id) {
+                                    let _ = app.emit(
+                                        "service-alert",
+                                        ServiceAlert {
+                                            kind: "incident".to_string(),
+                                            indicator: inc.impact.clone(),
+                                            text: inc.name.clone(),
+                                        },
+                                    );
+                                }
+                            }
+                        }
+
+                        last_indicator = Some(s.indicator.clone());
+                        known_incidents = s.incidents.iter().map(|i| i.id.clone()).collect();
+                        first = false;
+                        let _ = app.emit("service-status", s);
+                    }
+                    Ok(status::StatusFetch::NotModified) => {
+                        fail = 0;
+                    }
+                    Err(e) => {
+                        fail = fail.saturating_add(1);
+                        if let Some(st) = app.try_state::<Arc<Mutex<StatusState>>>() {
+                            st.lock().unwrap().reachable = false;
+                        }
+                        let _ = app.emit("service-status-error", e.to_string());
+                        // Exponential backoff, capped, so a sustained outage of
+                        // the status page itself doesn't hammer it.
+                        let shift = fail.min(4);
+                        sleep = base.saturating_mul(1u64 << shift).min(600);
+                    }
+                }
+            }
+
+            tokio::time::sleep(Duration::from_secs(sleep)).await;
+        }
+    });
+}
+
 // --- Commands ---
+
+#[tauri::command]
+fn get_service_status(state: tauri::State<'_, Arc<Mutex<StatusState>>>) -> StatusSnapshot {
+    let g = state.lock().unwrap();
+    StatusSnapshot {
+        status: g.last.clone(),
+        reachable: g.reachable,
+    }
+}
 
 #[tauri::command]
 fn configure(
@@ -370,6 +488,11 @@ fn refresh_now(notify: tauri::State<'_, Arc<Notify>>) -> Result<(), String> {
 #[tauri::command]
 async fn open_claude() -> Result<(), String> {
     open::that("https://claude.ai/new").map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn open_status_page() -> Result<(), String> {
+    open::that(status::STATUS_PAGE_URL).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -502,6 +625,7 @@ pub fn run() {
             // Business-logic state, owned by the backend loop.
             app.manage(Mutex::new(AppConfig::default()));
             app.manage(Mutex::new(AlertEngine::new()));
+            app.manage(Arc::new(Mutex::new(StatusState::default())));
             let notify = Arc::new(Notify::new());
             app.manage(notify.clone());
 
@@ -599,6 +723,7 @@ pub fn run() {
             }
 
             spawn_poll_loop(app.handle().clone(), notify);
+            spawn_status_loop(app.handle().clone());
 
             Ok(())
         })
@@ -615,6 +740,8 @@ pub fn run() {
             get_forecast,
             get_analytics,
             get_analytics_compare,
+            get_service_status,
+            open_status_page,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

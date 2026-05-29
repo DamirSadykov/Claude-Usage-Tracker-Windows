@@ -94,6 +94,9 @@ const props = defineProps<{
   dailyBudgetEnabled: boolean;
   dailyBudget: number;
   suggestedBudget: number | null;
+  serviceStatusEnabled: boolean;
+  serviceStatusInterval: number;
+  serviceStatusNotify: boolean;
   locale: string;
 }>();
 
@@ -116,6 +119,9 @@ const emit = defineEmits<{
     ccAnalyticsEnabled: boolean;
     dailyBudgetEnabled: boolean;
     dailyBudget: number;
+    serviceStatusEnabled: boolean;
+    serviceStatusInterval: number;
+    serviceStatusNotify: boolean;
     locale: string;
   }];
 }>();
@@ -141,6 +147,9 @@ const localTypes = ref<AlertTypes>(normalizeAlertTypes(props.alertTypes));
 const localCc = ref(props.ccAnalyticsEnabled);
 const localBudgetEnabled = ref(props.dailyBudgetEnabled);
 const localBudget = ref(props.dailyBudget);
+const localSvcEnabled = ref(props.serviceStatusEnabled);
+const localSvcInterval = ref(props.serviceStatusInterval);
+const localSvcNotify = ref(props.serviceStatusNotify);
 const localLocale = ref(props.locale);
 
 watch(() => props.sessionKey, (v) => (localSessionKey.value = v));
@@ -167,6 +176,9 @@ watch(() => props.alertTypes, (v) => (localTypes.value = normalizeAlertTypes(v))
 watch(() => props.ccAnalyticsEnabled, (v) => (localCc.value = v));
 watch(() => props.dailyBudgetEnabled, (v) => (localBudgetEnabled.value = v));
 watch(() => props.dailyBudget, (v) => (localBudget.value = v));
+watch(() => props.serviceStatusEnabled, (v) => (localSvcEnabled.value = v));
+watch(() => props.serviceStatusInterval, (v) => (localSvcInterval.value = v));
+watch(() => props.serviceStatusNotify, (v) => (localSvcNotify.value = v));
 watch(() => props.locale, (v) => (localLocale.value = v));
 
 // Keep each threshold triple strictly ascending with a 1% gap so the colour
@@ -213,6 +225,9 @@ function handleSave() {
     ccAnalyticsEnabled: localCc.value,
     dailyBudgetEnabled: localBudgetEnabled.value,
     dailyBudget: Math.round(localBudget.value) || 0,
+    serviceStatusEnabled: localSvcEnabled.value,
+    serviceStatusInterval: localSvcInterval.value,
+    serviceStatusNotify: localSvcNotify.value,
     locale: localLocale.value,
   });
 }
@@ -530,6 +545,42 @@ function handleSave() {
               <div class="field-label">{{ t('quietHoursEnd') }}</div>
               <input v-model="localQuietEnd" type="time" class="field-input" />
             </div>
+          </div>
+        </div>
+      </template>
+
+      <!-- Claude service status (status.claude.com) — independent of usage alerts -->
+      <div class="card toggle-card" @click="localSvcEnabled = !localSvcEnabled">
+        <div style="flex: 1; min-width: 0">
+          <div class="card-title" style="font-size: 13px">{{ t('serviceStatus') }}</div>
+          <div class="card-sub">{{ t('serviceStatusDesc') }}</div>
+        </div>
+        <div class="toggle" :class="{ on: localSvcEnabled }">
+          <div class="toggle-knob"></div>
+        </div>
+      </div>
+      <template v-if="localSvcEnabled">
+        <div class="card">
+          <div class="card-row" style="align-items: center">
+            <div class="field-label" style="margin-bottom: 0">{{ t('serviceStatusInterval') }}</div>
+            <span class="pct muted" style="font-size: 14px">{{ localSvcInterval }}s</span>
+          </div>
+          <input
+            v-model.number="localSvcInterval"
+            type="range"
+            class="field-range"
+            min="30"
+            max="600"
+            step="10"
+          />
+        </div>
+        <div class="card toggle-card" @click="localSvcNotify = !localSvcNotify">
+          <div style="flex: 1; min-width: 0">
+            <div class="card-title" style="font-size: 13px">{{ t('serviceStatusNotify') }}</div>
+            <div class="card-sub">{{ t('serviceStatusNotifyDesc') }}</div>
+          </div>
+          <div class="toggle" :class="{ on: localSvcNotify }">
+            <div class="toggle-knob"></div>
           </div>
         </div>
       </template>
