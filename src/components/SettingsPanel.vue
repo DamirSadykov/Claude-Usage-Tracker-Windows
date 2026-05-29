@@ -85,6 +85,9 @@ const props = defineProps<{
   alertTiers: AlertTiers;
   alertTypes: AlertTypes;
   ccAnalyticsEnabled: boolean;
+  dailyBudgetEnabled: boolean;
+  dailyBudget: number;
+  suggestedBudget: number | null;
   locale: string;
 }>();
 
@@ -104,6 +107,8 @@ const emit = defineEmits<{
     alertTiers: AlertTiers;
     alertTypes: AlertTypes;
     ccAnalyticsEnabled: boolean;
+    dailyBudgetEnabled: boolean;
+    dailyBudget: number;
     locale: string;
   }];
 }>();
@@ -126,6 +131,8 @@ const localQuietEnd = ref(props.quietHoursEnd);
 const localTiers = ref<AlertTiers>(normalizeAlertTiers(props.alertTiers));
 const localTypes = ref<AlertTypes>(normalizeAlertTypes(props.alertTypes));
 const localCc = ref(props.ccAnalyticsEnabled);
+const localBudgetEnabled = ref(props.dailyBudgetEnabled);
+const localBudget = ref(props.dailyBudget);
 const localLocale = ref(props.locale);
 
 watch(() => props.sessionKey, (v) => (localSessionKey.value = v));
@@ -149,6 +156,8 @@ watch(() => props.quietHoursEnd, (v) => (localQuietEnd.value = v));
 watch(() => props.alertTiers, (v) => (localTiers.value = normalizeAlertTiers(v)));
 watch(() => props.alertTypes, (v) => (localTypes.value = normalizeAlertTypes(v)));
 watch(() => props.ccAnalyticsEnabled, (v) => (localCc.value = v));
+watch(() => props.dailyBudgetEnabled, (v) => (localBudgetEnabled.value = v));
+watch(() => props.dailyBudget, (v) => (localBudget.value = v));
 watch(() => props.locale, (v) => (localLocale.value = v));
 
 // Keep each threshold triple strictly ascending with a 1% gap so the colour
@@ -170,6 +179,13 @@ function useAscending(t1: Ref<number>, t2: Ref<number>, t3: Ref<number>) {
 useAscending(localS1, localS2, localS3);
 useAscending(localW1, localW2, localW3);
 
+function applySuggestion() {
+  if (props.suggestedBudget === null) return;
+  localBudget.value = localCc.value
+    ? Math.round(props.suggestedBudget * 100) / 100
+    : Math.round(props.suggestedBudget * 10) / 10;
+}
+
 function handleSave() {
   emit("save", {
     sessionKey: localSessionKey.value.trim(),
@@ -186,6 +202,8 @@ function handleSave() {
     alertTiers: { ...localTiers.value },
     alertTypes: { ...localTypes.value },
     ccAnalyticsEnabled: localCc.value,
+    dailyBudgetEnabled: localBudgetEnabled.value,
+    dailyBudget: localBudget.value,
     locale: localLocale.value,
   });
 }
@@ -428,6 +446,44 @@ function handleSave() {
         <div class="cc-note-row">{{ t('ccAnalyticsReads') }}</div>
         <div class="cc-note-row">{{ t('ccAnalyticsData') }}</div>
         <div class="cc-note-row">{{ t('ccAnalyticsLocal') }}</div>
+      </div>
+
+      <!-- Daily budget -->
+      <div class="card toggle-card" @click="localBudgetEnabled = !localBudgetEnabled">
+        <div style="flex: 1; min-width: 0">
+          <div class="card-title" style="font-size: 13px">{{ t('dailyBudget') }}</div>
+          <div class="card-sub">{{ t('dailyBudgetDesc') }}</div>
+        </div>
+        <div class="toggle" :class="{ on: localBudgetEnabled }">
+          <div class="toggle-knob"></div>
+        </div>
+      </div>
+      <div v-if="localBudgetEnabled" class="card">
+        <div class="field-label">
+          {{ localCc ? t('dailyBudgetUnitUsd') : t('dailyBudgetUnitPct') }}
+        </div>
+        <input
+          v-model.number="localBudget"
+          type="number"
+          class="field-input"
+          min="0"
+          :step="localCc ? 1 : 5"
+        />
+        <div
+          v-if="suggestedBudget !== null && localCc === ccAnalyticsEnabled"
+          class="budget-suggest"
+        >
+          <span class="field-hint" style="margin: 0">
+            {{ t('budgetSuggest', {
+              value: localCc
+                ? '$' + suggestedBudget.toFixed(2)
+                : suggestedBudget.toFixed(1) + '%',
+            }) }}
+          </span>
+          <button type="button" class="suggest-btn" @click="applySuggestion">
+            {{ t('budgetSuggestApply') }}
+          </button>
+        </div>
       </div>
 
       <!-- Updates -->
@@ -751,5 +807,30 @@ function handleSave() {
 .btn-check:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+.budget-suggest {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 8px;
+}
+
+.suggest-btn {
+  flex-shrink: 0;
+  padding: 4px 10px;
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--accent);
+  font-size: 12px;
+  font-family: var(--segoe);
+  cursor: pointer;
+  transition: background 120ms;
+}
+
+.suggest-btn:hover {
+  background: rgba(255, 255, 255, 0.06);
 }
 </style>

@@ -50,28 +50,103 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-// Place the flyout centred above the tray click, clamped to the monitor.
-fn position_flyout(window: &WebviewWindow, anchor: PhysicalPosition<f64>) {
+// Fixed gap between the flyout and the taskbar / screen edges, in logical px.
+const FLYOUT_MARGIN: f64 = 8.0;
+
+// Which screen edge the taskbar occupies.
+#[derive(Clone, Copy)]
+enum TaskbarEdge {
+    Bottom,
+    Top,
+    Left,
+    Right,
+}
+
+// Pin the flyout to the taskbar edge near the tray icon, using the monitor
+// work area so it never overlaps the taskbar. The exact click point inside the
+// tray icon does not affect the result — only which monitor and which side of
+// the screen the icon is on. `anchor` is the tray click position (physical); it
+// only selects the corner/side. When absent (opened from the menu) we default
+// to the conventional bottom-right placement.
+fn position_flyout(window: &WebviewWindow, anchor: Option<PhysicalPosition<f64>>) {
     let Ok(size) = window.outer_size() else {
         return;
     };
-    let mut x = anchor.x as i32 - size.width as i32 / 2;
-    let mut y = anchor.y as i32 - size.height as i32 - 8;
-    if let Ok(Some(monitor)) = window.current_monitor() {
-        let mp = monitor.position();
-        let ms = monitor.size();
-        let max_x = (mp.x + ms.width as i32 - size.width as i32).max(mp.x);
-        let max_y = (mp.y + ms.height as i32 - size.height as i32).max(mp.y);
-        x = x.clamp(mp.x, max_x);
-        y = y.clamp(mp.y, max_y);
-    }
+    let Ok(Some(monitor)) = window.current_monitor() else {
+        return;
+    };
+
+    // Margin in logical px → physical, so spacing stays constant across DPI.
+    let margin = (FLYOUT_MARGIN * monitor.scale_factor()).round() as i32;
+    let win_w = size.width as i32;
+    let win_h = size.height as i32;
+
+    // Full monitor bounds (physical).
+    let mp = monitor.position();
+    let ms = monitor.size();
+    let mon_top = mp.y;
+    let mon_bottom = mp.y + ms.height as i32;
+    let mon_left = mp.x;
+    let mon_right = mp.x + ms.width as i32;
+
+    // Work area = monitor minus the taskbar (physical).
+    let wa = monitor.work_area();
+    let wa_top = wa.position.y;
+    let wa_bottom = wa.position.y + wa.size.height as i32;
+    let wa_left = wa.position.x;
+    let wa_right = wa.position.x + wa.size.width as i32;
+
+    // The taskbar lives on the edge with the largest strip reclaimed from the
+    // work area. Default to Bottom when nothing is reclaimed (e.g. auto-hide).
+    let gap_top = wa_top - mon_top;
+    let gap_bottom = mon_bottom - wa_bottom;
+    let gap_left = wa_left - mon_left;
+    let gap_right = mon_right - wa_right;
+    let edge = if gap_left > gap_right && gap_left > gap_top && gap_left > gap_bottom {
+        TaskbarEdge::Left
+    } else if gap_right > gap_top && gap_right > gap_bottom {
+        TaskbarEdge::Right
+    } else if gap_top > gap_bottom {
+        TaskbarEdge::Top
+    } else {
+        TaskbarEdge::Bottom
+    };
+
+    let (x, y) = match edge {
+        TaskbarEdge::Bottom | TaskbarEdge::Top => {
+            let y = match edge {
+                TaskbarEdge::Top => wa_top + margin,
+                _ => wa_bottom - win_h - margin,
+            };
+            // Align to the side of the tray icon; default to the right corner.
+            let x = match anchor {
+                Some(a) if (a.x as i32) < (wa_left + wa_right) / 2 => wa_left + margin,
+                _ => wa_right - win_w - margin,
+            };
+            (x, y)
+        }
+        TaskbarEdge::Left | TaskbarEdge::Right => {
+            let x = match edge {
+                TaskbarEdge::Left => wa_left + margin,
+                _ => wa_right - win_w - margin,
+            };
+            let y = match anchor {
+                Some(a) if (a.y as i32) < (wa_top + wa_bottom) / 2 => wa_top + margin,
+                _ => wa_bottom - win_h - margin,
+            };
+            (x, y)
+        }
+    };
+
+    // Clamp inside the work area in case the window is larger than expected.
+    let x = x.clamp(wa_left, (wa_right - win_w).max(wa_left));
+    let y = y.clamp(wa_top, (wa_bottom - win_h).max(wa_top));
+
     let _ = window.set_position(PhysicalPosition::new(x, y));
 }
 
 fn show_flyout(window: &WebviewWindow, anchor: Option<PhysicalPosition<f64>>) {
-    if let Some(a) = anchor {
-        position_flyout(window, a);
-    }
+    position_flyout(window, anchor);
     let _ = window.show();
     let _ = window.set_focus();
 }
@@ -113,6 +188,45 @@ fn compute_levels(u: &UsageData, cfg: &AppConfig) -> UsageLevels {
     }
 }
 
+// --- Daily budget & snooze helpers ---
+
+/// Start of the current local day, expressed as a UTC RFC3339 string (matches
+/// how snapshots/cc_usage timestamps are stored).
+fn local_midnight_rfc3339() -> String {
+    let today = chrono::Local::now().date_naive();
+    let midnight = today.and_hms_opt(0, 0, 0).unwrap();
+    midnight
+        .and_local_timezone(chrono::Local)
+        .single()
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+        .unwrap_or_else(chrono::Utc::now)
+        .to_rfc3339()
+}
+
+/// Consumption since local midnight, in the unit implied by `cc_analytics_enabled`:
+/// dollars (CC cost) when on, percent of the weekly limit when off. `None` when
+/// the budget is disabled.
+fn today_spent_for(stats: &StatsDb, cfg: &AppConfig, usage: &UsageData, now: &str) -> Option<f64> {
+    if !cfg.daily_budget_enabled {
+        return None;
+    }
+    let from = local_midnight_rfc3339();
+    if cfg.cc_analytics_enabled {
+        stats.cost_in(&from, now).ok()
+    } else {
+        let current = usage.seven_day.percent_used;
+        let baseline = stats.seven_day_baseline(&from, now).ok().flatten().unwrap_or(current);
+        Some((current - baseline).max(0.0))
+    }
+}
+
+fn is_muted(muted_until: Option<&str>, now: chrono::DateTime<chrono::Utc>) -> bool {
+    match muted_until.and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()) {
+        Some(until) => now < until.with_timezone(&chrono::Utc),
+        None => false,
+    }
+}
+
 // --- Background polling loop: the single owner of business logic ---
 
 async fn run_cycle(app: &AppHandle, cfg: &AppConfig, auto_started: &mut bool) {
@@ -146,12 +260,17 @@ async fn run_cycle(app: &AppHandle, cfg: &AppConfig, auto_started: &mut bool) {
     );
 
     if cfg.notifications_enabled {
-        let delta = app.try_state::<Arc<StatsDb>>().and_then(|s| {
-            let now = chrono::Utc::now();
+        let now = chrono::Utc::now();
+        let stats = app.try_state::<Arc<StatsDb>>();
+        let delta = stats.as_ref().and_then(|s| {
             let from = (now - chrono::Duration::hours(1)).to_rfc3339();
             let to = now.to_rfc3339();
             s.compute_delta(&from, &to).ok().flatten()
         });
+        let today_spent = stats
+            .as_ref()
+            .and_then(|s| today_spent_for(s, cfg, &usage, &now.to_rfc3339()));
+        let muted = is_muted(cfg.notifications_muted_until.as_deref(), now);
         let now_min = {
             let n = chrono::Local::now();
             n.hour() * 60 + n.minute()
@@ -159,7 +278,7 @@ async fn run_cycle(app: &AppHandle, cfg: &AppConfig, auto_started: &mut bool) {
         let events = {
             let eng = app.state::<Mutex<AlertEngine>>();
             let mut e = eng.lock().unwrap();
-            e.evaluate(&usage, cfg, now_min, delta.as_ref())
+            e.evaluate(&usage, cfg, now_min, delta.as_ref(), today_spent, muted)
         };
         for ev in events {
             let _ = app.emit("alert", ev);

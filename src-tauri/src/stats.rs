@@ -261,6 +261,27 @@ impl StatsDb {
         rows.collect()
     }
 
+    /// Total Claude Code cost (USD) recorded in `[from, to)`. Drives the daily
+    /// budget when CC analytics is enabled.
+    pub fn cost_in(&self, from: &str, to: &str) -> Result<f64, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        Ok(totals_for(&conn, from, to)?.cost)
+    }
+
+    /// Earliest recorded `seven_day_pct` in `[from, to]` — the day's starting
+    /// weekly usage, used to derive "consumed today" when CC analytics is off.
+    pub fn seven_day_baseline(&self, from: &str, to: &str) -> Result<Option<f64>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT seven_day_pct FROM usage_snapshots
+             WHERE timestamp >= ?1 AND timestamp <= ?2
+             ORDER BY timestamp ASC LIMIT 1",
+            params![from, to],
+            |row| row.get(0),
+        )
+        .optional()
+    }
+
     pub fn compute_delta(&self, from: &str, to: &str) -> Result<Option<UsageDelta>, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
 
@@ -725,5 +746,38 @@ mod tests {
         assert_eq!(a.totals.cost, 0.0);
         assert!(a.by_model.is_empty());
         assert!(a.daily.is_empty());
+    }
+
+    // --- daily budget helpers ---
+
+    #[test]
+    fn cost_in_sums_only_window() {
+        let db = mem_db();
+        db.cc_upsert(&[
+            cc_row("m1", "2026-01-01T10:00:00Z", "claude-opus-4-7", 100, 0, 1.5, "s1"),
+            cc_row("m2", "2026-01-01T12:00:00Z", "claude-opus-4-7", 100, 0, 2.0, "s1"),
+            cc_row("m3", "2026-01-02T10:00:00Z", "claude-sonnet-4-5", 50, 0, 9.0, "s2"),
+        ])
+        .unwrap();
+        let cost = db.cost_in("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z").unwrap();
+        assert!((cost - 3.5).abs() < 1e-9, "only Jan 1 rows count, got {cost}");
+        // empty window → zero
+        assert_eq!(db.cost_in("2026-02-01T00:00:00Z", "2026-02-02T00:00:00Z").unwrap(), 0.0);
+    }
+
+    #[test]
+    fn seven_day_baseline_takes_earliest() {
+        let db = mem_db();
+        db.insert_at("2026-01-01T08:00:00Z", 10.0, 20.0, None);
+        db.insert_at("2026-01-01T12:00:00Z", 30.0, 35.0, None);
+        let base = db
+            .seven_day_baseline("2026-01-01T00:00:00Z", "2026-01-01T23:59:59Z")
+            .unwrap();
+        assert_eq!(base, Some(20.0));
+        // no snapshot in window → None
+        assert!(db
+            .seven_day_baseline("2026-02-01T00:00:00Z", "2026-02-02T00:00:00Z")
+            .unwrap()
+            .is_none());
     }
 }

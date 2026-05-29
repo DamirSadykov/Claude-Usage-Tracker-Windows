@@ -6,6 +6,7 @@ import SettingsPanel from "./components/SettingsPanel.vue";
 import UsagePanel from "./components/UsagePanel.vue";
 import MiniPanel from "./components/MiniPanel.vue";
 import AnalyticsPanel from "./components/AnalyticsPanel.vue";
+import FocusControls from "./components/FocusControls.vue";
 import {
     DEFAULT_THRESHOLDS,
     normalize,
@@ -79,6 +80,14 @@ const quietHoursEnabled = ref(false);
 const quietHoursStart = ref("23:00");
 const quietHoursEnd = ref("08:00");
 const ccAnalyticsEnabled = ref(false);
+const dailyBudgetEnabled = ref(false);
+const dailyBudget = ref(0);
+const notificationsMutedUntil = ref<string | null>(null);
+const todaySpent = ref<number | null>(null);
+const suggestedBudget = ref<number | null>(null);
+const budgetUnit = computed<"usd" | "pct">(() =>
+    ccAnalyticsEnabled.value ? "usd" : "pct",
+);
 const usage = ref<UsageData | null>(null);
 const levels = ref<UsageLevels | null>(null);
 const error = ref("");
@@ -127,6 +136,11 @@ async function loadSettings() {
             (await store.get<string>("quietHoursEnd")) ?? "08:00";
         ccAnalyticsEnabled.value =
             (await store.get<boolean>("ccAnalyticsEnabled")) ?? false;
+        dailyBudgetEnabled.value =
+            (await store.get<boolean>("dailyBudgetEnabled")) ?? false;
+        dailyBudget.value = (await store.get<number>("dailyBudget")) ?? 0;
+        notificationsMutedUntil.value =
+            (await store.get<string>("notificationsMutedUntil")) ?? null;
         const savedLocale = await store.get<string>("locale");
         if (savedLocale) locale.value = savedLocale;
     } catch {
@@ -152,6 +166,9 @@ async function saveSettings() {
     await store.set("quietHoursStart", quietHoursStart.value);
     await store.set("quietHoursEnd", quietHoursEnd.value);
     await store.set("ccAnalyticsEnabled", ccAnalyticsEnabled.value);
+    await store.set("dailyBudgetEnabled", dailyBudgetEnabled.value);
+    await store.set("dailyBudget", dailyBudget.value);
+    await store.set("notificationsMutedUntil", notificationsMutedUntil.value);
     await store.set("locale", locale.value);
     await store.save();
 }
@@ -175,6 +192,9 @@ function buildConfig() {
         alert_tiers: alertTiers.value,
         alert_types: alertTypes.value,
         cc_analytics_enabled: ccAnalyticsEnabled.value,
+        daily_budget_enabled: dailyBudgetEnabled.value,
+        daily_budget: dailyBudget.value,
+        notifications_muted_until: notificationsMutedUntil.value,
     };
 }
 
@@ -195,11 +215,95 @@ async function ensurePermission(): Promise<boolean> {
     return granted;
 }
 
-async function toast(a: AlertEvent) {
+async function notify(title: string, body: string) {
     if (!(await ensurePermission())) return;
     const { sendNotification } = await import("@tauri-apps/plugin-notification");
-    const { title, body } = localizeAlert(t, a);
     sendNotification({ title, body });
+}
+
+async function toast(a: AlertEvent) {
+    const { title, body } = localizeAlert(t, a);
+    await notify(title, body);
+}
+
+// Consumption since local midnight, in the unit implied by ccAnalyticsEnabled
+// ($ from CC analytics, else % of the weekly limit). Uses existing commands.
+async function loadTodaySpent() {
+    if (!dailyBudgetEnabled.value || !configured.value) {
+        todaySpent.value = null;
+        return;
+    }
+    const from = new Date(new Date().setHours(0, 0, 0, 0)).toISOString();
+    const to = new Date().toISOString();
+    try {
+        if (ccAnalyticsEnabled.value) {
+            const a = await invoke<{ totals: { cost: number } }>("get_analytics", {
+                from,
+                to,
+            });
+            todaySpent.value = a.totals.cost;
+        } else {
+            const snaps = await invoke<Array<{ seven_day_pct: number }>>(
+                "get_usage_snapshots",
+                { from, to },
+            );
+            const current = usage.value?.seven_day.percent_used ?? 0;
+            const baseline = snaps.length ? snaps[0].seven_day_pct : current;
+            todaySpent.value = Math.max(0, current - baseline);
+        }
+    } catch {
+        todaySpent.value = null;
+    }
+}
+
+async function setMute(until: string | null) {
+    notificationsMutedUntil.value = until;
+    await saveSettings();
+    await applyConfig();
+}
+
+// Daily budget that would spread the remaining weekly limit evenly until reset
+// (instead of burning it in one day). In % mode it's the leftover weekly % over
+// the days left; in $ mode we extrapolate the weekly $ ceiling from this week's
+// spend vs the weekly %, then spread the remainder.
+async function loadSuggestion() {
+    const wk = usage.value?.seven_day;
+    if (!configured.value || !wk?.reset_at) {
+        suggestedBudget.value = null;
+        return;
+    }
+    const end = new Date(wk.reset_at).getTime();
+    const daysLeft = (end - Date.now()) / 86400000;
+    if (daysLeft <= 0) {
+        suggestedBudget.value = null;
+        return;
+    }
+    if (budgetUnit.value === "pct") {
+        suggestedBudget.value = Math.max(100 - wk.percent_used, 0) / daysLeft;
+        return;
+    }
+    // $ mode: need enough weekly usage to extrapolate a ceiling reliably.
+    if (wk.percent_used < 1) {
+        suggestedBudget.value = null;
+        return;
+    }
+    try {
+        const from = new Date(end - 7 * 86400000).toISOString();
+        const to = new Date().toISOString();
+        const a = await invoke<{ totals: { cost: number } }>("get_analytics", {
+            from,
+            to,
+        });
+        const weekCost = a.totals.cost;
+        if (weekCost <= 0) {
+            suggestedBudget.value = null;
+            return;
+        }
+        const ceiling = weekCost / (wk.percent_used / 100);
+        suggestedBudget.value = Math.max(ceiling - weekCost, 0) / daysLeft;
+    } catch {
+        suggestedBudget.value = null;
+    }
 }
 
 async function refresh() {
@@ -268,6 +372,8 @@ async function handleSave(settings: {
     alertTiers: AlertTiers;
     alertTypes: AlertTypes;
     ccAnalyticsEnabled: boolean;
+    dailyBudgetEnabled: boolean;
+    dailyBudget: number;
     locale: string;
 }) {
     sessionKey.value = settings.sessionKey;
@@ -284,6 +390,8 @@ async function handleSave(settings: {
     alertTiers.value = normalizeAlertTiers(settings.alertTiers);
     alertTypes.value = normalizeAlertTypes(settings.alertTypes);
     ccAnalyticsEnabled.value = settings.ccAnalyticsEnabled;
+    dailyBudgetEnabled.value = settings.dailyBudgetEnabled;
+    dailyBudget.value = settings.dailyBudget;
     locale.value = settings.locale;
     // The backend re-arms its alert engine on disable (see `configure`).
     await saveSettings();
@@ -292,6 +400,7 @@ async function handleSave(settings: {
     // Analytics is unavailable once the opt-in is turned off.
     if (!ccAnalyticsEnabled.value) showAnalytics.value = false;
     await applyConfig();
+    await loadTodaySpent();
 }
 
 function toggleAnalytics() {
@@ -329,6 +438,8 @@ onMounted(async () => {
                 levels.value = e.payload.levels;
                 error.value = "";
                 loading.value = false;
+                void loadTodaySpent();
+                void loadSuggestion();
             },
         ),
         await listen<string>("usage-error", (e) => {
@@ -542,6 +653,9 @@ onUnmounted(() => {
             :quiet-hours-start="quietHoursStart"
             :quiet-hours-end="quietHoursEnd"
             :cc-analytics-enabled="ccAnalyticsEnabled"
+            :daily-budget-enabled="dailyBudgetEnabled"
+            :daily-budget="dailyBudget"
+            :suggested-budget="suggestedBudget"
             :locale="locale"
             @save="handleSave"
         />
@@ -592,16 +706,26 @@ onUnmounted(() => {
                 </div>
             </div>
 
-            <UsagePanel
-                v-else-if="usage && levels"
-                :usage="usage"
-                :levels="levels"
-                :loading="loading"
-                :auto-start-enabled="autoStartSession"
-                :auto-start-status="autoStartStatus"
-                @refresh="refresh"
-                @manual-start="handleManualStart"
-            />
+            <template v-else-if="usage && levels">
+                <UsagePanel
+                    :usage="usage"
+                    :levels="levels"
+                    :loading="loading"
+                    :auto-start-enabled="autoStartSession"
+                    :auto-start-status="autoStartStatus"
+                    :daily-budget-enabled="dailyBudgetEnabled"
+                    :daily-budget="dailyBudget"
+                    :today-spent="todaySpent"
+                    :budget-unit="budgetUnit"
+                    @refresh="refresh"
+                    @manual-start="handleManualStart"
+                />
+                <FocusControls
+                    :muted-until="notificationsMutedUntil"
+                    @mute="setMute"
+                    @notify="notify"
+                />
+            </template>
 
             <div
                 v-else
