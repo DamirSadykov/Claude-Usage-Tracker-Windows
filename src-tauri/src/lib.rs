@@ -50,28 +50,103 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-// Place the flyout centred above the tray click, clamped to the monitor.
-fn position_flyout(window: &WebviewWindow, anchor: PhysicalPosition<f64>) {
+// Fixed gap between the flyout and the taskbar / screen edges, in logical px.
+const FLYOUT_MARGIN: f64 = 8.0;
+
+// Which screen edge the taskbar occupies.
+#[derive(Clone, Copy)]
+enum TaskbarEdge {
+    Bottom,
+    Top,
+    Left,
+    Right,
+}
+
+// Pin the flyout to the taskbar edge near the tray icon, using the monitor
+// work area so it never overlaps the taskbar. The exact click point inside the
+// tray icon does not affect the result — only which monitor and which side of
+// the screen the icon is on. `anchor` is the tray click position (physical); it
+// only selects the corner/side. When absent (opened from the menu) we default
+// to the conventional bottom-right placement.
+fn position_flyout(window: &WebviewWindow, anchor: Option<PhysicalPosition<f64>>) {
     let Ok(size) = window.outer_size() else {
         return;
     };
-    let mut x = anchor.x as i32 - size.width as i32 / 2;
-    let mut y = anchor.y as i32 - size.height as i32 - 8;
-    if let Ok(Some(monitor)) = window.current_monitor() {
-        let mp = monitor.position();
-        let ms = monitor.size();
-        let max_x = (mp.x + ms.width as i32 - size.width as i32).max(mp.x);
-        let max_y = (mp.y + ms.height as i32 - size.height as i32).max(mp.y);
-        x = x.clamp(mp.x, max_x);
-        y = y.clamp(mp.y, max_y);
-    }
+    let Ok(Some(monitor)) = window.current_monitor() else {
+        return;
+    };
+
+    // Margin in logical px → physical, so spacing stays constant across DPI.
+    let margin = (FLYOUT_MARGIN * monitor.scale_factor()).round() as i32;
+    let win_w = size.width as i32;
+    let win_h = size.height as i32;
+
+    // Full monitor bounds (physical).
+    let mp = monitor.position();
+    let ms = monitor.size();
+    let mon_top = mp.y;
+    let mon_bottom = mp.y + ms.height as i32;
+    let mon_left = mp.x;
+    let mon_right = mp.x + ms.width as i32;
+
+    // Work area = monitor minus the taskbar (physical).
+    let wa = monitor.work_area();
+    let wa_top = wa.position.y;
+    let wa_bottom = wa.position.y + wa.size.height as i32;
+    let wa_left = wa.position.x;
+    let wa_right = wa.position.x + wa.size.width as i32;
+
+    // The taskbar lives on the edge with the largest strip reclaimed from the
+    // work area. Default to Bottom when nothing is reclaimed (e.g. auto-hide).
+    let gap_top = wa_top - mon_top;
+    let gap_bottom = mon_bottom - wa_bottom;
+    let gap_left = wa_left - mon_left;
+    let gap_right = mon_right - wa_right;
+    let edge = if gap_left > gap_right && gap_left > gap_top && gap_left > gap_bottom {
+        TaskbarEdge::Left
+    } else if gap_right > gap_top && gap_right > gap_bottom {
+        TaskbarEdge::Right
+    } else if gap_top > gap_bottom {
+        TaskbarEdge::Top
+    } else {
+        TaskbarEdge::Bottom
+    };
+
+    let (x, y) = match edge {
+        TaskbarEdge::Bottom | TaskbarEdge::Top => {
+            let y = match edge {
+                TaskbarEdge::Top => wa_top + margin,
+                _ => wa_bottom - win_h - margin,
+            };
+            // Align to the side of the tray icon; default to the right corner.
+            let x = match anchor {
+                Some(a) if (a.x as i32) < (wa_left + wa_right) / 2 => wa_left + margin,
+                _ => wa_right - win_w - margin,
+            };
+            (x, y)
+        }
+        TaskbarEdge::Left | TaskbarEdge::Right => {
+            let x = match edge {
+                TaskbarEdge::Left => wa_left + margin,
+                _ => wa_right - win_w - margin,
+            };
+            let y = match anchor {
+                Some(a) if (a.y as i32) < (wa_top + wa_bottom) / 2 => wa_top + margin,
+                _ => wa_bottom - win_h - margin,
+            };
+            (x, y)
+        }
+    };
+
+    // Clamp inside the work area in case the window is larger than expected.
+    let x = x.clamp(wa_left, (wa_right - win_w).max(wa_left));
+    let y = y.clamp(wa_top, (wa_bottom - win_h).max(wa_top));
+
     let _ = window.set_position(PhysicalPosition::new(x, y));
 }
 
 fn show_flyout(window: &WebviewWindow, anchor: Option<PhysicalPosition<f64>>) {
-    if let Some(a) = anchor {
-        position_flyout(window, a);
-    }
+    position_flyout(window, anchor);
     let _ = window.show();
     let _ = window.set_focus();
 }
