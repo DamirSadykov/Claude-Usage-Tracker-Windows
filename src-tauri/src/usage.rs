@@ -74,33 +74,47 @@ struct ApiResponse {
     extra_usage: Option<ApiExtraUsage>,
 }
 
+/// Deserialize a scalar the API may send as an explicit `null`, falling back to
+/// `T::default()`. `#[serde(default)]` alone only covers a *missing* key, not a
+/// present `null` — and this API sends `null` liberally for inactive fields
+/// (e.g. `extra_usage.utilization` is `null` when extra usage is unused).
+fn null_default<'de, D, T>(de: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(de)?.unwrap_or_default())
+}
+
 #[derive(Debug, Deserialize)]
 struct ApiTier {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     utilization: f64,
     #[serde(default)]
     resets_at: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     is_limited: bool,
 }
 
 #[derive(Debug, Deserialize)]
 struct ApiExtraUsage {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     is_enabled: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     monthly_limit: f64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     used_credits: f64,
+    // `null` when extra usage is enabled but unused — kept as None and derived
+    // from used/limit in `build_usage` rather than defaulted blindly to 0.
     #[serde(default)]
-    utilization: f64,
+    utilization: Option<f64>,
     #[serde(default)]
     currency: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ApiPrepaidCredits {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     amount: f64,
     #[serde(default)]
     currency: Option<String>,
@@ -243,10 +257,19 @@ fn snippet(s: &str) -> String {
 fn build_usage(api: ApiResponse, prepaid: Option<ApiPrepaidCredits>) -> UsageData {
     let extra_usage = api.extra_usage.and_then(|e| {
         if e.is_enabled {
+            // The API may omit/null `utilization` (enabled but unused); derive it
+            // from used/limit so a 0-balance account reads as 0%, not a crash.
+            let utilization = e.utilization.unwrap_or_else(|| {
+                if e.monthly_limit > 0.0 {
+                    e.used_credits / e.monthly_limit * 100.0
+                } else {
+                    0.0
+                }
+            });
             Some(ExtraUsage {
                 used_credits: e.used_credits / 100.0,
                 monthly_limit: e.monthly_limit / 100.0,
-                utilization: e.utilization,
+                utilization,
                 currency: e.currency.unwrap_or_else(|| "USD".to_string()),
             })
         } else {
@@ -497,6 +520,55 @@ mod tests {
         assert_eq!(u.seven_day.percent_used, 0.0);
         assert!(u.extra_usage.is_none(), "disabled extra usage → None");
         assert!(u.prepaid_balance.is_none());
+    }
+
+    #[test]
+    fn parses_real_response_with_null_extra_utilization_and_unknown_tiers() {
+        // Verbatim payload from a user whose fetch crashed at the
+        // `extra_usage.utilization: null` field (#473). Also exercises unknown
+        // tier keys the API added (oauth_apps/cowork/omelette/tangelo/…) which
+        // must be ignored, and a 0-balance enabled extra-usage account.
+        let json = r#"{
+            "five_hour": {"utilization":73.0,"resets_at":"2026-05-29T13:30:00.550752+00:00"},
+            "seven_day": {"utilization":14.0,"resets_at":"2026-06-01T03:00:00.550774+00:00"},
+            "seven_day_oauth_apps": null,
+            "seven_day_opus": null,
+            "seven_day_sonnet": {"utilization":0.0,"resets_at":null},
+            "seven_day_cowork": null,
+            "seven_day_omelette": null,
+            "tangelo": null,
+            "iguana_necktie": null,
+            "omelette_promotional": null,
+            "extra_usage": {"is_enabled":true,"monthly_limit":2000,"used_credits":0.0,"utilization":null,"currency":"USD","disabled_reason":null}
+        }"#;
+        let u = parse(json, None);
+
+        assert_eq!(u.five_hour.percent_used, 73.0);
+        assert_eq!(u.seven_day.percent_used, 14.0);
+        assert!(u.seven_day_opus.is_none());
+        assert_eq!(u.seven_day_sonnet.as_ref().unwrap().percent_used, 0.0);
+
+        // Enabled but unused: null utilization derived from used/limit → 0%.
+        let e = u.extra_usage.expect("enabled extra usage is present");
+        assert_eq!(e.used_credits, 0.0);
+        assert_eq!(e.monthly_limit, 20.0); // 2000 cents → dollars
+        assert_eq!(e.utilization, 0.0);
+        assert_eq!(e.currency, "USD");
+    }
+
+    #[test]
+    fn null_scalars_throughout_do_not_crash() {
+        // "Everything null" disabled-extra shape: every scalar arrives as null.
+        let json = r#"{
+            "five_hour": {"utilization":null,"resets_at":null,"is_limited":null},
+            "seven_day": {"utilization":null,"resets_at":null,"is_limited":null},
+            "extra_usage": {"is_enabled":null,"monthly_limit":null,"used_credits":null,"utilization":null,"currency":null}
+        }"#;
+        let u = parse(json, Some(r#"{ "amount": null, "currency": null }"#));
+        assert_eq!(u.five_hour.percent_used, 0.0);
+        assert!(!u.five_hour.is_limited);
+        assert!(u.extra_usage.is_none(), "is_enabled null → disabled → None");
+        assert_eq!(u.prepaid_balance, Some(0.0));
     }
 
     #[test]
