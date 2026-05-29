@@ -27,6 +27,11 @@ const TYPE_LABELS: Record<AlertTypeKey, string> = {
 
 const { t } = useI18n();
 
+// Settings are grouped into topic tabs. A future iteration may promote this to
+// a dedicated settings window with the same sections.
+type SettingsTab = "account" | "limits" | "notifications" | "budget" | "updates";
+const tab = ref<SettingsTab>("account");
+
 const {
   currentVersion,
   availableVersion,
@@ -211,7 +216,77 @@ function handleSave() {
 
 <template>
   <form class="settings-form" @submit.prevent="handleSave">
+    <!-- Topic tabs -->
+    <div class="settings-tabs">
+      <button
+        type="button"
+        class="settings-tab"
+        :class="{ active: tab === 'account' }"
+        @click="tab = 'account'"
+      >
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4">
+          <circle cx="8" cy="5.5" r="2.5" />
+          <path d="M3 13.5c0-2.5 2.2-4 5-4s5 1.5 5 4" stroke-linecap="round" />
+        </svg>
+        <span>{{ t('tabAccount') }}</span>
+      </button>
+      <button
+        type="button"
+        class="settings-tab"
+        :class="{ active: tab === 'limits' }"
+        @click="tab = 'limits'"
+      >
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4">
+          <line x1="2.5" y1="4.5" x2="13.5" y2="4.5" stroke-linecap="round" />
+          <line x1="2.5" y1="8" x2="13.5" y2="8" stroke-linecap="round" />
+          <line x1="2.5" y1="11.5" x2="13.5" y2="11.5" stroke-linecap="round" />
+          <circle cx="5" cy="4.5" r="1.9" fill="currentColor" stroke="none" />
+          <circle cx="10.5" cy="8" r="1.9" fill="currentColor" stroke="none" />
+          <circle cx="6.5" cy="11.5" r="1.9" fill="currentColor" stroke="none" />
+        </svg>
+        <span>{{ t('tabLimits') }}</span>
+      </button>
+      <button
+        type="button"
+        class="settings-tab"
+        :class="{ active: tab === 'notifications' }"
+        @click="tab = 'notifications'"
+      >
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4">
+          <path d="M4 7a4 4 0 0 1 8 0c0 3 1 4 1 4H3s1-1 1-4z" stroke-linejoin="round" />
+          <path d="M6.5 13a1.6 1.6 0 0 0 3 0" stroke-linecap="round" />
+        </svg>
+        <span>{{ t('tabAlerts') }}</span>
+      </button>
+      <button
+        type="button"
+        class="settings-tab"
+        :class="{ active: tab === 'budget' }"
+        @click="tab = 'budget'"
+      >
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4">
+          <circle cx="8" cy="8" r="6" />
+          <path d="M8 4.3v7.4M9.9 6c-.4-.7-1.1-1-1.9-1-1 0-1.8.5-1.8 1.4 0 1.9 3.7 1 3.7 2.9 0 .9-.8 1.4-1.9 1.4-.8 0-1.5-.4-1.9-1" stroke-linecap="round" stroke-linejoin="round" />
+        </svg>
+        <span>{{ t('tabBudget') }}</span>
+      </button>
+      <button
+        type="button"
+        class="settings-tab"
+        :class="{ active: tab === 'updates' }"
+        @click="tab = 'updates'"
+      >
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4">
+          <path d="M8 2.5v7M5 6.5l3 3 3-3" stroke-linecap="round" stroke-linejoin="round" />
+          <path d="M3 12.5h10" stroke-linecap="round" />
+        </svg>
+        <span>{{ t('tabUpdates') }}</span>
+      </button>
+    </div>
+
     <div class="cards">
+      <!-- ===== Account ===== -->
+      <template v-if="tab === 'account'">
       <!-- Session Key -->
       <div class="card">
         <div class="field-label">{{ t('sessionKey') }}</div>
@@ -296,7 +371,10 @@ function handleSave() {
           <div class="toggle-knob"></div>
         </div>
       </div>
+      </template>
 
+      <!-- ===== Limits / thresholds ===== -->
+      <template v-if="tab === 'limits'">
       <!-- Session (5h) thresholds — also drive the tray icon colour -->
       <div class="card">
         <div class="field-label">{{ t('thresholdsSession') }}</div>
@@ -343,7 +421,10 @@ function handleSave() {
           <span class="thr-val">{{ localW3 }}%</span>
         </div>
       </div>
+      </template>
 
+      <!-- ===== Notifications ===== -->
+      <template v-if="tab === 'notifications'">
       <!-- Notifications toggle -->
       <div class="card toggle-card" @click="localNotify = !localNotify">
         <div style="flex: 1; min-width: 0">
@@ -431,7 +512,10 @@ function handleSave() {
           </div>
         </div>
       </template>
+      </template>
 
+      <!-- ===== Budget & analytics ===== -->
+      <template v-if="tab === 'budget'">
       <!-- Claude Code analytics (opt-in, off by default) -->
       <div class="card toggle-card" @click="localCc = !localCc">
         <div style="flex: 1; min-width: 0">
@@ -485,7 +569,10 @@ function handleSave() {
           </button>
         </div>
       </div>
+      </template>
 
+      <!-- ===== Updates ===== -->
+      <template v-if="tab === 'updates'">
       <!-- Updates -->
       <div class="card">
         <div class="card-row" style="align-items: center">
@@ -536,6 +623,7 @@ function handleSave() {
           @change="saveUpdaterSettings()"
         />
       </div>
+      </template>
     </div>
 
     <div style="padding: 8px 10px 12px">
@@ -552,6 +640,51 @@ function handleSave() {
   flex-direction: column;
   flex: 1;
   min-height: 0;
+}
+
+.settings-tabs {
+  display: flex;
+  gap: 2px;
+  padding: 8px 10px 2px;
+  flex-shrink: 0;
+}
+
+.settings-tab {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 7px 2px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-3);
+  font-size: 10.5px;
+  font-family: var(--segoe);
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 120ms, color 120ms;
+}
+
+.settings-tab:hover {
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-2);
+}
+
+.settings-tab.active {
+  background: rgba(255, 255, 255, 0.07);
+  color: var(--text);
+}
+
+.settings-tab svg {
+  opacity: 0.8;
+}
+
+.settings-tab.active svg {
+  color: var(--accent);
+  opacity: 1;
 }
 
 .thr-row {
