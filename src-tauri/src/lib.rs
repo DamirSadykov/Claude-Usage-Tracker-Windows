@@ -1,8 +1,9 @@
-mod alerts;
-mod cc;
-mod stats;
-mod status;
-mod usage;
+pub mod alerts;
+pub mod cc;
+pub mod domain;
+pub mod stats;
+pub mod status;
+pub mod usage;
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,6 +21,7 @@ use tauri_plugin_autostart::MacosLauncher;
 use tokio::sync::Notify;
 
 use alerts::{tier_level, AlertEngine, AppConfig};
+use domain::{compute_levels, is_muted, today_spent_for, UsageLevels};
 use stats::StatsDb;
 use usage::UsageData;
 
@@ -156,77 +158,9 @@ fn show_flyout(window: &WebviewWindow, anchor: Option<PhysicalPosition<f64>>) {
 // --- Event payloads pushed to the frontend ---
 
 #[derive(Serialize, Clone)]
-struct UsageLevels {
-    five_hour: u8,
-    seven_day: u8,
-    seven_day_opus: Option<u8>,
-    seven_day_sonnet: Option<u8>,
-    extra_usage: Option<u8>,
-}
-
-#[derive(Serialize, Clone)]
 struct UsageUpdate {
     usage: UsageData,
     levels: UsageLevels,
-}
-
-fn compute_levels(u: &UsageData, cfg: &AppConfig) -> UsageLevels {
-    let weekly = &cfg.weekly_thresholds;
-    UsageLevels {
-        five_hour: tier_level(u.five_hour.percent_used, &cfg.session_thresholds),
-        seven_day: tier_level(u.seven_day.percent_used, weekly),
-        seven_day_opus: u
-            .seven_day_opus
-            .as_ref()
-            .map(|t| tier_level(t.percent_used, weekly)),
-        seven_day_sonnet: u
-            .seven_day_sonnet
-            .as_ref()
-            .map(|t| tier_level(t.percent_used, weekly)),
-        extra_usage: u
-            .extra_usage
-            .as_ref()
-            .map(|e| tier_level(e.utilization, weekly)),
-    }
-}
-
-// --- Daily budget & snooze helpers ---
-
-/// Start of the current local day, expressed as a UTC RFC3339 string (matches
-/// how snapshots/cc_usage timestamps are stored).
-fn local_midnight_rfc3339() -> String {
-    let today = chrono::Local::now().date_naive();
-    let midnight = today.and_hms_opt(0, 0, 0).unwrap();
-    midnight
-        .and_local_timezone(chrono::Local)
-        .single()
-        .map(|dt| dt.with_timezone(&chrono::Utc))
-        .unwrap_or_else(chrono::Utc::now)
-        .to_rfc3339()
-}
-
-/// Consumption since local midnight, in the unit implied by `cc_analytics_enabled`:
-/// dollars (CC cost) when on, percent of the weekly limit when off. `None` when
-/// the budget is disabled.
-fn today_spent_for(stats: &StatsDb, cfg: &AppConfig, usage: &UsageData, now: &str) -> Option<f64> {
-    if !cfg.daily_budget_enabled {
-        return None;
-    }
-    let from = local_midnight_rfc3339();
-    if cfg.cc_analytics_enabled {
-        stats.cost_in(&from, now).ok()
-    } else {
-        let current = usage.seven_day.percent_used;
-        let baseline = stats.seven_day_baseline(&from, now).ok().flatten().unwrap_or(current);
-        Some((current - baseline).max(0.0))
-    }
-}
-
-fn is_muted(muted_until: Option<&str>, now: chrono::DateTime<chrono::Utc>) -> bool {
-    match muted_until.and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()) {
-        Some(until) => now < until.with_timezone(&chrono::Utc),
-        None => false,
-    }
 }
 
 // --- Background polling loop: the single owner of business logic ---
