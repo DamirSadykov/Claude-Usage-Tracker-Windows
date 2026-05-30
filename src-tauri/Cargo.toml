@@ -1,6 +1,6 @@
 [package]
 name = "claude-usage-tracker"
-version = "0.3.0"
+version = "0.3.1"
 description = "Claude AI Usage Tracker for Windows"
 authors = ["Damir Sadykov <damir.it.work@gmail.com>"]
 edition = "2021"
@@ -30,3 +30,9 @@ open = "5"
 image = { version = "0.25", default-features = false, features = ["png"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 chrono = { version = "0.4", features = ["serde"] }
+
+# Windows-only: used to remove a stale HKCU\...\Run autostart entry left by
+# older versions (the launch-on-login feature was removed in 0.3.0, but updates
+# don't fire the NSIS uninstall hook that cleared the key — see remove_legacy_autostart).
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"

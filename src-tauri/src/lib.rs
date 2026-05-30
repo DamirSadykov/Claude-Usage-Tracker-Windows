@@ -195,6 +195,40 @@ fn record_diag(app: &AppHandle, kind: &str, summary: &str, detail: String) {
     }
 }
 
+// --- Legacy autostart cleanup ---
+
+/// Remove a stale autostart entry left in the registry by versions that shipped
+/// the launch-on-login feature (<= 0.3.0). The feature is gone, but an in-app /
+/// passive update does not run the NSIS uninstall hook that cleared the
+/// `HKCU\...\Run` value, so an already-enabled autostart would keep launching
+/// the app at login (and keep tripping Kaspersky's PDM heuristic). We delete it
+/// on every startup. The value name matches what tauri-plugin-autostart wrote
+/// (`package_info().name` == productName). Idempotent: an absent value is a
+/// no-op. Deleting our own persistence entry is benign, unlike adding one.
+fn remove_legacy_autostart(app: &AppHandle) {
+    #[cfg(windows)]
+    {
+        use winreg::enums::{HKEY_CURRENT_USER, KEY_SET_VALUE};
+        use winreg::RegKey;
+
+        let name = app.package_info().name.clone();
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        match hkcu
+            .open_subkey_with_flags(r"Software\Microsoft\Windows\CurrentVersion\Run", KEY_SET_VALUE)
+        {
+            Ok(run) => match run.delete_value(&name) {
+                Ok(()) => info!("removed stale autostart Run entry '{}'", name),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => warn!("failed to remove stale autostart Run entry: {}", e),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!("failed to open Run key for autostart cleanup: {}", e),
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = app;
+}
+
 // --- Background polling loop: the single owner of business logic ---
 
 async fn run_cycle(app: &AppHandle, cfg: &AppConfig, auto_started: &mut bool) {
@@ -654,6 +688,9 @@ pub fn run() {
         .setup(|app| {
             let version = app.package_info().version.to_string();
             info!("Claude Usage Tracker v{} starting", version);
+
+            // Clear any stale launch-on-login entry from older versions.
+            remove_legacy_autostart(app.handle());
 
             // Diagnostics: route panics to a marker file in the log dir, and pick
             // up any report left by a crash on the previous run.
