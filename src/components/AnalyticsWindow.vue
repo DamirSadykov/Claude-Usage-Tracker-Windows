@@ -530,6 +530,15 @@ onMounted(load);
   padding: 5px 8px;
   font-size: 12px;
   font-family: var(--segoe);
+  /* Hints the platform to render the dropdown in a dark colour scheme so the
+     OS popup menu (which the WebView can't fully restyle) picks dark fg/bg. */
+  color-scheme: dark;
+}
+/* `<option>` is system-painted on Windows — set explicit colours so the
+   dropdown isn't white-on-white in dark mode. */
+.aw-filters select option {
+  background: #232323;
+  color: #e8e8e8;
 }
 .aw-presets {
   display: inline-flex;
