@@ -36,6 +36,20 @@ Chart.register(
 
 const { t, locale } = useI18n();
 
+// Each Tauri window is a separate WebView; vue-i18n boots from navigator
+// language and doesn't see the popup's saved locale. Read it from the shared
+// store so the analytics window opens in the same language the user picked.
+async function loadLocaleFromStore() {
+  try {
+    const { load: loadStore } = await import("@tauri-apps/plugin-store");
+    const store = await loadStore("settings.json");
+    const saved = await store.get<string>("locale");
+    if (saved) locale.value = saved;
+  } catch {
+    // store missing or unreadable → keep detected default
+  }
+}
+
 interface Totals {
   input: number;
   output: number;
@@ -218,7 +232,15 @@ function renderCharts() {
           },
         ],
       },
-      options: chartOpts("$"),
+      options: {
+        ...chartOpts("$"),
+        plugins: {
+          legend: { display: false },
+          // Default tooltip prints the raw JS number ("$2.90000000000004").
+          // Round it the same way the KPI/list cells do.
+          tooltip: { callbacks: { label: (c) => fmtCost(Number(c.parsed.y) || 0) } },
+        },
+      },
     });
   }
 
@@ -275,7 +297,10 @@ function renderCharts() {
           grid: { color: grid },
           ticks: {
             color: tick,
-            callback: (v: string | number) => (unit === "$" ? "$" + v : fmtTokens(Number(v))),
+            // For cost ticks, round to 2 decimals — Chart.js' auto-ticks emit
+            // raw floats (e.g. 2.90000000000004) which leak into the axis.
+            callback: (v: string | number) =>
+              unit === "$" ? "$" + Number(v).toFixed(2) : fmtTokens(Number(v)),
           },
         },
       },
@@ -333,7 +358,10 @@ function maxCache(rows: SessionUsage[]): number {
 
 watch([dateFrom, dateTo, projectFilter], load);
 watch(locale, () => renderCharts());
-onMounted(load);
+onMounted(async () => {
+  await loadLocaleFromStore();
+  await load();
+});
 </script>
 
 <template>
