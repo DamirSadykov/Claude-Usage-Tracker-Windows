@@ -85,6 +85,7 @@ pub fn parse_line(line: &str) -> Option<CcUsageRow> {
         .get("sessionId")
         .and_then(Value::as_str)
         .map(str::to_string);
+    let project = v.get("cwd").and_then(Value::as_str).and_then(project_name);
     let cost = cost_for(model, input, output, cache_create, cache_read);
 
     Some(CcUsageRow {
@@ -97,7 +98,24 @@ pub fn parse_line(line: &str) -> Option<CcUsageRow> {
         cache_read,
         cost,
         session_id,
+        project,
     })
+}
+
+/// Project label from a working directory: the last path component of a `cwd`
+/// like `D:\projects\app` or `/home/u/app` → `app`. None if empty.
+fn project_name(cwd: &str) -> Option<String> {
+    let name = cwd
+        .trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("")
+        .trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
 }
 
 /// Resolve the Claude config directory: `CLAUDE_CONFIG_DIR` if set, else

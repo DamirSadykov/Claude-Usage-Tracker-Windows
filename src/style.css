@@ -343,6 +343,12 @@ body,
 .icon-btn.spin svg {
     animation: spin 600ms ease;
 }
+/* Pin active: filled accent so the "stays open" state is unmistakable. */
+.icon-btn.pin-on,
+.icon-btn.pin-on:hover {
+    background: var(--accent);
+    color: #fff;
+}
 @keyframes spin {
     from {
         transform: rotate(0);
