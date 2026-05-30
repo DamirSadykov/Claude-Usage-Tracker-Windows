@@ -86,6 +86,18 @@ pub fn parse_line(line: &str) -> Option<CcUsageRow> {
         .and_then(Value::as_str)
         .map(str::to_string);
     let project = v.get("cwd").and_then(Value::as_str).and_then(project_name);
+    // Subagent attribution: `isSidechain=true` marks Task() child turns; the
+    // transcript may also carry `agentName` / `attributionAgent`. The caller
+    // augments this from the file name (agent-*.jsonl) for older transcripts
+    // that lacked the flag.
+    let is_subagent = v.get("isSidechain").and_then(Value::as_bool).unwrap_or(false)
+        || v.get("agentName").is_some()
+        || v.get("agentId").is_some();
+    let agent_name = v
+        .get("agentName")
+        .and_then(Value::as_str)
+        .or_else(|| v.get("attributionAgent").and_then(Value::as_str))
+        .map(str::to_string);
     let cost = cost_for(model, input, output, cache_create, cache_read);
 
     Some(CcUsageRow {
@@ -99,6 +111,8 @@ pub fn parse_line(line: &str) -> Option<CcUsageRow> {
         cost,
         session_id,
         project,
+        is_subagent,
+        agent_name,
     })
 }
 
@@ -152,13 +166,24 @@ fn parse_file(path: &Path) -> Vec<CcUsageRow> {
         Ok(f) => f,
         Err(_) => return Vec::new(),
     };
+    // Files named `agent-<uuid>.jsonl` only hold subagent turns. Use that as a
+    // fallback when individual lines lack the `isSidechain` / `agentName` flags
+    // (older Claude Code transcripts).
+    let from_agent_file = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.starts_with("agent-"))
+        .unwrap_or(false);
     let reader = BufReader::new(file);
     let mut rows = Vec::new();
     for line in reader.lines().map_while(Result::ok) {
         if line.is_empty() {
             continue;
         }
-        if let Some(row) = parse_line(&line) {
+        if let Some(mut row) = parse_line(&line) {
+            if from_agent_file {
+                row.is_subagent = true;
+            }
             rows.push(row);
         }
     }

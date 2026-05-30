@@ -16,7 +16,8 @@ mod forecast;
 mod snapshots;
 
 pub use analytics::{
-    Analytics, DailyPoint, HeatCell, ModelUsage, PeriodCompare, ProjectUsage, SessionUsage, Totals,
+    Analytics, AnalyticsExt, DailyPoint, HeatCell, Insight, ModelUsage, PeriodCompare,
+    ProjectUsage, SessionUsage, SubagentSummary, SubagentUsage, Totals,
 };
 pub use cc_store::CcUsageRow;
 pub use forecast::{ForecastData, TierForecast};
@@ -77,6 +78,14 @@ const MIGRATIONS: &[&str] = &[
     // attribute messages that were already stored before the project column
     // existed (INSERT OR IGNORE alone never revisits them).
     "DELETE FROM cc_files;",
+    // v5 — subagent attribution. `is_subagent` is 1 when the line was produced
+    // by a Task() child (transcript carries isSidechain=true or an agentName /
+    // an `agent-*.jsonl` source path); `agent_name` is the subagent label when
+    // exposed by the transcript. Wiping cc_files forces a re-ingest so existing
+    // rows get backfilled.
+    "ALTER TABLE cc_usage ADD COLUMN is_subagent INTEGER NOT NULL DEFAULT 0;
+     ALTER TABLE cc_usage ADD COLUMN agent_name TEXT;
+     DELETE FROM cc_files;",
 ];
 
 fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -270,6 +279,8 @@ mod tests {
             cost,
             session_id: Some(session.into()),
             project: None,
+            is_subagent: false,
+            agent_name: None,
         }
     }
 

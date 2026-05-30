@@ -248,6 +248,8 @@ mod tests {
             cost: 0.5,
             session_id: Some("s1".into()),
             project: None,
+            is_subagent: false,
+            agent_name: None,
         }])
         .unwrap();
         let now = Utc::now().to_rfc3339();

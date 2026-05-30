@@ -20,6 +20,11 @@ pub struct CcUsageRow {
     /// Working-directory basename the message was produced in (from the
     /// transcript's `cwd`). None for older rows / lines without a cwd.
     pub project: Option<String>,
+    /// True when the line was produced by a Task() subagent (sidechain).
+    pub is_subagent: bool,
+    /// Subagent label exposed by the transcript (`agentName`/`attributionAgent`),
+    /// when present — useful for grouping subagent spend by agent type.
+    pub agent_name: Option<String>,
 }
 
 impl StatsDb {
@@ -32,15 +37,20 @@ impl StatsDb {
         {
             let mut stmt = tx.prepare(
                 "INSERT OR IGNORE INTO cc_usage
-                 (message_id, ts, model, input, output, cache_create, cache_read, cost, session_id, project)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                 (message_id, ts, model, input, output, cache_create, cache_read, cost,
+                  session_id, project, is_subagent, agent_name)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
             )?;
-            // Backfill `project` onto rows stored before the column existed:
-            // INSERT OR IGNORE leaves an existing message untouched, so without
-            // this a re-ingest would never attribute already-stored messages.
+            // Backfill `project` / `is_subagent` / `agent_name` onto rows stored
+            // before those columns existed. INSERT OR IGNORE leaves an existing
+            // message untouched, so without this a re-ingest would never
+            // attribute already-stored messages.
             let mut backfill = tx.prepare(
-                "UPDATE cc_usage SET project = ?2
-                 WHERE message_id = ?1 AND project IS NULL AND ?2 IS NOT NULL",
+                "UPDATE cc_usage
+                    SET project     = COALESCE(project, ?2),
+                        is_subagent = CASE WHEN ?3 = 1 THEN 1 ELSE is_subagent END,
+                        agent_name  = COALESCE(agent_name, ?4)
+                  WHERE message_id = ?1",
             )?;
             for r in rows {
                 inserted += stmt.execute(params![
@@ -54,8 +64,15 @@ impl StatsDb {
                     r.cost,
                     r.session_id,
                     r.project,
+                    r.is_subagent as i64,
+                    r.agent_name,
                 ])?;
-                backfill.execute(params![r.message_id, r.project])?;
+                backfill.execute(params![
+                    r.message_id,
+                    r.project,
+                    r.is_subagent as i64,
+                    r.agent_name,
+                ])?;
             }
         }
         tx.commit()?;

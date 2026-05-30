@@ -309,6 +309,14 @@ function isoDaysAgo(days: number): string {
   return new Date(Date.now() - days * 86400000).toISOString();
 }
 
+async function openDetails() {
+  try {
+    await invoke("open_analytics_window");
+  } catch (e) {
+    console.error("open_analytics_window failed", e);
+  }
+}
+
 async function load() {
   loading.value = true;
   error.value = "";
@@ -475,6 +483,13 @@ onUnmounted(() => {
         <button :class="{ on: metric === 'cost' }" @click="metric = 'cost'">{{ t('metricCost') }}</button>
         <button :class="{ on: metric === 'tokens' }" @click="metric = 'tokens'">{{ t('metricTokens') }}</button>
       </div>
+      <button class="more-btn" @click="openDetails" :title="t('analyticsOpenDetails')">
+        {{ t('analyticsMore') }}
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M7 17 17 7" />
+          <path d="M7 7h10v10" />
+        </svg>
+      </button>
     </div>
 
     <div v-if="error" class="empty">{{ error }}</div>
@@ -625,7 +640,28 @@ onUnmounted(() => {
 .controls {
   display: flex;
   justify-content: space-between;
+  align-items: center;
   gap: 8px;
+  flex-wrap: wrap;
+}
+.more-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 10px;
+  border: 1px solid var(--stroke-strong);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-3);
+  font-size: 13px;
+  font-family: var(--segoe);
+  cursor: pointer;
+  transition: background 120ms, color 120ms, border-color 120ms;
+}
+.more-btn:hover {
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text);
+  border-color: var(--accent);
 }
 
 .seg {

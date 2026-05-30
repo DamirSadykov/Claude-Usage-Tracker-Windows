@@ -583,6 +583,38 @@ async fn get_analytics(
     stats.analytics(&from, &to).map_err(|e| e.to_string())
 }
 
+/// Extended analytics for the standalone dashboard. `project` filters by
+/// working-directory basename (None = all). `top_n` caps the costly-session
+/// lists (per-metric, so cost vs cache_create stay separate).
+#[tauri::command]
+async fn get_analytics_ext(
+    from: String,
+    to: String,
+    project: Option<String>,
+    top_n: Option<usize>,
+    stats: tauri::State<'_, Arc<StatsDb>>,
+) -> Result<stats::AnalyticsExt, String> {
+    stats
+        .analytics_ext(&from, &to, project.as_deref(), top_n.unwrap_or(10))
+        .map_err(|e| e.to_string())
+}
+
+/// Dump the same extended bundle as a pretty-printed JSON string. The dashboard
+/// surfaces this for the "Process with Claude Code" flow — the user copies it
+/// into their CLI to ask for higher-order insights.
+#[tauri::command]
+async fn export_analytics_json(
+    from: String,
+    to: String,
+    project: Option<String>,
+    stats: tauri::State<'_, Arc<StatsDb>>,
+) -> Result<String, String> {
+    let ext = stats
+        .analytics_ext(&from, &to, project.as_deref(), 25)
+        .map_err(|e| e.to_string())?;
+    serde_json::to_string_pretty(&ext).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn get_analytics_compare(
     cur_from: String,
@@ -615,6 +647,19 @@ fn report_issue(store: tauri::State<'_, Arc<DiagStore>>) -> Result<(), String> {
     let url = report::build_issue_url(&report);
     info!("Opening issue page for diag kind={}", report.kind);
     open::that(url).map_err(|e| e.to_string())
+}
+
+/// Show (and focus) the standalone analytics window. It's declared hidden in
+/// tauri.conf and revealed on demand from the popup's "Подробнее" button.
+#[tauri::command]
+fn open_analytics_window(app: AppHandle) {
+    if let Some(win) = app.get_webview_window("analytics") {
+        let _ = win.unminimize();
+        let _ = win.show();
+        let _ = win.set_focus();
+    } else {
+        warn!("analytics window not found");
+    }
 }
 
 /// Opens the folder containing the log file in the OS file manager.
@@ -822,6 +867,9 @@ pub fn run() {
             open_log_dir,
             report_frontend_error,
             set_pin,
+            open_analytics_window,
+            get_analytics_ext,
+            export_analytics_json,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
