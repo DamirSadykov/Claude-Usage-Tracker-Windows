@@ -318,12 +318,13 @@ const prepaidBalance = computed(() => props.usage.prepaid_balance);
       </div>
     </div>
 
-    <!-- Auto-start -->
-    <div v-if="autoStartEnabled" class="auto-start-card">
+    <!-- Auto-start: transient status text or "start session" CTA. Active-session
+         indicator now lives in the status tray under the header. -->
+    <div
+      v-if="autoStartEnabled && (autoStartStatus || !sessionActive)"
+      class="auto-start-card"
+    >
       <span v-if="autoStartStatus" class="auto-status">{{ autoStartStatus }}</span>
-      <span v-else-if="sessionActive" class="auto-status active">
-        <span class="dot"></span> {{ t('sessionActive') }}
-      </span>
       <button v-else class="auto-btn" @click="$emit('manual-start')" :disabled="loading">
         {{ t('startSession') }}
       </button>
@@ -345,10 +346,6 @@ const prepaidBalance = computed(() => props.usage.prepaid_balance);
   display: inline-flex;
   align-items: center;
   gap: 7px;
-}
-
-.auto-status.active {
-  color: var(--success);
 }
 
 .auto-btn {

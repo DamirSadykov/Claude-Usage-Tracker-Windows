@@ -2,7 +2,6 @@ import { createI18n } from "vue-i18n";
 
 const messages = {
   en: {
-    trackingActive: "Tracking active",
     refresh: "Refresh",
     back: "Back",
     settings: "Settings",
@@ -187,7 +186,6 @@ const messages = {
     statusToastIncident: "New Claude incident",
   },
   ru: {
-    trackingActive: "Отслеживание активно",
     refresh: "Обновить",
     back: "Назад",
     settings: "Настройки",
