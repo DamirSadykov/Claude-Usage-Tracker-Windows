@@ -214,6 +214,12 @@ async function loadSettings() {
     }
 }
 
+const pinned = ref(false);
+async function togglePin() {
+    pinned.value = !pinned.value;
+    await invoke("set_pin", { pinned: pinned.value });
+}
+
 async function saveSettings() {
     const { load } = await import("@tauri-apps/plugin-store");
     const store = await load("settings.json");
@@ -729,6 +735,17 @@ onUnmounted(() => {
                         <rect x="4" y="8" width="2.5" height="4" rx="0.5"/>
                         <rect x="7.5" y="5" width="2.5" height="7" rx="0.5"/>
                         <rect x="11" y="9" width="2.5" height="3" rx="0.5"/>
+                    </svg>
+                </button>
+                <button
+                    class="icon-btn"
+                    :class="{ 'pin-on': pinned }"
+                    @click="togglePin"
+                    :title="pinned ? t('pinOn') : t('pin')"
+                >
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M12 17v5" />
+                        <path d="M9 10.76V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v5.76a2 2 0 0 0 .59 1.42l1.12 1.12A1 1 0 0 1 17 15H7a1 1 0 0 1-.71-1.7l1.12-1.12A2 2 0 0 0 9 10.76Z" />
                     </svg>
                 </button>
                 <button

@@ -15,7 +15,9 @@ mod cc_store;
 mod forecast;
 mod snapshots;
 
-pub use analytics::{Analytics, DailyPoint, HeatCell, ModelUsage, PeriodCompare, Totals};
+pub use analytics::{
+    Analytics, DailyPoint, HeatCell, ModelUsage, PeriodCompare, ProjectUsage, SessionUsage, Totals,
+};
 pub use cc_store::CcUsageRow;
 pub use forecast::{ForecastData, TierForecast};
 pub use snapshots::{UsageDelta, UsageSnapshot};
@@ -68,6 +70,13 @@ const MIGRATIONS: &[&str] = &[
         size  INTEGER NOT NULL,
         mtime TEXT NOT NULL
     );",
+    // v3 — per-project attribution. `project` is the working-directory basename
+    // taken from each transcript line's `cwd`; NULL for lines without a cwd.
+    "ALTER TABLE cc_usage ADD COLUMN project TEXT;",
+    // v4 — force a one-time full re-ingest so the `cc_upsert` backfill can
+    // attribute messages that were already stored before the project column
+    // existed (INSERT OR IGNORE alone never revisits them).
+    "DELETE FROM cc_files;",
 ];
 
 fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -260,6 +269,7 @@ mod tests {
             cache_read: 0,
             cost,
             session_id: Some(session.into()),
+            project: None,
         }
     }
 
@@ -363,7 +373,83 @@ mod tests {
         assert_eq!(a.totals.total_tokens, 0);
         assert_eq!(a.totals.cost, 0.0);
         assert!(a.by_model.is_empty());
+        assert!(a.by_project.is_empty());
+        assert!(a.anomalies.is_empty());
         assert!(a.daily.is_empty());
+    }
+
+    #[test]
+    fn analytics_groups_by_project() {
+        let db = mem_db();
+        db.cc_upsert(&[
+            CcUsageRow { project: Some("alpha".into()), ..cc_row("m1", "2026-01-01T10:00:00Z", "claude-opus-4-7", 100, 0, 1.0, "s1") },
+            CcUsageRow { project: Some("alpha".into()), ..cc_row("m2", "2026-01-01T11:00:00Z", "claude-opus-4-7", 200, 0, 2.0, "s2") },
+            CcUsageRow { project: Some("beta".into()),  ..cc_row("m3", "2026-01-01T12:00:00Z", "claude-sonnet-4-5", 50, 0, 0.5, "s3") },
+            CcUsageRow { project: None,                 ..cc_row("m4", "2026-01-01T13:00:00Z", "claude-haiku-4-5", 10, 0, 0.1, "s4") },
+        ])
+        .unwrap();
+
+        let a = db.analytics("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z").unwrap();
+        // ordered by tokens desc: alpha (300, 2 sessions) before beta (50) before None (10)
+        assert_eq!(a.by_project.len(), 3);
+        assert_eq!(a.by_project[0].project.as_deref(), Some("alpha"));
+        assert_eq!(a.by_project[0].total_tokens, 300);
+        assert_eq!(a.by_project[0].sessions, 2);
+        assert_eq!(a.by_project[1].project.as_deref(), Some("beta"));
+        assert!(a.by_project[2].project.is_none());
+    }
+
+    #[test]
+    fn cc_upsert_backfills_null_project() {
+        let db = mem_db();
+        // First seen without a project (e.g. ingested before the column existed).
+        assert_eq!(db.cc_upsert(&[cc_row("m1", "2026-01-01T10:00:00Z", "claude-opus-4-7", 100, 0, 1.0, "s1")]).unwrap(), 1);
+        // Re-ingest of the same message now carries a project: no new insert, but
+        // the stored row gets attributed.
+        let with_proj = CcUsageRow { project: Some("alpha".into()), ..cc_row("m1", "2026-01-01T10:00:00Z", "claude-opus-4-7", 100, 0, 1.0, "s1") };
+        assert_eq!(db.cc_upsert(&[with_proj]).unwrap(), 0, "dedup still ignores the duplicate insert");
+
+        let a = db.analytics("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z").unwrap();
+        assert_eq!(a.by_project.len(), 1);
+        assert_eq!(a.by_project[0].project.as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn analytics_flags_token_outlier_sessions() {
+        let db = mem_db();
+        // Five typical sessions plus one ~1000× larger — only the big one is an outlier.
+        let mut rows = Vec::new();
+        for i in 0..5 {
+            rows.push(cc_row(
+                &format!("s{i}"),
+                "2026-01-01T10:00:00Z",
+                "claude-opus-4-7",
+                100,
+                0,
+                0.1,
+                &format!("sess{i}"),
+            ));
+        }
+        rows.push(cc_row("big", "2026-01-01T12:00:00Z", "claude-opus-4-7", 100_000, 0, 50.0, "sessbig"));
+        db.cc_upsert(&rows).unwrap();
+
+        let a = db.analytics("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z").unwrap();
+        assert_eq!(a.anomalies.len(), 1, "only the outsized session is flagged");
+        assert_eq!(a.anomalies[0].session_id, "sessbig");
+        assert_eq!(a.anomalies[0].total_tokens, 100_000);
+    }
+
+    #[test]
+    fn analytics_no_anomalies_with_thin_history() {
+        let db = mem_db();
+        // Below the MIN_SESSIONS baseline: even a big session isn't flagged.
+        db.cc_upsert(&[
+            cc_row("a", "2026-01-01T10:00:00Z", "claude-opus-4-7", 100, 0, 0.1, "s1"),
+            cc_row("b", "2026-01-01T11:00:00Z", "claude-opus-4-7", 100_000, 0, 50.0, "s2"),
+        ])
+        .unwrap();
+        let a = db.analytics("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z").unwrap();
+        assert!(a.anomalies.is_empty());
     }
 
     // --- daily budget helpers ---
