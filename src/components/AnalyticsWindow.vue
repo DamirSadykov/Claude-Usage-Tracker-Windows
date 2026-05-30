@@ -274,8 +274,22 @@ function renderCharts() {
 }
 
 // --- insight rendering ---
+// vue-i18n doesn't take the full ICU `{n, number, …}` syntax in its default
+// parser, so format numbers in JS before substituting. `cost` → "$X.XX",
+// percent-like fields → integer percent, everything else passed through.
+const PCT_KEYS = new Set(["pct", "share_pct"]);
 function insightText(ins: Insight): string {
-  return t(ins.label_key, ins.params as Record<string, unknown>);
+  const p: Record<string, string | number> = {};
+  for (const [k, v] of Object.entries(ins.params)) {
+    if (typeof v === "number") {
+      if (k === "cost") p[k] = fmtCost(v);
+      else if (PCT_KEYS.has(k)) p[k] = v.toFixed(0);
+      else p[k] = v;
+    } else {
+      p[k] = v as string;
+    }
+  }
+  return t(ins.label_key, p);
 }
 
 // --- export ---
