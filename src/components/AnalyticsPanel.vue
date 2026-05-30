@@ -340,12 +340,28 @@ function isoDaysAgo(days: number): string {
   return new Date(Date.now() - days * 86400000).toISOString();
 }
 
+async function openDetails() {
+  try {
+    await invoke("open_analytics_window");
+  } catch (e) {
+    console.error("open_analytics_window failed", e);
+  }
+}
+
 async function load() {
   loading.value = true;
   error.value = "";
   try {
-    // Pull in any new transcript data first (no-op if disabled or unchanged).
-    await invoke("ingest_cc_usage").catch(() => {});
+    // Kick off ingest in the background — don't block the first render on it.
+    // After a schema migration that wipes cc_files (e.g. v4/v5/v6), the first
+    // ingest re-parses every transcript and can take 10–30s; awaiting it here
+    // would keep the flyout window focused and stop it from auto-hiding to
+    // the tray. When ingest finishes, refresh the panel quietly.
+    invoke("ingest_cc_usage")
+      .then((n) => {
+        if (typeof n === "number" && n > 0) void reload();
+      })
+      .catch(() => {});
     const from = isoDaysAgo(rangeDays.value);
     const to = new Date().toISOString();
     data.value = await invoke<Analytics>("get_analytics", { from, to });
@@ -364,6 +380,24 @@ async function load() {
   } finally {
     loading.value = false;
   }
+}
+
+async function reload() {
+  // Light refresh after a background ingest completed — re-query analytics
+  // without re-triggering ingest or showing a loading spinner.
+  try {
+    const from = isoDaysAgo(rangeDays.value);
+    const to = new Date().toISOString();
+    data.value = await invoke<Analytics>("get_analytics", { from, to });
+    compare.value = await invoke<PeriodCompare>("get_analytics_compare", {
+      curFrom: from,
+      curTo: to,
+      prevFrom: isoDaysAgo(rangeDays.value * 2),
+      prevTo: from,
+    });
+    await nextTick();
+    renderCharts();
+  } catch {}
 }
 
 function renderCharts() {
@@ -506,6 +540,13 @@ onUnmounted(() => {
         <button :class="{ on: metric === 'cost' }" @click="metric = 'cost'">{{ t('metricCost') }}</button>
         <button :class="{ on: metric === 'tokens' }" @click="metric = 'tokens'">{{ t('metricTokens') }}</button>
       </div>
+      <button class="more-btn" @click="openDetails" :title="t('analyticsOpenDetails')">
+        {{ t('analyticsMore') }}
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M7 17 17 7" />
+          <path d="M7 7h10v10" />
+        </svg>
+      </button>
     </div>
 
     <div v-if="error" class="empty">{{ error }}</div>
@@ -677,7 +718,28 @@ onUnmounted(() => {
 .controls {
   display: flex;
   justify-content: space-between;
+  align-items: center;
   gap: 8px;
+  flex-wrap: wrap;
+}
+.more-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 10px;
+  border: 1px solid var(--stroke-strong);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-3);
+  font-size: 13px;
+  font-family: var(--segoe);
+  cursor: pointer;
+  transition: background 120ms, color 120ms, border-color 120ms;
+}
+.more-btn:hover {
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text);
+  border-color: var(--accent);
 }
 
 .seg {

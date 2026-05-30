@@ -6,6 +6,7 @@ import SettingsPanel from "./components/SettingsPanel.vue";
 import UsagePanel from "./components/UsagePanel.vue";
 import MiniPanel from "./components/MiniPanel.vue";
 import AnalyticsPanel from "./components/AnalyticsPanel.vue";
+import AnalyticsWindow from "./components/AnalyticsWindow.vue";
 import FocusControls from "./components/FocusControls.vue";
 import ServiceStatusBar from "./components/ServiceStatusBar.vue";
 import {
@@ -22,6 +23,7 @@ import type { AlertEvent } from "./alertFormat";
 import { useUpdater, initUpdater } from "./updater";
 
 const isMini = window.location.hash === "#mini";
+const isAnalytics = window.location.hash === "#analytics";
 
 export interface UsageTier {
     percent_used: number;
@@ -570,6 +572,7 @@ async function toggleMini() {
 
 onMounted(async () => {
     if (isMini) return; // the mini window self-initializes via MiniPanel
+    if (isAnalytics) return; // the analytics window has its own init flow
 
     await loadSettings();
 
@@ -667,6 +670,7 @@ onUnmounted(() => {
 
 <template>
     <MiniPanel v-if="isMini" />
+    <AnalyticsWindow v-else-if="isAnalytics" />
     <div v-else class="flyout accent-claude">
         <!-- Header -->
         <div class="fly-hd">
