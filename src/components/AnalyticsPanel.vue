@@ -42,6 +42,22 @@ interface ModelUsage {
   cost: number;
   messages: number;
 }
+interface ProjectUsage {
+  project: string | null;
+  total_tokens: number;
+  cost: number;
+  messages: number;
+  sessions: number;
+}
+interface SessionUsage {
+  session_id: string;
+  project: string | null;
+  start: string;
+  end: string;
+  total_tokens: number;
+  cost: number;
+  messages: number;
+}
 interface HeatCell {
   weekday: number;
   hour: number;
@@ -61,6 +77,8 @@ interface Totals {
 interface Analytics {
   daily: DailyPoint[];
   by_model: ModelUsage[];
+  by_project: ProjectUsage[];
+  anomalies: SessionUsage[];
   heatmap: HeatCell[];
   totals: Totals;
 }
@@ -252,6 +270,39 @@ const avgPerSession = computed(() => {
     cost: tot.cost / tot.sessions,
   };
 });
+
+// --- per-project & anomalies ---
+function projectName(p: string | null): string {
+  return p && p.length ? p : t("projectUnknown");
+}
+
+// Largest project value (in the current metric) — scales the proportional bars.
+const projectMax = computed(() => {
+  let max = 0;
+  for (const p of data.value?.by_project ?? []) {
+    const v = metricVal(p.total_tokens, p.cost);
+    if (v > max) max = v;
+  }
+  return max;
+});
+
+// Anomalies are detected server-side by tokens, so the "× average" multiple is
+// always token-based regardless of the metric toggle.
+const avgSessionTokens = computed(() => {
+  const tot = data.value?.totals;
+  return tot && tot.sessions > 0 ? tot.total_tokens / tot.sessions : 0;
+});
+function anomalyRatio(s: SessionUsage): number {
+  return avgSessionTokens.value > 0 ? s.total_tokens / avgSessionTokens.value : 0;
+}
+
+// "2026-05-27T13:57:29Z" → local "05-27 13:57".
+function fmtWhen(iso: string): string {
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return iso;
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
 
 // --- data loading ---
 function isoDaysAgo(days: number): string {
@@ -453,6 +504,22 @@ onUnmounted(() => {
         </div>
       </div>
 
+      <!-- Anomalous spend warning -->
+      <div class="alert-card" v-if="data.anomalies.length">
+        <div class="alert-head">
+          <span class="alert-ic">!</span>
+          <span>{{ t('anomalyBanner', { count: data.anomalies.length }) }}</span>
+        </div>
+        <div class="anomaly-list">
+          <div v-for="s in data.anomalies" :key="s.session_id" class="anomaly-row">
+            <span class="anomaly-when">{{ fmtWhen(s.start) }}</span>
+            <span class="anomaly-proj">{{ projectName(s.project) }}</span>
+            <span class="anomaly-mult">×{{ anomalyRatio(s).toFixed(1) }}</span>
+            <span class="anomaly-val">{{ fmtMetric(s.total_tokens, s.cost) }}</span>
+          </div>
+        </div>
+      </div>
+
       <!-- Usage over time (day / week) -->
       <div class="block">
         <div class="block-head">
@@ -495,6 +562,25 @@ onUnmounted(() => {
               <span class="dot" :style="{ background: modelColor(modelLabel(m.model)) }"></span>
               <span class="legend-name">{{ modelLabel(m.model) }}</span>
               <span class="legend-val">{{ fmtMetric(m.total_tokens, m.cost) }}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- By project -->
+      <div class="block" v-if="data.by_project.length">
+        <div class="block-title">{{ t('analyticsByProject') }}</div>
+        <div class="pbars">
+          <div v-for="p in data.by_project" :key="p.project ?? '∅'" class="pbar-row">
+            <div class="pbar-head">
+              <span class="pbar-name">{{ projectName(p.project) }}</span>
+              <span class="pbar-val">{{ fmtMetric(p.total_tokens, p.cost) }}</span>
+            </div>
+            <div class="pbar-track">
+              <div
+                class="pbar-fill"
+                :style="{ width: projectMax ? (metricVal(p.total_tokens, p.cost) / projectMax) * 100 + '%' : '0%' }"
+              ></div>
             </div>
           </div>
         </div>
@@ -717,6 +803,113 @@ onUnmounted(() => {
   margin-left: 36px;
   font-size: 12px;
   color: var(--text-4);
+}
+
+/* Anomalous-spend warning card */
+.alert-card {
+  border: 1px solid rgba(248, 113, 113, 0.4);
+  background: rgba(248, 113, 113, 0.08);
+  border-radius: 8px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.alert-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #f87171;
+}
+.alert-ic {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #f87171;
+  color: #1a1a1a;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  font-size: 13px;
+}
+.anomaly-list {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.anomaly-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+}
+.anomaly-when {
+  color: var(--text-4);
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+.anomaly-proj {
+  color: var(--text-2);
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.anomaly-mult {
+  color: #f87171;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+.anomaly-val {
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+
+/* Per-project proportional bars */
+.pbars {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+.pbar-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  font-size: 14px;
+  margin-bottom: 3px;
+}
+.pbar-name {
+  flex: 1;
+  min-width: 0;
+  color: var(--text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pbar-val {
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+.pbar-track {
+  height: 7px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.06);
+  overflow: hidden;
+}
+.pbar-fill {
+  height: 100%;
+  border-radius: 4px;
+  background: var(--accent);
+  transition: width 200ms;
 }
 
 .empty {

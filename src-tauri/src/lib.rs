@@ -50,6 +50,18 @@ fn tray_icon_for(percent: f64, thresholds: &[f64]) -> Vec<u8> {
 // We record the auto-hide time and ignore re-opens within this window.
 const REOPEN_DEBOUNCE_MS: u64 = 350;
 
+// When pinned, the popup ignores focus-out and stays open until the user
+// dismisses it (tray click or unpin). Shared between the focus-out handler and
+// the `set_pin` command.
+static PINNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Pin/unpin the popup. While pinned it won't auto-hide on focus loss (a click
+/// outside the window), so the user can work in other windows with it open.
+#[tauri::command]
+fn set_pin(pinned: bool) {
+    PINNED.store(pinned, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -775,8 +787,10 @@ pub fn run() {
                         let _ = w.hide();
                     }
                     WindowEvent::Focused(false) => {
-                        win_last_hide.store(now_ms(), Ordering::Relaxed);
-                        let _ = w.hide();
+                        if !PINNED.load(Ordering::Relaxed) {
+                            win_last_hide.store(now_ms(), Ordering::Relaxed);
+                            let _ = w.hide();
+                        }
                     }
                     _ => {}
                 });
@@ -807,6 +821,7 @@ pub fn run() {
             report_issue,
             open_log_dir,
             report_frontend_error,
+            set_pin,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

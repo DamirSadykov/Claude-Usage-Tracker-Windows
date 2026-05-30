@@ -247,6 +247,7 @@ mod tests {
             cache_read: 0,
             cost: 0.5,
             session_id: Some("s1".into()),
+            project: None,
         }])
         .unwrap();
         let now = Utc::now().to_rfc3339();
