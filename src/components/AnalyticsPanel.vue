@@ -130,14 +130,45 @@ function modelLabel(m: string): string {
   return ver ? `${fam} ${ver[1]}.${ver[2]}` : fam;
 }
 
-const MODEL_COLORS: Record<string, string> = {
-  Opus: "#d97757",
-  Sonnet: "#6ccb5f",
-  Haiku: "#5b9bd5",
+// Each family anchors a hue; individual versions within a family get distinct
+// shades around that hue, so "Opus 4.7" and "Opus 4.8" read as different
+// colours while still grouping visually by family. [h, s, l] of the base shade.
+const FAMILY_HSL: Record<string, [number, number, number]> = {
+  Opus: [16, 63, 59], // #d97757
+  Sonnet: [113, 50, 58], // #6ccb5f
+  Haiku: [209, 58, 59], // #5b9bd5
 };
+const FALLBACK_HSL: [number, number, number] = [220, 8, 62];
+
+// Build a stable label→colour map from the models actually present. Versions
+// in a family are sorted and spread across a lightness (and slight hue) range
+// so every model gets its own colour, not one shared per family.
+const modelColorMap = computed<Record<string, string>>(() => {
+  const families = new Map<string, string[]>();
+  for (const m of data.value?.by_model ?? []) {
+    const label = modelLabel(m.model);
+    const fam = label.split(" ")[0];
+    const list = families.get(fam) ?? [];
+    if (!list.includes(label)) list.push(label);
+    families.set(fam, list);
+  }
+  const map: Record<string, string> = {};
+  for (const [fam, labels] of families) {
+    labels.sort();
+    const [h, s, l] = FAMILY_HSL[fam] ?? FALLBACK_HSL;
+    const n = labels.length;
+    labels.forEach((label, i) => {
+      // Symmetric spread around the base: single model keeps the base shade.
+      const t = n === 1 ? 0 : i / (n - 1) - 0.5; // -0.5 … +0.5
+      const light = Math.round(l + t * 30);
+      const hue = Math.round(h + t * 16);
+      map[label] = `hsl(${hue} ${s}% ${light}%)`;
+    });
+  }
+  return map;
+});
 function modelColor(label: string): string {
-  const fam = label.split(" ")[0];
-  return MODEL_COLORS[fam] ?? "#9aa0a6";
+  return modelColorMap.value[label] ?? `hsl(${FALLBACK_HSL[0]} ${FALLBACK_HSL[1]}% ${FALLBACK_HSL[2]}%)`;
 }
 
 // Token components. cache_read is muted — it's the cheap per-turn re-read of
@@ -532,21 +563,42 @@ onUnmounted(() => {
         <div class="chart-wrap"><canvas ref="dailyCanvas"></canvas></div>
       </div>
 
-      <!-- Token breakdown (tokens mode) — rows toggle their layer in the chart -->
+      <!-- Token breakdown (tokens mode) — chips toggle their layer in the chart -->
       <div class="block" v-if="metric === 'tokens'">
-        <div class="block-title">{{ t('tokBreakdown') }}</div>
-        <div class="legend">
+        <div class="block-head">
+          <div class="block-title">{{ t('tokBreakdown') }}</div>
+          <div class="tok-hint">{{ t('tokToggleHint') }}</div>
+        </div>
+        <div class="tok-filters">
           <button
             v-for="b in tokenBreakdown"
             :key="b.key"
             type="button"
-            class="legend-item legend-toggle"
+            class="tok-chip"
             :class="{ off: hiddenTokens.has(b.key) }"
+            :aria-pressed="!hiddenTokens.has(b.key)"
             @click="toggleToken(b.key)"
           >
-            <span class="dot" :style="{ background: b.color }"></span>
-            <span class="legend-name">{{ t(TOKEN_LABEL[b.key]) }}</span>
-            <span class="legend-val">{{ fmtTokens(b.value) }}</span>
+            <span
+              class="tok-check"
+              :style="{
+                background: hiddenTokens.has(b.key) ? 'transparent' : b.color,
+                borderColor: b.color,
+              }"
+            >
+              <svg v-if="!hiddenTokens.has(b.key)" viewBox="0 0 12 12" width="11" height="11">
+                <path
+                  d="M2 6.2l2.6 2.6L10 3.3"
+                  fill="none"
+                  stroke="#fff"
+                  stroke-width="2"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                />
+              </svg>
+            </span>
+            <span class="tok-name">{{ t(TOKEN_LABEL[b.key]) }}</span>
+            <span class="tok-val">{{ fmtTokens(b.value) }}</span>
           </button>
         </div>
         <div class="tok-note">{{ t('tokCacheNote') }}</div>
@@ -744,24 +796,56 @@ onUnmounted(() => {
   font-variant-numeric: tabular-nums;
 }
 
-/* Clickable token-type rows that toggle their layer in the daily chart. */
-.legend-toggle {
-  background: none;
-  border: none;
-  padding: 2px 0;
+/* Clickable token-type chips that toggle their layer in the daily chart. */
+.tok-hint {
+  font-size: 12px;
+  color: var(--text-4);
+}
+.tok-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.tok-chip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px 6px 8px;
+  border: 1px solid var(--stroke-strong);
+  border-radius: 8px;
+  background: var(--card-bg, rgba(255, 255, 255, 0.03));
   font-family: var(--segoe);
-  text-align: left;
+  font-size: 13px;
   cursor: pointer;
-  transition: opacity 120ms;
+  transition: background 120ms, border-color 120ms, opacity 120ms;
 }
-.legend-toggle:hover {
-  opacity: 0.85;
+.tok-chip:hover {
+  border-color: var(--accent);
+  background: rgba(255, 255, 255, 0.06);
 }
-.legend-toggle.off {
-  opacity: 0.4;
+.tok-chip.off {
+  opacity: 0.5;
 }
-.legend-toggle.off .legend-name {
+.tok-chip.off .tok-name {
   text-decoration: line-through;
+}
+.tok-check {
+  width: 16px;
+  height: 16px;
+  border-radius: 4px;
+  border: 1.5px solid;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: background 120ms;
+}
+.tok-name {
+  color: var(--text-2);
+}
+.tok-val {
+  color: var(--text-4);
+  font-variant-numeric: tabular-nums;
 }
 
 .tok-note {
