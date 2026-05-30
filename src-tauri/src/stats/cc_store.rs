@@ -25,6 +25,9 @@ pub struct CcUsageRow {
     /// Subagent label exposed by the transcript (`agentName`/`attributionAgent`),
     /// when present — useful for grouping subagent spend by agent type.
     pub agent_name: Option<String>,
+    /// Tool-use blocks in this message, grouped by tool name (e.g. ("Edit", 3),
+    /// ("Bash", 1)). Empty when the message had no tool calls.
+    pub tool_uses: Vec<(String, i64)>,
 }
 
 impl StatsDb {
@@ -52,6 +55,12 @@ impl StatsDb {
                         agent_name  = COALESCE(agent_name, ?4)
                   WHERE message_id = ?1",
             )?;
+            // Per-message tool-use rows are inserted once per (message_id, tool).
+            // INSERT OR IGNORE so re-ingest of the same transcript line is a no-op.
+            let mut tool_stmt = tx.prepare(
+                "INSERT OR IGNORE INTO cc_tool_use (message_id, tool_name, n)
+                 VALUES (?1, ?2, ?3)",
+            )?;
             for r in rows {
                 inserted += stmt.execute(params![
                     r.message_id,
@@ -73,6 +82,9 @@ impl StatsDb {
                     r.is_subagent as i64,
                     r.agent_name,
                 ])?;
+                for (tool, n) in &r.tool_uses {
+                    tool_stmt.execute(params![r.message_id, tool, n])?;
+                }
             }
         }
         tx.commit()?;

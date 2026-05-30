@@ -250,6 +250,7 @@ mod tests {
             project: None,
             is_subagent: false,
             agent_name: None,
+            tool_uses: Vec::new(),
         }])
         .unwrap();
         let now = Utc::now().to_rfc3339();

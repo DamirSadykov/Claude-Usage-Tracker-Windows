@@ -121,6 +121,9 @@ pub struct Insight {
     /// `params` so a single key supports every locale.
     pub label_key: String,
     pub params: serde_json::Value,
+    /// `observation` = «what happened» (factual cards); `recommendation` =
+    /// «what to change» (actionable, threshold-triggered). UI tabs split on it.
+    pub category: &'static str,
 }
 
 /// Extended analytics bundle for the standalone dashboard window: everything
@@ -143,6 +146,19 @@ pub struct AnalyticsExt {
     pub insights: Vec<Insight>,
     /// Distinct project names present in the window — feeds the UI filter.
     pub projects: Vec<String>,
+    /// Tool-use breakdown over the window: how many times each tool was
+    /// invoked. Empty when the period predates the tool-tracking migration or
+    /// no transcripts in the window have been re-ingested yet.
+    pub tool_breakdown: Vec<ToolUsage>,
+}
+
+/// Aggregate use of one tool (e.g. "Edit", "Bash", "Read") over a window:
+/// total calls and the messages they were spread across.
+#[derive(Debug, Serialize)]
+pub struct ToolUsage {
+    pub tool_name: String,
+    pub calls: i64,
+    pub messages: i64,
 }
 
 fn totals_for(conn: &Connection, from: &str, to: &str) -> Result<Totals, rusqlite::Error> {
@@ -223,7 +239,7 @@ fn sessions_in(
 /// the rest of the window, returned sorted by tokens descending. Needs at least
 /// `MIN_SESSIONS` to have a meaningful baseline; below that, returns empty so a
 /// couple of large early sessions don't all read as "anomalies".
-fn flag_anomalies(sessions: Vec<SessionUsage>) -> Vec<SessionUsage> {
+fn flag_anomalies(sessions: &[SessionUsage]) -> Vec<SessionUsage> {
     const MIN_SESSIONS: usize = 5;
     let n = sessions.len();
     if n < MIN_SESSIONS {
@@ -234,8 +250,9 @@ fn flag_anomalies(sessions: Vec<SessionUsage>) -> Vec<SessionUsage> {
     let var = toks.iter().map(|t| (t - mean).powi(2)).sum::<f64>() / n as f64;
     let threshold = mean + 2.0 * var.sqrt();
     let mut out: Vec<SessionUsage> = sessions
-        .into_iter()
+        .iter()
         .filter(|s| (s.total_tokens as f64) > threshold)
+        .cloned()
         .collect();
     out.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
     out
@@ -339,7 +356,7 @@ impl StatsDb {
         };
 
         let sessions = sessions_in(&conn, from, to, None)?;
-        let anomalies = flag_anomalies(sessions);
+        let anomalies = flag_anomalies(&sessions);
 
         let totals = totals_for(&conn, from, to)?;
         Ok(Analytics {
@@ -560,7 +577,7 @@ impl StatsDb {
         let mut by_cache = sessions.clone();
         by_cache.sort_by(|a, b| b.cache_create.cmp(&a.cache_create));
         by_cache.truncate(top_n);
-        let anomalies = flag_anomalies(sessions);
+        let anomalies = flag_anomalies(&sessions);
 
         // --- distinct project list (for the UI filter) ---
         let projects = {
@@ -575,7 +592,90 @@ impl StatsDb {
             rows
         };
 
-        let insights = build_insights(&totals, &by_project, &by_subagent, &subagent_summary, &daily);
+        // --- cold restarts inside sessions (compact / model switch fingerprint) ---
+        // A "cold turn" has cache_read=0 + meaningful cache_create. The first
+        // turn of any session is naturally cold, so a session with ≥2 cold
+        // turns has at least one mid-session restart (auto-compaction or a
+        // model switch). "cold_cost" sums what was paid to rebuild the cache
+        // on those mid-session restarts — that's the avoidable spend.
+        //
+        // Threshold (cache_create > 10_000) is empirical: scanning all local
+        // transcripts gives post-compact cache_create at median 24K, p25 ~20K,
+        // p10 ~2K (essentially noise). First-turn cache_create medians 15K.
+        // 10K sits between p10 (noise) and p25 (real compactions) and is
+        // smaller than typical first-turn writes, so the ≥2-count filter
+        // reliably excludes "just a normal session start".
+        let cold_restarts = {
+            let mut stmt = prepare_proj(
+                "WITH cold AS (
+                    SELECT session_id, project, COUNT(*) AS n_cold, SUM(cost) AS cold_cost
+                    FROM cc_usage
+                    WHERE ts >= ?1 AND ts < ?2 AND session_id IS NOT NULL
+                      AND cache_read = 0 AND cache_create > 10000{proj}
+                    GROUP BY session_id
+                    HAVING n_cold >= 2
+                 )
+                 SELECT session_id, project, n_cold, cold_cost
+                 FROM cold
+                 ORDER BY cold_cost DESC"
+                    .to_string(),
+            )?;
+            let map_row = |r: &rusqlite::Row| -> Result<(String, Option<String>, i64, f64), rusqlite::Error> {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            };
+            let rows: Vec<(String, Option<String>, i64, f64)> = match project {
+                Some(p) => stmt
+                    .query_map(params![from, to, p], map_row)?
+                    .collect::<Result<Vec<_>, _>>()?,
+                None => stmt
+                    .query_map(params![from, to], map_row)?
+                    .collect::<Result<Vec<_>, _>>()?,
+            };
+            rows
+        };
+
+        // --- tool-use breakdown over the window (project-aware) ---
+        let tool_breakdown = {
+            let mut stmt = prepare_proj(
+                "SELECT tu.tool_name,
+                        COALESCE(SUM(tu.n), 0) AS calls,
+                        COUNT(DISTINCT tu.message_id) AS messages
+                 FROM cc_tool_use tu
+                 JOIN cc_usage cu USING (message_id)
+                 WHERE cu.ts >= ?1 AND cu.ts < ?2{proj}
+                 GROUP BY tu.tool_name
+                 ORDER BY calls DESC"
+                    .to_string(),
+            )?;
+            let map_row = |r: &rusqlite::Row| {
+                Ok(ToolUsage {
+                    tool_name: r.get(0)?,
+                    calls: r.get(1)?,
+                    messages: r.get(2)?,
+                })
+            };
+            match project {
+                Some(p) => stmt
+                    .query_map(params![from, to, p], map_row)?
+                    .collect::<Result<Vec<_>, _>>()?,
+                None => stmt
+                    .query_map(params![from, to], map_row)?
+                    .collect::<Result<Vec<_>, _>>()?,
+            }
+        };
+
+        let efficacy = subagent_efficacy(&conn, from, to, project)?;
+        let insights = build_insights(
+            &totals,
+            &by_project,
+            &by_subagent,
+            &subagent_summary,
+            &daily,
+            &by_model,
+            &sessions,
+            efficacy.as_ref(),
+            &cold_restarts,
+        );
 
         Ok(AnalyticsExt {
             totals,
@@ -589,6 +689,7 @@ impl StatsDb {
             anomalies,
             insights,
             projects,
+            tool_breakdown,
         })
     }
 }
@@ -608,6 +709,76 @@ impl Clone for SessionUsage {
     }
 }
 
+/// Per-session-class spend numbers for the "do subagents pay off?" insight.
+/// Both halves count only MAIN-loop messages (`is_subagent = 0`) so we compare
+/// like-with-like: how much the operator paid on the main thread when they
+/// also ran subagents in that session vs when they didn't.
+struct EfficacyBucket {
+    sessions: i64,
+    main_msgs: i64,
+    main_cost: f64,
+}
+struct SubagentEfficacy {
+    with_sub: EfficacyBucket,
+    without_sub: EfficacyBucket,
+}
+
+/// Bucket sessions by "ran a subagent at least once" and compute main-loop
+/// cost-per-message in each bucket. Returns None when either bucket is too
+/// small for a fair comparison (< 3 sessions).
+fn subagent_efficacy(
+    conn: &Connection,
+    from: &str,
+    to: &str,
+    project: Option<&str>,
+) -> Result<Option<SubagentEfficacy>, rusqlite::Error> {
+    let proj_clause = if project.is_some() { " AND project = ?3" } else { "" };
+    let sql = format!(
+        "WITH sess_class AS (
+            SELECT session_id, MAX(is_subagent) AS has_sub
+            FROM cc_usage
+            WHERE ts >= ?1 AND ts < ?2 AND session_id IS NOT NULL{proj}
+            GROUP BY session_id
+         )
+         SELECT sc.has_sub,
+                COUNT(DISTINCT cu.session_id),
+                SUM(CASE WHEN cu.is_subagent = 0 THEN 1 ELSE 0 END),
+                COALESCE(SUM(CASE WHEN cu.is_subagent = 0 THEN cu.cost END), 0.0)
+         FROM cc_usage cu
+         JOIN sess_class sc USING (session_id)
+         WHERE cu.ts >= ?1 AND cu.ts < ?2 AND cu.session_id IS NOT NULL{proj}
+         GROUP BY sc.has_sub",
+        proj = proj_clause
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut with_sub = EfficacyBucket { sessions: 0, main_msgs: 0, main_cost: 0.0 };
+    let mut without_sub = EfficacyBucket { sessions: 0, main_msgs: 0, main_cost: 0.0 };
+    let mut handle_row = |r: &rusqlite::Row| -> Result<(), rusqlite::Error> {
+        let has_sub: i64 = r.get(0)?;
+        let bucket = if has_sub == 1 { &mut with_sub } else { &mut without_sub };
+        bucket.sessions = r.get(1)?;
+        bucket.main_msgs = r.get(2)?;
+        bucket.main_cost = r.get(3)?;
+        Ok(())
+    };
+    match project {
+        Some(p) => {
+            let mut rows = stmt.query(params![from, to, p])?;
+            while let Some(row) = rows.next()? { handle_row(row)?; }
+        }
+        None => {
+            let mut rows = stmt.query(params![from, to])?;
+            while let Some(row) = rows.next()? { handle_row(row)?; }
+        }
+    };
+    // Need a fair denominator on both sides — otherwise a single mixed session
+    // would dictate the verdict.
+    if with_sub.sessions < 3 || without_sub.sessions < 3 {
+        return Ok(None);
+    }
+    Ok(Some(SubagentEfficacy { with_sub, without_sub }))
+}
+
 /// Deterministic insight builder. Each rule is a small if-let on aggregates;
 /// keys point at i18n entries so the same insight reads fluently in en/ru.
 fn build_insights(
@@ -616,6 +787,10 @@ fn build_insights(
     by_subagent: &[SubagentUsage],
     subagent: &SubagentSummary,
     daily: &[DailyPoint],
+    by_model: &[ModelUsage],
+    sessions: &[SessionUsage],
+    efficacy: Option<&SubagentEfficacy>,
+    cold_restarts: &[(String, Option<String>, i64, f64)],
 ) -> Vec<Insight> {
     use serde_json::json;
     let mut out = Vec::new();
@@ -629,6 +804,7 @@ fn build_insights(
                 "cost": top.cost,
                 "share_pct": pct(top.cost, totals.cost),
             }),
+            category: "observation",
         });
     }
 
@@ -640,6 +816,7 @@ fn build_insights(
                 kind: "cache_share".into(),
                 label_key: "insightCacheShare".into(),
                 params: json!({ "pct": share }),
+                category: "observation",
             });
         }
     }
@@ -654,6 +831,7 @@ fn build_insights(
                 "messages": subagent.subagent_messages,
                 "sessions": subagent.subagent_sessions,
             }),
+            category: "observation",
         });
     }
     if let Some(top_agent) = by_subagent.iter().next() {
@@ -665,6 +843,7 @@ fn build_insights(
                     "name": top_agent.agent_name,
                     "cost": top_agent.cost,
                 }),
+                category: "observation",
             });
         }
     }
@@ -675,11 +854,223 @@ fn build_insights(
                 kind: "peak_day".into(),
                 label_key: "insightPeakDay".into(),
                 params: json!({ "date": peak.date, "cost": peak.cost }),
+                category: "observation",
             });
         }
     }
 
+    // --- cache churn ---
+    // Cache writes are 12.5× more expensive than reads. When >15% of all cached
+    // input was written (not just read), the operator is invalidating the
+    // prefix often — usually by editing files mid-chat or switching system
+    // prompts. The fix is shorter chats, not "be more careful with edits".
+    let cache_total = totals.cache_create + totals.cache_read;
+    if cache_total > 100_000 {
+        let churn = totals.cache_create as f64 / cache_total as f64 * 100.0;
+        if churn >= 15.0 {
+            // Attribute to the sessions that wrote the most into the cache.
+            let mut top: Vec<&SessionUsage> = sessions.iter().filter(|s| s.cache_create > 0).collect();
+            top.sort_by(|a, b| b.cache_create.cmp(&a.cache_create));
+            out.push(Insight {
+                kind: "cache_churn".into(),
+                label_key: "insightCacheChurn".into(),
+                params: json!({
+                    "churn_pct": churn,
+                    "affected": affected_json(&top, 5),
+                }),
+                category: "recommendation",
+            });
+        }
+    }
+
+    // --- bloated sessions: avg context per message > 150K ---
+    // Each turn reads the full conversation context out of cache. A session
+    // whose average per-turn context is in the >150K zone is exponentially
+    // expensive to continue — a fresh chat would be cheaper.
+    let mut bloated: Vec<&SessionUsage> = sessions
+        .iter()
+        .filter(|s| s.messages > 5 && (s.total_tokens / s.messages.max(1)) > 150_000)
+        .collect();
+    bloated.sort_by(|a, b| {
+        let aa = a.total_tokens / a.messages.max(1);
+        let bb = b.total_tokens / b.messages.max(1);
+        bb.cmp(&aa)
+    });
+    if let Some(top) = bloated.first() {
+        let avg_ctx = top.total_tokens / top.messages.max(1);
+        out.push(Insight {
+            kind: "bloated_session".into(),
+            label_key: "insightBloatedSession".into(),
+            params: json!({
+                "session": top.session_id.chars().take(8).collect::<String>(),
+                "avg_ctx": avg_ctx,
+                "cost": top.cost,
+                "affected": affected_json(&bloated, 5),
+            }),
+            category: "recommendation",
+        });
+    }
+
+    // --- long sessions: > 8h span OR > 300 messages ---
+    // Long sessions accumulate context and pay tail cost on every turn. List
+    // up to 5 worst offenders so the user can pick where to split.
+    let mut long_pairs: Vec<(&SessionUsage, i64)> = sessions
+        .iter()
+        .filter_map(|s| {
+            let hours = parse_duration_hours(&s.start, &s.end).unwrap_or(0);
+            if hours >= 8 || s.messages >= 300 { Some((s, hours)) } else { None }
+        })
+        .collect();
+    long_pairs.sort_by(|a, b| b.1.cmp(&a.1).then(b.0.messages.cmp(&a.0.messages)));
+    if let Some((top_s, top_h)) = long_pairs.first().copied() {
+        let affected: Vec<&SessionUsage> = long_pairs.iter().map(|(s, _)| *s).collect();
+        out.push(Insight {
+            kind: "long_session".into(),
+            label_key: "insightLongSession".into(),
+            params: json!({
+                "session": top_s.session_id.chars().take(8).collect::<String>(),
+                "hours": top_h,
+                "messages": top_s.messages,
+                "cost": top_s.cost,
+                "affected": affected_json(&affected, 5),
+            }),
+            category: "recommendation",
+        });
+    }
+
+    // --- mixed models (Opus only — switching opus-4-6 ↔ opus-4-7 is a real
+    // operator choice; sonnet/opus split is intentional plan-vs-execute). ---
+    let opus_versions: Vec<&str> = by_model
+        .iter()
+        .filter(|m| m.model.to_ascii_lowercase().contains("opus") && m.cost > 0.0)
+        .map(|m| m.model.as_str())
+        .collect();
+    if opus_versions.len() >= 2 {
+        // No per-session model attribution in this struct — fall back to top
+        // sessions by cost so the user has somewhere to start digging.
+        let mut top: Vec<&SessionUsage> = sessions.iter().collect();
+        top.sort_by(|a, b| b.cost.partial_cmp(&a.cost).unwrap_or(std::cmp::Ordering::Equal));
+        out.push(Insight {
+            kind: "mixed_models".into(),
+            label_key: "insightMixedModels".into(),
+            params: json!({
+                "models": opus_versions.join(", "),
+                "count": opus_versions.len(),
+                "affected": affected_json(&top, 5),
+            }),
+            category: "recommendation",
+        });
+    }
+
+    // --- cold restarts inside sessions ---
+    // A session's first turn is naturally cold; ≥2 cold turns mean at least
+    // one mid-session restart (auto-compaction or model switch). Sum the cost
+    // of those cold turns — that's the avoidable spend.
+    if !cold_restarts.is_empty() {
+        let total_cold_cost: f64 = cold_restarts.iter().map(|(_, _, _, c)| c).sum();
+        let total_restarts: i64 = cold_restarts
+            .iter()
+            .map(|(_, _, n, _)| n.saturating_sub(1))
+            .sum();
+        if total_restarts > 0 {
+            let affected: Vec<serde_json::Value> = cold_restarts
+                .iter()
+                .take(5)
+                .map(|(sid, proj, _, cost)| {
+                    json!({
+                        "session_id": sid,
+                        "project": proj,
+                        "cost": cost,
+                    })
+                })
+                .collect();
+            out.push(Insight {
+                kind: "cold_restarts".into(),
+                label_key: "insightColdRestarts".into(),
+                params: json!({
+                    "restarts": total_restarts,
+                    "sessions": cold_restarts.len(),
+                    "cost": total_cold_cost,
+                    "affected": serde_json::Value::Array(affected),
+                }),
+                category: "recommendation",
+            });
+        }
+    }
+
+    // --- subagent efficacy ---
+    // "Does spawning a subagent pay off?" — compare main-loop cost-per-message
+    // in sessions that ran ≥1 subagent vs sessions that didn't. Report only
+    // when the delta is meaningful (≥20% one way or the other).
+    if let Some(eff) = efficacy {
+        let with_rate = if eff.with_sub.main_msgs > 0 {
+            eff.with_sub.main_cost / eff.with_sub.main_msgs as f64
+        } else {
+            0.0
+        };
+        let without_rate = if eff.without_sub.main_msgs > 0 {
+            eff.without_sub.main_cost / eff.without_sub.main_msgs as f64
+        } else {
+            0.0
+        };
+        if with_rate > 0.0 && without_rate > 0.0 {
+            let delta_pct = (with_rate - without_rate) / without_rate * 100.0;
+            if delta_pct.abs() >= 20.0 {
+                // Negative delta = subagents reduced main-loop cost/msg → "help".
+                let label_key = if delta_pct < 0.0 {
+                    "insightSubagentEfficacyHelp"
+                } else {
+                    "insightSubagentEfficacyHurt"
+                };
+                // The "affected" list here surfaces the priciest sessions in
+                // the period regardless of bucket — the user can cross-reference
+                // them with the by-subagent table to see which had subagents.
+                let mut top: Vec<&SessionUsage> = sessions.iter().collect();
+                top.sort_by(|a, b| b.cost.partial_cmp(&a.cost).unwrap_or(std::cmp::Ordering::Equal));
+                out.push(Insight {
+                    kind: "subagent_efficacy".into(),
+                    label_key: label_key.into(),
+                    params: json!({
+                        "delta_pct": delta_pct.abs(),
+                        "with_rate": with_rate,
+                        "without_rate": without_rate,
+                        "with_sessions": eff.with_sub.sessions,
+                        "without_sessions": eff.without_sub.sessions,
+                        "affected": affected_json(&top, 5),
+                    }),
+                    category: "recommendation",
+                });
+            }
+        }
+    }
+
     out
+}
+
+/// Compact JSON list of sessions for the UI to render under a recommendation
+/// ("which sessions caused this?"). Capped at `n` and includes only the fields
+/// the dashboard actually displays: session_id, project, cost.
+fn affected_json(sessions: &[&SessionUsage], n: usize) -> serde_json::Value {
+    use serde_json::json;
+    let arr: Vec<serde_json::Value> = sessions
+        .iter()
+        .take(n)
+        .map(|s| json!({
+            "session_id": s.session_id,
+            "project": s.project,
+            "cost": s.cost,
+        }))
+        .collect();
+    serde_json::Value::Array(arr)
+}
+
+/// Hours between two RFC3339 timestamps, integer-truncated. None on parse error.
+fn parse_duration_hours(start: &str, end: &str) -> Option<i64> {
+    let s = chrono::DateTime::parse_from_rfc3339(start).ok()?;
+    let e = chrono::DateTime::parse_from_rfc3339(end).ok()?;
+    let secs = (e - s).num_seconds();
+    if secs < 0 { return Some(0); }
+    Some(secs / 3600)
 }
 
 fn pct(part: f64, total: f64) -> f64 {

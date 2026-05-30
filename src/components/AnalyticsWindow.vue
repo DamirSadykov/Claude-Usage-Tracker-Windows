@@ -111,6 +111,12 @@ interface Insight {
   kind: string;
   label_key: string;
   params: Record<string, unknown>;
+  category: "observation" | "recommendation";
+}
+interface ToolUsage {
+  tool_name: string;
+  calls: number;
+  messages: number;
 }
 interface AnalyticsExt {
   totals: Totals;
@@ -124,6 +130,7 @@ interface AnalyticsExt {
   anomalies: SessionUsage[];
   insights: Insight[];
   projects: string[];
+  tool_breakdown: ToolUsage[];
 }
 
 // --- filters ---
@@ -310,15 +317,19 @@ function renderCharts() {
 
 // --- insight rendering ---
 // vue-i18n doesn't take the full ICU `{n, number, …}` syntax in its default
-// parser, so format numbers in JS before substituting. `cost` → "$X.XX",
-// percent-like fields → integer percent, everything else passed through.
-const PCT_KEYS = new Set(["pct", "share_pct"]);
+// parser, so format numbers in JS before substituting. `cost`/`*_rate` →
+// "$X.XX" (rate is also dollars: $/msg). Percent-like fields → integer
+// percent. `avg_ctx` → compact token form. Everything else passed through.
+const PCT_KEYS = new Set(["pct", "share_pct", "churn_pct", "delta_pct"]);
+const COST_KEYS = new Set(["cost", "with_rate", "without_rate"]);
+const TOK_KEYS = new Set(["avg_ctx"]);
 function insightText(ins: Insight): string {
   const p: Record<string, string | number> = {};
   for (const [k, v] of Object.entries(ins.params)) {
     if (typeof v === "number") {
-      if (k === "cost") p[k] = fmtCost(v);
+      if (COST_KEYS.has(k)) p[k] = fmtCost(v);
       else if (PCT_KEYS.has(k)) p[k] = v.toFixed(0);
+      else if (TOK_KEYS.has(k)) p[k] = fmtTokens(v);
       else p[k] = v;
     } else {
       p[k] = v as string;
@@ -356,10 +367,116 @@ function maxCache(rows: SessionUsage[]): number {
   return rows.reduce((m, r) => (r.cache_create > m ? r.cache_create : m), 0);
 }
 
+// --- insight tabs ---
+// Backend tags each insight as `observation` (factual) or `recommendation`
+// (actionable). Default to Recommendations because they're the reason a user
+// opens the dashboard. If a period has none, fall through to Findings.
+const insightTab = ref<"observation" | "recommendation">("recommendation");
+
+// --- ignored insights (persisted) ---
+// Stored as an array of kind strings in settings.json. Anything in here is
+// hidden from the active list and exposed in a separate "Скрытые" block with
+// a restore button. Persistence keeps the choice across app restarts.
+const ignoredKinds = ref<string[]>([]);
+async function loadIgnored() {
+  try {
+    const { load: loadStore } = await import("@tauri-apps/plugin-store");
+    const store = await loadStore("settings.json");
+    const raw = await store.get<string[]>("ignoredInsights");
+    if (Array.isArray(raw)) ignoredKinds.value = raw;
+  } catch {}
+}
+async function saveIgnored() {
+  try {
+    const { load: loadStore } = await import("@tauri-apps/plugin-store");
+    const store = await loadStore("settings.json");
+    await store.set("ignoredInsights", [...ignoredKinds.value]);
+    await store.save();
+  } catch {}
+}
+function ignoreInsight(kind: string) {
+  if (!ignoredKinds.value.includes(kind)) {
+    ignoredKinds.value = [...ignoredKinds.value, kind];
+    saveIgnored();
+  }
+}
+function restoreInsight(kind: string) {
+  ignoredKinds.value = ignoredKinds.value.filter((k) => k !== kind);
+  saveIgnored();
+}
+
+const observations = computed(() =>
+  (data.value?.insights ?? []).filter(
+    (i) => i.category === "observation" && !ignoredKinds.value.includes(i.kind),
+  ),
+);
+const recommendations = computed(() =>
+  (data.value?.insights ?? []).filter(
+    (i) => i.category === "recommendation" && !ignoredKinds.value.includes(i.kind),
+  ),
+);
+const ignoredInsights = computed(() =>
+  (data.value?.insights ?? []).filter((i) => ignoredKinds.value.includes(i.kind)),
+);
+const activeInsights = computed(() =>
+  insightTab.value === "observation" ? observations.value : recommendations.value,
+);
+// When the period has zero (non-ignored) recs, auto-jump to Findings so the
+// section isn't just an "empty" placeholder on the default tab.
+watch(
+  [() => data.value?.insights, ignoredKinds],
+  () => {
+    if (!data.value?.insights?.length) return;
+    if (recommendations.value.length === 0 && observations.value.length > 0) {
+      insightTab.value = "observation";
+    } else if (recommendations.value.length > 0) {
+      insightTab.value = "recommendation";
+    }
+  },
+  { immediate: false },
+);
+
+// --- affected sessions per insight (expandable list) ---
+interface AffectedSession {
+  session_id: string;
+  project: string | null;
+  cost: number;
+}
+function affectedOf(ins: Insight): AffectedSession[] {
+  const a = (ins.params as Record<string, unknown>)?.affected;
+  return Array.isArray(a) ? (a as AffectedSession[]) : [];
+}
+const expandedAffected = ref<Set<string>>(new Set());
+function toggleAffected(kind: string) {
+  const next = new Set(expandedAffected.value);
+  if (next.has(kind)) next.delete(kind);
+  else next.add(kind);
+  expandedAffected.value = next;
+}
+
+// --- tool breakdown: collapse + search ---
+// Top-3 by default; «подробнее» reveals the long tail. A search box filters
+// across the entire list (search wins over collapse — if there's a query, all
+// matches show regardless of `toolExpanded`).
+const toolExpanded = ref(false);
+const toolSearch = ref("");
+const TOOL_COLLAPSED_N = 3;
+const filteredTools = computed(() => {
+  const q = toolSearch.value.trim().toLowerCase();
+  const all = data.value?.tool_breakdown ?? [];
+  if (q) return all.filter((t) => t.tool_name.toLowerCase().includes(q));
+  return all;
+});
+const visibleTools = computed(() => {
+  if (toolSearch.value.trim()) return filteredTools.value;
+  return toolExpanded.value ? filteredTools.value : filteredTools.value.slice(0, TOOL_COLLAPSED_N);
+});
+
 watch([dateFrom, dateTo, projectFilter], load);
 watch(locale, () => renderCharts());
 onMounted(async () => {
   await loadLocaleFromStore();
+  await loadIgnored();
   await load();
 });
 </script>
@@ -420,12 +537,75 @@ onMounted(async () => {
           </div>
         </section>
 
-        <!-- Insights -->
-        <section v-if="data.insights.length" class="aw-insights">
-          <div v-for="ins in data.insights" :key="ins.kind" class="aw-insight" :data-kind="ins.kind">
-            <span class="aw-insight-tag">{{ t("insight") }}</span>
-            <span>{{ insightText(ins) }}</span>
+        <!-- Insights — tabbed: observations (factual) vs recommendations (actionable) -->
+        <section v-if="data.insights.length" class="aw-insights-block">
+          <div class="aw-tabs">
+            <button
+              class="aw-tab"
+              :class="{ 'aw-tab--active': insightTab === 'recommendation' }"
+              @click="insightTab = 'recommendation'"
+            >
+              {{ t("insightTabRecommendations") }}
+              <span class="aw-tab-count">{{ recommendations.length }}</span>
+            </button>
+            <button
+              class="aw-tab"
+              :class="{ 'aw-tab--active': insightTab === 'observation' }"
+              @click="insightTab = 'observation'"
+            >
+              {{ t("insightTabObservations") }}
+              <span class="aw-tab-count">{{ observations.length }}</span>
+            </button>
           </div>
+          <div v-if="activeInsights.length" class="aw-insights">
+            <div
+              v-for="ins in activeInsights"
+              :key="ins.kind"
+              class="aw-insight"
+              :data-kind="ins.kind"
+              :data-category="ins.category"
+            >
+              <div class="aw-insight-row">
+                <span class="aw-insight-tag">{{ t("insight") }}</span>
+                <span class="aw-insight-text">{{ insightText(ins) }}</span>
+                <button
+                  class="aw-insight-x"
+                  :title="t('ignoreInsight')"
+                  @click="ignoreInsight(ins.kind)"
+                >×</button>
+              </div>
+              <div v-if="affectedOf(ins).length" class="aw-affected">
+                <button class="aw-link-btn" @click="toggleAffected(ins.kind)">
+                  {{ expandedAffected.has(ins.kind) ? t('hideSessions') : t('showAffectedSessions') + ' (' + affectedOf(ins).length + ')' }}
+                </button>
+                <ul v-if="expandedAffected.has(ins.kind)" class="aw-affected-list">
+                  <li v-for="a in affectedOf(ins)" :key="a.session_id" class="aw-affected-item">
+                    <button
+                      class="aw-row-id"
+                      @click="copyId(a.session_id)"
+                      :title="t('copySession') + ': ' + a.session_id"
+                    >{{ shortId(a.session_id) }}</button>
+                    <span class="aw-row-proj">{{ projectName(a.project) }}</span>
+                    <span class="aw-row-val">{{ fmtCost(a.cost) }}</span>
+                  </li>
+                </ul>
+              </div>
+            </div>
+          </div>
+          <div v-else class="aw-insights-empty">{{ t("insightEmpty") }}</div>
+
+          <!-- Hidden insights — restorable -->
+          <details v-if="ignoredInsights.length" class="aw-ignored">
+            <summary>{{ t('hiddenInsights') }} ({{ ignoredInsights.length }})</summary>
+            <div class="aw-ignored-list">
+              <div v-for="ins in ignoredInsights" :key="'h' + ins.kind" class="aw-ignored-row">
+                <span class="aw-ignored-text">{{ insightText(ins) }}</span>
+                <button class="aw-link-btn" @click="restoreInsight(ins.kind)">
+                  {{ t('restore') }}
+                </button>
+              </div>
+            </div>
+          </details>
         </section>
 
         <!-- Charts -->
@@ -469,6 +649,44 @@ onMounted(async () => {
               </tr>
             </tbody>
           </table>
+        </section>
+
+        <!-- Tool breakdown — search + top-3 by default, "Show more" reveals long tail -->
+        <section class="aw-card" v-if="data.tool_breakdown.length">
+          <div class="aw-card-hd">
+            {{ t("toolBreakdown") }}
+            <span class="aw-sub">{{ t("toolBreakdownHint") }}</span>
+            <input
+              v-model="toolSearch"
+              class="aw-search"
+              type="search"
+              :placeholder="t('toolSearchPlaceholder')"
+            />
+          </div>
+          <table v-if="visibleTools.length" class="aw-table">
+            <thead>
+              <tr>
+                <th>{{ t("toolName") }}</th>
+                <th>{{ t("toolCalls") }}</th>
+                <th>{{ t("toolMessages") }}</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="tu in visibleTools" :key="tu.tool_name">
+                <td>{{ tu.tool_name }}</td>
+                <td>{{ tu.calls.toLocaleString() }}</td>
+                <td>{{ tu.messages.toLocaleString() }}</td>
+              </tr>
+            </tbody>
+          </table>
+          <div v-else class="aw-insights-empty">{{ t('toolSearchEmpty') }}</div>
+          <button
+            v-if="!toolSearch.trim() && data.tool_breakdown.length > TOOL_COLLAPSED_N"
+            class="aw-link-btn"
+            @click="toolExpanded = !toolExpanded"
+          >
+            {{ toolExpanded ? t("showLess") : t("showMore") + ' (' + (data.tool_breakdown.length - TOOL_COLLAPSED_N) + ')' }}
+          </button>
         </section>
 
         <!-- Costly sessions -->
@@ -669,6 +887,55 @@ onMounted(async () => {
   margin-top: 4px;
 }
 
+.aw-insights-block {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.aw-tabs {
+  display: flex;
+  gap: 4px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+}
+.aw-tab {
+  background: transparent;
+  border: none;
+  color: rgba(255, 255, 255, 0.55);
+  padding: 8px 14px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.aw-tab:hover {
+  color: rgba(255, 255, 255, 0.85);
+}
+.aw-tab--active {
+  color: #6ccb5f;
+  border-bottom-color: #6ccb5f;
+}
+.aw-tab-count {
+  background: rgba(255, 255, 255, 0.1);
+  color: inherit;
+  border-radius: 10px;
+  padding: 1px 7px;
+  font-size: 10px;
+  font-weight: 700;
+  min-width: 18px;
+  text-align: center;
+}
+.aw-tab--active .aw-tab-count {
+  background: rgba(108, 203, 95, 0.25);
+}
+.aw-insights-empty {
+  color: rgba(255, 255, 255, 0.45);
+  font-size: 12px;
+  padding: 10px 4px;
+  font-style: italic;
+}
 .aw-insights {
   display: flex;
   flex-direction: column;
@@ -681,8 +948,101 @@ onMounted(async () => {
   padding: 8px 12px;
   font-size: 13px;
   display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.aw-insight-row {
+  display: flex;
   align-items: center;
   gap: 10px;
+}
+.aw-insight-text {
+  flex: 1;
+}
+.aw-insight-x {
+  background: transparent;
+  border: none;
+  color: rgba(255, 255, 255, 0.4);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 4px;
+}
+.aw-insight-x:hover {
+  color: rgba(255, 255, 255, 0.85);
+}
+.aw-affected {
+  font-size: 12px;
+  padding-left: 2px;
+}
+.aw-affected-list {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.aw-affected-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 8px;
+  background: rgba(0, 0, 0, 0.15);
+  border-radius: 5px;
+}
+.aw-ignored {
+  border-top: 1px dashed rgba(255, 255, 255, 0.1);
+  padding-top: 8px;
+  font-size: 12px;
+}
+.aw-ignored summary {
+  cursor: pointer;
+  color: rgba(255, 255, 255, 0.55);
+  user-select: none;
+}
+.aw-ignored summary:hover {
+  color: rgba(255, 255, 255, 0.8);
+}
+.aw-ignored-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
+}
+.aw-ignored-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: rgba(255, 255, 255, 0.55);
+  padding: 4px 8px;
+  background: rgba(255, 255, 255, 0.03);
+  border-radius: 5px;
+}
+.aw-ignored-text {
+  flex: 1;
+}
+.aw-search {
+  margin-left: auto;
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: inherit;
+  border-radius: 5px;
+  padding: 4px 10px;
+  font-size: 12px;
+  min-width: 180px;
+}
+.aw-search:focus {
+  outline: none;
+  border-color: rgba(108, 203, 95, 0.5);
+}
+.aw-insight[data-category="recommendation"] {
+  background: rgba(232, 184, 80, 0.08);
+  border-color: rgba(232, 184, 80, 0.4);
+}
+.aw-insight[data-category="recommendation"] .aw-insight-tag {
+  background: rgba(232, 184, 80, 0.3);
+  color: #e8b850;
 }
 .aw-insight-tag {
   background: rgba(108, 203, 95, 0.3);
@@ -694,6 +1054,18 @@ onMounted(async () => {
   letter-spacing: 0.05em;
   font-weight: 700;
   flex-shrink: 0;
+}
+.aw-link-btn {
+  background: transparent;
+  border: none;
+  color: #6ccb5f;
+  font-size: 12px;
+  padding: 8px 0 0;
+  cursor: pointer;
+  text-align: left;
+}
+.aw-link-btn:hover {
+  text-decoration: underline;
 }
 
 .aw-grid {

@@ -99,6 +99,7 @@ pub fn parse_line(line: &str) -> Option<CcUsageRow> {
         .or_else(|| v.get("attributionAgent").and_then(Value::as_str))
         .map(str::to_string);
     let cost = cost_for(model, input, output, cache_create, cache_read);
+    let tool_uses = extract_tool_uses(msg);
 
     Some(CcUsageRow {
         message_id,
@@ -113,7 +114,34 @@ pub fn parse_line(line: &str) -> Option<CcUsageRow> {
         project,
         is_subagent,
         agent_name,
+        tool_uses,
     })
+}
+
+/// Tool-use blocks in an assistant message, grouped by tool name (preserving
+/// occurrence order — first-seen wins for tie-breaking). Empty when the
+/// message had no `tool_use` blocks (text-only reply).
+fn extract_tool_uses(msg: &Value) -> Vec<(String, i64)> {
+    let Some(content) = msg.get("content").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    // Small vec is fine — a single assistant turn rarely emits more than a
+    // handful of distinct tool kinds. Linear scan keeps insertion order.
+    let mut out: Vec<(String, i64)> = Vec::new();
+    for block in content {
+        if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+            continue;
+        }
+        let Some(name) = block.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(entry) = out.iter_mut().find(|(n, _)| n == name) {
+            entry.1 += 1;
+        } else {
+            out.push((name.to_string(), 1));
+        }
+    }
+    out
 }
 
 /// Project label from a working directory: the last path component of a `cwd`
