@@ -405,6 +405,14 @@ pub async fn start_session(
         });
     }
 
+    start_session_unchecked(session_key, org_id, project_id).await
+}
+
+pub async fn start_session_unchecked(
+    session_key: &str,
+    org_id: &str,
+    project_id: &str,
+) -> Result<SessionStartResult, Box<dyn std::error::Error + Send + Sync>> {
     let client = reqwest::Client::new();
     let headers = build_headers(session_key)?;
 

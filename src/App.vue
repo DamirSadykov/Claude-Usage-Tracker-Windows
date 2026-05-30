@@ -128,6 +128,31 @@ interface DiagReport {
 const diag = ref<DiagReport | null>(null);
 const showAnalytics = ref(false);
 const autoStartStatus = ref("");
+let autoStartTimer: ReturnType<typeof setInterval> | null = null;
+function stopAutoStartTimer() {
+    if (autoStartTimer) {
+        clearInterval(autoStartTimer);
+        autoStartTimer = null;
+    }
+}
+function startAutoStartCountdown(firesAtMs: number, attempt: number) {
+    stopAutoStartTimer();
+    const tick = () => {
+        const remaining = Math.max(0, Math.ceil((firesAtMs - Date.now()) / 1000));
+        if (remaining === 0) {
+            stopAutoStartTimer();
+            autoStartStatus.value = t("checkingSession");
+            return;
+        }
+        const prefix =
+            attempt > 1
+                ? t("autoStartRetryIn", { n: attempt })
+                : t("autoStartIn");
+        autoStartStatus.value = `${prefix} ${remaining}${t("secondsShort")}`;
+    };
+    tick();
+    autoStartTimer = setInterval(tick, 500);
+}
 const configured = computed(() => sessionKey.value && orgId.value);
 
 const unlisteners: Array<() => void> = [];
@@ -585,6 +610,7 @@ onMounted(async () => {
             await saveSettings();
         }),
         await listen<boolean>("auto-start-result", (e) => {
+            stopAutoStartTimer();
             autoStartStatus.value = e.payload
                 ? t("sessionAlreadyActive")
                 : t("sessionStarted");
@@ -594,6 +620,23 @@ onMounted(async () => {
         }),
         await listen<string>("auto-start-error", (e) => {
             autoStartStatus.value = t("error") + ": " + String(e.payload);
+        }),
+        await listen<{ fires_at_ms: number; attempt: number; countdown_secs: number }>(
+            "auto-start-pending",
+            (e) => {
+                startAutoStartCountdown(e.payload.fires_at_ms, e.payload.attempt);
+            },
+        ),
+        await listen<{ reason: string }>("auto-start-cancelled", (e) => {
+            stopAutoStartTimer();
+            if (e.payload.reason === "max-attempts") {
+                autoStartStatus.value = t("autoStartGaveUp");
+                setTimeout(() => {
+                    autoStartStatus.value = "";
+                }, 5000);
+            } else {
+                autoStartStatus.value = "";
+            }
         }),
         await listen("open-settings", () => {
             showSettings.value = true;
