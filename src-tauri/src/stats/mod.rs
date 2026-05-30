@@ -16,7 +16,8 @@ mod forecast;
 mod snapshots;
 
 pub use analytics::{
-    Analytics, DailyPoint, HeatCell, ModelUsage, PeriodCompare, ProjectUsage, SessionUsage, Totals,
+    Analytics, AnalyticsExt, DailyPoint, HeatCell, Insight, ModelUsage, PeriodCompare,
+    ProjectUsage, SessionUsage, SubagentSummary, SubagentUsage, ToolUsage, Totals,
 };
 pub use cc_store::CcUsageRow;
 pub use forecast::{ForecastData, TierForecast};
@@ -77,6 +78,26 @@ const MIGRATIONS: &[&str] = &[
     // attribute messages that were already stored before the project column
     // existed (INSERT OR IGNORE alone never revisits them).
     "DELETE FROM cc_files;",
+    // v5 — subagent attribution. `is_subagent` is 1 when the line was produced
+    // by a Task() child (transcript carries isSidechain=true or an agentName /
+    // an `agent-*.jsonl` source path); `agent_name` is the subagent label when
+    // exposed by the transcript. Wiping cc_files forces a re-ingest so existing
+    // rows get backfilled.
+    "ALTER TABLE cc_usage ADD COLUMN is_subagent INTEGER NOT NULL DEFAULT 0;
+     ALTER TABLE cc_usage ADD COLUMN agent_name TEXT;
+     DELETE FROM cc_files;",
+    // v6 — per-message tool-use counts. One row per (message_id, tool_name)
+    // with the call count; we can `SUM(n)` across messages to see how much a
+    // session "wrote" (Edit/Write) vs "read" (Read/Grep) vs "ran" (Bash). Wipe
+    // cc_files so all transcripts re-ingest and back-fill the new table.
+    "CREATE TABLE IF NOT EXISTS cc_tool_use (
+        message_id TEXT NOT NULL,
+        tool_name  TEXT NOT NULL,
+        n          INTEGER NOT NULL,
+        PRIMARY KEY (message_id, tool_name)
+    );
+    CREATE INDEX IF NOT EXISTS idx_cc_tool_use_name ON cc_tool_use(tool_name);
+    DELETE FROM cc_files;",
 ];
 
 fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -270,6 +291,9 @@ mod tests {
             cost,
             session_id: Some(session.into()),
             project: None,
+            is_subagent: false,
+            agent_name: None,
+            tool_uses: Vec::new(),
         }
     }
 

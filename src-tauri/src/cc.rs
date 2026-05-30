@@ -86,7 +86,20 @@ pub fn parse_line(line: &str) -> Option<CcUsageRow> {
         .and_then(Value::as_str)
         .map(str::to_string);
     let project = v.get("cwd").and_then(Value::as_str).and_then(project_name);
+    // Subagent attribution: `isSidechain=true` marks Task() child turns; the
+    // transcript may also carry `agentName` / `attributionAgent`. The caller
+    // augments this from the file name (agent-*.jsonl) for older transcripts
+    // that lacked the flag.
+    let is_subagent = v.get("isSidechain").and_then(Value::as_bool).unwrap_or(false)
+        || v.get("agentName").is_some()
+        || v.get("agentId").is_some();
+    let agent_name = v
+        .get("agentName")
+        .and_then(Value::as_str)
+        .or_else(|| v.get("attributionAgent").and_then(Value::as_str))
+        .map(str::to_string);
     let cost = cost_for(model, input, output, cache_create, cache_read);
+    let tool_uses = extract_tool_uses(msg);
 
     Some(CcUsageRow {
         message_id,
@@ -99,7 +112,36 @@ pub fn parse_line(line: &str) -> Option<CcUsageRow> {
         cost,
         session_id,
         project,
+        is_subagent,
+        agent_name,
+        tool_uses,
     })
+}
+
+/// Tool-use blocks in an assistant message, grouped by tool name (preserving
+/// occurrence order — first-seen wins for tie-breaking). Empty when the
+/// message had no `tool_use` blocks (text-only reply).
+fn extract_tool_uses(msg: &Value) -> Vec<(String, i64)> {
+    let Some(content) = msg.get("content").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    // Small vec is fine — a single assistant turn rarely emits more than a
+    // handful of distinct tool kinds. Linear scan keeps insertion order.
+    let mut out: Vec<(String, i64)> = Vec::new();
+    for block in content {
+        if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+            continue;
+        }
+        let Some(name) = block.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some(entry) = out.iter_mut().find(|(n, _)| n == name) {
+            entry.1 += 1;
+        } else {
+            out.push((name.to_string(), 1));
+        }
+    }
+    out
 }
 
 /// Project label from a working directory: the last path component of a `cwd`
@@ -152,13 +194,24 @@ fn parse_file(path: &Path) -> Vec<CcUsageRow> {
         Ok(f) => f,
         Err(_) => return Vec::new(),
     };
+    // Files named `agent-<uuid>.jsonl` only hold subagent turns. Use that as a
+    // fallback when individual lines lack the `isSidechain` / `agentName` flags
+    // (older Claude Code transcripts).
+    let from_agent_file = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.starts_with("agent-"))
+        .unwrap_or(false);
     let reader = BufReader::new(file);
     let mut rows = Vec::new();
     for line in reader.lines().map_while(Result::ok) {
         if line.is_empty() {
             continue;
         }
-        if let Some(row) = parse_line(&line) {
+        if let Some(mut row) = parse_line(&line) {
+            if from_agent_file {
+                row.is_subagent = true;
+            }
             rows.push(row);
         }
     }

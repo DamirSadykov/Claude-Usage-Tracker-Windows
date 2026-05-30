@@ -21,7 +21,7 @@
         "decorations": false,
         "alwaysOnTop": true,
         "center": true,
-        "visible": true,
+        "visible": false,
         "skipTaskbar": true
       },
       {
@@ -36,6 +36,19 @@
         "visible": false,
         "skipTaskbar": true,
         "transparent": false
+      },
+      {
+        "label": "analytics",
+        "url": "index.html#analytics",
+        "title": "Claude Usage — Analytics",
+        "width": 960,
+        "height": 720,
+        "minWidth": 720,
+        "minHeight": 520,
+        "resizable": true,
+        "decorations": true,
+        "center": true,
+        "visible": false
       }
     ],
     "trayIcon": {
