@@ -21,6 +21,11 @@ interface ServiceStatus {
 
 const { t, locale } = useI18n();
 
+const props = defineProps<{
+    sessionActive: boolean;
+    serviceEnabled: boolean;
+}>();
+
 const status = ref<ServiceStatus | null>(null);
 const reachable = ref(true);
 const expanded = ref(false);
@@ -90,6 +95,8 @@ async function openStatusPage() {
 }
 
 onMounted(async () => {
+    if (!props.serviceEnabled) return;
+
     try {
         const snap = await invoke<{
             status: ServiceStatus | null;
@@ -124,36 +131,52 @@ onUnmounted(() => {
 </script>
 
 <template>
-    <div class="svc" :class="`svc-${level}`">
-        <div
-            class="svc-row"
-            :class="{ clickable: hasIncidents }"
-            @click="toggle"
-        >
-            <span class="svc-dot"></span>
-            <span class="svc-label">{{ label }}</span>
-            <span v-if="hasIncidents" class="svc-count">{{
-                incidents.length
-            }}</span>
-            <span class="svc-spacer"></span>
-            <svg
-                v-if="hasIncidents"
-                class="svc-chev"
-                :class="{ open: expanded }"
-                width="12"
-                height="12"
-                viewBox="0 0 16 16"
-                fill="none"
-                stroke="currentColor"
-                stroke-width="1.5"
+    <div class="svc">
+        <div class="svc-row">
+            <div
+                v-if="serviceEnabled"
+                class="svc-chip"
+                :class="[`svc-${level}`, { clickable: hasIncidents }]"
+                @click="toggle"
             >
-                <path
-                    d="M4 6l4 4 4-4"
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                />
-            </svg>
+                <span class="svc-dot"></span>
+                <span class="svc-label">{{ label }}</span>
+                <span v-if="hasIncidents" class="svc-count">{{
+                    incidents.length
+                }}</span>
+                <svg
+                    v-if="hasIncidents"
+                    class="svc-chev"
+                    :class="{ open: expanded }"
+                    width="12"
+                    height="12"
+                    viewBox="0 0 16 16"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="1.5"
+                >
+                    <path
+                        d="M4 6l4 4 4-4"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                    />
+                </svg>
+            </div>
+
+            <span
+                v-if="serviceEnabled && sessionActive"
+                class="svc-sep"
+            ></span>
+
+            <div v-if="sessionActive" class="svc-chip svc-session">
+                <span class="svc-dot"></span>
+                <span class="svc-label">{{ t("sessionActive") }}</span>
+            </div>
+
+            <span class="svc-spacer"></span>
+
             <button
+                v-if="serviceEnabled"
                 class="svc-link"
                 :title="t('statusOpen')"
                 @click.stop="openStatusPage"
@@ -217,8 +240,24 @@ onUnmounted(() => {
     padding: 7px 10px;
 }
 
-.svc-row.clickable {
+.svc-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    min-width: 0;
+}
+
+.svc-chip.clickable {
     cursor: pointer;
+}
+
+.svc-sep {
+    width: 3px;
+    height: 3px;
+    border-radius: 50%;
+    background: var(--text-4);
+    opacity: 0.6;
+    flex-shrink: 0;
 }
 
 .svc-dot {
@@ -242,18 +281,9 @@ onUnmounted(() => {
     background: #f87171;
 }
 
-/* Tint the whole bar when something is wrong so it draws the eye. */
-.svc-minor {
-    border-color: rgba(255, 193, 7, 0.4);
-    background: rgba(255, 193, 7, 0.08);
-}
-.svc-major {
-    border-color: rgba(217, 119, 87, 0.45);
-    background: rgba(217, 119, 87, 0.1);
-}
-.svc-critical {
-    border-color: rgba(248, 113, 113, 0.5);
-    background: rgba(248, 113, 113, 0.12);
+.svc-session .svc-dot {
+    background: var(--success);
+    box-shadow: 0 0 8px rgba(108, 203, 95, 0.6);
 }
 
 .svc-label {

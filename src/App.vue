@@ -112,6 +112,11 @@ const budgetUnit = computed<"usd" | "pct">(() =>
 const usage = ref<UsageData | null>(null);
 const levels = ref<UsageLevels | null>(null);
 const forecast = ref<ForecastData | null>(null);
+const sessionActive = computed(() => {
+    const fh = usage.value?.five_hour;
+    if (!fh) return false;
+    return fh.percent_used > 0 || fh.reset_at !== null;
+});
 const error = ref("");
 const errorReportable = ref(false);
 const loading = ref(false);
@@ -686,10 +691,6 @@ onUnmounted(() => {
                     </svg>
                     Claude Usage
                 </div>
-                <div class="app-status" v-if="usage && !showSettings">
-                    <span class="dot"></span>
-                    <span>{{ t("trackingActive") }}</span>
-                </div>
             </div>
             <div class="fly-hd-right">
                 <button
@@ -790,8 +791,12 @@ onUnmounted(() => {
 
         <div class="hr"></div>
 
-        <!-- Claude service status (status.claude.com) -->
-        <ServiceStatusBar v-if="serviceStatusEnabled" />
+        <!-- Status tray: Claude service health + 5h session activity -->
+        <ServiceStatusBar
+            v-if="usage && !showSettings && (serviceStatusEnabled || sessionActive)"
+            :service-enabled="serviceStatusEnabled"
+            :session-active="sessionActive"
+        />
 
         <!-- Update banner -->
         <div

@@ -16,7 +16,7 @@
         "label": "main",
         "title": "Claude Usage Tracker",
         "width": 440,
-        "height": 680,
+        "height": 700,
         "resizable": false,
         "decorations": false,
         "alwaysOnTop": true,
