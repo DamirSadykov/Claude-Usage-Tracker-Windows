@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::Timelike;
 use log::{error, info, warn};
@@ -197,7 +197,40 @@ fn record_diag(app: &AppHandle, kind: &str, summary: &str, detail: String) {
 
 // --- Background polling loop: the single owner of business logic ---
 
-async fn run_cycle(app: &AppHandle, cfg: &AppConfig, auto_started: &mut bool) {
+const AUTO_START_COUNTDOWN_SECS: u64 = 10;
+const AUTO_START_RETRY_SECS: u64 = 30;
+const AUTO_START_MAX_ATTEMPTS: u32 = 5;
+
+#[derive(Default)]
+enum AutoStartPhase {
+    #[default]
+    Idle,
+    Pending { fires_at: Instant, attempt: u32 },
+}
+
+#[derive(Default)]
+struct AutoStartCtx {
+    done_this_window: bool,
+    phase: AutoStartPhase,
+}
+
+#[derive(Serialize, Clone)]
+struct AutoStartPendingEvent {
+    fires_at_ms: i64,
+    attempt: u32,
+    countdown_secs: u64,
+}
+
+#[derive(Serialize, Clone)]
+struct AutoStartCancelledEvent {
+    reason: &'static str,
+}
+
+async fn run_cycle(
+    app: &AppHandle,
+    cfg: &AppConfig,
+    ctx: &mut AutoStartCtx,
+) -> Option<Instant> {
     let usage = match usage::fetch_usage(&cfg.session_key, &cfg.org_id).await {
         Ok(u) => u,
         Err(e) => {
@@ -215,7 +248,7 @@ async fn run_cycle(app: &AppHandle, cfg: &AppConfig, auto_started: &mut bool) {
                     reportable: true,
                 },
             );
-            return;
+            return None;
         }
     };
 
@@ -267,18 +300,101 @@ async fn run_cycle(app: &AppHandle, cfg: &AppConfig, auto_started: &mut bool) {
         }
     }
 
-    if cfg.auto_start_session {
-        let active = usage.five_hour.percent_used > 0.0 || usage.five_hour.reset_at.is_some();
-        if active {
-            *auto_started = false;
-        } else if !*auto_started {
-            *auto_started = true;
-            auto_start(app, cfg).await;
+    if !cfg.auto_start_session {
+        if matches!(ctx.phase, AutoStartPhase::Pending { .. }) {
+            ctx.phase = AutoStartPhase::Idle;
+            let _ = app.emit(
+                "auto-start-cancelled",
+                AutoStartCancelledEvent { reason: "disabled" },
+            );
         }
+        ctx.done_this_window = false;
+        return None;
     }
+
+    let active = usage.five_hour.percent_used > 0.0 || usage.five_hour.reset_at.is_some();
+    if active {
+        ctx.done_this_window = false;
+        if matches!(ctx.phase, AutoStartPhase::Pending { .. }) {
+            ctx.phase = AutoStartPhase::Idle;
+            let _ = app.emit(
+                "auto-start-cancelled",
+                AutoStartCancelledEvent { reason: "active" },
+            );
+        }
+        return None;
+    }
+
+    if ctx.done_this_window {
+        return None;
+    }
+
+    let now = Instant::now();
+    let (fires_at, attempt) = match &ctx.phase {
+        AutoStartPhase::Idle => {
+            let fires_at = now + Duration::from_secs(AUTO_START_COUNTDOWN_SECS);
+            let fires_at_ms = chrono::Utc::now().timestamp_millis()
+                + (AUTO_START_COUNTDOWN_SECS as i64) * 1000;
+            ctx.phase = AutoStartPhase::Pending {
+                fires_at,
+                attempt: 1,
+            };
+            let _ = app.emit(
+                "auto-start-pending",
+                AutoStartPendingEvent {
+                    fires_at_ms,
+                    attempt: 1,
+                    countdown_secs: AUTO_START_COUNTDOWN_SECS,
+                },
+            );
+            return Some(fires_at);
+        }
+        AutoStartPhase::Pending { fires_at, attempt } => (*fires_at, *attempt),
+    };
+
+    if now < fires_at {
+        return Some(fires_at);
+    }
+
+    let success = auto_start(app, cfg).await;
+    if success {
+        ctx.done_this_window = true;
+        ctx.phase = AutoStartPhase::Idle;
+        return None;
+    }
+
+    if attempt >= AUTO_START_MAX_ATTEMPTS {
+        ctx.done_this_window = true;
+        ctx.phase = AutoStartPhase::Idle;
+        let _ = app.emit(
+            "auto-start-cancelled",
+            AutoStartCancelledEvent {
+                reason: "max-attempts",
+            },
+        );
+        return None;
+    }
+
+    let next_at = Instant::now() + Duration::from_secs(AUTO_START_RETRY_SECS);
+    let next_at_ms =
+        chrono::Utc::now().timestamp_millis() + (AUTO_START_RETRY_SECS as i64) * 1000;
+    let next_attempt = attempt + 1;
+    ctx.phase = AutoStartPhase::Pending {
+        fires_at: next_at,
+        attempt: next_attempt,
+    };
+    let _ = app.emit(
+        "auto-start-pending",
+        AutoStartPendingEvent {
+            fires_at_ms: next_at_ms,
+            attempt: next_attempt,
+            countdown_secs: AUTO_START_RETRY_SECS,
+        },
+    );
+    Some(next_at)
 }
 
-async fn auto_start(app: &AppHandle, cfg: &AppConfig) {
+async fn auto_start(app: &AppHandle, cfg: &AppConfig) -> bool {
     let mut project_id = cfg.project_id.clone();
     if project_id.is_empty() {
         match usage::ensure_project(&cfg.session_key, &cfg.org_id).await {
@@ -298,14 +414,15 @@ async fn auto_start(app: &AppHandle, cfg: &AppConfig) {
                     format!("ensure_project failed: {}", e),
                 );
                 let _ = app.emit("auto-start-error", e.to_string());
-                return;
+                return false;
             }
         }
     }
-    match usage::start_session(&cfg.session_key, &cfg.org_id, &project_id).await {
+    match usage::start_session_unchecked(&cfg.session_key, &cfg.org_id, &project_id).await {
         Ok(r) => {
             info!("Auto-start session: skipped={}", r.skipped);
             let _ = app.emit("auto-start-result", r.skipped);
+            true
         }
         Err(e) => {
             record_diag(
@@ -315,21 +432,36 @@ async fn auto_start(app: &AppHandle, cfg: &AppConfig) {
                 format!("start_session failed: {}", e),
             );
             let _ = app.emit("auto-start-error", e.to_string());
+            false
         }
     }
 }
 
 fn spawn_poll_loop(app: AppHandle, notify: Arc<Notify>) {
     tauri::async_runtime::spawn(async move {
-        let mut auto_started = false;
+        let mut ctx = AutoStartCtx::default();
         loop {
             let cfg = { app.state::<Mutex<AppConfig>>().lock().unwrap().clone() };
             let interval = cfg.refresh_interval.max(10);
-            if !cfg.session_key.is_empty() && !cfg.org_id.is_empty() {
-                run_cycle(&app, &cfg, &mut auto_started).await;
-            }
+            let next_deadline = if !cfg.session_key.is_empty() && !cfg.org_id.is_empty() {
+                run_cycle(&app, &cfg, &mut ctx).await
+            } else {
+                None
+            };
+            let max_sleep = Duration::from_secs(interval);
+            let sleep_dur = match next_deadline {
+                Some(d) => {
+                    let now = Instant::now();
+                    if d <= now {
+                        Duration::from_millis(50)
+                    } else {
+                        (d - now).min(max_sleep)
+                    }
+                }
+                None => max_sleep,
+            };
             tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(interval)) => {}
+                _ = tokio::time::sleep(sleep_dur) => {}
                 _ = notify.notified() => {}
             }
         }
