@@ -414,9 +414,9 @@ onMounted(async () => {
             <div class="aw-kpi-val">{{ data.totals.sessions }}</div>
             <div class="aw-kpi-lbl">{{ t("analyticsPerSession") }}</div>
           </div>
-          <div class="aw-kpi">
+          <div class="aw-kpi" :title="t('subagentKpiHint')">
             <div class="aw-kpi-val">{{ data.subagent_summary.subagent_messages }}</div>
-            <div class="aw-kpi-lbl">{{ t("subagentMessages") }}</div>
+            <div class="aw-kpi-lbl">{{ t("subagentKpiLabel") }}</div>
           </div>
         </section>
 
