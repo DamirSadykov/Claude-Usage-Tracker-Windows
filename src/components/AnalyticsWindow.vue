@@ -154,7 +154,12 @@ async function load() {
   loading.value = true;
   error.value = "";
   try {
-    await invoke("ingest_cc_usage").catch(() => {});
+    // Kick off ingest in the background — see AnalyticsPanel.vue for context.
+    invoke("ingest_cc_usage")
+      .then((n) => {
+        if (typeof n === "number" && n > 0) void reload();
+      })
+      .catch(() => {});
     data.value = await invoke<AnalyticsExt>("get_analytics_ext", {
       from: fromIso.value,
       to: toIso.value,
@@ -168,6 +173,19 @@ async function load() {
   } finally {
     loading.value = false;
   }
+}
+
+async function reload() {
+  try {
+    data.value = await invoke<AnalyticsExt>("get_analytics_ext", {
+      from: fromIso.value,
+      to: toIso.value,
+      project: projectFilter.value || null,
+      topN: 10,
+    });
+    await nextTick();
+    renderCharts();
+  } catch {}
 }
 
 // --- formatting ---

@@ -352,8 +352,16 @@ async function load() {
   loading.value = true;
   error.value = "";
   try {
-    // Pull in any new transcript data first (no-op if disabled or unchanged).
-    await invoke("ingest_cc_usage").catch(() => {});
+    // Kick off ingest in the background — don't block the first render on it.
+    // After a schema migration that wipes cc_files (e.g. v4/v5/v6), the first
+    // ingest re-parses every transcript and can take 10–30s; awaiting it here
+    // would keep the flyout window focused and stop it from auto-hiding to
+    // the tray. When ingest finishes, refresh the panel quietly.
+    invoke("ingest_cc_usage")
+      .then((n) => {
+        if (typeof n === "number" && n > 0) void reload();
+      })
+      .catch(() => {});
     const from = isoDaysAgo(rangeDays.value);
     const to = new Date().toISOString();
     data.value = await invoke<Analytics>("get_analytics", { from, to });
@@ -372,6 +380,24 @@ async function load() {
   } finally {
     loading.value = false;
   }
+}
+
+async function reload() {
+  // Light refresh after a background ingest completed — re-query analytics
+  // without re-triggering ingest or showing a loading spinner.
+  try {
+    const from = isoDaysAgo(rangeDays.value);
+    const to = new Date().toISOString();
+    data.value = await invoke<Analytics>("get_analytics", { from, to });
+    compare.value = await invoke<PeriodCompare>("get_analytics_compare", {
+      curFrom: from,
+      curTo: to,
+      prevFrom: isoDaysAgo(rangeDays.value * 2),
+      prevTo: from,
+    });
+    await nextTick();
+    renderCharts();
+  } catch {}
 }
 
 function renderCharts() {
