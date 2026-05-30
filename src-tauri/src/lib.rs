@@ -434,6 +434,17 @@ async fn auto_start(app: &AppHandle, cfg: &AppConfig) -> bool {
         Ok(r) => {
             info!("Auto-start session: skipped={}", r.skipped);
             let _ = app.emit("auto-start-result", r.skipped);
+            // Refresh UI immediately so the new active session is visible
+            // without waiting for the next polling interval.
+            if let Ok(usage) = usage::fetch_usage(&cfg.session_key, &cfg.org_id).await {
+                let rgba = tray_icon_for(usage.five_hour.percent_used, &cfg.session_thresholds);
+                if let Some(tray) = app.tray_by_id("main-tray") {
+                    let icon = tauri::image::Image::new_owned(rgba, 32, 32);
+                    let _ = tray.set_icon(Some(icon));
+                }
+                let levels = compute_levels(&usage, cfg);
+                let _ = app.emit("usage-updated", UsageUpdate { usage, levels });
+            }
             true
         }
         Err(e) => {
