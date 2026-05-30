@@ -158,6 +158,16 @@ function fmtTokens(n: number): string {
 function fmtCost(n: number): string {
   return "$" + n.toFixed(2);
 }
+// Sessions are keyed by UUID (the transcript file name). Show a compact form
+// in the table, copy the full id on click so the user can `grep` it.
+function shortId(id: string): string {
+  return id.length > 13 ? id.slice(0, 8) + "…" + id.slice(-4) : id;
+}
+async function copyId(id: string) {
+  try {
+    await navigator.clipboard.writeText(id);
+  } catch {}
+}
 function fmtWhen(iso: string): string {
   const d = new Date(iso);
   if (isNaN(d.getTime())) return iso;
@@ -439,9 +449,16 @@ onMounted(load);
             <div class="aw-card-hd">{{ t("costlyByCost") }}</div>
             <div class="aw-list">
               <div v-for="s in data.costly_by_cost" :key="'c' + s.session_id" class="aw-row">
-                <span class="aw-row-when">{{ fmtWhen(s.start) }}</span>
-                <span class="aw-row-proj">{{ projectName(s.project) }}</span>
-                <span class="aw-row-val">{{ fmtCost(s.cost) }}</span>
+                <div class="aw-row-line">
+                  <span class="aw-row-when">{{ fmtWhen(s.start) }}</span>
+                  <span v-if="!projectFilter" class="aw-row-proj">{{ projectName(s.project) }}</span>
+                  <button
+                    class="aw-row-id"
+                    @click="copyId(s.session_id)"
+                    :title="t('copySession') + ': ' + s.session_id"
+                  >{{ shortId(s.session_id) }}</button>
+                  <span class="aw-row-val">{{ fmtCost(s.cost) }}</span>
+                </div>
                 <div class="aw-row-bar">
                   <span :style="{ width: (maxCost(data.costly_by_cost) ? (s.cost / maxCost(data.costly_by_cost)) * 100 : 0) + '%' }"></span>
                 </div>
@@ -455,9 +472,16 @@ onMounted(load);
             </div>
             <div class="aw-list">
               <div v-for="s in data.costly_by_cache" :key="'k' + s.session_id" class="aw-row">
-                <span class="aw-row-when">{{ fmtWhen(s.start) }}</span>
-                <span class="aw-row-proj">{{ projectName(s.project) }}</span>
-                <span class="aw-row-val">{{ fmtTokens(s.cache_create) }}</span>
+                <div class="aw-row-line">
+                  <span class="aw-row-when">{{ fmtWhen(s.start) }}</span>
+                  <span v-if="!projectFilter" class="aw-row-proj">{{ projectName(s.project) }}</span>
+                  <button
+                    class="aw-row-id"
+                    @click="copyId(s.session_id)"
+                    :title="t('copySession') + ': ' + s.session_id"
+                  >{{ shortId(s.session_id) }}</button>
+                  <span class="aw-row-val">{{ fmtTokens(s.cache_create) }}</span>
+                </div>
                 <div class="aw-row-bar">
                   <span :style="{ width: (maxCache(data.costly_by_cache) ? (s.cache_create / maxCache(data.costly_by_cache)) * 100 : 0) + '%' }"></span>
                 </div>
@@ -705,29 +729,63 @@ onMounted(load);
   gap: 6px;
 }
 .aw-row {
-  display: grid;
-  grid-template-columns: 90px 1fr 70px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 13px;
+}
+.aw-row-line {
+  display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 13px;
 }
 .aw-row-when {
   color: var(--text-4, rgba(255, 255, 255, 0.5));
   font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
 }
 .aw-row-proj {
   color: var(--text-2, rgba(255, 255, 255, 0.85));
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+/* Click-to-copy session id chip. Filter-active rows have no project span, so
+   the chip takes the slack via flex:1 to keep the bar full-width. */
+.aw-row-id {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  color: var(--text-3, rgba(255, 255, 255, 0.7));
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--stroke-strong, rgba(255, 255, 255, 0.12));
+  border-radius: 4px;
+  padding: 2px 7px;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background 120ms, color 120ms, border-color 120ms;
+}
+.aw-row-id:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: var(--text, #e8e8e8);
+  border-color: var(--accent, #d97757);
+}
+.aw-row-proj:has(+ .aw-row-id) {
+  flex: 1;
+}
+.aw-row-line:not(:has(.aw-row-proj)) .aw-row-id {
+  flex: 1;
+  text-align: left;
 }
 .aw-row-val {
   text-align: right;
   font-variant-numeric: tabular-nums;
   color: var(--text-3, rgba(255, 255, 255, 0.7));
+  flex-shrink: 0;
 }
 .aw-row-bar {
-  grid-column: 1 / -1;
   height: 4px;
   background: rgba(255, 255, 255, 0.05);
   border-radius: 3px;
