@@ -664,6 +664,51 @@ impl StatsDb {
             }
         };
 
+        // --- idle cache gaps inside sessions ---
+        // Pair every cc_usage row with its predecessor in the same session via
+        // LAG. A gap of >10 minutes followed by a large cache_create write is
+        // the fingerprint of "user came back after TTL expired and the next
+        // turn rewrote the whole prefix at 1.25× pricing". One such event on a
+        // 300K-context session costs a few dollars of pure overhead.
+        let idle_gaps = {
+            let mut stmt = prepare_proj(
+                "WITH gaps AS (
+                    SELECT session_id, project, ts,
+                           LAG(ts) OVER (PARTITION BY session_id ORDER BY ts) AS prev_ts,
+                           cache_create, cost
+                    FROM cc_usage
+                    WHERE ts >= ?1 AND ts < ?2 AND session_id IS NOT NULL{proj}
+                 ),
+                 cold AS (
+                    SELECT session_id, project,
+                           COUNT(*) AS n_gaps,
+                           SUM(cost) AS wasted_cost,
+                           SUM(cache_create) AS wasted_writes
+                    FROM gaps
+                    WHERE prev_ts IS NOT NULL
+                      AND (julianday(ts) - julianday(prev_ts)) * 86400.0 > 600.0
+                      AND cache_create > 100000
+                    GROUP BY session_id
+                 )
+                 SELECT session_id, project, n_gaps, wasted_cost, wasted_writes
+                 FROM cold
+                 ORDER BY wasted_cost DESC"
+                    .to_string(),
+            )?;
+            let map_row = |r: &rusqlite::Row| -> Result<(String, Option<String>, i64, f64, i64), rusqlite::Error> {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            };
+            let rows: Vec<(String, Option<String>, i64, f64, i64)> = match project {
+                Some(p) => stmt
+                    .query_map(params![from, to, p], map_row)?
+                    .collect::<Result<Vec<_>, _>>()?,
+                None => stmt
+                    .query_map(params![from, to], map_row)?
+                    .collect::<Result<Vec<_>, _>>()?,
+            };
+            rows
+        };
+
         let efficacy = subagent_efficacy(&conn, from, to, project)?;
         let insights = build_insights(
             &totals,
@@ -675,6 +720,8 @@ impl StatsDb {
             &sessions,
             efficacy.as_ref(),
             &cold_restarts,
+            &tool_breakdown,
+            &idle_gaps,
         );
 
         Ok(AnalyticsExt {
@@ -791,6 +838,8 @@ fn build_insights(
     sessions: &[SessionUsage],
     efficacy: Option<&SubagentEfficacy>,
     cold_restarts: &[(String, Option<String>, i64, f64)],
+    tool_breakdown: &[ToolUsage],
+    idle_gaps: &[(String, Option<String>, i64, f64, i64)],
 ) -> Vec<Insight> {
     use serde_json::json;
     let mut out = Vec::new();
@@ -856,6 +905,61 @@ fn build_insights(
                 params: json!({ "date": peak.date, "cost": peak.cost }),
                 category: "observation",
             });
+        }
+    }
+
+    // --- tool-mix rules ---
+    // Surface the existing tool_breakdown aggregate: short sessions are noisy,
+    // so require ≥50 total calls before flagging anything. Edit/Write/MultiEdit
+    // dominating means the operator is barreling through changes without
+    // re-reading; Bash dominating usually means CI/debug work.
+    let total_calls: i64 = tool_breakdown.iter().map(|t| t.calls).sum();
+    if total_calls >= 50 {
+        let writes: i64 = tool_breakdown
+            .iter()
+            .filter(|t| matches!(t.tool_name.as_str(), "Edit" | "Write" | "MultiEdit"))
+            .map(|t| t.calls)
+            .sum();
+        let writes_pct = writes as f64 / total_calls as f64 * 100.0;
+        if writes_pct >= 60.0 {
+            out.push(Insight {
+                kind: "tool_heavy_writes".into(),
+                label_key: "insightToolHeavyWrites".into(),
+                params: json!({ "pct": writes_pct, "total_calls": total_calls }),
+                category: "recommendation",
+            });
+        }
+        let bash: i64 = tool_breakdown
+            .iter()
+            .filter(|t| t.tool_name == "Bash")
+            .map(|t| t.calls)
+            .sum();
+        let bash_pct = bash as f64 / total_calls as f64 * 100.0;
+        if bash_pct >= 40.0 {
+            out.push(Insight {
+                kind: "bash_heavy".into(),
+                label_key: "insightBashHeavy".into(),
+                params: json!({ "pct": bash_pct, "total_calls": total_calls }),
+                category: "observation",
+            });
+        }
+    }
+
+    // --- subagent attribution ---
+    // The by-subagent breakdown groups anonymously-spawned agents under
+    // "<unnamed>". When that bucket dominates, the breakdown stops being
+    // actionable — operator should pass `description` so groups are nameable.
+    if subagent.subagent_cost > 0.0 {
+        if let Some(unnamed) = by_subagent.iter().find(|s| s.agent_name == "<unnamed>") {
+            let share = unnamed.cost / subagent.subagent_cost * 100.0;
+            if share >= 50.0 {
+                out.push(Insight {
+                    kind: "subagent_no_attribution".into(),
+                    label_key: "insightSubagentNoAttribution".into(),
+                    params: json!({ "pct": share, "cost": unnamed.cost }),
+                    category: "recommendation",
+                });
+            }
         }
     }
 
@@ -996,6 +1100,74 @@ fn build_insights(
                 category: "recommendation",
             });
         }
+    }
+
+    // --- idle cache gaps ---
+    // Same input data shape as cold_restarts but a distinct failure mode:
+    // operator left the chat open across the ephemeral-cache TTL (≈5 min),
+    // and the next turn paid 1.25× to recreate the prefix. We require
+    // wasted_writes ≥100K so we don't fire on cheap sessions where rewriting
+    // 30K hardly matters.
+    let significant_gaps: Vec<&(String, Option<String>, i64, f64, i64)> = idle_gaps
+        .iter()
+        .filter(|(_, _, _, _, w)| *w >= 100_000)
+        .collect();
+    if !significant_gaps.is_empty() {
+        let total_wasted: f64 = significant_gaps.iter().map(|(_, _, _, c, _)| c).sum();
+        let total_events: i64 = significant_gaps.iter().map(|(_, _, n, _, _)| n).sum();
+        if total_wasted >= 1.0 {
+            let affected: Vec<serde_json::Value> = significant_gaps
+                .iter()
+                .take(5)
+                .map(|(sid, proj, _, cost, _)| {
+                    json!({
+                        "session_id": sid,
+                        "project": proj,
+                        "cost": cost,
+                    })
+                })
+                .collect();
+            out.push(Insight {
+                kind: "idle_cache_gap".into(),
+                label_key: "insightIdleCacheGap".into(),
+                params: json!({
+                    "events": total_events,
+                    "sessions": significant_gaps.len(),
+                    "cost": total_wasted,
+                    "affected": serde_json::Value::Array(affected),
+                }),
+                category: "recommendation",
+            });
+        }
+    }
+
+    // --- expensive session ---
+    // A single session that ate ≥$50 OR ≥40% of the period's spend (when total
+    // is meaningful, >$5). Complements long_session — that one fires on time
+    // and turn count; this one fires on raw dollar share regardless of length.
+    let expensive: Vec<&SessionUsage> = {
+        let mut v: Vec<&SessionUsage> = sessions
+            .iter()
+            .filter(|s| {
+                s.cost >= 50.0 || (totals.cost > 5.0 && s.cost / totals.cost >= 0.40)
+            })
+            .collect();
+        v.sort_by(|a, b| b.cost.partial_cmp(&a.cost).unwrap_or(std::cmp::Ordering::Equal));
+        v
+    };
+    if let Some(top) = expensive.first() {
+        let share = if totals.cost > 0.0 { top.cost / totals.cost * 100.0 } else { 0.0 };
+        out.push(Insight {
+            kind: "expensive_session".into(),
+            label_key: "insightExpensiveSession".into(),
+            params: json!({
+                "session": top.session_id.chars().take(8).collect::<String>(),
+                "cost": top.cost,
+                "share_pct": share,
+                "affected": affected_json(&expensive, 5),
+            }),
+            category: "observation",
+        });
     }
 
     // --- subagent efficacy ---

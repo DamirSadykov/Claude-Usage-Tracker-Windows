@@ -7,6 +7,8 @@
 import { ref, computed, onMounted, watch, nextTick } from "vue";
 import { useI18n } from "vue-i18n";
 import { invoke } from "@tauri-apps/api/core";
+import { getInsightHelpHtml, hasInsightHelp } from "../insightHelp";
+import { reconcileSectionPrefs, type SectionPref } from "../dashboardSections";
 import {
   Chart,
   BarController,
@@ -472,6 +474,50 @@ function toggleAffected(kind: string) {
   expandedAffected.value = next;
 }
 
+// Per-kind expandable help panel rendered below the insight card. The help
+// bundle is imported at the top of the file; the renderer caches HTML per
+// kind+locale so opening the same card twice is free.
+const expandedHelp = ref<Set<string>>(new Set());
+function toggleHelp(kind: string) {
+  const next = new Set(expandedHelp.value);
+  if (next.has(kind)) next.delete(kind);
+  else next.add(kind);
+  expandedHelp.value = next;
+}
+function helpAvailable(kind: string): boolean {
+  return hasInsightHelp(kind, locale.value);
+}
+function helpHtml(kind: string): string {
+  return getInsightHelpHtml(kind, locale.value);
+}
+
+// --- dashboard layout: section visibility + order ---
+// Persisted in settings.json under `dashboardSections`. Settings panel writes,
+// we read on mount. Visibility is enforced with v-if; order is enforced via
+// CSS `order` on the flex `<main>` container so we don't have to reshuffle the
+// DOM (each section keeps its own Vue keep-alive identity and chart canvas).
+const sectionPrefs = ref<SectionPref[]>(reconcileSectionPrefs(null));
+
+async function loadSectionPrefs() {
+  try {
+    const { load: loadStore } = await import("@tauri-apps/plugin-store");
+    const store = await loadStore("settings.json");
+    const raw = await store.get<unknown>("dashboardSections");
+    sectionPrefs.value = reconcileSectionPrefs(raw);
+  } catch {
+    sectionPrefs.value = reconcileSectionPrefs(null);
+  }
+}
+
+function sectionVisible(id: string): boolean {
+  return sectionPrefs.value.find((s) => s.id === id)?.visible ?? true;
+}
+
+function sectionOrder(id: string): number {
+  const i = sectionPrefs.value.findIndex((s) => s.id === id);
+  return i >= 0 ? i : 999;
+}
+
 // --- tool breakdown: collapse + search ---
 // Top-3 by default; «подробнее» reveals the long tail. A search box filters
 // across the entire list (search wins over collapse — if there's a query, all
@@ -495,6 +541,7 @@ watch(locale, () => renderCharts());
 onMounted(async () => {
   await loadLocaleFromStore();
   await loadIgnored();
+  await loadSectionPrefs();
   await load();
 });
 </script>
@@ -536,7 +583,11 @@ onMounted(async () => {
 
       <template v-else-if="data">
         <!-- KPI summary -->
-        <section class="aw-kpis">
+        <section
+          v-if="sectionVisible('kpi')"
+          :style="{ order: sectionOrder('kpi') }"
+          class="aw-kpis"
+        >
           <div class="aw-kpi">
             <div class="aw-kpi-val">{{ fmtCost(data.totals.cost) }}</div>
             <div class="aw-kpi-lbl">{{ t("analyticsTotal") }}</div>
@@ -556,7 +607,11 @@ onMounted(async () => {
         </section>
 
         <!-- Insights — tabbed: observations (factual) vs recommendations (actionable) -->
-        <section v-if="data.insights.length" class="aw-insights-block">
+        <section
+          v-if="sectionVisible('insights') && data.insights.length"
+          :style="{ order: sectionOrder('insights') }"
+          class="aw-insights-block"
+        >
           <div class="aw-tabs">
             <button
               class="aw-tab"
@@ -587,11 +642,23 @@ onMounted(async () => {
                 <span class="aw-insight-tag">{{ t("insight") }}</span>
                 <span class="aw-insight-text">{{ insightText(ins) }}</span>
                 <button
+                  v-if="helpAvailable(ins.kind)"
+                  class="aw-insight-help"
+                  :title="t(expandedHelp.has(ins.kind) ? 'hideHelp' : 'showHelp')"
+                  :aria-expanded="expandedHelp.has(ins.kind)"
+                  @click="toggleHelp(ins.kind)"
+                >?</button>
+                <button
                   class="aw-insight-x"
                   :title="t('ignoreInsight')"
                   @click="ignoreInsight(ins.kind)"
                 >×</button>
               </div>
+              <div
+                v-if="expandedHelp.has(ins.kind)"
+                class="aw-insight-help-body"
+                v-html="helpHtml(ins.kind)"
+              ></div>
               <div v-if="affectedOf(ins).length" class="aw-affected">
                 <button class="aw-link-btn" @click="toggleAffected(ins.kind)">
                   {{ expandedAffected.has(ins.kind) ? t('hideSessions') : t('showAffectedSessions') + ' (' + affectedOf(ins).length + ')' }}
@@ -627,7 +694,11 @@ onMounted(async () => {
         </section>
 
         <!-- Charts -->
-        <section class="aw-grid">
+        <section
+          v-if="sectionVisible('charts')"
+          :style="{ order: sectionOrder('charts') }"
+          class="aw-grid"
+        >
           <div class="aw-card">
             <div class="aw-card-hd">{{ t("chartCost") }}</div>
             <div class="aw-chart"><canvas ref="costCanvas"></canvas></div>
@@ -639,7 +710,11 @@ onMounted(async () => {
         </section>
 
         <!-- Subagents -->
-        <section class="aw-card" v-if="data.by_subagent.length">
+        <section
+          v-if="sectionVisible('subagents') && data.by_subagent.length"
+          :style="{ order: sectionOrder('subagents') }"
+          class="aw-card"
+        >
           <div class="aw-card-hd">
             {{ t("subagentBreakdown") }}
             <span class="aw-sub">
@@ -670,7 +745,11 @@ onMounted(async () => {
         </section>
 
         <!-- Tool breakdown — search + top-3 by default, "Show more" reveals long tail -->
-        <section class="aw-card" v-if="data.tool_breakdown.length">
+        <section
+          v-if="sectionVisible('tools') && data.tool_breakdown.length"
+          :style="{ order: sectionOrder('tools') }"
+          class="aw-card"
+        >
           <div class="aw-card-hd">
             {{ t("toolBreakdown") }}
             <span class="aw-sub">{{ t("toolBreakdownHint") }}</span>
@@ -708,7 +787,11 @@ onMounted(async () => {
         </section>
 
         <!-- Costly sessions -->
-        <section class="aw-grid">
+        <section
+          v-if="sectionVisible('costly')"
+          :style="{ order: sectionOrder('costly') }"
+          class="aw-grid"
+        >
           <div class="aw-card">
             <div class="aw-card-hd">{{ t("costlyByCost") }}</div>
             <div class="aw-list">
@@ -976,6 +1059,65 @@ onMounted(async () => {
 }
 .aw-insight-text {
   flex: 1;
+}
+.aw-insight-help {
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  color: rgba(255, 255, 255, 0.55);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  cursor: pointer;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.aw-insight-help:hover,
+.aw-insight-help[aria-expanded="true"] {
+  color: rgba(255, 255, 255, 0.95);
+  border-color: rgba(255, 255, 255, 0.55);
+  background: rgba(255, 255, 255, 0.06);
+}
+.aw-insight-help-body {
+  color: rgba(255, 255, 255, 0.78);
+  font-size: 12.5px;
+  line-height: 1.55;
+  padding: 4px 4px 2px;
+  border-top: 1px dashed rgba(255, 255, 255, 0.1);
+  margin-top: 2px;
+}
+.aw-insight-help-body h4 {
+  margin: 10px 0 4px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.95);
+}
+.aw-insight-help-body h4:first-child {
+  margin-top: 0;
+}
+.aw-insight-help-body p {
+  margin: 0 0 8px;
+}
+.aw-insight-help-body ul {
+  margin: 0 0 8px;
+  padding-left: 18px;
+}
+.aw-insight-help-body li {
+  margin-bottom: 3px;
+}
+.aw-insight-help-body code {
+  background: rgba(255, 255, 255, 0.08);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 11.5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.aw-insight-help-body strong {
+  color: rgba(255, 255, 255, 0.95);
 }
 .aw-insight-x {
   background: transparent;
