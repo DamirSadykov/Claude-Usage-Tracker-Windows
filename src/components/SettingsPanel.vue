@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch } from "vue";
+import { ref, watch, computed, onMounted } from "vue";
 import type { Ref } from "vue";
 import { useI18n } from "vue-i18n";
 import {
@@ -10,6 +10,12 @@ import {
 } from "../thresholds";
 import type { AlertTiers, AlertTierKey, AlertTypes, AlertTypeKey } from "../thresholds";
 import { useUpdater } from "../updater";
+import { INSIGHT_KINDS } from "../insightKinds";
+import {
+  DASHBOARD_SECTIONS,
+  reconcileSectionPrefs,
+  type SectionPref,
+} from "../dashboardSections";
 
 const TIER_LABELS: Record<AlertTierKey, string> = {
   five_hour: "session5h",
@@ -29,7 +35,7 @@ const { t } = useI18n();
 
 // Settings are grouped into topic tabs. A future iteration may promote this to
 // a dedicated settings window with the same sections (see issue discussion).
-type SettingsTab = "account" | "limits" | "notifications" | "budget" | "updates";
+type SettingsTab = "account" | "limits" | "notifications" | "budget" | "insights" | "dashboard" | "updates";
 const tab = ref<SettingsTab>("account");
 
 const {
@@ -148,6 +154,102 @@ watch(() => props.serviceStatusInterval, (v) => (localSvcInterval.value = v));
 watch(() => props.serviceStatusNotify, (v) => (localSvcNotify.value = v));
 watch(() => props.locale, (v) => (localLocale.value = v));
 
+// --- Insights toggles ---
+// We mirror AnalyticsWindow.vue's pattern: read/write `ignoredInsights` in
+// settings.json directly, without threading the array through props/save.
+// The toggle in the UI is the *enabled* state — checked = visible = NOT in
+// ignoredInsights.
+const ignoredKinds = ref<string[]>([]);
+
+async function loadIgnoredInsights() {
+  try {
+    const { load: loadStore } = await import("@tauri-apps/plugin-store");
+    const store = await loadStore("settings.json");
+    const raw = await store.get<string[]>("ignoredInsights");
+    if (Array.isArray(raw)) ignoredKinds.value = raw;
+  } catch {}
+}
+
+async function saveIgnoredInsights() {
+  try {
+    const { load: loadStore } = await import("@tauri-apps/plugin-store");
+    const store = await loadStore("settings.json");
+    await store.set("ignoredInsights", [...ignoredKinds.value]);
+    await store.save();
+  } catch {}
+}
+
+function isInsightEnabled(kind: string): boolean {
+  return !ignoredKinds.value.includes(kind);
+}
+
+function toggleInsight(kind: string) {
+  const i = ignoredKinds.value.indexOf(kind);
+  if (i >= 0) ignoredKinds.value.splice(i, 1);
+  else ignoredKinds.value.push(kind);
+  saveIgnoredInsights();
+}
+
+const insightObservations = computed(() =>
+  INSIGHT_KINDS.filter((k) => k.category === "observation"),
+);
+const insightRecommendations = computed(() =>
+  INSIGHT_KINDS.filter((k) => k.category === "recommendation"),
+);
+
+onMounted(loadIgnoredInsights);
+
+// --- Dashboard section prefs ---
+// Stored as a single `dashboardSections` array of {id, visible} preserving
+// order. AnalyticsWindow reads the same key, so reorder/hide is reflected on
+// the next refresh of that window. We never thread this through props/save —
+// it's analytics-window-local config.
+const sectionPrefs = ref<SectionPref[]>([]);
+
+async function loadSectionPrefs() {
+  try {
+    const { load: loadStore } = await import("@tauri-apps/plugin-store");
+    const store = await loadStore("settings.json");
+    const raw = await store.get<unknown>("dashboardSections");
+    sectionPrefs.value = reconcileSectionPrefs(raw);
+  } catch {
+    sectionPrefs.value = reconcileSectionPrefs(null);
+  }
+}
+
+async function saveSectionPrefs() {
+  try {
+    const { load: loadStore } = await import("@tauri-apps/plugin-store");
+    const store = await loadStore("settings.json");
+    await store.set("dashboardSections", JSON.parse(JSON.stringify(sectionPrefs.value)));
+    await store.save();
+  } catch {}
+}
+
+function sectionLabel(id: string): string {
+  const def = DASHBOARD_SECTIONS.find((s) => s.id === id);
+  return def ? t(def.labelKey) : id;
+}
+
+function toggleSection(id: string) {
+  const s = sectionPrefs.value.find((x) => x.id === id);
+  if (!s) return;
+  s.visible = !s.visible;
+  saveSectionPrefs();
+}
+
+function moveSection(id: string, delta: -1 | 1) {
+  const i = sectionPrefs.value.findIndex((s) => s.id === id);
+  const j = i + delta;
+  if (i < 0 || j < 0 || j >= sectionPrefs.value.length) return;
+  const arr = [...sectionPrefs.value];
+  [arr[i], arr[j]] = [arr[j], arr[i]];
+  sectionPrefs.value = arr;
+  saveSectionPrefs();
+}
+
+onMounted(loadSectionPrefs);
+
 // Keep each threshold triple strictly ascending with a 1% gap so the colour
 // bands can't overlap. Fixed slider scale (5..99) + clamping — dynamic min/max
 // would make neighbouring thumbs visually drift when their range changes.
@@ -255,6 +357,33 @@ function handleSave() {
           <path d="M8 4.3v7.4M9.9 6c-.4-.7-1.1-1-1.9-1-1 0-1.8.5-1.8 1.4 0 1.9 3.7 1 3.7 2.9 0 .9-.8 1.4-1.9 1.4-.8 0-1.5-.4-1.9-1" stroke-linecap="round" stroke-linejoin="round" />
         </svg>
         <span>{{ t('tabBudget') }}</span>
+      </button>
+      <button
+        type="button"
+        class="settings-tab"
+        :class="{ active: tab === 'insights' }"
+        @click="tab = 'insights'"
+      >
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4">
+          <path d="M8 2c-2.5 0-4.3 2-4.3 4.3 0 1.6.8 2.7 1.6 3.5.4.4.7.8.7 1.2v.5h4v-.5c0-.4.3-.8.7-1.2.8-.8 1.6-1.9 1.6-3.5C12.3 4 10.5 2 8 2z" stroke-linejoin="round" />
+          <line x1="6.5" y1="13.5" x2="9.5" y2="13.5" stroke-linecap="round" />
+          <line x1="7" y1="14.8" x2="9" y2="14.8" stroke-linecap="round" />
+        </svg>
+        <span>{{ t('tabInsights') }}</span>
+      </button>
+      <button
+        type="button"
+        class="settings-tab"
+        :class="{ active: tab === 'dashboard' }"
+        @click="tab = 'dashboard'"
+      >
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4">
+          <rect x="2.5" y="2.5" width="5" height="6" rx="1" />
+          <rect x="8.5" y="2.5" width="5" height="3" rx="1" />
+          <rect x="2.5" y="9.5" width="5" height="4" rx="1" />
+          <rect x="8.5" y="6.5" width="5" height="7" rx="1" />
+        </svg>
+        <span>{{ t('tabDashboard') }}</span>
       </button>
       <button
         type="button"
@@ -599,6 +728,91 @@ function handleSave() {
       </div>
       </template>
 
+      <!-- ===== Insights ===== -->
+      <template v-if="tab === 'insights'">
+      <div class="card">
+        <div class="field-label">{{ t('insightsSettingsTitle') }}</div>
+        <div class="field-hint" style="margin-top: 0; margin-bottom: 4px">
+          {{ t('insightsSettingsDesc') }}
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="field-label">{{ t('insightTabRecommendations') }}</div>
+        <div
+          v-for="def in insightRecommendations"
+          :key="def.kind"
+          class="tier-row"
+          @click="toggleInsight(def.kind)"
+        >
+          <span class="tier-name">{{ t(def.shortLabelKey) }}</span>
+          <div class="toggle" :class="{ on: isInsightEnabled(def.kind) }">
+            <div class="toggle-knob"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="field-label">{{ t('insightTabObservations') }}</div>
+        <div
+          v-for="def in insightObservations"
+          :key="def.kind"
+          class="tier-row"
+          @click="toggleInsight(def.kind)"
+        >
+          <span class="tier-name">{{ t(def.shortLabelKey) }}</span>
+          <div class="toggle" :class="{ on: isInsightEnabled(def.kind) }">
+            <div class="toggle-knob"></div>
+          </div>
+        </div>
+      </div>
+      </template>
+
+      <!-- ===== Dashboard layout ===== -->
+      <template v-if="tab === 'dashboard'">
+      <div class="card">
+        <div class="field-label">{{ t('dashboardSettingsTitle') }}</div>
+        <div class="field-hint" style="margin-top: 0; margin-bottom: 4px">
+          {{ t('dashboardSettingsDesc') }}
+        </div>
+      </div>
+
+      <div class="card">
+        <div
+          v-for="(pref, idx) in sectionPrefs"
+          :key="pref.id"
+          class="tier-row dash-row"
+        >
+          <div class="dash-order">
+            <button
+              type="button"
+              class="dash-move"
+              :disabled="idx === 0"
+              :title="t('moveUp')"
+              @click="moveSection(pref.id, -1)"
+            >▲</button>
+            <button
+              type="button"
+              class="dash-move"
+              :disabled="idx === sectionPrefs.length - 1"
+              :title="t('moveDown')"
+              @click="moveSection(pref.id, 1)"
+            >▼</button>
+          </div>
+          <span class="tier-name" @click="toggleSection(pref.id)">
+            {{ sectionLabel(pref.id) }}
+          </span>
+          <div
+            class="toggle"
+            :class="{ on: pref.visible }"
+            @click="toggleSection(pref.id)"
+          >
+            <div class="toggle-knob"></div>
+          </div>
+        </div>
+      </div>
+      </template>
+
       <!-- ===== Updates ===== -->
       <template v-if="tab === 'updates'">
       <!-- Updates -->
@@ -750,6 +964,41 @@ function handleSave() {
   gap: 12px;
   padding: 6px 0;
   cursor: pointer;
+}
+.dash-row {
+  cursor: default;
+}
+.dash-row .tier-name {
+  flex: 1;
+  cursor: pointer;
+}
+.dash-order {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 1px;
+  margin-right: 4px;
+}
+.dash-move {
+  background: transparent;
+  border: 1px solid var(--stroke-strong, rgba(255, 255, 255, 0.12));
+  color: rgba(255, 255, 255, 0.75);
+  width: 22px;
+  height: 14px;
+  border-radius: 3px;
+  font-size: 9px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.dash-move:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+.dash-move:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.06);
 }
 
 .cc-note {
