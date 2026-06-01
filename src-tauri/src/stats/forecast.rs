@@ -1,24 +1,54 @@
 //! Exhaustion forecast (issue #7): per-tier burn-rate, ETA to 100% and the
-//! recommended pace to last until reset, derived from the recent snapshots.
+//! recommended pace to last until reset.
+//!
+//! The displayed ETA is driven by a **moving average of hourly burn** over
+//! the past `LOOKBACK_HOURS` (7 days), per the issue #7 spec ("скользящее
+//! среднее с настраиваемым окном"). A median was tried first — it gave the
+//! sensible "1 hot hour doesn't dominate" property — but for typical users
+//! more than half of the 168 weekly hours are idle, so the median sits at 0
+//! and ETA is permanently absent ("хватит до сброса" forever). The mean
+//! correctly amortises real total burn across the whole window: a single
+//! 20%/h spike in a week of zeros becomes 20/168 ≈ 0.12%/h going forward,
+//! which is the honest forward-projection. The short-window rate is still
+//! used by `alerts::engine` for "your 5h session is about to end" — a
+//! different question — and is computed there directly from `compute_delta`.
 
 use chrono::{DateTime, Duration, Utc};
-use rusqlite::{params, OptionalExtension};
+use rusqlite::params;
 use serde::Serialize;
 
 use super::StatsDb;
 
-// Mirror of the burn-rate guards in `alerts.rs`. Duplicated on purpose: `stats`
-// is the lower layer and must not depend on `alerts` (which already depends on
-// `stats`). Keep the two in sync.
-const MIN_SPAN_MIN: f64 = 10.0; // need at least this much history to estimate a rate
-const MIN_RATE: f64 = 0.05; // %/min — below this is noise/flat, no ETA
+// `alerts::engine` keeps its own MIN_RATE (0.05 %/min ≈ 3 %/h) — appropriate
+// for a short-window burn that's about to exhaust the 5h session. For the
+// display forecast we average over a week, so typical burn lands at well under
+// 1 %/h; gating on 3 %/h would suppress every ETA. We let the pace check
+// (eta < ttr) do the "is this worth warning about" filtering instead, and
+// only treat rate=0 as "no ETA".
+
+/// Lookback for the moving-average rate. A full week covers the slowest
+/// reset tier and smooths diurnal/weekly idle patterns into the denominator.
+const LOOKBACK_HOURS: i64 = 7 * 24;
+
+/// An hour bucket counts only if its two endpoints can be sampled from
+/// snapshots no more than this far apart. 3h covers normal usage gaps (a
+/// lunch break, a meeting) without inventing data for genuine off-periods.
+const MAX_INTERP_GAP_MIN: i64 = 180;
+
+/// Forward-fill window for the "right edge of the most recent bucket". The
+/// loop's h=1 bucket ends at `now`, but the latest snapshot is always tens of
+/// seconds older (poll interval ≥ 10s, forecast is called right after the
+/// usage-updated emit). Without this we'd permanently drop the most recent
+/// hour and never reach coverage > 0 for users with little history.
+const FORWARD_FILL_GAP_MIN: i64 = 10;
 
 #[derive(Debug, Serialize, PartialEq)]
 pub struct TierForecast {
-    pub rate_per_hour: f64,            // measured burn, %/h (clamped ≥ 0)
-    pub eta_minutes: Option<f64>,      // minutes to 100% at the measured rate
+    pub rate_per_hour: f64,            // moving-average burn, %/h (clamped ≥ 0)
+    pub eta_minutes: Option<f64>,      // minutes to 100% at the moving-average rate
     pub allowed_per_hour: Option<f64>, // %/h you may still spend to last until reset
-    pub pace: String,                  // "idle" | "ok" | "warn"
+    pub pace: String,                  // "unknown" | "ok" | "warn"
+    pub coverage_hours: u32,           // # hour buckets backing the average
 }
 
 impl TierForecast {
@@ -29,6 +59,7 @@ impl TierForecast {
             eta_minutes: None,
             allowed_per_hour: None,
             pace: "unknown".to_string(),
+            coverage_hours: 0,
         }
     }
 }
@@ -40,51 +71,124 @@ pub struct ForecastData {
     pub extra_usage: Option<TierForecast>,
 }
 
-/// Pure forecast math for one tier. `span_min` is the history span backing the
-/// rate (None when there's too little to measure). `reset_at` drives the
-/// *allowed* pace (independent of history); the measured rate drives the ETA.
+/// One sample of a tier's percent at a given moment, plus the `reset_at` it was
+/// reported with. `reset_at` is carried so we can tell that consecutive
+/// snapshots straddle a reset boundary (drop the pair — it isn't burn).
+type Series = Vec<(DateTime<Utc>, f64, Option<String>)>;
+
+/// Linearly interpolate `pct` at moment `t` between the snapshot pair that
+/// brackets it. Returns `None` when the bracket either has too large a gap
+/// (likely the app was off — interpolating fabricates burn) or straddles a
+/// reset. Reset detection uses `hi.pct < lo.pct` rather than `reset_at`
+/// equality: the API returns `resets_at` with microsecond precision that can
+/// drift between responses, and string-equal comparison was dropping almost
+/// every pair in production even when no reset had happened.
+fn pct_at(series: &Series, t: DateTime<Utc>) -> Option<(f64, Option<String>)> {
+    if series.is_empty() {
+        return None;
+    }
+    let idx_hi = series.partition_point(|s| s.0 <= t);
+    if idx_hi == 0 {
+        return None; // no snapshot at-or-before t
+    }
+    let lo = &series[idx_hi - 1];
+    if lo.0 == t {
+        return Some((lo.1, lo.2.clone()));
+    }
+    if idx_hi == series.len() {
+        // No snapshot after t. Forward-fill from the most recent one only if
+        // it's still fresh — otherwise we'd extend stale state forever.
+        let age_min = (t - lo.0).num_minutes();
+        if age_min <= FORWARD_FILL_GAP_MIN {
+            return Some((lo.1, lo.2.clone()));
+        }
+        return None;
+    }
+    let hi = &series[idx_hi];
+    let gap_min = (hi.0 - lo.0).num_minutes();
+    if gap_min > MAX_INTERP_GAP_MIN {
+        return None;
+    }
+    // Pct decreased between brackets → a reset (or limit-clear) happened
+    // somewhere inside, can't linearly interpolate across it.
+    if hi.1 < lo.1 {
+        return None;
+    }
+    let span_ms = (hi.0 - lo.0).num_milliseconds() as f64;
+    if span_ms <= 0.0 {
+        return Some((lo.1, lo.2.clone()));
+    }
+    let frac = (t - lo.0).num_milliseconds() as f64 / span_ms;
+    Some((lo.1 + (hi.1 - lo.1) * frac, lo.2.clone()))
+}
+
+/// Arithmetic mean of hourly `%/hour` burn over the past `lookback_hours`,
+/// plus the count of hour buckets that contributed. A bucket contributes when
+/// both endpoints can be sampled (see `pct_at`) and the end pct didn't drop
+/// below the start (resets are caught either by `pct_at` returning None for
+/// a bracket whose pct decreased, or by this check when both endpoints sit
+/// on either side of a reset but the post-reset value is lower). Idle hours
+/// count as 0 — they belong in the denominator: amortising a real burn
+/// across the rest of the week is exactly what makes the projection honest.
+fn mean_hourly_rate(
+    series: &Series,
+    now: DateTime<Utc>,
+    lookback_hours: i64,
+) -> (Option<f64>, u32) {
+    let mut total: f64 = 0.0;
+    let mut count: u32 = 0;
+    for h in 1..=lookback_hours {
+        let end = now - Duration::hours(h - 1);
+        let start = end - Duration::hours(1);
+        if let (Some((sp, _)), Some((ep, _))) = (pct_at(series, start), pct_at(series, end)) {
+            if ep >= sp {
+                total += ep - sp;
+                count += 1;
+            }
+        }
+    }
+    if count == 0 {
+        return (None, 0);
+    }
+    (Some(total / count as f64), count)
+}
+
+/// Build the per-tier forecast from the latest snapshot + the precomputed
+/// mean rate. `reset_at` drives the allowed pace (independent of history);
+/// the mean rate drives the ETA.
 fn tier_forecast(
     current: f64,
     reset_at: Option<&str>,
-    earliest: Option<f64>,
-    span_min: Option<f64>,
+    mean_rate_per_hour: Option<f64>,
+    coverage_hours: u32,
     now: DateTime<Utc>,
 ) -> TierForecast {
-    // Minutes until reset (positive only). Drives allowed pace + ahead/behind.
     let time_to_reset_min = reset_at
         .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
         .map(|r| (r.with_timezone(&Utc) - now).num_milliseconds() as f64 / 60000.0)
         .filter(|&m| m > 0.0);
 
-    // Recommended pace to land exactly at 100% on reset — needs no history.
     let allowed_per_hour = match time_to_reset_min {
         Some(ttr) if current < 100.0 => Some((100.0 - current) / ttr * 60.0),
         _ => None,
     };
 
-    // Measured burn → ETA. Requires enough history and a non-trivial rate.
-    let rate_per_min = match (earliest, span_min) {
-        (Some(e), Some(s)) if s >= MIN_SPAN_MIN => Some((current - e) / s),
-        _ => None,
-    };
-    let rate_per_hour = rate_per_min.map(|r| r.max(0.0) * 60.0).unwrap_or(0.0);
-    let eta_minutes = match rate_per_min {
-        Some(r) if r >= MIN_RATE && current < 100.0 => Some((100.0 - current) / r),
-        _ => None,
+    let rate_per_hour = mean_rate_per_hour.unwrap_or(0.0).max(0.0);
+    let eta_minutes = if rate_per_hour > 0.0 && current < 100.0 {
+        Some((100.0 - current) / (rate_per_hour / 60.0))
+    } else {
+        None
     };
 
-    let pace = if rate_per_min.is_none() {
-        // Too little history to measure a burn rate — say so, don't claim safety.
+    let pace = if mean_rate_per_hour.is_none() {
         "unknown"
     } else if let (Some(eta), Some(ttr)) = (eta_minutes, time_to_reset_min) {
-        // Measured rate gives an ETA: warn only if it lands before the reset.
         if eta < ttr {
             "warn"
         } else {
             "ok"
         }
     } else {
-        // Measured but flat (rate below noise), or no reset to race → will last.
         "ok"
     };
 
@@ -93,16 +197,19 @@ fn tier_forecast(
         eta_minutes,
         allowed_per_hour,
         pace: pace.to_string(),
+        coverage_hours,
     }
 }
 
 impl StatsDb {
-    /// Exhaustion forecast per tier, derived from the latest snapshot's current
-    /// values plus the burn rate over `[now − window_min, now]`. `now` is injected
-    /// so the math (window bound + time-to-reset) is deterministic under test.
+    /// Exhaustion forecast per tier. `window_min` is accepted for API stability
+    /// (it used to bound the burn-rate sample) but is ignored — the rate is now
+    /// the arithmetic mean of hourly burn over the past 7 days. `now` is
+    /// injected so the math (lookback bound + time-to-reset) is deterministic
+    /// under test.
     pub fn forecast(
         &self,
-        window_min: i64,
+        _window_min: i64,
         now: DateTime<Utc>,
     ) -> Result<ForecastData, rusqlite::Error> {
         // Current state = the most recent snapshot (recorded just before the
@@ -118,47 +225,77 @@ impl StatsDb {
             }
         };
 
-        // Earliest snapshot inside the averaging window, for the rate baseline.
-        let from = (now - Duration::minutes(window_min)).to_rfc3339();
-        let earliest: Option<(String, f64, f64, Option<f64>)> = {
+        // Single batched read of the 7-day window for all three tiers.
+        let lookback_from = (now - Duration::hours(LOOKBACK_HOURS)).to_rfc3339();
+        let rows: Vec<(String, f64, Option<String>, f64, Option<String>, Option<f64>)> = {
             let conn = self.conn.lock().unwrap();
-            conn.query_row(
-                "SELECT timestamp, five_hour_pct, seven_day_pct, extra_pct
-                 FROM usage_snapshots WHERE timestamp >= ?1
-                 ORDER BY timestamp ASC LIMIT 1",
-                params![from],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-            )
-            .optional()?
+            let mut stmt = conn.prepare(
+                "SELECT timestamp, five_hour_pct, five_hour_reset,
+                        seven_day_pct, seven_day_reset, extra_pct
+                 FROM usage_snapshots
+                 WHERE timestamp >= ?1
+                 ORDER BY timestamp ASC",
+            )?;
+            let mapped = stmt.query_map(params![lookback_from], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, f64>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, f64>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<f64>>(5)?,
+                ))
+            })?;
+            mapped.collect::<Result<Vec<_>, _>>()?
         };
 
-        // Span of measured history (None when the earliest == latest row).
-        let span_min = earliest.as_ref().and_then(|e| {
-            let a = DateTime::parse_from_rfc3339(&e.0).ok()?;
-            let b = DateTime::parse_from_rfc3339(&latest.timestamp).ok()?;
-            let s = (b - a).num_milliseconds() as f64 / 60000.0;
-            (s > 0.0).then_some(s)
-        });
+        let mut five_series: Series = Vec::with_capacity(rows.len());
+        let mut seven_series: Series = Vec::with_capacity(rows.len());
+        let mut extra_series: Series = Vec::with_capacity(rows.len());
+        for (ts, fhp, fhr, sdp, sdr, ex) in &rows {
+            let t = match DateTime::parse_from_rfc3339(ts) {
+                Ok(d) => d.with_timezone(&Utc),
+                Err(_) => continue,
+            };
+            five_series.push((t, *fhp, fhr.clone()));
+            seven_series.push((t, *sdp, sdr.clone()));
+            // Extra has no per-row reset_at in snapshots → drop the column to
+            // avoid spurious "reset boundary" splits.
+            if let Some(p) = ex {
+                extra_series.push((t, *p, None));
+            }
+        }
+
+        let (fh_med, fh_cov) =
+            mean_hourly_rate(&five_series, now, LOOKBACK_HOURS);
+        let (sd_med, sd_cov) =
+            mean_hourly_rate(&seven_series, now, LOOKBACK_HOURS);
+        let (ex_med, ex_cov) =
+            mean_hourly_rate(&extra_series, now, LOOKBACK_HOURS);
+
+        // Allowed-pace pre-touches `latest` which is also needed below; avoid
+        // re-querying by reusing it.
+        let latest_ref = &latest;
 
         Ok(ForecastData {
             five_hour: tier_forecast(
-                latest.five_hour_pct,
-                latest.five_hour_reset.as_deref(),
-                earliest.as_ref().map(|e| e.1),
-                span_min,
+                latest_ref.five_hour_pct,
+                latest_ref.five_hour_reset.as_deref(),
+                fh_med,
+                fh_cov,
                 now,
             ),
             seven_day: tier_forecast(
-                latest.seven_day_pct,
-                latest.seven_day_reset.as_deref(),
-                earliest.as_ref().map(|e| e.2),
-                span_min,
+                latest_ref.seven_day_pct,
+                latest_ref.seven_day_reset.as_deref(),
+                sd_med,
+                sd_cov,
                 now,
             ),
-            // Extra usage has no reset_at in snapshots → no allowed pace, ETA only.
-            extra_usage: latest.extra_pct.map(|cur| {
-                tier_forecast(cur, None, earliest.as_ref().and_then(|e| e.3), span_min, now)
-            }),
+            extra_usage: latest_ref
+                .extra_pct
+                .map(|cur| tier_forecast(cur, None, ex_med, ex_cov, now)),
         })
     }
 }
+

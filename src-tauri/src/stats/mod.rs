@@ -547,31 +547,161 @@ mod tests {
     }
 
     #[test]
-    fn forecast_ok_when_rate_below_threshold() {
+    fn forecast_ok_when_slow_rate_outlasts_reset() {
         let db = mem_db();
         let now = now_at("2026-01-01T01:00:00Z");
-        // 40→41% over 60min = 0.0167%/min < MIN_RATE → measured-but-flat → no ETA,
-        // pace "ok" (we did measure: it lasts), allowed still set.
+        // 40→41 over 60min → mean 1%/h. ETA at 1%/h = (100−41)·60 = 3540min;
+        // reset is only 240min away → ETA well past it → pace=ok. The mean
+        // path no longer suppresses small rates; the pace check handles it.
         db.insert_full("2026-01-01T00:00:00Z", 40.0, Some("2026-01-01T05:00:00Z"), 0.0, None, None);
         db.insert_full("2026-01-01T01:00:00Z", 41.0, Some("2026-01-01T05:00:00Z"), 0.0, None, None);
 
         let fh = db.forecast(60, now).unwrap().five_hour;
-        assert!(fh.eta_minutes.is_none());
+        assert!((fh.eta_minutes.unwrap() - 3540.0).abs() < 1e-6);
         assert!(fh.allowed_per_hour.is_some());
         assert_eq!(fh.pace, "ok");
     }
 
     #[test]
-    fn forecast_unknown_when_span_too_short() {
+    fn forecast_unknown_when_history_doesnt_span_an_hour() {
         let db = mem_db();
         let now = now_at("2026-01-01T01:00:00Z");
-        // Only 5min of history (< MIN_SPAN_MIN) → rate unmeasurable → "unknown".
+        // Only 5min of history → no hour bucket fully covered (the earliest
+        // sample is at 00:55, so pct_at(00:00) can't be sampled) → unknown.
         db.insert_full("2026-01-01T00:55:00Z", 40.0, Some("2026-01-01T05:00:00Z"), 0.0, None, None);
         db.insert_full("2026-01-01T01:00:00Z", 60.0, Some("2026-01-01T05:00:00Z"), 0.0, None, None);
 
         let fh = db.forecast(60, now).unwrap().five_hour;
-        assert!(fh.eta_minutes.is_none(), "span < MIN_SPAN_MIN must not yield an ETA");
+        assert!(fh.eta_minutes.is_none(), "no fully covered hour bucket → no ETA");
         assert_eq!(fh.pace, "unknown");
+        assert_eq!(fh.coverage_hours, 0);
+    }
+
+    #[test]
+    fn forecast_spike_amortised_into_week_average() {
+        let db = mem_db();
+        let now = now_at("2026-01-08T00:00:00Z");
+        let reset_five = "2026-01-08T05:00:00Z";
+        let reset_seven = "2026-01-14T00:00:00Z"; // 6 days away
+        // Past week: hourly snapshots, all flat at 5% (idle).
+        for h in 0..=167 {
+            let ts = (now_at("2026-01-01T00:00:00Z") + chrono::Duration::hours(h)).to_rfc3339();
+            db.insert_full(&ts, 5.0, Some(reset_five), 5.0, Some(reset_seven), None);
+        }
+        // Hot final hour: 5%→25% (a 20%/h spike — what the short-window
+        // forecast used to extrapolate into "exhausts tomorrow").
+        db.insert_full("2026-01-08T00:00:00Z", 25.0, Some(reset_five), 25.0, Some(reset_seven), None);
+
+        let f = db.forecast(60, now).unwrap();
+        // Sum of bucket deltas = 20 (just the spike) over 168 covered buckets.
+        // The mean amortises that into 20/168 ≈ 0.119%/h going forward.
+        assert!(f.seven_day.coverage_hours >= 100, "{}", f.seven_day.coverage_hours);
+        let expected = 20.0 / 168.0;
+        assert!(
+            (f.seven_day.rate_per_hour - expected).abs() < 1e-6,
+            "got {}, expected {}",
+            f.seven_day.rate_per_hour,
+            expected
+        );
+        // 75% left at ~0.12%/h → ~26 days, reset in 6 → pace=ok.
+        assert_eq!(f.seven_day.pace, "ok");
+    }
+
+    #[test]
+    fn forecast_mean_projects_chronic_burn_to_warn() {
+        let db = mem_db();
+        let now = now_at("2026-01-08T00:00:00Z");
+        let reset_seven = "2026-01-14T00:00:00Z"; // 6 days = 8640 min away
+        // Seven-day pct grows 0.5%/h every hour for a week — no spike, just
+        // steady chronic burn. The mean must surface this and project a real
+        // ETA, even though no single bucket looks alarming.
+        for h in 0..=167 {
+            let ts = (now_at("2026-01-01T00:00:00Z") + chrono::Duration::hours(h)).to_rfc3339();
+            let pct = (h as f64) * 0.5;
+            db.insert_full(&ts, 0.0, Some("2026-01-08T05:00:00Z"), pct, Some(reset_seven), None);
+        }
+        // Final snapshot at `now` extends the same 0.5%/h trend (h=168 → 84%).
+        db.insert_full("2026-01-08T00:00:00Z", 0.0, Some("2026-01-08T05:00:00Z"), 84.0, Some(reset_seven), None);
+
+        let week = db.forecast(60, now).unwrap().seven_day;
+        assert!((week.rate_per_hour - 0.5).abs() < 1e-6, "{}", week.rate_per_hour);
+        // 16% left at 0.5%/h → 32h = 1920 min vs. 8640 min to reset → warn.
+        let eta = week.eta_minutes.expect("chronic burn must produce an ETA");
+        assert!((eta - 1920.0).abs() < 1.0, "{eta}");
+        assert_eq!(week.pace, "warn");
+    }
+
+    #[test]
+    fn forecast_forward_fills_when_now_is_slightly_after_latest() {
+        let db = mem_db();
+        // `now` is 30s after the latest snapshot — the common live case
+        // because Utc::now() ticks past the poll loop's record_snapshot.
+        // Without forward-fill the h=1 bucket would be dropped on every call
+        // and a freshly-installed user would see "collecting data…" forever.
+        let now = now_at("2026-01-01T01:00:30Z");
+        db.insert_full("2026-01-01T00:00:00Z", 40.0, Some("2026-01-01T05:00:00Z"), 0.0, None, None);
+        db.insert_full("2026-01-01T01:00:00Z", 60.0, Some("2026-01-01T05:00:00Z"), 0.0, None, None);
+
+        let fh = db.forecast(60, now).unwrap().five_hour;
+        assert!(fh.coverage_hours >= 1, "forward-fill should keep h=1 covered");
+        // Interpolated start ≈ 40.17, forward-filled end = 60 → ~19.83%/h.
+        assert!(
+            fh.rate_per_hour > 15.0 && fh.rate_per_hour < 22.0,
+            "{}",
+            fh.rate_per_hour
+        );
+    }
+
+    #[test]
+    fn forecast_ignores_reset_at_microsecond_drift() {
+        let db = mem_db();
+        let now = now_at("2026-01-01T01:00:00Z");
+        // Same logical 5h reset window, but the API returned two slightly
+        // different sub-second timestamps for it. The earlier reset_at-strict
+        // implementation dropped every such pair in production; the rate is
+        // now driven by pct-decrease detection, which doesn't care.
+        db.insert_full(
+            "2026-01-01T00:00:00Z",
+            40.0,
+            Some("2026-01-01T05:00:00.111111+00:00"),
+            0.0,
+            None,
+            None,
+        );
+        db.insert_full(
+            "2026-01-01T01:00:00Z",
+            60.0,
+            Some("2026-01-01T05:00:00.222222+00:00"),
+            0.0,
+            None,
+            None,
+        );
+        let fh = db.forecast(60, now).unwrap().five_hour;
+        assert!(fh.coverage_hours >= 1);
+        assert!((fh.rate_per_hour - 20.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn forecast_drops_pairs_that_cross_reset() {
+        let db = mem_db();
+        let now = now_at("2026-01-08T02:00:00Z");
+        let reset_a = "2026-01-08T01:00:00Z"; // about to reset
+        let reset_b = "2026-01-15T01:00:00Z"; // post-reset
+        // Pre-reset hour [00:00, 01:00] burns 0.5%/h (80 → 80.5).
+        db.insert_full("2026-01-08T00:00:00Z", 80.0, Some(reset_a), 80.0, Some(reset_a), None);
+        db.insert_full("2026-01-08T01:00:00Z", 80.5, Some(reset_a), 80.5, Some(reset_a), None);
+        // Reset boundary: both tiers drop to 5%, reset_at flips.
+        db.insert_full("2026-01-08T01:00:01Z", 5.0, Some(reset_b), 5.0, Some(reset_b), None);
+        // Post-reset hour [01:00, 02:00] would be the bucket crossing the reset.
+        db.insert_full("2026-01-08T02:00:00Z", 7.0, Some(reset_b), 7.0, Some(reset_b), None);
+
+        let week = db.forecast(60, now).unwrap().seven_day;
+        // h=1 ([01:00, 02:00]) brackets the reset_at flip → dropped.
+        // h=2 ([00:00, 01:00]) is fully pre-reset → contributes 0.5%/h.
+        // No negative "burn" of −75% leaks into the median.
+        assert!(week.rate_per_hour >= 0.0);
+        assert!((week.rate_per_hour - 0.5).abs() < 1e-6, "{}", week.rate_per_hour);
+        assert!(week.coverage_hours >= 1);
     }
 
     #[test]
