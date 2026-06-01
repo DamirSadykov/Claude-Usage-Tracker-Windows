@@ -823,6 +823,8 @@ fn report_issue(store: tauri::State<'_, Arc<DiagStore>>) -> Result<(), String> {
 
 /// Show (and focus) the standalone analytics window. It's declared hidden in
 /// tauri.conf and revealed on demand from the popup's "Подробнее" button.
+/// The system [X] is intercepted in `setup` to hide rather than destroy the
+/// window, so a lookup here is the single source of truth for its lifecycle.
 #[tauri::command]
 fn open_analytics_window(app: AppHandle) {
     if let Some(win) = app.get_webview_window("analytics") {
@@ -1010,6 +1012,19 @@ pub fn run() {
                         }
                     }
                     _ => {}
+                });
+            }
+
+            // Analytics window: hide on [X] instead of destroying. Keeps the
+            // webview alive so `open_analytics_window` can simply show+focus it
+            // every time — one canonical path, no re-create/white-screen race.
+            if let Some(window) = app.get_webview_window("analytics") {
+                let w = window.clone();
+                window.on_window_event(move |event| {
+                    if let WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = w.hide();
+                    }
                 });
             }
 
