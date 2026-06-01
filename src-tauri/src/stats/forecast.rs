@@ -9,9 +9,18 @@
 //! and ETA is permanently absent ("хватит до сброса" forever). The mean
 //! correctly amortises real total burn across the whole window: a single
 //! 20%/h spike in a week of zeros becomes 20/168 ≈ 0.12%/h going forward,
-//! which is the honest forward-projection. The short-window rate is still
-//! used by `alerts::engine` for "your 5h session is about to end" — a
-//! different question — and is computed there directly from `compute_delta`.
+//! which is the honest forward-projection.
+//!
+//! Coverage is widened with `cc_usage` activity: an hour bucket that has no
+//! snapshot coverage (app was off, gap > 3h) but also no Claude Code event
+//! is a verified idle zero, not missing data. This stops the mean from being
+//! biased toward "average burn during active hours" for users who only run
+//! the tracker while coding. See `mean_hourly_rate` for the gory details and
+//! the web/API caveat.
+//!
+//! The short-window rate is still used by `alerts::engine` for "your 5h
+//! session is about to end" — a different question — and is computed there
+//! directly from `compute_delta`.
 
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::params;
@@ -123,27 +132,51 @@ fn pct_at(series: &Series, t: DateTime<Utc>) -> Option<(f64, Option<String>)> {
 }
 
 /// Arithmetic mean of hourly `%/hour` burn over the past `lookback_hours`,
-/// plus the count of hour buckets that contributed. A bucket contributes when
-/// both endpoints can be sampled (see `pct_at`) and the end pct didn't drop
-/// below the start (resets are caught either by `pct_at` returning None for
-/// a bracket whose pct decreased, or by this check when both endpoints sit
-/// on either side of a reset but the post-reset value is lower). Idle hours
-/// count as 0 — they belong in the denominator: amortising a real burn
-/// across the rest of the week is exactly what makes the projection honest.
+/// plus the count of hour buckets that contributed.
+///
+/// A bucket contributes in one of two ways:
+/// 1. Snapshot-sampled: both endpoints come from `pct_at`, and the end pct
+///    didn't drop below the start (resets are caught here or inside `pct_at`).
+/// 2. **CC-confirmed idle**: snapshots can't sample the bucket (app was off,
+///    too large a gap, etc.), BUT `cc_activity` has no row in [start, end].
+///    Since Claude Code activity is the only way `pct` can grow for this
+///    user, an hour with zero CC events is a verified zero — we add it as
+///    0 burn instead of dropping it. This grows the denominator for users
+///    who keep the app off when not coding, pulling the projection toward
+///    the typical-week truth and away from "average of active hours".
+///
+/// The CC signal misses pure web/API usage; for users who routinely burn
+/// limits through the web UI without recording to ~/.claude, the projection
+/// will under-count. That's acceptable: the active-only branch was already
+/// over-counting in the other direction, and most users of this app are
+/// CC-primary by self-selection.
 fn mean_hourly_rate(
     series: &Series,
+    cc_activity: &[DateTime<Utc>],
     now: DateTime<Utc>,
     lookback_hours: i64,
 ) -> (Option<f64>, u32) {
+    // Only use CC as an idle witness when there's *some* CC activity in the
+    // lookback. An empty cc_activity could mean either "user doesn't use CC"
+    // or "ingest is broken" — either way the absence isn't evidence of idle.
+    let cc_witness_available = !cc_activity.is_empty();
+
     let mut total: f64 = 0.0;
     let mut count: u32 = 0;
     for h in 1..=lookback_hours {
         let end = now - Duration::hours(h - 1);
         let start = end - Duration::hours(1);
-        if let (Some((sp, _)), Some((ep, _))) = (pct_at(series, start), pct_at(series, end)) {
-            if ep >= sp {
+        match (pct_at(series, start), pct_at(series, end)) {
+            (Some((sp, _)), Some((ep, _))) if ep >= sp => {
                 total += ep - sp;
                 count += 1;
+            }
+            _ => {
+                if cc_witness_available
+                    && !has_activity_in_range(cc_activity, start, end)
+                {
+                    count += 1; // confirmed idle hour, contributes 0
+                }
             }
         }
     }
@@ -151,6 +184,18 @@ fn mean_hourly_rate(
         return (None, 0);
     }
     (Some(total / count as f64), count)
+}
+
+/// True iff `activity` (sorted ascending) has any timestamp in the half-open
+/// interval `[start, end)`. Binary-searches both edges — O(log n) per bucket.
+fn has_activity_in_range(
+    activity: &[DateTime<Utc>],
+    start: DateTime<Utc>,
+    end: DateTime<Utc>,
+) -> bool {
+    let lo = activity.partition_point(|t| *t < start);
+    let hi = activity.partition_point(|t| *t < end);
+    hi > lo
 }
 
 /// Build the per-tier forecast from the latest snapshot + the precomputed
@@ -266,12 +311,31 @@ impl StatsDb {
             }
         }
 
+        // Claude Code activity in the same lookback. Used as an "idle witness":
+        // an hour bucket with no snapshot coverage but also no CC event is a
+        // verified zero, not a missing measurement.
+        let cc_activity: Vec<DateTime<Utc>> = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT ts FROM cc_usage WHERE ts >= ?1 ORDER BY ts ASC",
+            )?;
+            let mapped = stmt.query_map(params![lookback_from], |r| r.get::<_, String>(0))?;
+            mapped
+                .filter_map(|r| r.ok())
+                .filter_map(|s| {
+                    DateTime::parse_from_rfc3339(&s)
+                        .ok()
+                        .map(|d| d.with_timezone(&Utc))
+                })
+                .collect()
+        };
+
         let (fh_med, fh_cov) =
-            mean_hourly_rate(&five_series, now, LOOKBACK_HOURS);
+            mean_hourly_rate(&five_series, &cc_activity, now, LOOKBACK_HOURS);
         let (sd_med, sd_cov) =
-            mean_hourly_rate(&seven_series, now, LOOKBACK_HOURS);
+            mean_hourly_rate(&seven_series, &cc_activity, now, LOOKBACK_HOURS);
         let (ex_med, ex_cov) =
-            mean_hourly_rate(&extra_series, now, LOOKBACK_HOURS);
+            mean_hourly_rate(&extra_series, &cc_activity, now, LOOKBACK_HOURS);
 
         // Allowed-pace pre-touches `latest` which is also needed below; avoid
         // re-querying by reusing it.

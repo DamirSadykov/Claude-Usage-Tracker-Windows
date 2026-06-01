@@ -734,6 +734,63 @@ mod tests {
     }
 
     #[test]
+    fn forecast_uses_cc_activity_to_widen_idle_coverage() {
+        let db = mem_db();
+        let now = now_at("2026-01-08T00:00:00Z");
+        let reset = "2026-01-14T00:00:00Z";
+        // Snapshots only for the last 3 hours — the rest of the week the app
+        // was off. CC activity exists somewhere in the past week (proving the
+        // CC ingest is wired up), but happened only in one of the off-hours.
+        db.insert_full("2026-01-07T21:00:00Z", 8.0,  Some(reset), 8.0,  Some(reset), None);
+        db.insert_full("2026-01-07T22:00:00Z", 10.0, Some(reset), 10.0, Some(reset), None);
+        db.insert_full("2026-01-07T23:00:00Z", 12.0, Some(reset), 12.0, Some(reset), None);
+        db.insert_full("2026-01-08T00:00:00Z", 14.0, Some(reset), 14.0, Some(reset), None);
+        // A handful of CC events; only the one at 03:00 falls inside an
+        // off-hour bucket, all others sit inside the snapshot-covered hours.
+        db.cc_upsert(&[
+            cc_row("c1", "2026-01-05T03:00:00Z", "claude-opus-4-7", 100, 0, 0.1, "s1"),
+            cc_row("c2", "2026-01-07T22:30:00Z", "claude-opus-4-7", 100, 0, 0.1, "s2"),
+            cc_row("c3", "2026-01-07T23:30:00Z", "claude-opus-4-7", 100, 0, 0.1, "s3"),
+        ])
+        .unwrap();
+
+        // Without the CC witness: only 3 snapshot-covered hours (each 2%/h)
+        // would contribute → mean ≈ 2%/h. With the CC witness: 3 covered + many
+        // confirmed-idle off-hours → mean drops drastically.
+        let week = db.forecast(60, now).unwrap().seven_day;
+        assert!(
+            week.coverage_hours > 100,
+            "CC-confirmed idle should expand coverage well past the 3 snapshot hours, got {}",
+            week.coverage_hours
+        );
+        assert!(
+            week.rate_per_hour < 0.5,
+            "off-hours should dilute the 2%/h burst, got {}",
+            week.rate_per_hour
+        );
+    }
+
+    #[test]
+    fn forecast_does_not_invent_idle_when_cc_data_is_absent() {
+        let db = mem_db();
+        let now = now_at("2026-01-08T00:00:00Z");
+        let reset = "2026-01-14T00:00:00Z";
+        // Same setup as the previous test, but cc_usage is empty — we have
+        // no way to tell whether the user simply doesn't use CC or whether
+        // the ingest is broken. Falling back to snapshot-only coverage keeps
+        // the mean honest to what we can actually verify.
+        db.insert_full("2026-01-07T21:00:00Z", 8.0,  Some(reset), 8.0,  Some(reset), None);
+        db.insert_full("2026-01-07T22:00:00Z", 10.0, Some(reset), 10.0, Some(reset), None);
+        db.insert_full("2026-01-07T23:00:00Z", 12.0, Some(reset), 12.0, Some(reset), None);
+        db.insert_full("2026-01-08T00:00:00Z", 14.0, Some(reset), 14.0, Some(reset), None);
+
+        let week = db.forecast(60, now).unwrap().seven_day;
+        // Three covered hours (h=1..3), all at 2%/h.
+        assert_eq!(week.coverage_hours, 3);
+        assert!((week.rate_per_hour - 2.0).abs() < 1e-6, "{}", week.rate_per_hour);
+    }
+
+    #[test]
     fn forecast_empty_db_is_unknown() {
         let db = mem_db();
         let f = db.forecast(60, now_at("2026-01-01T01:00:00Z")).unwrap();
