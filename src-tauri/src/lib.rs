@@ -210,8 +210,11 @@ fn record_diag(app: &AppHandle, kind: &str, summary: &str, detail: String) {
 // --- Background polling loop: the single owner of business logic ---
 
 const AUTO_START_COUNTDOWN_SECS: u64 = 10;
-const AUTO_START_RETRY_SECS: u64 = 30;
-const AUTO_START_MAX_ATTEMPTS: u32 = 5;
+// 5 минут между попытками — короче ловит CF burst-limit и снова получает
+// 429 на ровном месте (Mac-версия по той же причине использует 5-минутный
+// цикл проверок).
+const AUTO_START_RETRY_SECS: u64 = 300;
+const AUTO_START_MAX_ATTEMPTS: u32 = 3;
 
 #[derive(Default)]
 enum AutoStartPhase {
@@ -409,53 +412,79 @@ async fn run_cycle(
 async fn auto_start(app: &AppHandle, cfg: &AppConfig) -> bool {
     let mut project_id = cfg.project_id.clone();
     if project_id.is_empty() {
-        match usage::ensure_project(&cfg.session_key, &cfg.org_id).await {
-            Ok(p) => {
-                project_id = p.uuid.clone();
-                if let Some(c) = app.try_state::<Mutex<AppConfig>>() {
-                    c.lock().unwrap().project_id = project_id.clone();
+        match resolve_project(app, cfg).await {
+            Ok(id) => project_id = id,
+            Err(()) => return false,
+        }
+    }
+
+    let mut tried_reresolve = false;
+    loop {
+        match usage::start_session_unchecked(&cfg.session_key, &cfg.org_id, &project_id).await {
+            Ok(r) => {
+                info!("Auto-start session: skipped={}", r.skipped);
+                let _ = app.emit("auto-start-result", r.skipped);
+                // Refresh UI immediately so the new active session is visible
+                // without waiting for the next polling interval.
+                if let Ok(usage) = usage::fetch_usage(&cfg.session_key, &cfg.org_id).await {
+                    let rgba = tray_icon_for(usage.five_hour.percent_used, &cfg.session_thresholds);
+                    if let Some(tray) = app.tray_by_id("main-tray") {
+                        let icon = tauri::image::Image::new_owned(rgba, 32, 32);
+                        let _ = tray.set_icon(Some(icon));
+                    }
+                    let levels = compute_levels(&usage, cfg);
+                    let _ = app.emit("usage-updated", UsageUpdate { usage, levels });
                 }
-                // Let the frontend persist the resolved id back to the store.
-                let _ = app.emit("project-resolved", project_id.clone());
+                return true;
             }
             Err(e) => {
+                let msg = e.to_string();
+                // Сохранённый project_id протух (проект удалили или сменили
+                // org). Перерезолвим один раз и пробуем ещё раз — на следующий
+                // tick polling-а не наступим на те же грабли.
+                if !tried_reresolve && msg.contains("Create conversation error 404") {
+                    tried_reresolve = true;
+                    match resolve_project(app, cfg).await {
+                        Ok(id) => {
+                            project_id = id;
+                            continue;
+                        }
+                        Err(()) => return false,
+                    }
+                }
                 record_diag(
                     app,
                     "auto-start",
-                    "Не удалось создать/найти проект для авто-сессии",
-                    format!("ensure_project failed: {}", e),
+                    "Не удалось запустить авто-сессию",
+                    format!("start_session failed: {}", msg),
                 );
-                let _ = app.emit("auto-start-error", e.to_string());
+                let _ = app.emit("auto-start-error", msg);
                 return false;
             }
         }
     }
-    match usage::start_session_unchecked(&cfg.session_key, &cfg.org_id, &project_id).await {
-        Ok(r) => {
-            info!("Auto-start session: skipped={}", r.skipped);
-            let _ = app.emit("auto-start-result", r.skipped);
-            // Refresh UI immediately so the new active session is visible
-            // without waiting for the next polling interval.
-            if let Ok(usage) = usage::fetch_usage(&cfg.session_key, &cfg.org_id).await {
-                let rgba = tray_icon_for(usage.five_hour.percent_used, &cfg.session_thresholds);
-                if let Some(tray) = app.tray_by_id("main-tray") {
-                    let icon = tauri::image::Image::new_owned(rgba, 32, 32);
-                    let _ = tray.set_icon(Some(icon));
-                }
-                let levels = compute_levels(&usage, cfg);
-                let _ = app.emit("usage-updated", UsageUpdate { usage, levels });
+}
+
+async fn resolve_project(app: &AppHandle, cfg: &AppConfig) -> Result<String, ()> {
+    match usage::ensure_project(&cfg.session_key, &cfg.org_id).await {
+        Ok(p) => {
+            let project_id = p.uuid;
+            if let Some(c) = app.try_state::<Mutex<AppConfig>>() {
+                c.lock().unwrap().project_id = project_id.clone();
             }
-            true
+            // Let the frontend persist the resolved id back to the store.
+            let _ = app.emit("project-resolved", project_id.clone());
+            Ok(project_id)
         }
         Err(e) => {
             record_diag(
                 app,
                 "auto-start",
-                "Не удалось запустить авто-сессию",
-                format!("start_session failed: {}", e),
+                "Не удалось создать/найти проект для авто-сессии",
+                format!("ensure_project failed: {}", e),
             );
             let _ = app.emit("auto-start-error", e.to_string());
-            false
+            Err(())
         }
     }
 }

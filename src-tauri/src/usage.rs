@@ -1,6 +1,26 @@
+use std::sync::LazyLock;
+use std::time::Duration;
+
 use log::{debug, warn};
 use reqwest::header::{HeaderMap, HeaderValue, COOKIE, CONTENT_TYPE, ACCEPT, USER_AGENT, REFERER};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
+
+/// Один shared `reqwest::Client` на всё приложение: переиспользует
+/// connection pool и HTTP/2 stream, не плодит TCP/TLS handshake на каждый
+/// запрос — иначе claude.ai/Cloudflare видят «N разных клиентов с одной
+/// cookie» и отвечают 429.
+static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("failed to build shared reqwest::Client")
+});
+
+/// Сериализует исходящие запросы к claude.ai, чтобы auto-start не
+/// конкурировал во времени с polling fetch_usage (одновременные запросы
+/// с одной cookie ловят CF burst-limit).
+static CLAUDE_API_LOCK: Mutex<()> = Mutex::const_new(());
 
 /// Human-readable classification of a reqwest failure. We never log the URL's
 /// query or the session key — only the failure mode — so logs are safe to share
@@ -166,7 +186,8 @@ pub async fn fetch_usage(
         warn!("fetch_usage: empty session_key or org_id");
     }
 
-    let client = reqwest::Client::new();
+    let _api_guard = CLAUDE_API_LOCK.lock().await;
+    let client = &*HTTP_CLIENT;
     let headers = match build_headers(session_key) {
         Ok(h) => h,
         Err(e) => {
@@ -316,7 +337,8 @@ pub async fn ensure_project(
     session_key: &str,
     org_id: &str,
 ) -> Result<ProjectInfo, Box<dyn std::error::Error + Send + Sync>> {
-    let client = reqwest::Client::new();
+    let _api_guard = CLAUDE_API_LOCK.lock().await;
+    let client = &*HTTP_CLIENT;
     let headers = build_headers(session_key)?;
 
     let list_url = format!(
@@ -413,7 +435,8 @@ pub async fn start_session_unchecked(
     org_id: &str,
     project_id: &str,
 ) -> Result<SessionStartResult, Box<dyn std::error::Error + Send + Sync>> {
-    let client = reqwest::Client::new();
+    let _api_guard = CLAUDE_API_LOCK.lock().await;
+    let client = &*HTTP_CLIENT;
     let headers = build_headers(session_key)?;
 
     let conv_uuid = gen_uuid();
