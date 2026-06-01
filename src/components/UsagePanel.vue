@@ -52,6 +52,18 @@ function paceClass(pace: string): string {
   return pace === "warn" ? "pace-warn" : pace === "ok" ? "pace-ok" : "pace-neutral";
 }
 
+// Hover tooltip explaining what the ETA is built on. With ≥1 hour of recorded
+// history we name the actual coverage; otherwise we fall back to the generic
+// label so the basis is still obvious to the user.
+type ForecastLike = { coverage_hours?: number };
+function forecastTip(f: ForecastLike | null): string {
+  if (!f) return "";
+  const h = f.coverage_hours ?? 0;
+  return h > 0
+    ? t("forecastBasisTip", { hours: h })
+    : t("forecastBasisTipShort");
+}
+
 function fmtRate(rate: number): string {
   return rate.toFixed(rate < 1 ? 2 : 1) + "%";
 }
@@ -192,12 +204,18 @@ const prepaidBalance = computed(() => props.usage.prepaid_balance);
       <div class="bar" :class="lvlClass(levels.five_hour)">
         <i :style="{ width: Math.min(fiveHour.percent_used, 100) + '%' }"></i>
       </div>
-      <div v-if="sessionActive && fhForecast" class="pace-row" :class="paceClass(fhForecast.pace)">
+      <div
+        v-if="sessionActive && fhForecast"
+        class="pace-row"
+        :class="paceClass(fhForecast.pace)"
+        :title="forecastTip(fhForecast)"
+      >
         <template v-if="fhForecast.pace === 'warn' && fhForecast.eta_minutes !== null">
           {{ t('etaSession', { time: formatEta(t, fhForecast.eta_minutes) }) }}
         </template>
         <template v-else-if="fhForecast.pace === 'unknown'">{{ t('etaCollecting') }}</template>
         <template v-else>{{ t('etaSafe') }}</template>
+        <template v-if="fhForecast.pace !== 'unknown' && fhForecast.coverage_hours > 0"> · {{ t('meanRate', { rate: fmtRate(fhForecast.rate_per_hour) }) }}</template>
       </div>
     </div>
 
@@ -225,10 +243,16 @@ const prepaidBalance = computed(() => props.usage.prepaid_balance);
           :title="t('idealPace')"
         ></span>
       </div>
-      <div v-if="weekForecast" class="pace-row" :class="paceClass(weekForecast.pace)">
+      <div
+        v-if="weekForecast"
+        class="pace-row"
+        :class="paceClass(weekForecast.pace)"
+        :title="forecastTip(weekForecast)"
+      >
         <template v-if="weekForecast.pace === 'warn' && weekForecast.eta_minutes !== null">{{ t('etaExhaust', { date: etaDate(weekForecast.eta_minutes) }) }}</template>
         <template v-else-if="weekForecast.pace === 'unknown'">{{ t('etaCollecting') }}</template>
         <template v-else>{{ t('etaSafe') }}</template>
+        <template v-if="weekForecast.pace !== 'unknown' && weekForecast.coverage_hours > 0"> · {{ t('meanRate', { rate: fmtRate(weekForecast.rate_per_hour) }) }}</template>
         <template v-if="weekForecast.allowed_per_hour !== null"> · {{ t('allowedRate', { rate: fmtRate(weekForecast.allowed_per_hour) }) }}</template>
       </div>
     </div>
@@ -301,7 +325,11 @@ const prepaidBalance = computed(() => props.usage.prepaid_balance);
       <div class="bar" :class="lvlClass(levels.extra_usage)">
         <i :style="{ width: Math.min(extraUsage.utilization, 100) + '%' }"></i>
       </div>
-      <div v-if="extraForecast && extraForecast.eta_minutes !== null" class="pace-row pace-neutral">
+      <div
+        v-if="extraForecast && extraForecast.eta_minutes !== null"
+        class="pace-row pace-neutral"
+        :title="forecastTip(extraForecast)"
+      >
         {{ t('etaExhaust', { date: etaDate(extraForecast.eta_minutes) }) }}
       </div>
     </div>
