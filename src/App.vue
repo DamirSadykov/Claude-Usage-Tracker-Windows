@@ -63,6 +63,7 @@ export interface TierForecast {
     eta_minutes: number | null;
     allowed_per_hour: number | null;
     pace: "unknown" | "ok" | "warn";
+    coverage_hours: number;
 }
 
 export interface ForecastData {
