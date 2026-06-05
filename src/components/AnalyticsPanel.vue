@@ -2,6 +2,7 @@
 import { ref, watch, onMounted, onUnmounted, computed, nextTick } from "vue";
 import { useI18n } from "vue-i18n";
 import { invoke } from "@tauri-apps/api/core";
+import { fmtDateTime, fmtDay } from "../dateFormat";
 import {
   Chart,
   BarController,
@@ -231,7 +232,7 @@ const chartPoints = computed<ChartPoint[]>(() => {
   const daily = data.value?.daily ?? [];
   if (granularity.value === "day") {
     return daily.map((p) => ({
-      label: p.date.slice(5),
+      label: fmtDay(p.date, locale.value),
       input: p.input,
       output: p.output,
       cache_create: p.cache_create,
@@ -244,7 +245,7 @@ const chartPoints = computed<ChartPoint[]>(() => {
     const wk = mondayOf(p.date);
     let a = weeks.get(wk);
     if (!a) {
-      a = { label: wk.slice(5), input: 0, output: 0, cache_create: 0, cache_read: 0, cost: 0 };
+      a = { label: fmtDay(wk, locale.value), input: 0, output: 0, cache_create: 0, cache_read: 0, cost: 0 };
       weeks.set(wk, a);
     }
     a.input += p.input;
@@ -327,12 +328,10 @@ function anomalyRatio(s: SessionUsage): number {
   return avgSessionTokens.value > 0 ? s.total_tokens / avgSessionTokens.value : 0;
 }
 
-// "2026-05-27T13:57:29Z" → local "05-27 13:57".
+// Session timestamp → numeric date+time for the active locale
+// (ru "31.12.2026, 13:57" / en "12/31/2026, 01:57 PM").
 function fmtWhen(iso: string): string {
-  const d = new Date(iso);
-  if (isNaN(d.getTime())) return iso;
-  const p = (n: number) => String(n).padStart(2, "0");
-  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  return fmtDateTime(iso, locale.value);
 }
 
 // --- data loading ---

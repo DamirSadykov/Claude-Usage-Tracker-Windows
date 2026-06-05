@@ -334,6 +334,13 @@ body,
     background: var(--accent);
     color: #fff;
 }
+/* Analytics toggle active: same filled-accent treatment as pin so the
+   "you're on the charts page" state is unmistakable. */
+.icon-btn.active,
+.icon-btn.active:hover {
+    background: var(--accent);
+    color: #fff;
+}
 @keyframes spin {
     from {
         transform: rotate(0);

@@ -9,6 +9,7 @@ import { useI18n } from "vue-i18n";
 import { invoke } from "@tauri-apps/api/core";
 import { getInsightHelpHtml, hasInsightHelp } from "../insightHelp";
 import { reconcileSectionPrefs, type SectionPref } from "../dashboardSections";
+import { fmtDateTime, fmtDay } from "../dateFormat";
 import {
   Chart,
   BarController,
@@ -209,11 +210,10 @@ async function copyId(id: string) {
     await navigator.clipboard.writeText(id);
   } catch {}
 }
+// Session timestamp → numeric date+time for the active locale
+// (ru "31.12.2026, 13:57" / en "12/31/2026, 01:57 PM").
 function fmtWhen(iso: string): string {
-  const d = new Date(iso);
-  if (isNaN(d.getTime())) return iso;
-  const p = (n: number) => String(n).padStart(2, "0");
-  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  return fmtDateTime(iso, locale.value);
 }
 function projectName(p: string | null): string {
   return p && p.length ? p : t("projectUnknown");
@@ -234,7 +234,7 @@ let tokenChart: Chart | null = null;
 function renderCharts() {
   const d = data.value;
   if (!d) return;
-  const labels = d.daily.map((p) => p.date.slice(5));
+  const labels = d.daily.map((p) => fmtDay(p.date, locale.value));
   const grid = "rgba(255,255,255,0.06)";
   const tick = "rgba(255,255,255,0.45)";
 
