@@ -226,6 +226,9 @@ pub async fn fetch_usage(
         let hint = match status.as_u16() {
             401 | 403 => " — ключ сессии недействителен или истёк",
             404 => " — проверьте Organization ID",
+            // 503 "app unavailable" / 502 / 500 etc.: claude.ai is down or in
+            // maintenance — not the user's config. Say so in plain language.
+            500..=599 => " — сервис Claude временно недоступен, повторите позже",
             _ => "",
         };
         return Err(format!("API вернул {}{}", status, hint).into());
