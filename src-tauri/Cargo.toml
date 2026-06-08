@@ -1,6 +1,6 @@
 [package]
 name = "claude-usage-tracker"
-version = "0.4.2"
+version = "0.4.3"
 description = "Claude AI Usage Tracker for Windows"
 authors = ["Damir Sadykov <damir.it.work@gmail.com>"]
 edition = "2021"
