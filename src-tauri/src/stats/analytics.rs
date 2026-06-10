@@ -592,38 +592,45 @@ impl StatsDb {
             rows
         };
 
-        // --- cold restarts inside sessions (compact / model switch fingerprint) ---
-        // A "cold turn" has cache_read=0 + meaningful cache_create. The first
-        // turn of any session is naturally cold, so a session with ≥2 cold
-        // turns has at least one mid-session restart (auto-compaction or a
-        // model switch). "cold_cost" sums what was paid to rebuild the cache
-        // on those mid-session restarts — that's the avoidable spend.
-        //
-        // Threshold (cache_create > 10_000) is empirical: scanning all local
-        // transcripts gives post-compact cache_create at median 24K, p25 ~20K,
-        // p10 ~2K (essentially noise). First-turn cache_create medians 15K.
-        // 10K sits between p10 (noise) and p25 (real compactions) and is
-        // smaller than typical first-turn writes, so the ≥2-count filter
-        // reliably excludes "just a normal session start".
-        let cold_restarts = {
+        // --- cold cache rewrites inside sessions (classified by cause) ---
+        // A "cold rewrite" is a mid-session turn that reused almost nothing from
+        // cache (cache_read < 5K) yet rewrote a large prefix (cache_create ≥ 50K),
+        // re-paying input at 1.25×. The session's first turn is naturally cold, so
+        // we exclude it (prev_ts IS NOT NULL) — every counted turn is a genuine
+        // mid-session rebuild. Each is classified against its predecessor:
+        //   • model_switch — the model changed (each model keeps its own cache)
+        //   • idle         — same model, gap > 15 min (the cache TTL ~1 h expired)
+        //   • compaction   — same model, small gap (auto-compaction rewrote history)
+        // Empirically (local transcripts) the three form clean populations: gap≈0
+        // compactions, gap≥~19 min idle expiries (the 5–18 min band is dead), and
+        // a rare model switch. Thresholds (5K / 50K / 15 min) match the runtime
+        // engine so this dashboard breakdown and the live toast agree on what
+        // counts as a cold rewrite.
+        let cold_rewrites = {
             let mut stmt = prepare_proj(
-                "WITH cold AS (
-                    SELECT session_id, project, COUNT(*) AS n_cold, SUM(cost) AS cold_cost
+                "WITH g AS (
+                    SELECT session_id, project, ts, cost, cache_read, cache_create, model,
+                           LAG(ts)    OVER (PARTITION BY session_id ORDER BY ts) AS prev_ts,
+                           LAG(model) OVER (PARTITION BY session_id ORDER BY ts) AS prev_model
                     FROM cc_usage
-                    WHERE ts >= ?1 AND ts < ?2 AND session_id IS NOT NULL
-                      AND cache_read = 0 AND cache_create > 10000{proj}
-                    GROUP BY session_id
-                    HAVING n_cold >= 2
+                    WHERE ts >= ?1 AND ts < ?2 AND is_subagent = 0 AND session_id IS NOT NULL{proj}
                  )
-                 SELECT session_id, project, n_cold, cold_cost
-                 FROM cold
-                 ORDER BY cold_cost DESC"
+                 SELECT session_id, project, cost,
+                        CASE
+                          WHEN model IS NOT prev_model THEN 'model_switch'
+                          WHEN (julianday(ts) - julianday(prev_ts)) * 86400.0 > 900.0 THEN 'idle'
+                          ELSE 'compaction'
+                        END AS cause
+                 FROM g
+                 WHERE prev_ts IS NOT NULL
+                   AND cache_read < 5000
+                   AND cache_create >= 50000"
                     .to_string(),
             )?;
-            let map_row = |r: &rusqlite::Row| -> Result<(String, Option<String>, i64, f64), rusqlite::Error> {
+            let map_row = |r: &rusqlite::Row| -> Result<(String, Option<String>, f64, String), rusqlite::Error> {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
             };
-            let rows: Vec<(String, Option<String>, i64, f64)> = match project {
+            let rows: Vec<(String, Option<String>, f64, String)> = match project {
                 Some(p) => stmt
                     .query_map(params![from, to, p], map_row)?
                     .collect::<Result<Vec<_>, _>>()?,
@@ -664,51 +671,6 @@ impl StatsDb {
             }
         };
 
-        // --- idle cache gaps inside sessions ---
-        // Pair every cc_usage row with its predecessor in the same session via
-        // LAG. A gap of >10 minutes followed by a large cache_create write is
-        // the fingerprint of "user came back after TTL expired and the next
-        // turn rewrote the whole prefix at 1.25× pricing". One such event on a
-        // 300K-context session costs a few dollars of pure overhead.
-        let idle_gaps = {
-            let mut stmt = prepare_proj(
-                "WITH gaps AS (
-                    SELECT session_id, project, ts,
-                           LAG(ts) OVER (PARTITION BY session_id ORDER BY ts) AS prev_ts,
-                           cache_create, cost
-                    FROM cc_usage
-                    WHERE ts >= ?1 AND ts < ?2 AND session_id IS NOT NULL{proj}
-                 ),
-                 cold AS (
-                    SELECT session_id, project,
-                           COUNT(*) AS n_gaps,
-                           SUM(cost) AS wasted_cost,
-                           SUM(cache_create) AS wasted_writes
-                    FROM gaps
-                    WHERE prev_ts IS NOT NULL
-                      AND (julianday(ts) - julianday(prev_ts)) * 86400.0 > 600.0
-                      AND cache_create > 100000
-                    GROUP BY session_id
-                 )
-                 SELECT session_id, project, n_gaps, wasted_cost, wasted_writes
-                 FROM cold
-                 ORDER BY wasted_cost DESC"
-                    .to_string(),
-            )?;
-            let map_row = |r: &rusqlite::Row| -> Result<(String, Option<String>, i64, f64, i64), rusqlite::Error> {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-            };
-            let rows: Vec<(String, Option<String>, i64, f64, i64)> = match project {
-                Some(p) => stmt
-                    .query_map(params![from, to, p], map_row)?
-                    .collect::<Result<Vec<_>, _>>()?,
-                None => stmt
-                    .query_map(params![from, to], map_row)?
-                    .collect::<Result<Vec<_>, _>>()?,
-            };
-            rows
-        };
-
         let efficacy = subagent_efficacy(&conn, from, to, project)?;
         let insights = build_insights(
             &totals,
@@ -719,9 +681,8 @@ impl StatsDb {
             &by_model,
             &sessions,
             efficacy.as_ref(),
-            &cold_restarts,
+            &cold_rewrites,
             &tool_breakdown,
-            &idle_gaps,
         );
 
         Ok(AnalyticsExt {
@@ -837,9 +798,8 @@ fn build_insights(
     by_model: &[ModelUsage],
     sessions: &[SessionUsage],
     efficacy: Option<&SubagentEfficacy>,
-    cold_restarts: &[(String, Option<String>, i64, f64)],
+    cold_rewrites: &[(String, Option<String>, f64, String)],
     tool_breakdown: &[ToolUsage],
-    idle_gaps: &[(String, Option<String>, i64, f64, i64)],
 ) -> Vec<Insight> {
     use serde_json::json;
     let mut out = Vec::new();
@@ -1066,74 +1026,53 @@ fn build_insights(
         });
     }
 
-    // --- cold restarts inside sessions ---
-    // A session's first turn is naturally cold; ≥2 cold turns mean at least
-    // one mid-session restart (auto-compaction or model switch). Sum the cost
-    // of those cold turns — that's the avoidable spend.
-    if !cold_restarts.is_empty() {
-        let total_cold_cost: f64 = cold_restarts.iter().map(|(_, _, _, c)| c).sum();
-        let total_restarts: i64 = cold_restarts
-            .iter()
-            .map(|(_, _, n, _)| n.saturating_sub(1))
-            .sum();
-        if total_restarts > 0 {
-            let affected: Vec<serde_json::Value> = cold_restarts
-                .iter()
-                .take(5)
-                .map(|(sid, proj, _, cost)| {
-                    json!({
-                        "session_id": sid,
-                        "project": proj,
-                        "cost": cost,
-                    })
-                })
-                .collect();
-            out.push(Insight {
-                kind: "cold_restarts".into(),
-                label_key: "insightColdRestarts".into(),
-                params: json!({
-                    "restarts": total_restarts,
-                    "sessions": cold_restarts.len(),
-                    "cost": total_cold_cost,
-                    "affected": serde_json::Value::Array(affected),
-                }),
-                category: "recommendation",
-            });
-        }
-    }
+    // --- cold cache rewrites, split by cause ---
+    // One card aggregating every mid-session cold rewrite (see the classified
+    // query above), broken into the three things that drop the cache:
+    // compaction rewriting history, the prompt-cache TTL (~1 h) expiring over an
+    // idle gap, and a model switch. The frontend renders the per-cause lines;
+    // here we tally count + cost per cause, the grand total, and the costliest
+    // sessions. A $1 floor keeps trivial rewrites off the board.
+    if !cold_rewrites.is_empty() {
+        let total_cost: f64 = cold_rewrites.iter().map(|(_, _, c, _)| c).sum();
+        if total_cost >= 1.0 {
+            // Per-cause tally, in the fixed order we want to read them.
+            let mut causes: Vec<serde_json::Value> = Vec::new();
+            for cause in ["compaction", "idle", "model_switch"] {
+                let n = cold_rewrites.iter().filter(|(_, _, _, k)| k == cause).count();
+                if n == 0 {
+                    continue;
+                }
+                let cost: f64 = cold_rewrites
+                    .iter()
+                    .filter(|(_, _, _, k)| k == cause)
+                    .map(|(_, _, c, _)| c)
+                    .sum();
+                causes.push(json!({ "cause": cause, "n": n, "cost": cost }));
+            }
 
-    // --- idle cache gaps ---
-    // Same input data shape as cold_restarts but a distinct failure mode:
-    // operator left the chat open across the ephemeral-cache TTL (≈5 min),
-    // and the next turn paid 1.25× to recreate the prefix. We require
-    // wasted_writes ≥100K so we don't fire on cheap sessions where rewriting
-    // 30K hardly matters.
-    let significant_gaps: Vec<&(String, Option<String>, i64, f64, i64)> = idle_gaps
-        .iter()
-        .filter(|(_, _, _, _, w)| *w >= 100_000)
-        .collect();
-    if !significant_gaps.is_empty() {
-        let total_wasted: f64 = significant_gaps.iter().map(|(_, _, _, c, _)| c).sum();
-        let total_events: i64 = significant_gaps.iter().map(|(_, _, n, _, _)| n).sum();
-        if total_wasted >= 1.0 {
-            let affected: Vec<serde_json::Value> = significant_gaps
+            // Costliest sessions across all causes (top 5) for the affected list.
+            let mut by_session: Vec<(String, Option<String>, f64)> = Vec::new();
+            for (sid, proj, cost, _) in cold_rewrites {
+                match by_session.iter_mut().find(|(s, _, _)| s == sid) {
+                    Some(e) => e.2 += cost,
+                    None => by_session.push((sid.clone(), proj.clone(), *cost)),
+                }
+            }
+            by_session.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+            let affected: Vec<serde_json::Value> = by_session
                 .iter()
                 .take(5)
-                .map(|(sid, proj, _, cost, _)| {
-                    json!({
-                        "session_id": sid,
-                        "project": proj,
-                        "cost": cost,
-                    })
-                })
+                .map(|(sid, proj, cost)| json!({ "session_id": sid, "project": proj, "cost": cost }))
                 .collect();
+
             out.push(Insight {
-                kind: "idle_cache_gap".into(),
-                label_key: "insightIdleCacheGap".into(),
+                kind: "cold_rewrites".into(),
+                label_key: "insightColdRewrites".into(),
                 params: json!({
-                    "events": total_events,
-                    "sessions": significant_gaps.len(),
-                    "cost": total_wasted,
+                    "events": cold_rewrites.len(),
+                    "cost": total_cost,
+                    "causes": serde_json::Value::Array(causes),
                     "affected": serde_json::Value::Array(affected),
                 }),
                 category: "recommendation",

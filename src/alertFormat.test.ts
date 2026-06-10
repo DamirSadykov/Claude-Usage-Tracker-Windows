@@ -71,7 +71,7 @@ describe("localizeAlert", () => {
   it("cold rewrite (idle cause) formats tokens + cost, null project falls back", () => {
     const a: AlertEvent = {
       kind: "insight",
-      name: "idle_cache_gap",
+      name: "cold_rewrites",
       params: { project: null, cause: "idle", gap_minutes: 42, tokens: 320000, cost_usd: 1.7 },
     };
     expect(localizeAlert(t, a)).toEqual({
@@ -83,7 +83,7 @@ describe("localizeAlert", () => {
   it("cold rewrite (compact cause) uses the compaction body", () => {
     const a: AlertEvent = {
       kind: "insight",
-      name: "idle_cache_gap",
+      name: "cold_rewrites",
       params: { project: "myapp", cause: "compact", gap_minutes: 0, tokens: 96000, cost_usd: 0.6 },
     };
     expect(localizeAlert(t, a)).toEqual({

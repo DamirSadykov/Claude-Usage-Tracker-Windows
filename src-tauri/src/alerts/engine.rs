@@ -24,7 +24,7 @@ const RESET_EPSILON: f64 = 1.0; // percent_used <= this counts as "reset"
 // "this is getting long, consider splitting". Time/cost are intentionally not
 // used in v1.
 const LONG_SESSION_MESSAGES: i64 = 200;
-// cold-rewrite detection (the runtime side of `idle_cache_gap`). Empirically the
+// cold-rewrite detection (the runtime side of `cold_rewrites`). Empirically the
 // prompt cache survives well past the 5-min default TTL, so we don't predict from
 // idle time — we detect the *actual* rewrite on the latest turn: tiny read +
 // a large create means the whole prefix was rebuilt at 1.25× pricing.
@@ -54,7 +54,7 @@ pub enum AlertEvent {
     /// Aggregated alerts that were suppressed during quiet hours.
     CatchUp { count: usize, items: Vec<AlertEvent> },
     /// A runtime optimization tip about the active Claude Code session. `name` is
-    /// the insight kind (`long_session` / `idle_cache_gap`); `params` carries the
+    /// the insight kind (`long_session` / `cold_rewrites`); `params` carries the
     /// localization placeholders. The inner field is `name`, not `kind`, to avoid
     /// colliding with the serde tag.
     Insight {
@@ -234,7 +234,7 @@ impl AlertEngine {
         if enabled("long_session") {
             self.eval_long_session(&session, suppressed, out);
         }
-        if enabled("idle_cache_gap") {
+        if enabled("cold_rewrites") {
             self.eval_cold_rewrite(&session, suppressed, out);
         }
     }
@@ -293,7 +293,7 @@ impl AlertEngine {
         };
         self.dispatch(
             AlertEvent::Insight {
-                name: "idle_cache_gap".into(),
+                name: "cold_rewrites".into(),
                 params: serde_json::json!({
                     "project": s.project,
                     "cause": cause,
