@@ -98,6 +98,21 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX IF NOT EXISTS idx_cc_tool_use_name ON cc_tool_use(tool_name);
     DELETE FROM cc_files;",
+    // v7 — recompute stored `cost` after the Opus price correction. Cost is
+    // snapshotted at ingest time, so rows stored before the fix keep the old
+    // Opus rate ($15/$75 — the legacy Opus 4/4.1 price); current Opus 4.5–4.8 is
+    // $5/$25, which had overstated Opus spend 3×. A re-ingest can't fix this
+    // (cc_upsert is INSERT-OR-IGNORE and never rewrites cost), and transcripts
+    // may be gone, so we recompute in place. Mirrors cc::price_per_mtok /
+    // cost_for at the time of writing; if prices change again, APPEND a new
+    // migration rather than editing this one.
+    "UPDATE cc_usage SET cost = CASE
+        WHEN model LIKE '%fable%'  THEN (input*10.0 + cache_create*10.0*1.25 + cache_read*10.0*0.1 + output*50.0) / 1000000.0
+        WHEN model LIKE '%opus%'   THEN (input* 5.0 + cache_create* 5.0*1.25 + cache_read* 5.0*0.1 + output*25.0) / 1000000.0
+        WHEN model LIKE '%sonnet%' THEN (input* 3.0 + cache_create* 3.0*1.25 + cache_read* 3.0*0.1 + output*15.0) / 1000000.0
+        WHEN model LIKE '%haiku%'  THEN (input* 1.0 + cache_create* 1.0*1.25 + cache_read* 1.0*0.1 + output* 5.0) / 1000000.0
+        ELSE 0.0
+     END;",
 ];
 
 fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -186,6 +201,34 @@ mod tests {
         migrate(&conn).unwrap();
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(v, MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn v7_recomputes_cost_for_current_prices() {
+        // Rows stored with a deliberately wrong cost get rewritten by the v7
+        // recompute migration to the current per-family price (mirrors cost_for).
+        let db = mem_db();
+        let conn = db.conn.lock().unwrap();
+        conn.execute_batch(
+            "INSERT INTO cc_usage (message_id, ts, model, input, output, cache_create, cache_read, cost)
+             VALUES ('o','t','claude-opus-4-7', 1000, 2000, 0, 0, 999.0),
+                    ('s','t','claude-sonnet-4-5', 500, 1000, 0, 0, 999.0),
+                    ('f','t','claude-fable-5',   1000, 2000, 0, 0, 999.0),
+                    ('h','t','claude-haiku-4-5',  100,  100, 1000, 10000, 999.0);",
+        )
+        .unwrap();
+        // Re-run only the cost-recompute migration (v7 = index 6); idempotent.
+        conn.execute_batch(MIGRATIONS[6]).unwrap();
+        let cost = |id: &str| -> f64 {
+            conn.query_row("SELECT cost FROM cc_usage WHERE message_id=?1", [id], |r| r.get(0))
+                .unwrap()
+        };
+        // opus $5/$25; sonnet $3/$15; fable $10/$50; haiku $1/$5 (+cache mults).
+        assert!((cost("o") - 0.055).abs() < 1e-9, "opus {}", cost("o"));
+        assert!((cost("s") - 0.0165).abs() < 1e-9, "sonnet {}", cost("s"));
+        assert!((cost("f") - 0.11).abs() < 1e-9, "fable {}", cost("f"));
+        // haiku: (100 + 1000*1.25 + 10000*0.1 + 100*5)/1e6 = (100+1250+1000+500)/1e6
+        assert!((cost("h") - 0.00285).abs() < 1e-9, "haiku {}", cost("h"));
     }
 
     #[test]

@@ -4,9 +4,9 @@
 //! exposes. Fixtures live under `tests/fixtures/projects/`; the DB is in-memory.
 //!
 //! Expected fixture contents (see tests/fixtures/projects/*):
-//!   msg-1  opus    in 1000  out 2000               -> cost 0.165
+//!   msg-1  opus    in 1000  out 2000               -> cost 0.055
 //!   msg-2  sonnet  in  500  out 1000               -> cost 0.0165
-//!   msg-3  opus    in  100  out  100  cc 1000 cr 10000 -> cost 0.04275
+//!   msg-3  opus    in  100  out  100  cc 1000 cr 10000 -> cost 0.01425
 //! plus a duplicate msg-1 (deduped), a user line and a <synthetic> line (skipped).
 
 use std::path::{Path, PathBuf};
@@ -45,7 +45,7 @@ fn ingest_dedups_skips_noise_and_aggregates() {
     assert_eq!(t.cache_read, 10000);
     assert_eq!(t.total_tokens, 15700); // 1600 + 3100 + 1000 + 10000
     assert!(
-        (t.cost - 0.224_25).abs() < 1e-6,
+        (t.cost - 0.085_75).abs() < 1e-6,
         "total cost was {}",
         t.cost
     );
@@ -84,13 +84,13 @@ fn window_excludes_rows_outside_range() {
         .unwrap();
     assert_eq!(day.totals.messages, 2);
     assert_eq!(day.totals.sessions, 1);
-    assert!((day.totals.cost - 0.181_5).abs() < 1e-6);
+    assert!((day.totals.cost - 0.071_5).abs() < 1e-6);
 
     // cost_in agrees with the analytics window.
     let cost = db
         .cost_in("2026-05-20T00:00:00Z", "2026-05-21T00:00:00Z")
         .unwrap();
-    assert!((cost - 0.181_5).abs() < 1e-6, "cost_in was {cost}");
+    assert!((cost - 0.071_5).abs() < 1e-6, "cost_in was {cost}");
 }
 
 #[test]
