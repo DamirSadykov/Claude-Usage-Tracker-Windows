@@ -536,7 +536,7 @@ mod tests {
     fn cold_rewrite_primes_then_fires_once_with_cause() {
         let mut eng = AlertEngine::new();
         let mut c = runtime_cfg();
-        c.runtime_insight_kinds = vec!["idle_cache_gap".into()];
+        c.runtime_insight_kinds = vec!["cold_rewrites".into()];
         let u = flat();
         prime(&mut eng, &u, &c);
 
@@ -547,7 +547,7 @@ mod tests {
         // new cold-rewrite turn after a long gap → fires, labelled idle
         eng.set_active_session(Some(cold(warm("s1", "t2", 11), 40.0)));
         let out = eng.evaluate(&u, &c, 0, None, None, false);
-        assert!(is_insight(&out, "idle_cache_gap"));
+        assert!(is_insight(&out, "cold_rewrites"));
         assert_eq!(insight_cause(&out).as_deref(), Some("idle"));
 
         // same turn again → no repeat
@@ -564,7 +564,7 @@ mod tests {
     fn cold_rewrite_guards_warm_small_and_first_turn() {
         let mut eng = AlertEngine::new();
         let mut c = runtime_cfg();
-        c.runtime_insight_kinds = vec!["idle_cache_gap".into()];
+        c.runtime_insight_kinds = vec!["cold_rewrites".into()];
         let u = flat();
         prime(&mut eng, &u, &c);
         eng.set_active_session(Some(warm("s1", "t0", 5)));
@@ -600,15 +600,15 @@ mod tests {
         eng.set_active_session(Some(warm("s1", "t1", 500)));
         assert!(eng.evaluate(&u, &c, 0, None, None, false).is_empty());
 
-        // master on but only idle_cache_gap in the kind set → long_session gated out
+        // master on but only cold_rewrites in the kind set → long_session gated out
         c.runtime_insights_enabled = true;
-        c.runtime_insight_kinds = vec!["idle_cache_gap".into()];
+        c.runtime_insight_kinds = vec!["cold_rewrites".into()];
         let mut eng2 = AlertEngine::new();
         prime(&mut eng2, &u, &c);
         eng2.set_active_session(Some(warm("s1", "t1", 500))); // prime cold tracker
         let _ = eng2.evaluate(&u, &c, 0, None, None, false);
         eng2.set_active_session(Some(cold(warm("s1", "t2", 500), 40.0)));
-        assert!(is_insight(&eng2.evaluate(&u, &c, 0, None, None, false), "idle_cache_gap"));
+        assert!(is_insight(&eng2.evaluate(&u, &c, 0, None, None, false), "cold_rewrites"));
     }
 
     #[test]

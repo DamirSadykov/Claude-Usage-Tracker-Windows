@@ -466,6 +466,31 @@ function affectedOf(ins: Insight): AffectedSession[] {
   const a = (ins.params as Record<string, unknown>)?.affected;
   return Array.isArray(a) ? (a as AffectedSession[]) : [];
 }
+
+// cold_rewrites carries a per-cause breakdown the flat label can't render. Map
+// each cause to its localized label and pre-format the cost; the template lists
+// only the causes the backend actually saw (zero-count ones are omitted there).
+const COLD_CAUSE_LABEL: Record<string, string> = {
+  compaction: "insightColdCauseCompaction",
+  idle: "insightColdCauseIdle",
+  model_switch: "insightColdCauseModelSwitch",
+};
+interface ColdCause {
+  cause: string;
+  label: string;
+  n: number;
+  cost: string;
+}
+function coldCauses(ins: Insight): ColdCause[] {
+  const arr = (ins.params as Record<string, unknown>)?.causes;
+  if (!Array.isArray(arr)) return [];
+  return (arr as Array<{ cause: string; n: number; cost: number }>).map((c) => ({
+    cause: c.cause,
+    label: t(COLD_CAUSE_LABEL[c.cause] ?? c.cause),
+    n: c.n,
+    cost: fmtCost(c.cost),
+  }));
+}
 const expandedAffected = ref<Set<string>>(new Set());
 function toggleAffected(kind: string) {
   const next = new Set(expandedAffected.value);
@@ -653,6 +678,19 @@ onMounted(async () => {
                   :title="t('ignoreInsight')"
                   @click="ignoreInsight(ins.kind)"
                 >×</button>
+              </div>
+              <ul v-if="ins.kind === 'cold_rewrites'" class="aw-cold-causes">
+                <li
+                  v-for="c in coldCauses(ins)"
+                  :key="c.cause"
+                  class="aw-cold-cause"
+                >
+                  <span class="aw-cold-cause-label">{{ c.label }}</span>
+                  <span class="aw-cold-cause-val">{{ c.n }} × {{ c.cost }}</span>
+                </li>
+              </ul>
+              <div v-if="ins.kind === 'cold_rewrites'" class="aw-cold-fix">
+                {{ t('insightColdRewritesFix') }}
               </div>
               <div
                 v-if="expandedHelp.has(ins.kind)"
@@ -1130,6 +1168,38 @@ onMounted(async () => {
 }
 .aw-insight-x:hover {
   color: rgba(255, 255, 255, 0.85);
+}
+.aw-cold-causes {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.aw-cold-cause {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12.5px;
+  padding: 3px 8px;
+  background: rgba(0, 0, 0, 0.15);
+  border-radius: 5px;
+}
+.aw-cold-cause-label {
+  color: var(--text-2, rgba(255, 255, 255, 0.85));
+}
+.aw-cold-cause-val {
+  font-variant-numeric: tabular-nums;
+  color: var(--text-3, rgba(255, 255, 255, 0.6));
+  white-space: nowrap;
+}
+.aw-cold-fix {
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-3, rgba(255, 255, 255, 0.6));
+  margin-top: 8px;
 }
 .aw-affected {
   font-size: 12px;

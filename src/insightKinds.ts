@@ -31,13 +31,15 @@ export const INSIGHT_KINDS: InsightKindDef[] = [
   { kind: "bloated_session", category: "recommendation", labelKey: "insightBloatedSession", shortLabelKey: "insightLabelBloatedSession" },
   { kind: "long_session", category: "recommendation", labelKey: "insightLongSession", shortLabelKey: "insightLabelLongSession", runtimeCapable: true },
   { kind: "mixed_models", category: "recommendation", labelKey: "insightMixedModels", shortLabelKey: "insightLabelMixedModels" },
-  { kind: "cold_restarts", category: "recommendation", labelKey: "insightColdRestarts", shortLabelKey: "insightLabelColdRestarts" },
+  // Cold cache rewrites — one metric on two surfaces: the dashboard card shows a
+  // per-cause breakdown (compaction / idle / model switch); the runtime toast
+  // fires the moment one happens. Same `kind` drives both toggles in Settings.
+  { kind: "cold_rewrites", category: "recommendation", labelKey: "insightColdRewrites", shortLabelKey: "insightLabelColdRewrites", runtimeCapable: true },
   // subagent_efficacy uses one of two label_keys depending on sign; the toggle
   // list shows the help variant by default.
   { kind: "subagent_efficacy", category: "recommendation", labelKey: "insightSubagentEfficacyHelp", shortLabelKey: "insightLabelSubagentEfficacy" },
   { kind: "tool_heavy_writes", category: "recommendation", labelKey: "insightToolHeavyWrites", shortLabelKey: "insightLabelToolHeavyWrites" },
   { kind: "subagent_no_attribution", category: "recommendation", labelKey: "insightSubagentNoAttribution", shortLabelKey: "insightLabelSubagentNoAttribution" },
-  { kind: "idle_cache_gap", category: "recommendation", labelKey: "insightIdleCacheGap", shortLabelKey: "insightLabelIdleCacheGap", runtimeCapable: true },
 
   // expensive_session is an observation, not a recommendation — the user
   // doesn't need to "do" anything, but the session is worth opening.

@@ -51,7 +51,7 @@ function localizeInsight(
           messages: Number(params.messages ?? 0),
         }),
       };
-    case "idle_cache_gap": {
+    case "cold_rewrites": {
       const idle = params.cause !== "compact";
       return {
         title: t("alertInsightColdRewriteTitle"),

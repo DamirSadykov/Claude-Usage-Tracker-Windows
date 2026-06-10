@@ -47,10 +47,31 @@ fn default_forecast_window() -> u64 {
 }
 
 /// Runtime-insight kinds enabled by default once the master toggle is on. Only
-/// the two runtime-capable kinds exist in v1 — keep in sync with `RUNTIME_KINDS`
-/// in the engine and `runtimeCapable` in `insightKinds.ts`.
+/// the two runtime-capable kinds exist in v1 — keep in sync with the engine's
+/// `enabled(...)` checks and `runtimeCapable` in `insightKinds.ts`.
 fn default_runtime_insight_kinds() -> Vec<String> {
-    vec!["long_session".to_string(), "idle_cache_gap".to_string()]
+    vec!["long_session".to_string(), "cold_rewrites".to_string()]
+}
+
+/// Normalizes persisted runtime kinds, migrating the pre-release name
+/// `idle_cache_gap` → `cold_rewrites` so a settings.json written before the
+/// rename keeps its runtime toggle. Only relevant while #46 is unreleased; can
+/// be dropped once no old settings remain in the wild.
+fn de_runtime_insight_kinds<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Vec::<String>::deserialize(d)?;
+    Ok(raw
+        .into_iter()
+        .map(|k| {
+            if k == "idle_cache_gap" {
+                "cold_rewrites".to_string()
+            } else {
+                k
+            }
+        })
+        .collect())
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -99,7 +120,10 @@ pub struct AppConfig {
     // the per-kind tips selected in `runtime_insight_kinds`.
     #[serde(default)]
     pub runtime_insights_enabled: bool,
-    #[serde(default = "default_runtime_insight_kinds")]
+    #[serde(
+        default = "default_runtime_insight_kinds",
+        deserialize_with = "de_runtime_insight_kinds"
+    )]
     pub runtime_insight_kinds: Vec<String>,
 }
 

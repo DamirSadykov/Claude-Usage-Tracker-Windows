@@ -106,7 +106,7 @@ const serviceStatusEnabled = ref(true);
 const serviceStatusInterval = ref(90);
 const serviceStatusNotify = ref(true);
 const runtimeInsightsEnabled = ref(false);
-const runtimeInsightKinds = ref<string[]>(["long_session", "idle_cache_gap"]);
+const runtimeInsightKinds = ref<string[]>(["long_session", "cold_rewrites"]);
 const todaySpent = ref<number | null>(null);
 const suggestedBudget = ref<number | null>(null);
 const budgetUnit = computed<"usd" | "pct">(() =>
@@ -221,7 +221,13 @@ async function loadSettings() {
             (await store.get<boolean>("runtimeInsightsEnabled")) ?? false;
         {
             const rk = await store.get<string[]>("runtimeInsightKinds");
-            if (Array.isArray(rk)) runtimeInsightKinds.value = rk;
+            // Migrate the pre-release kind name idle_cache_gap → cold_rewrites so
+            // a settings.json written before the rename keeps its runtime toggle.
+            if (Array.isArray(rk)) {
+                runtimeInsightKinds.value = rk.map((k) =>
+                    k === "idle_cache_gap" ? "cold_rewrites" : k,
+                );
+            }
         }
         const savedLocale = await store.get<string>("locale");
         if (savedLocale) locale.value = savedLocale;
