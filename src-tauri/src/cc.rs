@@ -20,7 +20,9 @@ use crate::stats::{CcUsageRow, StatsDb};
 /// family substring so new point releases (opus-4-7, opus-4-8…) keep working.
 fn price_per_mtok(model: &str) -> Option<(f64, f64)> {
     let m = model.to_ascii_lowercase();
-    if m.contains("opus") {
+    if m.contains("fable") {
+        Some((10.0, 50.0))
+    } else if m.contains("opus") {
         Some((15.0, 75.0))
     } else if m.contains("sonnet") {
         Some((3.0, 15.0))
@@ -266,6 +268,7 @@ mod tests {
     #[test]
     fn pricing_by_family() {
         // 1M input + 1M output, no cache.
+        assert!((cost_for("claude-fable-5", 1_000_000, 1_000_000, 0, 0) - 60.0).abs() < 1e-6);
         assert!((cost_for("claude-opus-4-7", 1_000_000, 1_000_000, 0, 0) - 90.0).abs() < 1e-6);
         assert!((cost_for("claude-sonnet-4-5", 1_000_000, 1_000_000, 0, 0) - 18.0).abs() < 1e-6);
         assert!((cost_for("claude-haiku-4-5", 1_000_000, 1_000_000, 0, 0) - 6.0).abs() < 1e-6);

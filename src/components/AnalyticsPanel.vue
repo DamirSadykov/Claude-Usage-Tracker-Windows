@@ -120,13 +120,15 @@ function metricVal(tokens: number, cost: number): number {
 
 // "claude-opus-4-7" → "Opus 4.7"
 function modelLabel(m: string): string {
-  const fam = m.includes("opus")
-    ? "Opus"
-    : m.includes("sonnet")
-      ? "Sonnet"
-      : m.includes("haiku")
-        ? "Haiku"
-        : m;
+  const fam = m.includes("fable")
+    ? "Fable"
+    : m.includes("opus")
+      ? "Opus"
+      : m.includes("sonnet")
+        ? "Sonnet"
+        : m.includes("haiku")
+          ? "Haiku"
+          : m;
   const ver = m.match(/(\d+)-(\d+)/);
   return ver ? `${fam} ${ver[1]}.${ver[2]}` : fam;
 }
@@ -135,6 +137,7 @@ function modelLabel(m: string): string {
 // shades around that hue, so "Opus 4.7" and "Opus 4.8" read as different
 // colours while still grouping visually by family. [h, s, l] of the base shade.
 const FAMILY_HSL: Record<string, [number, number, number]> = {
+  Fable: [268, 48, 64], // #9a7fd1 — premium tier above Opus
   Opus: [16, 63, 59], // #d97757
   Sonnet: [113, 50, 58], // #6ccb5f
   Haiku: [209, 58, 59], // #5b9bd5
