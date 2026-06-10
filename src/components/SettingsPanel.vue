@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch, computed, onMounted } from "vue";
+import { ref, watch, onMounted } from "vue";
 import type { Ref } from "vue";
 import { useI18n } from "vue-i18n";
 import {
@@ -70,6 +70,8 @@ const props = defineProps<{
   serviceStatusEnabled: boolean;
   serviceStatusInterval: number;
   serviceStatusNotify: boolean;
+  runtimeInsightsEnabled: boolean;
+  runtimeInsightKinds: string[];
   locale: string;
 }>();
 
@@ -97,6 +99,8 @@ const emit = defineEmits<{
     serviceStatusNotify: boolean;
     locale: string;
   }];
+  // Runtime-insight settings save immediately (not via the Save button).
+  runtimeChange: [settings: { enabled: boolean; kinds: string[] }];
 }>();
 
 const localSessionKey = ref(props.sessionKey);
@@ -190,12 +194,40 @@ function toggleInsight(kind: string) {
   saveIgnoredInsights();
 }
 
-const insightObservations = computed(() =>
-  INSIGHT_KINDS.filter((k) => k.category === "observation"),
-);
-const insightRecommendations = computed(() =>
-  INSIGHT_KINDS.filter((k) => k.category === "recommendation"),
-);
+// All insight kinds in catalog order — rendered as a Dashboard / Runtime table.
+const allInsightKinds = INSIGHT_KINDS;
+
+// --- Runtime insights (issue #46) ---
+// Master opt-in + per-kind set. Both save immediately via the `runtimeChange`
+// emit (the backend reconfigures on the spot), unlike the Save-button settings.
+const localRuntimeEnabled = ref(props.runtimeInsightsEnabled);
+const localRuntimeKinds = ref<string[]>([...props.runtimeInsightKinds]);
+watch(() => props.runtimeInsightsEnabled, (v) => (localRuntimeEnabled.value = v));
+watch(() => props.runtimeInsightKinds, (v) => (localRuntimeKinds.value = [...v]));
+
+function isRuntimeOn(kind: string): boolean {
+  return localRuntimeEnabled.value && localRuntimeKinds.value.includes(kind);
+}
+
+function emitRuntime() {
+  emit("runtimeChange", {
+    enabled: localRuntimeEnabled.value,
+    kinds: [...localRuntimeKinds.value],
+  });
+}
+
+function toggleRuntimeMaster() {
+  localRuntimeEnabled.value = !localRuntimeEnabled.value;
+  emitRuntime();
+}
+
+function toggleRuntime(kind: string) {
+  if (!localRuntimeEnabled.value) return;
+  const i = localRuntimeKinds.value.indexOf(kind);
+  if (i >= 0) localRuntimeKinds.value.splice(i, 1);
+  else localRuntimeKinds.value.push(kind);
+  emitRuntime();
+}
 
 onMounted(loadIgnoredInsights);
 
@@ -737,32 +769,53 @@ function handleSave() {
         </div>
       </div>
 
-      <div class="card">
-        <div class="field-label">{{ t('insightTabRecommendations') }}</div>
-        <div
-          v-for="def in insightRecommendations"
-          :key="def.kind"
-          class="tier-row"
-          @click="toggleInsight(def.kind)"
-        >
-          <span class="tier-name">{{ t(def.shortLabelKey) }}</span>
-          <div class="toggle" :class="{ on: isInsightEnabled(def.kind) }">
-            <div class="toggle-knob"></div>
-          </div>
+      <!-- Runtime master opt-in -->
+      <div class="card toggle-card" @click="toggleRuntimeMaster">
+        <div style="flex: 1; min-width: 0">
+          <div class="card-title" style="font-size: 13px">{{ t('runtimeInsightsTitle') }}</div>
+          <div class="card-sub">{{ t('runtimeInsightsDesc') }}</div>
+        </div>
+        <div class="toggle" :class="{ on: localRuntimeEnabled }">
+          <div class="toggle-knob"></div>
         </div>
       </div>
 
+      <!-- Metric | Dashboard | Runtime -->
       <div class="card">
-        <div class="field-label">{{ t('insightTabObservations') }}</div>
+        <div class="insight-row insight-head">
+          <span class="insight-name"></span>
+          <span class="insight-col">{{ t('insightColDashboard') }}</span>
+          <span class="insight-col">{{ t('insightColRuntime') }}</span>
+        </div>
         <div
-          v-for="def in insightObservations"
+          v-for="def in allInsightKinds"
           :key="def.kind"
-          class="tier-row"
-          @click="toggleInsight(def.kind)"
+          class="insight-row"
         >
-          <span class="tier-name">{{ t(def.shortLabelKey) }}</span>
-          <div class="toggle" :class="{ on: isInsightEnabled(def.kind) }">
-            <div class="toggle-knob"></div>
+          <span class="insight-name">{{ t(def.shortLabelKey) }}</span>
+          <div class="insight-col">
+            <div
+              class="toggle"
+              :class="{ on: isInsightEnabled(def.kind) }"
+              @click="toggleInsight(def.kind)"
+            >
+              <div class="toggle-knob"></div>
+            </div>
+          </div>
+          <div class="insight-col">
+            <div
+              v-if="def.runtimeCapable"
+              class="toggle"
+              :class="{ on: isRuntimeOn(def.kind), disabled: !localRuntimeEnabled }"
+              @click="toggleRuntime(def.kind)"
+            >
+              <div class="toggle-knob"></div>
+            </div>
+            <span
+              v-else
+              class="insight-na"
+              :title="t('runtimeInsightUnavailable')"
+            >—</span>
           </div>
         </div>
       </div>
@@ -1025,6 +1078,44 @@ function handleSave() {
 .tier-name {
   font-size: 13px;
   color: var(--text-2);
+}
+
+/* Insights table: Metric | Dashboard | Runtime */
+.insight-row {
+  display: grid;
+  grid-template-columns: 1fr 72px 72px;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 0;
+}
+.insight-head {
+  border-bottom: 1px solid var(--stroke-strong);
+  padding-bottom: 8px;
+  margin-bottom: 2px;
+}
+.insight-name {
+  font-size: 13px;
+  color: var(--text-2);
+}
+.insight-col {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-3);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.insight-col .toggle {
+  cursor: pointer;
+}
+.insight-col .toggle.disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+.insight-na {
+  color: var(--text-4);
 }
 
 .field-label {

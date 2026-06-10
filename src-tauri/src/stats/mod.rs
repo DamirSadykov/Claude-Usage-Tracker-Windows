@@ -19,7 +19,7 @@ pub use analytics::{
     Analytics, AnalyticsExt, DailyPoint, HeatCell, Insight, ModelUsage, PeriodCompare,
     ProjectUsage, SessionUsage, SubagentSummary, SubagentUsage, ToolUsage, Totals,
 };
-pub use cc_store::CcUsageRow;
+pub use cc_store::{CcActiveSession, CcUsageRow};
 pub use forecast::{ForecastData, TierForecast};
 pub use snapshots::{UsageDelta, UsageSnapshot};
 

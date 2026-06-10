@@ -8,7 +8,8 @@ export type AlertEvent =
   | { kind: "reset"; tier: string }
   | { kind: "forecast"; eta_minutes: number }
   | { kind: "budget"; spent: number; budget: number; unit: string }
-  | { kind: "catch_up"; count: number; items: AlertEvent[] };
+  | { kind: "catch_up"; count: number; items: AlertEvent[] }
+  | { kind: "insight"; name: string; params: Record<string, unknown> };
 
 function fmtBudgetValue(value: number, unit: string): string {
   return unit === "usd" ? "$" + value.toFixed(2) : value.toFixed(1) + "%";
@@ -26,6 +27,48 @@ const TIER_LABEL: Record<string, string> = {
 
 function tierName(t: Translate, tier: string): string {
   return t(TIER_LABEL[tier] ?? tier);
+}
+
+function fmtTokens(n: number): string {
+  if (n >= 1000) return Math.round(n / 1000) + "K";
+  return String(n);
+}
+
+// Localizes a runtime optimization tip. `project` is the working-dir basename or
+// null; falls back to a generic label so we never read transcript content.
+function localizeInsight(
+  t: Translate,
+  name: string,
+  params: Record<string, unknown>,
+): { title: string; body: string } {
+  const project = (params.project as string | null) ?? t("insightProjectFallback");
+  switch (name) {
+    case "long_session":
+      return {
+        title: t("alertInsightLongSessionTitle"),
+        body: t("alertInsightLongSessionBody", {
+          project,
+          messages: Number(params.messages ?? 0),
+        }),
+      };
+    case "idle_cache_gap": {
+      const idle = params.cause !== "compact";
+      return {
+        title: t("alertInsightColdRewriteTitle"),
+        body: t(
+          idle ? "alertInsightColdRewriteIdleBody" : "alertInsightColdRewriteCompactBody",
+          {
+            project,
+            minutes: Math.round(Number(params.gap_minutes ?? 0)),
+            tokens: fmtTokens(Number(params.tokens ?? 0)),
+            cost: "$" + Number(params.cost_usd ?? 0).toFixed(2),
+          },
+        ),
+      };
+    }
+    default:
+      return { title: t("alertInsightLongSessionTitle"), body: name };
+  }
 }
 
 export function formatEta(t: Translate, minutes: number): string {
@@ -71,5 +114,7 @@ export function localizeAlert(t: Translate, a: AlertEvent): { title: string; bod
         a.items.map((i) => "• " + localizeAlert(t, i).body).join("\n");
       return { title: t("alertCatchUpTitle"), body };
     }
+    case "insight":
+      return localizeInsight(t, a.name, a.params);
   }
 }

@@ -56,6 +56,42 @@ describe("localizeAlert", () => {
     });
   });
 
+  it("long_session insight carries project + message count", () => {
+    const a: AlertEvent = {
+      kind: "insight",
+      name: "long_session",
+      params: { project: "myapp", messages: 240 },
+    };
+    expect(localizeAlert(t, a)).toEqual({
+      title: "alertInsightLongSessionTitle",
+      body: "alertInsightLongSessionBody(project=myapp,messages=240)",
+    });
+  });
+
+  it("cold rewrite (idle cause) formats tokens + cost, null project falls back", () => {
+    const a: AlertEvent = {
+      kind: "insight",
+      name: "idle_cache_gap",
+      params: { project: null, cause: "idle", gap_minutes: 42, tokens: 320000, cost_usd: 1.7 },
+    };
+    expect(localizeAlert(t, a)).toEqual({
+      title: "alertInsightColdRewriteTitle",
+      body: "alertInsightColdRewriteIdleBody(project=insightProjectFallback,minutes=42,tokens=320K,cost=$1.70)",
+    });
+  });
+
+  it("cold rewrite (compact cause) uses the compaction body", () => {
+    const a: AlertEvent = {
+      kind: "insight",
+      name: "idle_cache_gap",
+      params: { project: "myapp", cause: "compact", gap_minutes: 0, tokens: 96000, cost_usd: 0.6 },
+    };
+    expect(localizeAlert(t, a)).toEqual({
+      title: "alertInsightColdRewriteTitle",
+      body: "alertInsightColdRewriteCompactBody(project=myapp,minutes=0,tokens=96K,cost=$0.60)",
+    });
+  });
+
   it("catch_up aggregates its items' bodies", () => {
     const a: AlertEvent = {
       kind: "catch_up",
