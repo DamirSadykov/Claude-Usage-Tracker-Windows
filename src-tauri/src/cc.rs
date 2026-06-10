@@ -18,12 +18,14 @@ use crate::stats::{CcUsageRow, StatsDb};
 /// Per-million-token prices (input, output) in USD. Cache-write is input×1.25,
 /// cache-read is input×0.1 (Anthropic's published multipliers). Matched by model
 /// family substring so new point releases (opus-4-7, opus-4-8…) keep working.
+/// Opus is the current 4.5–4.8 rate ($5/$25); the legacy Opus 4/4.1 $15/$75 is
+/// not modelled separately since those are deprecated and rare in transcripts.
 fn price_per_mtok(model: &str) -> Option<(f64, f64)> {
     let m = model.to_ascii_lowercase();
     if m.contains("fable") {
         Some((10.0, 50.0))
     } else if m.contains("opus") {
-        Some((15.0, 75.0))
+        Some((5.0, 25.0))
     } else if m.contains("sonnet") {
         Some((3.0, 15.0))
     } else if m.contains("haiku") {
@@ -269,7 +271,7 @@ mod tests {
     fn pricing_by_family() {
         // 1M input + 1M output, no cache.
         assert!((cost_for("claude-fable-5", 1_000_000, 1_000_000, 0, 0) - 60.0).abs() < 1e-6);
-        assert!((cost_for("claude-opus-4-7", 1_000_000, 1_000_000, 0, 0) - 90.0).abs() < 1e-6);
+        assert!((cost_for("claude-opus-4-7", 1_000_000, 1_000_000, 0, 0) - 30.0).abs() < 1e-6);
         assert!((cost_for("claude-sonnet-4-5", 1_000_000, 1_000_000, 0, 0) - 18.0).abs() < 1e-6);
         assert!((cost_for("claude-haiku-4-5", 1_000_000, 1_000_000, 0, 0) - 6.0).abs() < 1e-6);
         // unknown model → 0
@@ -278,9 +280,9 @@ mod tests {
 
     #[test]
     fn cache_multipliers() {
-        // opus input price 15/MTok: cache_create ×1.25 = 18.75, cache_read ×0.1 = 1.5
+        // opus input price 5/MTok: cache_create ×1.25 = 6.25, cache_read ×0.1 = 0.5
         let c = cost_for("claude-opus-4-7", 0, 0, 1_000_000, 1_000_000);
-        assert!((c - (18.75 + 1.5)).abs() < 1e-6);
+        assert!((c - (6.25 + 0.5)).abs() < 1e-6);
     }
 
     #[test]
