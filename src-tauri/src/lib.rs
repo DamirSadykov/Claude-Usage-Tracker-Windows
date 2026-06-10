@@ -22,7 +22,7 @@ use tauri::{
 };
 use tokio::sync::Notify;
 
-use alerts::{tier_level, AlertEngine, AppConfig};
+use alerts::{tier_level, ActiveSession, AlertEngine, AppConfig};
 use domain::{compute_levels, is_muted, today_spent_for, UsageLevels};
 use report::{DiagReport, DiagStore};
 use stats::StatsDb;
@@ -305,9 +305,47 @@ async fn run_cycle(
             let n = chrono::Local::now();
             n.hour() * 60 + n.minute()
         };
+        // Active-session snapshot for runtime tips (issue #46). Computed outside
+        // the engine lock; idle time and rewrite-cost are derived here so the
+        // engine stays time- and pricing-agnostic.
+        let active_session = if cfg.runtime_insights_enabled {
+            stats
+                .as_ref()
+                .and_then(|s| s.cc_active_session().ok().flatten())
+                .map(|cs| {
+                    // Gap between the latest turn and its predecessor — what
+                    // labels a detected rewrite as idle vs compaction.
+                    let gap_minutes = cs
+                        .prev_ts
+                        .as_deref()
+                        .and_then(|p| {
+                            let a = chrono::DateTime::parse_from_rfc3339(p).ok()?;
+                            let b = chrono::DateTime::parse_from_rfc3339(&cs.last_ts).ok()?;
+                            Some((b - a).num_seconds() as f64 / 60.0)
+                        })
+                        .unwrap_or(0.0)
+                        .max(0.0);
+                    // Actual USD the latest turn spent rebuilding the prefix.
+                    let rewrite_cost = cc::cost_for(&cs.model, 0, 0, cs.last_cache_create, 0);
+                    ActiveSession {
+                        session_id: cs.session_id,
+                        project: cs.project,
+                        messages: cs.messages,
+                        last_ts: cs.last_ts,
+                        has_prev: cs.prev_ts.is_some(),
+                        gap_minutes,
+                        last_cache_read: cs.last_cache_read,
+                        last_cache_create: cs.last_cache_create,
+                        rewrite_cost_usd: rewrite_cost,
+                    }
+                })
+        } else {
+            None
+        };
         let events = {
             let eng = app.state::<Mutex<AlertEngine>>();
             let mut e = eng.lock().unwrap();
+            e.set_active_session(active_session);
             e.evaluate(&usage, cfg, now_min, delta.as_ref(), today_spent, muted)
         };
         for ev in events {

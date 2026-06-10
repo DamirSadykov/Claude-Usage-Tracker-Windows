@@ -46,6 +46,13 @@ fn default_forecast_window() -> u64 {
     60
 }
 
+/// Runtime-insight kinds enabled by default once the master toggle is on. Only
+/// the two runtime-capable kinds exist in v1 — keep in sync with `RUNTIME_KINDS`
+/// in the engine and `runtimeCapable` in `insightKinds.ts`.
+fn default_runtime_insight_kinds() -> Vec<String> {
+    vec!["long_session".to_string(), "idle_cache_gap".to_string()]
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct AppConfig {
     pub session_key: String,
@@ -87,6 +94,13 @@ pub struct AppConfig {
     pub service_status_interval: u64,
     #[serde(default = "default_true")]
     pub service_status_notify: bool,
+    // Runtime optimization tips (issue #46). Master opt-in, off by default — when
+    // on, the engine evaluates the active Claude Code session each poll and toasts
+    // the per-kind tips selected in `runtime_insight_kinds`.
+    #[serde(default)]
+    pub runtime_insights_enabled: bool,
+    #[serde(default = "default_runtime_insight_kinds")]
+    pub runtime_insight_kinds: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -122,6 +136,8 @@ impl Default for AppConfig {
             service_status_enabled: true,
             service_status_interval: 90,
             service_status_notify: true,
+            runtime_insights_enabled: false,
+            runtime_insight_kinds: default_runtime_insight_kinds(),
         }
     }
 }

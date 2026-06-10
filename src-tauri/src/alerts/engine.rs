@@ -19,6 +19,23 @@ const MIN_RATE: f64 = 0.05; // %/min — below this is noise/flat
 const MAX_PENDING: usize = 10;
 const RESET_EPSILON: f64 = 1.0; // percent_used <= this counts as "reset"
 
+// --- Runtime-insight tuning (issue #46) ---
+// long_session: number of assistant turns in the active session before we nudge
+// "this is getting long, consider splitting". Time/cost are intentionally not
+// used in v1.
+const LONG_SESSION_MESSAGES: i64 = 200;
+// cold-rewrite detection (the runtime side of `idle_cache_gap`). Empirically the
+// prompt cache survives well past the 5-min default TTL, so we don't predict from
+// idle time — we detect the *actual* rewrite on the latest turn: tiny read +
+// a large create means the whole prefix was rebuilt at 1.25× pricing.
+const COLD_READ_MAX: i64 = 5_000;
+const COLD_CREATE_GATE: i64 = 50_000;
+// Cause split: a real idle/TTL expiry only ever appears after a long pause
+// (scanning local transcripts: nothing between ~5 and ~19 min, then idle rewrites
+// from there up). A near-zero gap means the prefix was invalidated in-flow — a
+// compaction or history/model change, not an idle gap.
+const COLD_IDLE_GAP_MIN: f64 = 15.0;
+
 // --- Alert events (typed; the UI localizes & toasts them) ---
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -36,6 +53,41 @@ pub enum AlertEvent {
     Budget { spent: f64, budget: f64, unit: String },
     /// Aggregated alerts that were suppressed during quiet hours.
     CatchUp { count: usize, items: Vec<AlertEvent> },
+    /// A runtime optimization tip about the active Claude Code session. `name` is
+    /// the insight kind (`long_session` / `idle_cache_gap`); `params` carries the
+    /// localization placeholders. The inner field is `name`, not `kind`, to avoid
+    /// colliding with the serde tag.
+    Insight {
+        name: String,
+        params: serde_json::Value,
+    },
+}
+
+/// A snapshot of the currently-active Claude Code session, computed by the caller
+/// (newest-mtime transcript) and injected before `evaluate`. The engine reads it
+/// to decide runtime tips; it never reads transcript content — only these
+/// aggregate metrics. `idle_minutes` and `rewrite_waste_usd` are derived caller
+/// side (the engine is time- and pricing-agnostic).
+#[derive(Clone, Debug)]
+pub struct ActiveSession {
+    pub session_id: String,
+    /// Working-directory basename (the project label shown in the toast).
+    pub project: Option<String>,
+    /// Assistant turns in this session so far.
+    pub messages: i64,
+    /// Timestamp of the latest assistant turn — the de-dup key for cold rewrites.
+    pub last_ts: String,
+    /// False when the latest turn is the session's first (initial cache write, not
+    /// a *re*write — must not fire a cold-rewrite tip).
+    pub has_prev: bool,
+    /// Minutes between the latest turn and its predecessor (the pause that
+    /// preceded a rewrite — large = idle/TTL, near-zero = compaction).
+    pub gap_minutes: f64,
+    /// The latest turn's cache read / create token counts.
+    pub last_cache_read: i64,
+    pub last_cache_create: i64,
+    /// Actual USD the latest turn spent rebuilding the prefix (create × 1.25).
+    pub rewrite_cost_usd: f64,
 }
 
 #[derive(Clone, Default)]
@@ -52,6 +104,14 @@ pub struct AlertEngine {
     fired_budget: bool,
     primed: bool,
     pending: Vec<AlertEvent>,
+    // --- runtime-insight state ---
+    /// Transient input: the active session for the current `evaluate` cycle.
+    active_session: Option<ActiveSession>,
+    /// session_id we already fired `long_session` for (once per session).
+    long_session_fired_for: Option<String>,
+    /// The latest turn timestamp we've already evaluated for a cold rewrite —
+    /// fires at most once per turn, and primes (no fire) on the first sighting.
+    cold_last_ts: Option<String>,
 }
 
 impl AlertEngine {
@@ -67,6 +127,17 @@ impl AlertEngine {
         self.fired_budget = false;
         self.primed = false;
         self.pending.clear();
+        self.active_session = None;
+        self.long_session_fired_for = None;
+        self.cold_last_ts = None;
+    }
+
+    /// Inject the active-session snapshot consumed by the next `evaluate`. The
+    /// caller sets this each poll (None when runtime insights are off or no
+    /// session is active). Kept separate from `evaluate`'s args so the existing
+    /// usage-alert tests stay unchanged — they leave it None and emit no tips.
+    pub fn set_active_session(&mut self, session: Option<ActiveSession>) {
+        self.active_session = session;
     }
 
     /// Returns the events that should be toasted *now* (already past quiet-hours
@@ -142,7 +213,98 @@ impl AlertEngine {
 
         self.eval_budget(cfg, today_spent, suppressed, &mut out);
 
+        self.eval_insights(cfg, suppressed, &mut out);
+
         out
+    }
+
+    /// Runtime optimization tips about the active session. Gated by the master
+    /// opt-in and the per-kind enable set; each rule has its own de-dup so a tip
+    /// fires once per session / idle episode, not every poll.
+    fn eval_insights(&mut self, cfg: &AppConfig, suppressed: bool, out: &mut Vec<AlertEvent>) {
+        if !cfg.runtime_insights_enabled {
+            return;
+        }
+        let session = match self.active_session.clone() {
+            Some(s) => s,
+            None => return,
+        };
+        let enabled = |kind: &str| cfg.runtime_insight_kinds.iter().any(|k| k == kind);
+
+        if enabled("long_session") {
+            self.eval_long_session(&session, suppressed, out);
+        }
+        if enabled("idle_cache_gap") {
+            self.eval_cold_rewrite(&session, suppressed, out);
+        }
+    }
+
+    /// Fires once per session_id once it crosses the message threshold.
+    fn eval_long_session(
+        &mut self,
+        s: &ActiveSession,
+        suppressed: bool,
+        out: &mut Vec<AlertEvent>,
+    ) {
+        if s.messages < LONG_SESSION_MESSAGES {
+            return;
+        }
+        if self.long_session_fired_for.as_deref() == Some(s.session_id.as_str()) {
+            return;
+        }
+        self.long_session_fired_for = Some(s.session_id.clone());
+        self.dispatch(
+            AlertEvent::Insight {
+                name: "long_session".into(),
+                params: serde_json::json!({
+                    "project": s.project,
+                    "messages": s.messages,
+                }),
+            },
+            suppressed,
+            out,
+        );
+    }
+
+    /// Detects an *actual* cold prefix rewrite on the latest turn (tiny read +
+    /// large create) and toasts it once, labelling the cause by the preceding
+    /// gap (long pause → idle/TTL; near-zero → compaction/history change). Primes
+    /// on first sighting so a rewrite that predates app start doesn't fire.
+    fn eval_cold_rewrite(&mut self, s: &ActiveSession, suppressed: bool, out: &mut Vec<AlertEvent>) {
+        let first = self.cold_last_ts.is_none();
+        let seen = self.cold_last_ts.as_deref() == Some(s.last_ts.as_str());
+        self.cold_last_ts = Some(s.last_ts.clone());
+        if first || seen {
+            return;
+        }
+        // The session's first turn writes the cache (read 0, create large) but is
+        // not a *re*write — needs a predecessor turn.
+        if !s.has_prev {
+            return;
+        }
+        let cold = s.last_cache_read < COLD_READ_MAX && s.last_cache_create >= COLD_CREATE_GATE;
+        if !cold {
+            return;
+        }
+        let cause = if s.gap_minutes > COLD_IDLE_GAP_MIN {
+            "idle"
+        } else {
+            "compact"
+        };
+        self.dispatch(
+            AlertEvent::Insight {
+                name: "idle_cache_gap".into(),
+                params: serde_json::json!({
+                    "project": s.project,
+                    "cause": cause,
+                    "cost_usd": s.rewrite_cost_usd,
+                    "tokens": s.last_cache_create,
+                    "gap_minutes": s.gap_minutes.round(),
+                }),
+            },
+            suppressed,
+            out,
+        );
     }
 
     /// Fires once when today's consumption crosses the daily budget; re-arms

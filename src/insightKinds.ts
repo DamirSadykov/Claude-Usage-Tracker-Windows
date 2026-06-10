@@ -12,6 +12,9 @@ export interface InsightKindDef {
   labelKey: string;
   /** Short, placeholder-free label — used in toggle lists / Hidden expander. */
   shortLabelKey: string;
+  /** Can fire as a real-time toast about the active session (issue #46). Keep in
+   *  sync with `RUNTIME_KINDS` / `default_runtime_insight_kinds` in Rust. */
+  runtimeCapable?: boolean;
 }
 
 export const INSIGHT_KINDS: InsightKindDef[] = [
@@ -26,7 +29,7 @@ export const INSIGHT_KINDS: InsightKindDef[] = [
   // recommendations — what to change
   { kind: "cache_churn", category: "recommendation", labelKey: "insightCacheChurn", shortLabelKey: "insightLabelCacheChurn" },
   { kind: "bloated_session", category: "recommendation", labelKey: "insightBloatedSession", shortLabelKey: "insightLabelBloatedSession" },
-  { kind: "long_session", category: "recommendation", labelKey: "insightLongSession", shortLabelKey: "insightLabelLongSession" },
+  { kind: "long_session", category: "recommendation", labelKey: "insightLongSession", shortLabelKey: "insightLabelLongSession", runtimeCapable: true },
   { kind: "mixed_models", category: "recommendation", labelKey: "insightMixedModels", shortLabelKey: "insightLabelMixedModels" },
   { kind: "cold_restarts", category: "recommendation", labelKey: "insightColdRestarts", shortLabelKey: "insightLabelColdRestarts" },
   // subagent_efficacy uses one of two label_keys depending on sign; the toggle
@@ -34,7 +37,7 @@ export const INSIGHT_KINDS: InsightKindDef[] = [
   { kind: "subagent_efficacy", category: "recommendation", labelKey: "insightSubagentEfficacyHelp", shortLabelKey: "insightLabelSubagentEfficacy" },
   { kind: "tool_heavy_writes", category: "recommendation", labelKey: "insightToolHeavyWrites", shortLabelKey: "insightLabelToolHeavyWrites" },
   { kind: "subagent_no_attribution", category: "recommendation", labelKey: "insightSubagentNoAttribution", shortLabelKey: "insightLabelSubagentNoAttribution" },
-  { kind: "idle_cache_gap", category: "recommendation", labelKey: "insightIdleCacheGap", shortLabelKey: "insightLabelIdleCacheGap" },
+  { kind: "idle_cache_gap", category: "recommendation", labelKey: "insightIdleCacheGap", shortLabelKey: "insightLabelIdleCacheGap", runtimeCapable: true },
 
   // expensive_session is an observation, not a recommendation — the user
   // doesn't need to "do" anything, but the session is worth opening.

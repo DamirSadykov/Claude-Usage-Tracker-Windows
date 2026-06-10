@@ -14,7 +14,7 @@ mod engine;
 mod util;
 
 pub use config::{AlertTiers, AlertTypes, AppConfig};
-pub use engine::{AlertEngine, AlertEvent};
+pub use engine::{ActiveSession, AlertEngine, AlertEvent};
 pub use util::{in_quiet_hours, normalize, tier_level};
 
 /// Default colour-bucket thresholds (%), shared by the config defaults and the
@@ -449,6 +449,166 @@ mod tests {
         let u = usage(tier(0.0, None, false), tier(0.0, None, false));
         prime(&mut eng, &u, &c);
         assert!(eng.evaluate(&u, &c, 0, None, Some(99.0), false).is_empty());
+    }
+
+    // --- runtime insights (issue #46) ---
+
+    // A warm turn baseline (big read, no create); cold-rewrite tests flip the
+    // read/create/gap fields on a clone.
+    fn warm(id: &str, ts: &str, messages: i64) -> crate::alerts::ActiveSession {
+        crate::alerts::ActiveSession {
+            session_id: id.into(),
+            project: Some("proj".into()),
+            messages,
+            last_ts: ts.into(),
+            has_prev: true,
+            gap_minutes: 1.0,
+            last_cache_read: 200_000,
+            last_cache_create: 0,
+            rewrite_cost_usd: 0.0,
+        }
+    }
+
+    fn runtime_cfg() -> AppConfig {
+        let mut c = cfg();
+        c.runtime_insights_enabled = true;
+        c
+    }
+
+    fn flat() -> UsageData {
+        usage(tier(0.0, None, false), tier(0.0, None, false))
+    }
+
+    fn is_insight(out: &[AlertEvent], kind: &str) -> bool {
+        matches!(out, [AlertEvent::Insight { name, .. }] if name == kind)
+    }
+
+    // Turn `warm` into a cold prefix rewrite with the given gap (cause driver).
+    fn cold(mut s: crate::alerts::ActiveSession, gap: f64) -> crate::alerts::ActiveSession {
+        s.last_cache_read = 0;
+        s.last_cache_create = 300_000;
+        s.gap_minutes = gap;
+        s.rewrite_cost_usd = 1.7;
+        s
+    }
+
+    fn insight_cause(out: &[AlertEvent]) -> Option<String> {
+        match out {
+            [AlertEvent::Insight { params, .. }] => {
+                params.get("cause").and_then(|v| v.as_str()).map(String::from)
+            }
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn long_session_fires_once_and_rearms_on_new_session() {
+        let mut eng = AlertEngine::new();
+        let mut c = runtime_cfg();
+        c.runtime_insight_kinds = vec!["long_session".into()];
+        let u = flat();
+        prime(&mut eng, &u, &c);
+
+        eng.set_active_session(Some(warm("s1", "t1", 200)));
+        assert!(is_insight(&eng.evaluate(&u, &c, 0, None, None, false), "long_session"));
+
+        // same session, more messages → no repeat
+        eng.set_active_session(Some(warm("s1", "t2", 250)));
+        assert!(eng.evaluate(&u, &c, 0, None, None, false).is_empty());
+
+        // new session crossing the threshold → fires again
+        eng.set_active_session(Some(warm("s2", "t3", 300)));
+        assert!(is_insight(&eng.evaluate(&u, &c, 0, None, None, false), "long_session"));
+    }
+
+    #[test]
+    fn long_session_silent_below_threshold() {
+        let mut eng = AlertEngine::new();
+        let mut c = runtime_cfg();
+        c.runtime_insight_kinds = vec!["long_session".into()];
+        let u = flat();
+        prime(&mut eng, &u, &c);
+        eng.set_active_session(Some(warm("s1", "t1", 199)));
+        assert!(eng.evaluate(&u, &c, 0, None, None, false).is_empty());
+    }
+
+    #[test]
+    fn cold_rewrite_primes_then_fires_once_with_cause() {
+        let mut eng = AlertEngine::new();
+        let mut c = runtime_cfg();
+        c.runtime_insight_kinds = vec!["idle_cache_gap".into()];
+        let u = flat();
+        prime(&mut eng, &u, &c);
+
+        // first sighting primes the tracker (no fire on a pre-existing turn)
+        eng.set_active_session(Some(warm("s1", "t1", 10)));
+        assert!(eng.evaluate(&u, &c, 0, None, None, false).is_empty());
+
+        // new cold-rewrite turn after a long gap → fires, labelled idle
+        eng.set_active_session(Some(cold(warm("s1", "t2", 11), 40.0)));
+        let out = eng.evaluate(&u, &c, 0, None, None, false);
+        assert!(is_insight(&out, "idle_cache_gap"));
+        assert_eq!(insight_cause(&out).as_deref(), Some("idle"));
+
+        // same turn again → no repeat
+        eng.set_active_session(Some(cold(warm("s1", "t2", 11), 40.0)));
+        assert!(eng.evaluate(&u, &c, 0, None, None, false).is_empty());
+
+        // a near-zero-gap rewrite is labelled compaction
+        eng.set_active_session(Some(cold(warm("s1", "t3", 12), 0.2)));
+        let out2 = eng.evaluate(&u, &c, 0, None, None, false);
+        assert_eq!(insight_cause(&out2).as_deref(), Some("compact"));
+    }
+
+    #[test]
+    fn cold_rewrite_guards_warm_small_and_first_turn() {
+        let mut eng = AlertEngine::new();
+        let mut c = runtime_cfg();
+        c.runtime_insight_kinds = vec!["idle_cache_gap".into()];
+        let u = flat();
+        prime(&mut eng, &u, &c);
+        eng.set_active_session(Some(warm("s1", "t0", 5)));
+        assert!(eng.evaluate(&u, &c, 0, None, None, false).is_empty()); // prime
+
+        // warm turn (big read, no create) → silent
+        eng.set_active_session(Some(warm("s1", "t1", 6)));
+        assert!(eng.evaluate(&u, &c, 0, None, None, false).is_empty());
+
+        // create below the gate → silent
+        let mut tiny = warm("s1", "t2", 7);
+        tiny.last_cache_read = 0;
+        tiny.last_cache_create = 10_000;
+        tiny.gap_minutes = 40.0;
+        eng.set_active_session(Some(tiny));
+        assert!(eng.evaluate(&u, &c, 0, None, None, false).is_empty());
+
+        // session's first turn writes the cache (no predecessor) → not a rewrite
+        let mut first_turn = cold(warm("s1", "t3", 8), 40.0);
+        first_turn.has_prev = false;
+        eng.set_active_session(Some(first_turn));
+        assert!(eng.evaluate(&u, &c, 0, None, None, false).is_empty());
+    }
+
+    #[test]
+    fn runtime_master_toggle_and_per_kind_gate() {
+        let u = flat();
+
+        // master off → silent even with a qualifying session
+        let mut eng = AlertEngine::new();
+        let mut c = cfg();
+        prime(&mut eng, &u, &c);
+        eng.set_active_session(Some(warm("s1", "t1", 500)));
+        assert!(eng.evaluate(&u, &c, 0, None, None, false).is_empty());
+
+        // master on but only idle_cache_gap in the kind set → long_session gated out
+        c.runtime_insights_enabled = true;
+        c.runtime_insight_kinds = vec!["idle_cache_gap".into()];
+        let mut eng2 = AlertEngine::new();
+        prime(&mut eng2, &u, &c);
+        eng2.set_active_session(Some(warm("s1", "t1", 500))); // prime cold tracker
+        let _ = eng2.evaluate(&u, &c, 0, None, None, false);
+        eng2.set_active_session(Some(cold(warm("s1", "t2", 500), 40.0)));
+        assert!(is_insight(&eng2.evaluate(&u, &c, 0, None, None, false), "idle_cache_gap"));
     }
 
     #[test]

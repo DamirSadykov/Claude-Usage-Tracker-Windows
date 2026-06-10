@@ -105,6 +105,8 @@ const notificationsMutedUntil = ref<string | null>(null);
 const serviceStatusEnabled = ref(true);
 const serviceStatusInterval = ref(90);
 const serviceStatusNotify = ref(true);
+const runtimeInsightsEnabled = ref(false);
+const runtimeInsightKinds = ref<string[]>(["long_session", "idle_cache_gap"]);
 const todaySpent = ref<number | null>(null);
 const suggestedBudget = ref<number | null>(null);
 const budgetUnit = computed<"usd" | "pct">(() =>
@@ -215,6 +217,12 @@ async function loadSettings() {
             (await store.get<number>("serviceStatusInterval")) ?? 90;
         serviceStatusNotify.value =
             (await store.get<boolean>("serviceStatusNotify")) ?? true;
+        runtimeInsightsEnabled.value =
+            (await store.get<boolean>("runtimeInsightsEnabled")) ?? false;
+        {
+            const rk = await store.get<string[]>("runtimeInsightKinds");
+            if (Array.isArray(rk)) runtimeInsightKinds.value = rk;
+        }
         const savedLocale = await store.get<string>("locale");
         if (savedLocale) locale.value = savedLocale;
     } catch {
@@ -253,6 +261,8 @@ async function saveSettings() {
     await store.set("serviceStatusEnabled", serviceStatusEnabled.value);
     await store.set("serviceStatusInterval", serviceStatusInterval.value);
     await store.set("serviceStatusNotify", serviceStatusNotify.value);
+    await store.set("runtimeInsightsEnabled", runtimeInsightsEnabled.value);
+    await store.set("runtimeInsightKinds", [...runtimeInsightKinds.value]);
     await store.set("locale", locale.value);
     await store.save();
 }
@@ -283,6 +293,8 @@ function buildConfig() {
         service_status_enabled: serviceStatusEnabled.value,
         service_status_interval: serviceStatusInterval.value,
         service_status_notify: serviceStatusNotify.value,
+        runtime_insights_enabled: runtimeInsightsEnabled.value,
+        runtime_insight_kinds: [...runtimeInsightKinds.value],
     };
 }
 
@@ -553,6 +565,15 @@ async function handleSave(settings: {
     await applyConfig();
     await loadTodaySpent();
     await loadForecast();
+}
+
+// Runtime-insight settings save immediately (table checkboxes), so reconfigure
+// the backend on the spot rather than waiting for the Save button.
+async function handleRuntimeChange(payload: { enabled: boolean; kinds: string[] }) {
+    runtimeInsightsEnabled.value = payload.enabled;
+    runtimeInsightKinds.value = [...payload.kinds];
+    await saveSettings();
+    if (configured.value) await applyConfig();
 }
 
 function toggleAnalytics() {
@@ -884,8 +905,11 @@ onUnmounted(() => {
             :service-status-enabled="serviceStatusEnabled"
             :service-status-interval="serviceStatusInterval"
             :service-status-notify="serviceStatusNotify"
+            :runtime-insights-enabled="runtimeInsightsEnabled"
+            :runtime-insight-kinds="runtimeInsightKinds"
             :locale="locale"
             @save="handleSave"
+            @runtime-change="handleRuntimeChange"
         />
 
         <!-- Analytics -->
