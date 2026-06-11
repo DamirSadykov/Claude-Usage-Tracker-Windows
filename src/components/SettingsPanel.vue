@@ -70,6 +70,7 @@ const props = defineProps<{
   serviceStatusEnabled: boolean;
   serviceStatusInterval: number;
   serviceStatusNotify: boolean;
+  systemInfoEnabled: boolean;
   runtimeInsightsEnabled: boolean;
   runtimeInsightKinds: string[];
   locale: string;
@@ -97,6 +98,7 @@ const emit = defineEmits<{
     serviceStatusEnabled: boolean;
     serviceStatusInterval: number;
     serviceStatusNotify: boolean;
+    systemInfoEnabled: boolean;
     locale: string;
   }];
   // Runtime-insight settings save immediately (not via the Save button).
@@ -127,6 +129,7 @@ const localBudget = ref(props.dailyBudget);
 const localSvcEnabled = ref(props.serviceStatusEnabled);
 const localSvcInterval = ref(props.serviceStatusInterval);
 const localSvcNotify = ref(props.serviceStatusNotify);
+const localSystemInfo = ref(props.systemInfoEnabled);
 const localLocale = ref(props.locale);
 
 watch(() => props.sessionKey, (v) => (localSessionKey.value = v));
@@ -156,6 +159,7 @@ watch(() => props.dailyBudget, (v) => (localBudget.value = v));
 watch(() => props.serviceStatusEnabled, (v) => (localSvcEnabled.value = v));
 watch(() => props.serviceStatusInterval, (v) => (localSvcInterval.value = v));
 watch(() => props.serviceStatusNotify, (v) => (localSvcNotify.value = v));
+watch(() => props.systemInfoEnabled, (v) => (localSystemInfo.value = v));
 watch(() => props.locale, (v) => (localLocale.value = v));
 
 // --- Insights toggles ---
@@ -329,6 +333,7 @@ function handleSave() {
     serviceStatusEnabled: localSvcEnabled.value,
     serviceStatusInterval: localSvcInterval.value,
     serviceStatusNotify: localSvcNotify.value,
+    systemInfoEnabled: localSystemInfo.value,
     locale: localLocale.value,
   });
 }
@@ -504,6 +509,17 @@ function handleSave() {
           <div class="card-sub">{{ t('autoStartDesc') }}</div>
         </div>
         <div class="toggle" :class="{ on: localAutoStart }">
+          <div class="toggle-knob"></div>
+        </div>
+      </div>
+
+      <!-- Mini panel: whole-machine CPU + RAM (compact 2×2 vs original bars) -->
+      <div class="card toggle-card" @click="localSystemInfo = !localSystemInfo">
+        <div style="flex: 1; min-width: 0">
+          <div class="card-title" style="font-size: 13px">{{ t('miniSystemInfo') }}</div>
+          <div class="card-sub">{{ t('miniSystemInfoDesc') }}</div>
+        </div>
+        <div class="toggle" :class="{ on: localSystemInfo }">
           <div class="toggle-knob"></div>
         </div>
       </div>

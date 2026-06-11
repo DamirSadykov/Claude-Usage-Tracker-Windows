@@ -107,6 +107,7 @@ const serviceStatusInterval = ref(90);
 const serviceStatusNotify = ref(true);
 const runtimeInsightsEnabled = ref(false);
 const runtimeInsightKinds = ref<string[]>(["long_session", "cold_rewrites"]);
+const systemInfoEnabled = ref(true);
 const todaySpent = ref<number | null>(null);
 const suggestedBudget = ref<number | null>(null);
 const budgetUnit = computed<"usd" | "pct">(() =>
@@ -229,6 +230,8 @@ async function loadSettings() {
                 );
             }
         }
+        systemInfoEnabled.value =
+            (await store.get<boolean>("systemInfoEnabled")) ?? true;
         const savedLocale = await store.get<string>("locale");
         if (savedLocale) locale.value = savedLocale;
     } catch {
@@ -269,6 +272,7 @@ async function saveSettings() {
     await store.set("serviceStatusNotify", serviceStatusNotify.value);
     await store.set("runtimeInsightsEnabled", runtimeInsightsEnabled.value);
     await store.set("runtimeInsightKinds", [...runtimeInsightKinds.value]);
+    await store.set("systemInfoEnabled", systemInfoEnabled.value);
     await store.set("locale", locale.value);
     await store.save();
 }
@@ -301,6 +305,7 @@ function buildConfig() {
         service_status_notify: serviceStatusNotify.value,
         runtime_insights_enabled: runtimeInsightsEnabled.value,
         runtime_insight_kinds: [...runtimeInsightKinds.value],
+        system_info_enabled: systemInfoEnabled.value,
     };
 }
 
@@ -539,6 +544,7 @@ async function handleSave(settings: {
     serviceStatusEnabled: boolean;
     serviceStatusInterval: number;
     serviceStatusNotify: boolean;
+    systemInfoEnabled: boolean;
     locale: string;
 }) {
     sessionKey.value = settings.sessionKey;
@@ -561,6 +567,7 @@ async function handleSave(settings: {
     serviceStatusEnabled.value = settings.serviceStatusEnabled;
     serviceStatusInterval.value = settings.serviceStatusInterval;
     serviceStatusNotify.value = settings.serviceStatusNotify;
+    systemInfoEnabled.value = settings.systemInfoEnabled;
     locale.value = settings.locale;
     // The backend re-arms its alert engine on disable (see `configure`).
     await saveSettings();
@@ -911,6 +918,7 @@ onUnmounted(() => {
             :service-status-enabled="serviceStatusEnabled"
             :service-status-interval="serviceStatusInterval"
             :service-status-notify="serviceStatusNotify"
+            :system-info-enabled="systemInfoEnabled"
             :runtime-insights-enabled="runtimeInsightsEnabled"
             :runtime-insight-kinds="runtimeInsightKinds"
             :locale="locale"

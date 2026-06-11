@@ -125,6 +125,10 @@ pub struct AppConfig {
         deserialize_with = "de_runtime_insight_kinds"
     )]
     pub runtime_insight_kinds: Vec<String>,
+    // Mini panel: show whole-machine CPU + RAM (the compact 2×2 layout). Off
+    // reverts the mini to the original two-row 5h/7d bars. Gates the sysmon loop.
+    #[serde(default = "default_true")]
+    pub system_info_enabled: bool,
 }
 
 fn default_true() -> bool {
@@ -162,6 +166,7 @@ impl Default for AppConfig {
             service_status_notify: true,
             runtime_insights_enabled: false,
             runtime_insight_kinds: default_runtime_insight_kinds(),
+            system_info_enabled: true,
         }
     }
 }
