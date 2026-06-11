@@ -1,6 +1,6 @@
 [package]
 name = "claude-usage-tracker"
-version = "0.4.6"
+version = "0.4.7"
 description = "Claude AI Usage Tracker for Windows"
 authors = ["Damir Sadykov <damir.it.work@gmail.com>"]
 edition = "2021"
@@ -30,3 +30,6 @@ open = "5"
 image = { version = "0.25", default-features = false, features = ["png"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 chrono = { version = "0.4", features = ["serde"] }
+# Only the `system` feature: read global CPU + RAM. No disk/network/process
+# scanning — keeps the binary small and avoids behavioural-AV-sensitive calls.
+sysinfo = { version = "0.39.3", default-features = false, features = ["system"] }

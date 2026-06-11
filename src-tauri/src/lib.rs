@@ -4,6 +4,7 @@ pub mod domain;
 pub mod report;
 pub mod stats;
 pub mod status;
+pub mod sysmon;
 pub mod usage;
 
 use std::collections::HashSet;
@@ -666,6 +667,61 @@ fn spawn_status_loop(app: AppHandle) {
     });
 }
 
+// --- System resource monitor (whole-machine CPU + RAM for the mini panel) ---
+
+// How often the mini panel gets a fresh CPU/RAM reading.
+const SYSMON_INTERVAL: Duration = Duration::from_secs(2);
+
+// Mini window size per layout: compact 2×2 (CPU/RAM on) vs the original
+// two-row 5h/7d bars (off). Logical px — applied on each `configure`.
+const MINI_SIZE_FULL: (f64, f64) = (186.0, 64.0);
+const MINI_SIZE_BARS: (f64, f64) = (180.0, 80.0);
+
+/// Resize the mini window and tell it which layout to render. Called from
+/// `configure` so a toggle in settings takes effect immediately.
+fn apply_mini_layout(app: &AppHandle, system_info: bool) {
+    if let Some(mini) = app.get_webview_window("mini") {
+        let (w, h) = if system_info {
+            MINI_SIZE_FULL
+        } else {
+            MINI_SIZE_BARS
+        };
+        let _ = mini.set_size(tauri::LogicalSize::new(w, h));
+    }
+    let _ = app.emit_to("mini", "system-info-enabled", system_info);
+}
+
+fn spawn_sysmon_loop(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let mut sampler = sysmon::Sampler::new();
+        loop {
+            let enabled = {
+                app.state::<Mutex<AppConfig>>()
+                    .lock()
+                    .unwrap()
+                    .system_info_enabled
+            };
+            // Only sample while the feature is on AND the mini panel is on
+            // screen — otherwise there's no consumer, so skip the work entirely.
+            let visible = app
+                .get_webview_window("mini")
+                .and_then(|w| w.is_visible().ok())
+                .unwrap_or(false);
+
+            if enabled && visible {
+                // CPU load is a delta between two refreshes: prime, let the
+                // kernel counters settle, then read.
+                sampler.prime();
+                tokio::time::sleep(sysmon::Sampler::cpu_settle()).await;
+                let stats = sampler.sample();
+                let _ = app.emit_to("mini", "system-stats", stats);
+            }
+
+            tokio::time::sleep(SYSMON_INTERVAL).await;
+        }
+    });
+}
+
 // --- Commands ---
 
 #[tauri::command]
@@ -679,17 +735,21 @@ fn get_service_status(state: tauri::State<'_, Arc<Mutex<StatusState>>>) -> Statu
 
 #[tauri::command]
 fn configure(
+    app: AppHandle,
     config: AppConfig,
     state: tauri::State<'_, Mutex<AppConfig>>,
     engine: tauri::State<'_, Mutex<AlertEngine>>,
     notify: tauri::State<'_, Arc<Notify>>,
 ) -> Result<(), String> {
     let disable = !config.notifications_enabled;
+    let system_info = config.system_info_enabled;
     *state.lock().unwrap() = config;
     if disable {
         // Turning notifications off re-arms the engine for a clean next enable.
         engine.lock().unwrap().reset();
     }
+    // Resize the mini window and push the layout flag to it.
+    apply_mini_layout(&app, system_info);
     notify.notify_one(); // apply immediately, don't wait out the interval
     Ok(())
 }
@@ -1068,6 +1128,7 @@ pub fn run() {
 
             spawn_poll_loop(app.handle().clone(), notify);
             spawn_status_loop(app.handle().clone());
+            spawn_sysmon_loop(app.handle().clone());
 
             Ok(())
         })
