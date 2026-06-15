@@ -33,14 +33,15 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # Build the GitHub Release body from conventional commits of the latest
-      # tag (git-cliff), then append the installer download instructions.
+      # Build the release notes from conventional commits of the latest tag
+      # (git-cliff) + installer instructions. Saved to a file AND exposed as an
+      # output: the file feeds `gh release edit` (release body) after the build,
+      # the output feeds tauri-action's releaseBody (which populates latest.json).
       - name: Generate release notes
         id: notes
         shell: bash
         run: |
           {
-            echo 'BODY<<CLIFF_EOF'
             npx git-cliff --latest --strip header
             echo
             echo '---'
@@ -48,6 +49,10 @@ jobs:
             echo 'Установщик для Windows:'
             echo '- `.exe` — NSIS installer (рекомендуется)'
             echo '- `.msi` — MSI installer'
+          } > RELEASE_NOTES.md
+          {
+            echo 'BODY<<CLIFF_EOF'
+            cat RELEASE_NOTES.md
             echo 'CLIFF_EOF'
           } >> "$GITHUB_OUTPUT"
 
@@ -65,3 +70,14 @@ jobs:
           prerelease: false
           # Generate and upload latest.json so the in-app updater can find releases.
           includeUpdaterJson: true
+
+      # tauri-action's releaseBody populates latest.json (the in-app update
+      # banner) but does NOT overwrite the body of an already-published release.
+      # The `published` trigger means the release always pre-exists, so set its
+      # body explicitly — this is what the release page and the in-app "What's
+      # new" (GitHub Releases API) display.
+      - name: Apply changelog to release body
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "${{ github.ref_name }}" --notes-file RELEASE_NOTES.md
