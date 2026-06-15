@@ -770,6 +770,16 @@ async fn open_status_page() -> Result<(), String> {
     open::that(status::STATUS_PAGE_URL).map_err(|e| e.to_string())
 }
 
+/// Opens an external https URL in the default browser. Used by the About panel
+/// for the repo link and per-release pages. Restricted to https as a guard.
+#[tauri::command]
+async fn open_url(url: String) -> Result<(), String> {
+    if !url.starts_with("https://") {
+        return Err("Только https-ссылки".into());
+    }
+    open::that(url).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn ensure_project(
     session_key: String,
@@ -1147,6 +1157,7 @@ pub fn run() {
             get_analytics_compare,
             get_service_status,
             open_status_page,
+            open_url,
             get_last_diag,
             dismiss_diag,
             report_issue,

@@ -9,6 +9,7 @@ import AnalyticsPanel from "./components/AnalyticsPanel.vue";
 import AnalyticsWindow from "./components/AnalyticsWindow.vue";
 import FocusControls from "./components/FocusControls.vue";
 import ServiceStatusBar from "./components/ServiceStatusBar.vue";
+import AboutPanel from "./components/AboutPanel.vue";
 import {
     DEFAULT_THRESHOLDS,
     normalize,
@@ -125,6 +126,7 @@ const error = ref("");
 const errorReportable = ref(false);
 const loading = ref(false);
 const showSettings = ref(false);
+const showAbout = ref(false);
 
 interface DiagReport {
     kind: string;
@@ -591,7 +593,18 @@ async function handleRuntimeChange(payload: { enabled: boolean; kinds: string[] 
 
 function toggleAnalytics() {
     showAnalytics.value = !showAnalytics.value;
-    if (showAnalytics.value) showSettings.value = false;
+    if (showAnalytics.value) {
+        showSettings.value = false;
+        showAbout.value = false;
+    }
+}
+
+function toggleAbout() {
+    showAbout.value = !showAbout.value;
+    if (showAbout.value) {
+        showSettings.value = false;
+        showAnalytics.value = false;
+    }
 }
 
 async function handleManualStart() {
@@ -732,7 +745,7 @@ onUnmounted(() => {
                     class="icon-btn"
                     @click="toggleMini"
                     title="Mini widget"
-                    v-if="!showSettings && configured"
+                    v-if="!showSettings && !showAbout && configured"
                 >
                     <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
                         <rect x="1" y="5" width="14" height="8" rx="2" stroke-linecap="round"/>
@@ -744,7 +757,7 @@ onUnmounted(() => {
                     :class="{ spin: loading }"
                     @click="refresh"
                     :title="t('refresh')"
-                    v-if="!showSettings && configured"
+                    v-if="!showSettings && !showAbout && configured"
                 >
                     <svg
                         width="14"
@@ -767,7 +780,7 @@ onUnmounted(() => {
                     :class="{ active: showAnalytics }"
                     @click="toggleAnalytics"
                     :title="t('analytics')"
-                    v-if="!showSettings && configured && ccAnalyticsEnabled"
+                    v-if="!showSettings && !showAbout && configured && ccAnalyticsEnabled"
                 >
                     <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
                         <path d="M2 14V2" stroke-linecap="round"/>
@@ -790,7 +803,20 @@ onUnmounted(() => {
                 </button>
                 <button
                     class="icon-btn"
-                    @click="showSettings = !showSettings; showAnalytics = false"
+                    :class="{ active: showAbout }"
+                    @click="toggleAbout"
+                    :title="t('about')"
+                    v-if="!showSettings"
+                >
+                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+                        <circle cx="8" cy="8" r="6.5" />
+                        <line x1="8" y1="7.3" x2="8" y2="11.5" stroke-linecap="round" />
+                        <circle cx="8" cy="4.7" r="0.5" fill="currentColor" stroke="none" />
+                    </svg>
+                </button>
+                <button
+                    class="icon-btn"
+                    @click="showSettings = !showSettings; showAnalytics = false; showAbout = false"
                     :title="showSettings ? t('back') : t('settings')"
                 >
                     <svg
@@ -828,7 +854,7 @@ onUnmounted(() => {
 
         <!-- Status tray: Claude service health + 5h session activity -->
         <ServiceStatusBar
-            v-if="usage && !showSettings && (serviceStatusEnabled || sessionActive)"
+            v-if="usage && !showSettings && !showAbout && (serviceStatusEnabled || sessionActive)"
             :service-enabled="serviceStatusEnabled"
             :session-active="sessionActive"
         />
@@ -928,6 +954,9 @@ onUnmounted(() => {
 
         <!-- Analytics -->
         <AnalyticsPanel v-else-if="showAnalytics" :active="showAnalytics" />
+
+        <!-- About / What's new -->
+        <AboutPanel v-else-if="showAbout" />
 
         <!-- Usage -->
         <template v-else>
