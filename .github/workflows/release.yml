@@ -12,6 +12,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          # git-cliff needs the full history and all tags to build the changelog.
+          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -30,6 +33,24 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # Build the GitHub Release body from conventional commits of the latest
+      # tag (git-cliff), then append the installer download instructions.
+      - name: Generate release notes
+        id: notes
+        shell: bash
+        run: |
+          {
+            echo 'BODY<<CLIFF_EOF'
+            npx git-cliff --latest --strip header
+            echo
+            echo '---'
+            echo
+            echo 'Установщик для Windows:'
+            echo '- `.exe` — NSIS installer (рекомендуется)'
+            echo '- `.msi` — MSI installer'
+            echo 'CLIFF_EOF'
+          } >> "$GITHUB_OUTPUT"
+
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@v0
         env:
@@ -39,10 +60,7 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "Claude Usage Tracker ${{ github.ref_name }}"
-          releaseBody: |
-            Download the installer for Windows:
-            - `.exe` — NSIS installer (recommended)
-            - `.msi` — MSI installer
+          releaseBody: ${{ steps.notes.outputs.BODY }}
           releaseDraft: false
           prerelease: false
           # Generate and upload latest.json so the in-app updater can find releases.
