@@ -8,6 +8,8 @@
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
     "test": "vitest run",
+    "changelog": "git-cliff",
+    "changelog:latest": "git-cliff --latest --strip header",
     "bump": "node scripts/bump-version.mjs",
     "tauri": "tauri"
   },
@@ -25,6 +27,7 @@
     "@tauri-apps/plugin-store": "^2.2.0",
     "@tauri-apps/plugin-updater": "^2.10.1",
     "@vitejs/plugin-vue": "^5.2.3",
+    "git-cliff": "^2.13.1",
     "typescript": "^5.7.0",
     "vite": "^6.3.0",
     "vitest": "^4.1.7",

@@ -1,0 +1,62 @@
+# git-cliff configuration — генерация changelog из conventional commits.
+# Локальный предпросмотр:  npm run changelog        (весь changelog в stdout)
+#                          npm run changelog:latest (секция последней версии)
+# В CI release.yml собирает заметки последнего тега в тело GitHub Release.
+
+[changelog]
+# Заголовок печатается только в полном changelog (в release notes его отрезаем).
+header = """
+# Changelog
+
+Все заметные изменения в Claude Usage Tracker.\n
+"""
+# Шаблон одной версии (Tera). striptags убирает служебный `<!-- N -->`,
+# по которому сортируются группы, оставляя в выводе чистый заголовок.
+body = """
+{% if version %}\
+    ## {{ version | trim_start_matches(pat="v") }} — {{ timestamp | date(format="%Y-%m-%d") }}
+{% else %}\
+    ## Не выпущено
+{% endif %}\
+{% for group, commits in commits | group_by(attribute="group") %}
+    ### {{ group | striptags | trim }}
+    {% for commit in commits %}
+        - {{ commit.message | upper_first }}\
+    {% endfor %}
+{% endfor %}\n
+"""
+footer = ""
+# Убрать ведущие/замыкающие пробелы каждой строки шаблона.
+trim = true
+
+[git]
+# Парсить заголовки коммитов как conventional commits (feat:, fix:, …).
+conventional_commits = true
+# Коммиты не по conventional-формату не попадают в changelog.
+filter_unconventional = true
+split_commits = false
+# Группировка и фильтрация. Порядок групп задаётся префиксом `<!-- N -->`,
+# который сортируется, но вырезается striptags при выводе.
+commit_parsers = [
+  { message = "^feat", group = "<!-- 0 -->🚀 Новое" },
+  { message = "^fix", group = "<!-- 1 -->🐛 Исправления" },
+  { message = "^perf", group = "<!-- 2 -->⚡ Производительность" },
+  { message = "^refactor", group = "<!-- 3 -->♻️ Рефакторинг" },
+  { message = "^chore: bump version", skip = true },
+  { message = "^chore\\(release\\)", skip = true },
+  { message = "^chore\\(deps", skip = true },
+  { message = "^chore", skip = true },
+  { message = "^ci", skip = true },
+  { message = "^build", skip = true },
+  { message = "^docs", skip = true },
+  { message = "^style", skip = true },
+  { message = "^test", skip = true },
+  { message = ".*", group = "<!-- 9 -->🔧 Прочее" },
+]
+# Защита коммитов с пометкой breaking change.
+protect_breaking_commits = false
+filter_commits = false
+# Все теги релизные (vX.Y.Z); пустого диапазона не бывает.
+tag_pattern = "v[0-9]+\\.[0-9]+\\.[0-9]+"
+topo_order = false
+sort_commits = "oldest"
