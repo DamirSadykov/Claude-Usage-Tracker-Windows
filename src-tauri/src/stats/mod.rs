@@ -17,9 +17,10 @@ mod snapshots;
 
 pub use analytics::{
     Analytics, AnalyticsExt, DailyPoint, HeatCell, Insight, ModelUsage, PeriodCompare,
-    ProjectUsage, SessionUsage, SubagentSummary, SubagentUsage, ToolUsage, Totals,
+    Productivity, ProjectUsage, SessionUsage, SubagentSummary, SubagentUsage, TierBreakdown,
+    ToolErrorStats, ToolUsage, Totals, TrendMetrics,
 };
-pub use cc_store::{CcActiveSession, CcUsageRow};
+pub use cc_store::{CcActiveSession, CcUsageRow, ToolResultRow, TurnRow};
 pub use forecast::{ForecastData, TierForecast};
 pub use snapshots::{UsageDelta, UsageSnapshot};
 
@@ -113,6 +114,48 @@ const MIGRATIONS: &[&str] = &[
         WHEN model LIKE '%haiku%'  THEN (input* 1.0 + cache_create* 1.0*1.25 + cache_read* 1.0*0.1 + output* 5.0) / 1000000.0
         ELSE 0.0
      END;",
+    // v8 — service tier per assistant message + a one-time full re-ingest.
+    // `service_tier` is the value Anthropic's API echoes in
+    // message.usage.service_tier ("standard" / "priority" / "batch"); a low
+    // standard-share is an indirect throttling signal. NULL for older rows /
+    // lines that didn't carry the field. The single `DELETE FROM cc_files`
+    // forces every transcript to re-ingest once, back-filling this column AND
+    // the new tables/columns added by v9–v11 (all migrations run before the
+    // first ingest, so one wipe covers the whole batch of schema changes).
+    "ALTER TABLE cc_usage ADD COLUMN service_tier TEXT;
+     DELETE FROM cc_files;",
+    // v9 — tool-result outcomes. One row per tool_use_id: whether the tool call
+    // failed (is_error). Lives in type:"user" transcript lines (message.content[*]
+    // with type "tool_result"); we keep ONLY the boolean flag + ids/ts, never the
+    // tool output content (privacy contract). tool_use_id is the natural dedup
+    // key (one result per call).
+    "CREATE TABLE IF NOT EXISTS cc_tool_result (
+        tool_use_id TEXT PRIMARY KEY,
+        session_id  TEXT,
+        ts          TEXT NOT NULL,
+        is_error    INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_cc_tool_result_ts ON cc_tool_result(ts);",
+    // v10 — active-time turns. `cc_turn` stores one row per `turn_duration`
+    // system line (real wall-clock active time per turn, deduped by its uuid).
+    // `is_subagent` mirrors isSidechain (in practice always 0 — subagents don't
+    // emit turn_duration); `project` is the cwd basename for project filtering.
+    "CREATE TABLE IF NOT EXISTS cc_turn (
+        uuid          TEXT PRIMARY KEY,
+        session_id    TEXT,
+        ts            TEXT NOT NULL,
+        duration_ms   INTEGER,
+        message_count INTEGER,
+        is_subagent   INTEGER,
+        project       TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_cc_turn_session_ts ON cc_turn(session_id, ts);",
+    // v11 — git-commit/push counters per assistant message. Each counts the
+    // `git commit` / `git push` Bash invocations seen in that message; only the
+    // COUNT is stored, never the command text (privacy contract). Existing rows
+    // get DEFAULT 0 and are back-filled by the v8 re-ingest.
+    "ALTER TABLE cc_usage ADD COLUMN git_commits INTEGER NOT NULL DEFAULT 0;
+     ALTER TABLE cc_usage ADD COLUMN git_pushes  INTEGER NOT NULL DEFAULT 0;",
 ];
 
 fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -337,6 +380,31 @@ mod tests {
             is_subagent: false,
             agent_name: None,
             tool_uses: Vec::new(),
+            service_tier: None,
+            git_commits: 0,
+            git_pushes: 0,
+        }
+    }
+
+    fn tr(id: &str, ts: &str, sess: &str, is_error: bool) -> ToolResultRow {
+        ToolResultRow {
+            tool_use_id: id.into(),
+            session_id: Some(sess.into()),
+            ts: ts.into(),
+            is_error,
+        }
+    }
+
+    /// Build a turn row directly (mirrors what parse_turn_line would produce).
+    fn turn(uuid: &str, ts: &str, sess: &str, duration_ms: i64) -> TurnRow {
+        TurnRow {
+            uuid: uuid.into(),
+            session_id: Some(sess.into()),
+            ts: ts.into(),
+            duration_ms,
+            message_count: 1,
+            is_subagent: false,
+            project: None,
         }
     }
 
@@ -370,6 +438,363 @@ mod tests {
         // upsert overwrites
         db.cc_set_file_state("a.jsonl", 456, "2026-01-02T00:00:00Z").unwrap();
         assert_eq!(db.cc_file_state("a.jsonl").unwrap().unwrap().0, 456);
+    }
+
+    // --- migrations: v8–v11 ---
+
+    #[test]
+    fn migration_count_advances_to_eleven() {
+        let db = mem_db();
+        let conn = db.conn.lock().unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, MIGRATIONS.len() as i64);
+        assert_eq!(MIGRATIONS.len(), 11);
+    }
+
+    #[test]
+    fn cc_tool_result_and_turn_tables_exist_after_migrate() {
+        let db = mem_db();
+        let conn = db.conn.lock().unwrap();
+        for name in ["cc_tool_result", "cc_turn"] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    [name],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "table {name} should exist");
+        }
+        // git counter columns present on cc_usage.
+        for col in ["service_tier", "git_commits", "git_pushes"] {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('cc_usage') WHERE name=?1",
+                    [col],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "column {col} should exist");
+        }
+    }
+
+    // --- tool_result dedup + error rate ---
+
+    #[test]
+    fn cc_tool_result_dedups_by_tool_use_id() {
+        let db = mem_db();
+        let rows = vec![
+            tr("a", "2026-01-01T10:00:00Z", "s1", false),
+            tr("b", "2026-01-01T10:01:00Z", "s1", true),
+        ];
+        assert_eq!(db.cc_tool_result_upsert(&rows).unwrap(), 2);
+        // re-ingest same ids → 0 new
+        assert_eq!(db.cc_tool_result_upsert(&rows).unwrap(), 0);
+        // new id alongside existing → only the new one
+        let more = vec![
+            tr("a", "2026-01-01T10:00:00Z", "s1", false),
+            tr("c", "2026-01-02T10:00:00Z", "s2", true),
+        ];
+        assert_eq!(db.cc_tool_result_upsert(&more).unwrap(), 1);
+    }
+
+    #[test]
+    fn analytics_ext_computes_tool_error_rate() {
+        let db = mem_db();
+        db.cc_upsert(&[cc_row("m1", "2026-01-01T10:00:00Z", "claude-opus-4-7", 10, 5, 0.1, "s1")])
+            .unwrap();
+        // 1 of 4 calls errored → 25%
+        db.cc_tool_result_upsert(&[
+            tr("a", "2026-01-01T10:00:00Z", "s1", false),
+            tr("b", "2026-01-01T10:00:01Z", "s1", false),
+            tr("c", "2026-01-01T10:00:02Z", "s1", false),
+            tr("d", "2026-01-01T10:00:03Z", "s1", true),
+        ])
+        .unwrap();
+        let a = db
+            .analytics_ext("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z", None, 10)
+            .unwrap();
+        assert_eq!(a.tool_error.total, 4);
+        assert_eq!(a.tool_error.errors, 1);
+        assert!((a.tool_error.error_rate.unwrap() - 25.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn analytics_ext_tool_error_none_when_empty() {
+        let db = mem_db();
+        db.cc_upsert(&[cc_row("m1", "2026-01-01T10:00:00Z", "claude-opus-4-7", 10, 5, 0.1, "s1")])
+            .unwrap();
+        let a = db
+            .analytics_ext("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z", None, 10)
+            .unwrap();
+        assert_eq!(a.tool_error.total, 0);
+        assert!(a.tool_error.error_rate.is_none());
+    }
+
+    #[test]
+    fn insight_tool_error_rate_fires_on_volume_and_rate() {
+        let db = mem_db();
+        db.cc_upsert(&[cc_row("m1", "2026-01-01T10:00:00Z", "claude-opus-4-7", 10, 5, 0.1, "s1")])
+            .unwrap();
+        // 40 calls, 8 errors → 20% ≥ 15%, total ≥ 30 → fires
+        let mut rows = Vec::new();
+        for i in 0..40 {
+            rows.push(tr(
+                &format!("t{i}"),
+                "2026-01-01T10:00:00Z",
+                "s1",
+                i < 8, // first 8 are errors
+            ));
+        }
+        db.cc_tool_result_upsert(&rows).unwrap();
+        let a = db
+            .analytics_ext("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z", None, 10)
+            .unwrap();
+        assert!(a.insights.iter().any(|i| i.kind == "tool_error_rate"));
+    }
+
+    // --- service tier ---
+
+    #[test]
+    fn analytics_ext_computes_tier_breakdown() {
+        let db = mem_db();
+        let mk = |id: &str, tier: Option<&str>| CcUsageRow {
+            service_tier: tier.map(String::from),
+            ..cc_row(id, "2026-01-01T10:00:00Z", "claude-opus-4-7", 10, 5, 0.1, "s1")
+        };
+        db.cc_upsert(&[
+            mk("m1", Some("standard")),
+            mk("m2", Some("standard")),
+            mk("m3", Some("priority")),
+            mk("m4", None),
+        ])
+        .unwrap();
+        let a = db
+            .analytics_ext("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z", None, 10)
+            .unwrap();
+        assert_eq!(a.tier_breakdown.standard, 2);
+        assert_eq!(a.tier_breakdown.non_standard, 1);
+        assert_eq!(a.tier_breakdown.unknown, 1);
+        // 2 / (2+1) = 66.67%
+        assert!((a.tier_breakdown.standard_pct.unwrap() - 66.6667).abs() < 1e-2);
+    }
+
+    // --- cache hit ratio + savings ---
+
+    #[test]
+    fn analytics_computes_cache_hit_ratio() {
+        let db = mem_db();
+        // input=100, cache_read=900 → ratio = 900/(100+900) = 0.9
+        let m = CcUsageRow {
+            cache_read: 900,
+            cache_create: 0,
+            ..cc_row("m1", "2026-01-01T10:00:00Z", "claude-opus-4-7", 100, 50, 1.0, "s1")
+        };
+        db.cc_upsert(&[m]).unwrap();
+        let a = db.analytics("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z").unwrap();
+        assert!((a.totals.cache_hit_ratio - 0.9).abs() < 1e-9, "{}", a.totals.cache_hit_ratio);
+    }
+
+    #[test]
+    fn cache_hit_ratio_zero_when_no_read_or_input() {
+        let db = mem_db();
+        let m = CcUsageRow {
+            cache_create: 5000,
+            cache_read: 0,
+            ..cc_row("m1", "2026-01-01T10:00:00Z", "claude-opus-4-7", 0, 200, 1.0, "s1")
+        };
+        db.cc_upsert(&[m]).unwrap();
+        let a = db.analytics("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z").unwrap();
+        assert_eq!(a.totals.cache_hit_ratio, 0.0);
+    }
+
+    #[test]
+    fn analytics_computes_cache_savings_per_model() {
+        let db = mem_db();
+        // opus pin=5: read 1M → +4.5 ; create 1M → −1.25
+        let opus = CcUsageRow {
+            cache_read: 1_000_000,
+            cache_create: 1_000_000,
+            ..cc_row("o", "2026-01-01T10:00:00Z", "claude-opus-4-7", 0, 0, 0.0, "s1")
+        };
+        // sonnet pin=3: read 1M → +2.7 ; no create
+        let son = CcUsageRow {
+            cache_read: 1_000_000,
+            cache_create: 0,
+            ..cc_row("s", "2026-01-01T11:00:00Z", "claude-sonnet-4-5", 0, 0, 0.0, "s2")
+        };
+        db.cc_upsert(&[opus, son]).unwrap();
+        let a = db.analytics("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z").unwrap();
+        // (4.5 − 1.25) + 2.7 = 5.95
+        assert!((a.totals.cache_savings_usd - 5.95).abs() < 1e-9, "{}", a.totals.cache_savings_usd);
+    }
+
+    #[test]
+    fn cache_savings_can_be_negative_and_skips_unknown_model() {
+        let db = mem_db();
+        let churn = CcUsageRow {
+            cache_create: 1_000_000,
+            cache_read: 0,
+            ..cc_row("c", "2026-01-01T10:00:00Z", "claude-opus-4-7", 0, 0, 0.0, "s1")
+        };
+        let unknown = CcUsageRow {
+            cache_read: 1_000_000,
+            cache_create: 0,
+            ..cc_row("u", "2026-01-01T11:00:00Z", "mystery-model", 0, 0, 0.0, "s2")
+        };
+        db.cc_upsert(&[churn, unknown]).unwrap();
+        let a = db.analytics("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z").unwrap();
+        assert!((a.totals.cache_savings_usd + 1.25).abs() < 1e-9, "{}", a.totals.cache_savings_usd);
+    }
+
+    #[test]
+    fn insight_low_cache_hit_fires_on_volume_and_low_ratio() {
+        let db = mem_db();
+        // input=1.2M, cache_read=0.3M → read_input=1.5M (>1M), ratio=0.2 (<0.5)
+        let m = CcUsageRow {
+            cache_read: 300_000,
+            cache_create: 0,
+            ..cc_row("m", "2026-01-01T10:00:00Z", "claude-opus-4-7", 1_200_000, 0, 6.0, "s1")
+        };
+        db.cc_upsert(&[m]).unwrap();
+        let ext = db
+            .analytics_ext("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z", None, 10)
+            .unwrap();
+        assert!(ext.insights.iter().any(|i| i.kind == "low_cache_hit"));
+    }
+
+    #[test]
+    fn insight_low_cache_hit_silent_on_high_ratio() {
+        let db = mem_db();
+        // opus read 2M, input 50K → ratio ~0.975 → no low_cache_hit recommendation.
+        let m = CcUsageRow {
+            cache_read: 2_000_000,
+            cache_create: 0,
+            ..cc_row("m", "2026-01-01T10:00:00Z", "claude-opus-4-7", 50_000, 0, 1.0, "s1")
+        };
+        db.cc_upsert(&[m]).unwrap();
+        let ext = db
+            .analytics_ext("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z", None, 10)
+            .unwrap();
+        assert!(
+            !ext.insights.iter().any(|i| i.kind == "low_cache_hit"),
+            "ratio ~0.975 should not trigger the low-hit recommendation"
+        );
+    }
+
+    // --- turns / active time / productivity ---
+
+    #[test]
+    fn cc_turn_upsert_dedups_by_uuid() {
+        let db = mem_db();
+        let rows = vec![
+            turn("u1", "2026-01-01T10:00:00Z", "s1", 60_000),
+            turn("u2", "2026-01-01T10:05:00Z", "s1", 120_000),
+        ];
+        assert_eq!(db.cc_turn_upsert(&rows).unwrap(), 2);
+        assert_eq!(db.cc_turn_upsert(&rows).unwrap(), 0);
+        let more = vec![
+            turn("u1", "2026-01-01T10:00:00Z", "s1", 60_000),
+            turn("u3", "2026-01-02T10:00:00Z", "s2", 30_000),
+        ];
+        assert_eq!(db.cc_turn_upsert(&more).unwrap(), 1);
+    }
+
+    #[test]
+    fn productivity_sums_active_time_with_cap() {
+        let db = mem_db();
+        // anchor cost so derivatives are computable
+        db.cc_upsert(&[cc_row("m1", "2026-01-01T10:00:00Z", "claude-opus-4-7", 100, 0, 6.0, "s1")])
+            .unwrap();
+        // 60_000 + 120_000 + 3_600_000(capped to 1_800_000) = 1_980_000 ms
+        db.cc_turn_upsert(&[
+            turn("t1", "2026-01-01T10:00:00Z", "s1", 60_000),
+            turn("t2", "2026-01-01T10:01:00Z", "s1", 120_000),
+            turn("t3", "2026-01-01T10:02:00Z", "s1", 3_600_000),
+        ])
+        .unwrap();
+        let a = db
+            .analytics_ext("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z", None, 10)
+            .unwrap();
+        let p = &a.productivity;
+        assert_eq!(p.active_ms, 1_980_000);
+        assert_eq!(p.turns, 3);
+        assert!((p.active_hours - 0.55).abs() < 1e-9, "{}", p.active_hours);
+        // cost 6.0 / 0.55h = 10.909.../h
+        assert!((p.cost_per_active_hour.unwrap() - 6.0 / 0.55).abs() < 1e-9);
+    }
+
+    #[test]
+    fn productivity_derivatives_none_without_denominators() {
+        let db = mem_db();
+        // cost present but no turns/commits/edits → all per-X are None.
+        db.cc_upsert(&[cc_row("m1", "2026-01-01T10:00:00Z", "claude-opus-4-7", 100, 0, 6.0, "s1")])
+            .unwrap();
+        let a = db
+            .analytics_ext("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z", None, 10)
+            .unwrap();
+        let p = &a.productivity;
+        assert_eq!(p.active_ms, 0);
+        assert!(p.cost_per_active_hour.is_none());
+        assert!(p.tokens_per_active_minute.is_none());
+        assert!(p.cost_per_commit.is_none());
+        assert!(p.cost_per_edit.is_none());
+    }
+
+    #[test]
+    fn productivity_counts_git_commits_in_window() {
+        let db = mem_db();
+        db.cc_upsert(&[
+            CcUsageRow {
+                git_commits: 2,
+                git_pushes: 1,
+                ..cc_row("m1", "2026-01-01T10:00:00Z", "claude-opus-4-7", 100, 0, 10.0, "s1")
+            },
+            // outside the window → not counted
+            CcUsageRow {
+                git_commits: 5,
+                ..cc_row("m2", "2026-02-01T10:00:00Z", "claude-opus-4-7", 100, 0, 1.0, "s2")
+            },
+        ])
+        .unwrap();
+        let a = db
+            .analytics_ext("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z", None, 10)
+            .unwrap();
+        assert_eq!(a.productivity.git_commits, 2);
+        assert_eq!(a.productivity.git_pushes, 1);
+        // cost_per_commit = 10.0 / 2 = 5.0
+        assert!((a.productivity.cost_per_commit.unwrap() - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn insight_low_roi_fires_above_median() {
+        let db = mem_db();
+        // 5 typical sessions: cost 1.0 over 1h each → 1.0 $/h.
+        for i in 0..5 {
+            let sess = format!("s{i}");
+            db.cc_upsert(&[cc_row(
+                &format!("m{i}"),
+                "2026-01-01T10:00:00Z",
+                "claude-opus-4-7",
+                100,
+                0,
+                1.0,
+                &sess,
+            )])
+            .unwrap();
+            db.cc_turn_upsert(&[turn(&format!("u{i}"), "2026-01-01T10:00:00Z", &sess, 1_800_000)])
+                .unwrap();
+        }
+        // window cost is dominated by an expensive session: cost 50 over ~30min
+        // active. Window active_hours small, $/h high vs median 1.0.
+        db.cc_upsert(&[cc_row("big", "2026-01-01T12:00:00Z", "claude-opus-4-7", 100, 0, 50.0, "sbig")])
+            .unwrap();
+        db.cc_turn_upsert(&[turn("ubig", "2026-01-01T12:00:00Z", "sbig", 1_800_000)])
+            .unwrap();
+        let a = db
+            .analytics_ext("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z", None, 10)
+            .unwrap();
+        assert!(a.insights.iter().any(|i| i.kind == "low_roi"));
     }
 
     #[test]
@@ -431,6 +856,85 @@ mod tests {
             .unwrap();
         assert_eq!(c.current.total_tokens, 100);
         assert_eq!(c.previous.total_tokens, 50);
+        // Trend block mirrors the Totals for cost/tokens and carries the extras.
+        assert_eq!(c.current_trend.total_tokens, 100);
+        assert_eq!(c.previous_trend.total_tokens, 50);
+        assert!((c.current_trend.cost - 1.0).abs() < 1e-9);
+        assert!((c.previous_trend.cost - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn trend_compare_computes_error_rate_and_cost_per_hour_both_periods() {
+        let db = mem_db();
+        // --- current window (Jan 8..15): cost 6 over 0.5h active, 1/4 tool errors.
+        db.cc_upsert(&[cc_row("c1", "2026-01-10T10:00:00Z", "claude-opus-4-7", 100, 0, 6.0, "sc")])
+            .unwrap();
+        db.cc_turn_upsert(&[turn("tc", "2026-01-10T10:00:00Z", "sc", 1_800_000)]) // 0.5h
+            .unwrap();
+        db.cc_tool_result_upsert(&[
+            tr("ca", "2026-01-10T10:00:00Z", "sc", false),
+            tr("cb", "2026-01-10T10:00:01Z", "sc", false),
+            tr("cc", "2026-01-10T10:00:02Z", "sc", false),
+            tr("cd", "2026-01-10T10:00:03Z", "sc", true),
+        ])
+        .unwrap();
+        // --- previous window (Jan 1..8): cost 2 over 1h active, 0 tool errors.
+        // Two 30-min turns (each at the MAX_TURN_MS cap) sum to a clean 1h.
+        db.cc_upsert(&[cc_row("p1", "2026-01-03T10:00:00Z", "claude-opus-4-7", 50, 0, 2.0, "sp")])
+            .unwrap();
+        db.cc_turn_upsert(&[
+            turn("tp1", "2026-01-03T10:00:00Z", "sp", 1_800_000), // 0.5h
+            turn("tp2", "2026-01-03T10:30:00Z", "sp", 1_800_000), // 0.5h
+        ])
+        .unwrap();
+        db.cc_tool_result_upsert(&[
+            tr("pa", "2026-01-03T10:00:00Z", "sp", false),
+            tr("pb", "2026-01-03T10:00:01Z", "sp", false),
+        ])
+        .unwrap();
+
+        let c = db
+            .analytics_compare(
+                "2026-01-08T00:00:00Z",
+                "2026-01-15T00:00:00Z",
+                "2026-01-01T00:00:00Z",
+                "2026-01-08T00:00:00Z",
+            )
+            .unwrap();
+        // error_rate is a FRACTION (0..1): current 1/4 = 0.25, previous 0/2 = 0.0.
+        assert!((c.current_trend.error_rate.unwrap() - 0.25).abs() < 1e-9);
+        assert!((c.previous_trend.error_rate.unwrap() - 0.0).abs() < 1e-9);
+        // cost_per_active_hour: current 6/0.5 = 12, previous 2/1 = 2.
+        assert!((c.current_trend.cost_per_active_hour.unwrap() - 12.0).abs() < 1e-9);
+        assert!((c.previous_trend.cost_per_active_hour.unwrap() - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn trend_compare_empty_previous_yields_none_and_zero() {
+        let db = mem_db();
+        // Only the current window has data; previous window is empty.
+        db.cc_upsert(&[cc_row("c1", "2026-01-10T10:00:00Z", "claude-opus-4-7", 100, 0, 6.0, "sc")])
+            .unwrap();
+        db.cc_turn_upsert(&[turn("tc", "2026-01-10T10:00:00Z", "sc", 1_800_000)])
+            .unwrap();
+
+        let c = db
+            .analytics_compare(
+                "2026-01-08T00:00:00Z",
+                "2026-01-15T00:00:00Z",
+                "2026-01-01T00:00:00Z",
+                "2026-01-08T00:00:00Z",
+            )
+            .unwrap();
+        // Previous period: no rows, no turns, no tool results.
+        assert_eq!(c.previous_trend.total_tokens, 0);
+        assert_eq!(c.previous_trend.cost, 0.0);
+        assert_eq!(c.previous_trend.cache_hit_ratio, 0.0);
+        assert!(c.previous_trend.error_rate.is_none());
+        assert!(c.previous_trend.cost_per_active_hour.is_none());
+        // Current still has measurable cost-per-hour and no tool results → None rate.
+        assert!((c.current_trend.cost_per_active_hour.unwrap() - 12.0).abs() < 1e-9);
+        assert!(c.current_trend.error_rate.is_none());
     }
 
     #[test]

@@ -99,3 +99,33 @@ fn missing_projects_dir_is_zero() {
     let base = fixtures_base().join("does-not-exist");
     assert_eq!(cc::ingest(&base, &db).unwrap(), 0);
 }
+
+#[test]
+fn ingest_extracts_tool_results_turns_tier_and_git() {
+    // msg-3 (proj-b) carries a Bash `git commit && git push`, a tier of
+    // "standard", a following user line with two tool_results (1 error) and a
+    // turn_duration system line. The whole conveyor runs through parse_file.
+    let db = mem_db();
+    cc::ingest(&fixtures_base(), &db).unwrap();
+
+    let ext = db
+        .analytics_ext("2026-05-21T00:00:00Z", "2026-05-22T00:00:00Z", None, 10)
+        .unwrap();
+
+    // tool-result outcomes: 2 calls, 1 error → 50%
+    assert_eq!(ext.tool_error.total, 2);
+    assert_eq!(ext.tool_error.errors, 1);
+    assert!((ext.tool_error.error_rate.unwrap() - 50.0).abs() < 1e-9);
+
+    // service tier: msg-3 is "standard" → 100% standard share.
+    assert_eq!(ext.tier_breakdown.standard, 1);
+    assert!((ext.tier_breakdown.standard_pct.unwrap() - 100.0).abs() < 1e-9);
+
+    // active time: one 120_000 ms turn (under the cap).
+    assert_eq!(ext.productivity.turns, 1);
+    assert_eq!(ext.productivity.active_ms, 120_000);
+
+    // git: one commit + one push counted, command text never stored.
+    assert_eq!(ext.productivity.git_commits, 1);
+    assert_eq!(ext.productivity.git_pushes, 1);
+}

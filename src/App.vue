@@ -102,6 +102,11 @@ const quietHoursEnd = ref("08:00");
 const ccAnalyticsEnabled = ref(false);
 const dailyBudgetEnabled = ref(false);
 const dailyBudget = ref(0);
+// Efficiency goals (issue: trend/goals). cost/hour is USD/hour; errorRateMax is
+// a FRACTION 0..1 (matches AppConfig) — SettingsPanel edits it as a percent.
+// null = goal disabled. Read by AnalyticsWindow to colour the matching tiles.
+const goalCostPerHourMax = ref<number | null>(null);
+const goalErrorRateMax = ref<number | null>(null);
 const notificationsMutedUntil = ref<string | null>(null);
 const serviceStatusEnabled = ref(true);
 const serviceStatusInterval = ref(90);
@@ -212,6 +217,10 @@ async function loadSettings() {
         dailyBudgetEnabled.value =
             (await store.get<boolean>("dailyBudgetEnabled")) ?? false;
         dailyBudget.value = (await store.get<number>("dailyBudget")) ?? 0;
+        goalCostPerHourMax.value =
+            (await store.get<number | null>("goalCostPerHourMax")) ?? null;
+        goalErrorRateMax.value =
+            (await store.get<number | null>("goalErrorRateMax")) ?? null;
         notificationsMutedUntil.value =
             (await store.get<string>("notificationsMutedUntil")) ?? null;
         serviceStatusEnabled.value =
@@ -268,6 +277,8 @@ async function saveSettings() {
     await store.set("ccAnalyticsEnabled", ccAnalyticsEnabled.value);
     await store.set("dailyBudgetEnabled", dailyBudgetEnabled.value);
     await store.set("dailyBudget", dailyBudget.value);
+    await store.set("goalCostPerHourMax", goalCostPerHourMax.value);
+    await store.set("goalErrorRateMax", goalErrorRateMax.value);
     await store.set("notificationsMutedUntil", notificationsMutedUntil.value);
     await store.set("serviceStatusEnabled", serviceStatusEnabled.value);
     await store.set("serviceStatusInterval", serviceStatusInterval.value);
@@ -301,6 +312,8 @@ function buildConfig() {
         cc_analytics_enabled: ccAnalyticsEnabled.value,
         daily_budget_enabled: dailyBudgetEnabled.value,
         daily_budget: dailyBudget.value,
+        goal_cost_per_hour_max: goalCostPerHourMax.value,
+        goal_error_rate_max: goalErrorRateMax.value,
         notifications_muted_until: notificationsMutedUntil.value,
         service_status_enabled: serviceStatusEnabled.value,
         service_status_interval: serviceStatusInterval.value,
@@ -543,6 +556,8 @@ async function handleSave(settings: {
     ccAnalyticsEnabled: boolean;
     dailyBudgetEnabled: boolean;
     dailyBudget: number;
+    goalCostPerHourMax: number | null;
+    goalErrorRateMax: number | null;
     serviceStatusEnabled: boolean;
     serviceStatusInterval: number;
     serviceStatusNotify: boolean;
@@ -566,6 +581,8 @@ async function handleSave(settings: {
     ccAnalyticsEnabled.value = settings.ccAnalyticsEnabled;
     dailyBudgetEnabled.value = settings.dailyBudgetEnabled;
     dailyBudget.value = settings.dailyBudget;
+    goalCostPerHourMax.value = settings.goalCostPerHourMax;
+    goalErrorRateMax.value = settings.goalErrorRateMax;
     serviceStatusEnabled.value = settings.serviceStatusEnabled;
     serviceStatusInterval.value = settings.serviceStatusInterval;
     serviceStatusNotify.value = settings.serviceStatusNotify;
@@ -941,6 +958,8 @@ onUnmounted(() => {
             :daily-budget-enabled="dailyBudgetEnabled"
             :daily-budget="dailyBudget"
             :suggested-budget="suggestedBudget"
+            :goal-cost-per-hour-max="goalCostPerHourMax"
+            :goal-error-rate-max="goalErrorRateMax"
             :service-status-enabled="serviceStatusEnabled"
             :service-status-interval="serviceStatusInterval"
             :service-status-notify="serviceStatusNotify"

@@ -62,6 +62,8 @@ interface Totals {
   cost: number;
   messages: number;
   sessions: number;
+  cache_hit_ratio: number; // 0..1
+  cache_savings_usd: number; // can be < 0
 }
 interface DailyPoint {
   date: string;
@@ -121,6 +123,47 @@ interface ToolUsage {
   calls: number;
   messages: number;
 }
+interface TierBreakdown {
+  standard: number;
+  non_standard: number;
+  unknown: number;
+  standard_pct: number | null;
+}
+interface ToolErrorStats {
+  total: number;
+  errors: number;
+  error_rate: number | null;
+}
+interface Productivity {
+  active_ms: number;
+  active_minutes: number;
+  active_hours: number;
+  turns: number;
+  git_commits: number;
+  git_pushes: number;
+  edits: number;
+  cost_per_active_hour: number | null;
+  tokens_per_active_minute: number | null;
+  cost_per_commit: number | null;
+  cost_per_edit: number | null;
+}
+// Headline metrics for the trend badges. Mirrors the Rust `TrendMetrics`
+// (serde snake_case). error_rate / cost_per_active_hour are Option → null.
+// NB: trend error_rate is a FRACTION 0..1 (compared current vs previous), unlike
+// `ToolErrorStats.error_rate` on the Quality tile which is a percent 0..100.
+interface TrendMetrics {
+  cost: number;
+  total_tokens: number;
+  cache_hit_ratio: number; // 0..1
+  error_rate: number | null; // fraction 0..1
+  cost_per_active_hour: number | null; // USD/hour
+}
+interface PeriodCompare {
+  current: Totals;
+  previous: Totals;
+  current_trend: TrendMetrics;
+  previous_trend: TrendMetrics;
+}
 interface AnalyticsExt {
   totals: Totals;
   daily: DailyPoint[];
@@ -134,6 +177,9 @@ interface AnalyticsExt {
   insights: Insight[];
   projects: string[];
   tool_breakdown: ToolUsage[];
+  tier_breakdown: TierBreakdown;
+  tool_error: ToolErrorStats;
+  productivity: Productivity;
 }
 
 // --- filters ---
@@ -149,9 +195,23 @@ const projectFilter = ref<string>(""); // empty = all
 const loading = ref(false);
 const error = ref("");
 const data = ref<AnalyticsExt | null>(null);
+const compare = ref<PeriodCompare | null>(null);
+
+// Efficiency goals, read from the shared store (SettingsPanel writes them).
+// goalCostPerHourMax is USD/hour; goalErrorRateMax is a FRACTION 0..1. null =
+// goal disabled (no indicator shown).
+const goalCostPerHourMax = ref<number | null>(null);
+const goalErrorRateMax = ref<number | null>(null);
 
 const fromIso = computed(() => new Date(dateFrom.value + "T00:00:00").toISOString());
 const toIso = computed(() => new Date(dateTo.value + "T23:59:59.999").toISOString());
+// Previous window of equal length, immediately preceding the current one:
+// prev_to = cur_from, prev_from = cur_from − (cur_to − cur_from).
+const prevFromIso = computed(() => {
+  const cf = new Date(fromIso.value).getTime();
+  const ct = new Date(toIso.value).getTime();
+  return new Date(cf - (ct - cf)).toISOString();
+});
 
 async function load() {
   loading.value = true;
@@ -169,6 +229,18 @@ async function load() {
       project: projectFilter.value || null,
       topN: 10,
     });
+    // Period-over-period trend for the KPI badges (prev window of equal length).
+    // Non-fatal: a failure here just hides the badges, it doesn't break the page.
+    try {
+      compare.value = await invoke<PeriodCompare>("get_analytics_compare", {
+        curFrom: fromIso.value,
+        curTo: toIso.value,
+        prevFrom: prevFromIso.value,
+        prevTo: fromIso.value,
+      });
+    } catch {
+      compare.value = null;
+    }
     await nextTick();
     renderCharts();
   } catch (e) {
@@ -186,6 +258,16 @@ async function reload() {
       project: projectFilter.value || null,
       topN: 10,
     });
+    try {
+      compare.value = await invoke<PeriodCompare>("get_analytics_compare", {
+        curFrom: fromIso.value,
+        curTo: toIso.value,
+        prevFrom: prevFromIso.value,
+        prevTo: fromIso.value,
+      });
+    } catch {
+      compare.value = null;
+    }
     await nextTick();
     renderCharts();
   } catch {}
@@ -199,6 +281,28 @@ function fmtTokens(n: number): string {
 }
 function fmtCost(n: number): string {
   return "$" + n.toFixed(2);
+}
+function fmtPct(v: number): string {
+  return v.toFixed(1) + "%";
+}
+// Active time in ms → "Xч Yмин" / "Yмин" / "Zс". Compact, locale-agnostic units
+// (the unit suffixes are localized via i18n keys, the number is plain).
+function fmtDuration(ms: number): string {
+  const totalMin = Math.floor(ms / 60000);
+  if (totalMin >= 60) {
+    const h = Math.floor(totalMin / 60);
+    const m = totalMin % 60;
+    return m > 0 ? `${h}${t("unitHourShort")} ${m}${t("unitMinShort")}` : `${h}${t("unitHourShort")}`;
+  }
+  if (totalMin >= 1) return `${totalMin}${t("unitMinShort")}`;
+  return `${Math.floor(ms / 1000)}${t("unitSecShort")}`;
+}
+// Per-X derivatives are null when the denominator is zero — render "—", not 0/Inf.
+function fmtCostOrDash(v: number | null): string {
+  return v === null ? "—" : fmtCost(v);
+}
+function fmtTokensOrDash(v: number | null): string {
+  return v === null ? "—" : fmtTokens(v);
 }
 // Sessions are keyed by UUID (the transcript file name). Show a compact form
 // in the table, copy the full id on click so the user can `grep` it.
@@ -217,6 +321,110 @@ function fmtWhen(iso: string): string {
 }
 function projectName(p: string | null): string {
   return p && p.length ? p : t("projectUnknown");
+}
+
+// --- trend badges (period over period) ---
+// Each KPI tile that supports a trend shows a small badge: arrow + delta%.
+// `polarity` says which direction is "good":
+//   "up"      ↑ is better (green), ↓ worse (red)   — e.g. cache hit ratio
+//   "down"    ↓ is better (green), ↑ worse (red)   — e.g. error rate, $/hour
+//   "neutral" no colour — volume isn't good/bad     — e.g. cost, tokens
+type Polarity = "up" | "down" | "neutral";
+interface TrendBadge {
+  text: string; // "+12%" / "−4%" / "—"
+  arrow: "up" | "down" | "flat" | "none";
+  cls: "good" | "bad" | "neutral"; // colour class
+}
+const NO_TREND: TrendBadge = { text: "—", arrow: "none", cls: "neutral" };
+
+// Build a badge from current/previous values. cur/prev null or prev≤0 → "—".
+function makeTrend(cur: number | null, prev: number | null, polarity: Polarity): TrendBadge {
+  if (cur === null || prev === null || prev <= 0) return NO_TREND;
+  const pct = ((cur - prev) / prev) * 100;
+  const rounded = Math.round(pct);
+  const arrow: TrendBadge["arrow"] = rounded > 0 ? "up" : rounded < 0 ? "down" : "flat";
+  const sign = rounded > 0 ? "+" : rounded < 0 ? "−" : "";
+  const text = `${sign}${Math.abs(rounded)}%`;
+  let cls: TrendBadge["cls"] = "neutral";
+  if (polarity !== "neutral" && rounded !== 0) {
+    const improved = polarity === "up" ? rounded > 0 : rounded < 0;
+    cls = improved ? "good" : "bad";
+  }
+  return { text, arrow, cls };
+}
+
+const trendCost = computed(() =>
+  compare.value
+    ? makeTrend(compare.value.current_trend.cost, compare.value.previous_trend.cost, "neutral")
+    : NO_TREND,
+);
+const trendTokens = computed(() =>
+  compare.value
+    ? makeTrend(
+        compare.value.current_trend.total_tokens,
+        compare.value.previous_trend.total_tokens,
+        "neutral",
+      )
+    : NO_TREND,
+);
+const trendCacheHit = computed(() =>
+  compare.value
+    ? makeTrend(
+        compare.value.current_trend.cache_hit_ratio,
+        compare.value.previous_trend.cache_hit_ratio,
+        "up",
+      )
+    : NO_TREND,
+);
+// error_rate and cost_per_active_hour are both fraction/USD on each side, so
+// the delta% composes directly. Lower is better → "down" polarity.
+const trendErrorRate = computed(() =>
+  compare.value
+    ? makeTrend(
+        compare.value.current_trend.error_rate,
+        compare.value.previous_trend.error_rate,
+        "down",
+      )
+    : NO_TREND,
+);
+const trendCostPerHour = computed(() =>
+  compare.value
+    ? makeTrend(
+        compare.value.current_trend.cost_per_active_hour,
+        compare.value.previous_trend.cost_per_active_hour,
+        "down",
+      )
+    : NO_TREND,
+);
+
+// --- goal indicators ---
+// Two tiles can carry a goal indicator. The error-rate goal is stored as a
+// FRACTION 0..1; the tile metric `tool_error.error_rate` is a PERCENT 0..100 —
+// so we scale the goal up by 100 before comparing. $/hour is USD on both sides.
+type GoalState = "ok" | "exceeded" | null; // null = no goal set / no metric
+const errorRateGoalState = computed<GoalState>(() => {
+  const goal = goalErrorRateMax.value; // fraction 0..1
+  const metric = data.value?.tool_error.error_rate; // percent 0..100
+  if (goal === null || metric === null || metric === undefined) return null;
+  return metric <= goal * 100 ? "ok" : "exceeded";
+});
+const costPerHourGoalState = computed<GoalState>(() => {
+  const goal = goalCostPerHourMax.value; // USD/hour
+  const metric = data.value?.productivity.cost_per_active_hour; // USD/hour
+  if (goal === null || metric === null || metric === undefined) return null;
+  return metric <= goal ? "ok" : "exceeded";
+});
+
+async function loadGoals() {
+  try {
+    const { load: loadStore } = await import("@tauri-apps/plugin-store");
+    const store = await loadStore("settings.json");
+    goalCostPerHourMax.value = (await store.get<number | null>("goalCostPerHourMax")) ?? null;
+    goalErrorRateMax.value = (await store.get<number | null>("goalErrorRateMax")) ?? null;
+  } catch {
+    goalCostPerHourMax.value = null;
+    goalErrorRateMax.value = null;
+  }
 }
 
 // --- presets ---
@@ -340,9 +548,12 @@ function renderCharts() {
 // parser, so format numbers in JS before substituting. `cost`/`*_rate` →
 // "$X.XX" (rate is also dollars: $/msg). Percent-like fields → integer
 // percent. `avg_ctx` → compact token form. Everything else passed through.
-const PCT_KEYS = new Set(["pct", "share_pct", "churn_pct", "delta_pct"]);
-const COST_KEYS = new Set(["cost", "with_rate", "without_rate"]);
+const PCT_KEYS = new Set(["pct", "share_pct", "churn_pct", "delta_pct", "hit_pct", "standard_pct", "rate"]);
+const COST_KEYS = new Set(["cost", "with_rate", "without_rate", "savings", "per_h", "median_h"]);
 const TOK_KEYS = new Set(["avg_ctx"]);
+// One-decimal numeric keys (hours of active work in low_roi). Passed as a plain
+// number with no unit prefix — the i18n string carries the unit.
+const NUM1_KEYS = new Set(["active_h"]);
 function insightText(ins: Insight): string {
   const p: Record<string, string | number> = {};
   for (const [k, v] of Object.entries(ins.params)) {
@@ -350,6 +561,7 @@ function insightText(ins: Insight): string {
       if (COST_KEYS.has(k)) p[k] = fmtCost(v);
       else if (PCT_KEYS.has(k)) p[k] = v.toFixed(0);
       else if (TOK_KEYS.has(k)) p[k] = fmtTokens(v);
+      else if (NUM1_KEYS.has(k)) p[k] = v.toFixed(1);
       else p[k] = v;
     } else {
       p[k] = v as string;
@@ -387,12 +599,6 @@ function maxCache(rows: SessionUsage[]): number {
   return rows.reduce((m, r) => (r.cache_create > m ? r.cache_create : m), 0);
 }
 
-// --- insight tabs ---
-// Backend tags each insight as `observation` (factual) or `recommendation`
-// (actionable). Default to Recommendations because they're the reason a user
-// opens the dashboard. If a period has none, fall through to Findings.
-const insightTab = ref<"observation" | "recommendation">("recommendation");
-
 // --- ignored insights (persisted) ---
 // Stored as an array of kind strings in settings.json. Anything in here is
 // hidden from the active list and exposed in a separate "Скрытые" block with
@@ -425,35 +631,14 @@ function restoreInsight(kind: string) {
   saveIgnored();
 }
 
-const observations = computed(() =>
-  (data.value?.insights ?? []).filter(
-    (i) => i.category === "observation" && !ignoredKinds.value.includes(i.kind),
-  ),
-);
-const recommendations = computed(() =>
-  (data.value?.insights ?? []).filter(
-    (i) => i.category === "recommendation" && !ignoredKinds.value.includes(i.kind),
-  ),
+// Backend now emits only actionable recommendations, so the section is a flat
+// list (no observation/recommendation tab split). `activeInsights` is the
+// non-ignored set; ignored ones live in the restorable "Hidden" block.
+const activeInsights = computed(() =>
+  (data.value?.insights ?? []).filter((i) => !ignoredKinds.value.includes(i.kind)),
 );
 const ignoredInsights = computed(() =>
   (data.value?.insights ?? []).filter((i) => ignoredKinds.value.includes(i.kind)),
-);
-const activeInsights = computed(() =>
-  insightTab.value === "observation" ? observations.value : recommendations.value,
-);
-// When the period has zero (non-ignored) recs, auto-jump to Findings so the
-// section isn't just an "empty" placeholder on the default tab.
-watch(
-  [() => data.value?.insights, ignoredKinds],
-  () => {
-    if (!data.value?.insights?.length) return;
-    if (recommendations.value.length === 0 && observations.value.length > 0) {
-      insightTab.value = "observation";
-    } else if (recommendations.value.length > 0) {
-      insightTab.value = "recommendation";
-    }
-  },
-  { immediate: false },
 );
 
 // --- affected sessions per insight (expandable list) ---
@@ -543,6 +728,21 @@ function sectionOrder(id: string): number {
   return i >= 0 ? i : 999;
 }
 
+// --- session quality + productivity: hide sections with no data ---
+// Quality shows only when at least one of its two metrics is known (non-null),
+// so an empty window doesn't render a section full of "—".
+const hasQuality = computed(
+  () =>
+    !!data.value &&
+    (data.value.tier_breakdown.standard_pct !== null ||
+      data.value.tool_error.error_rate !== null),
+);
+// Productivity shows when the window has any turns or edits (like subagents/tools
+// hide when empty).
+const hasProductivity = computed(
+  () => !!data.value && (data.value.productivity.turns > 0 || data.value.productivity.edits > 0),
+);
+
 // --- tool breakdown: collapse + search ---
 // Top-3 by default; «подробнее» reveals the long tail. A search box filters
 // across the entire list (search wins over collapse — if there's a query, all
@@ -567,6 +767,7 @@ onMounted(async () => {
   await loadLocaleFromStore();
   await loadIgnored();
   await loadSectionPrefs();
+  await loadGoals();
   await load();
 });
 </script>
@@ -616,10 +817,24 @@ onMounted(async () => {
           <div class="aw-kpi">
             <div class="aw-kpi-val">{{ fmtCost(data.totals.cost) }}</div>
             <div class="aw-kpi-lbl">{{ t("analyticsTotal") }}</div>
+            <span
+              class="aw-trend"
+              :class="'t-' + trendCost.cls"
+              :title="trendCost.arrow === 'none' ? t('trendNoData') : t('trendVsPrev')"
+            >
+              <span class="aw-trend-arrow" :data-dir="trendCost.arrow"></span>{{ trendCost.text }}
+            </span>
           </div>
           <div class="aw-kpi">
             <div class="aw-kpi-val">{{ fmtTokens(data.totals.total_tokens) }}</div>
             <div class="aw-kpi-lbl">{{ t("metricTokens") }}</div>
+            <span
+              class="aw-trend"
+              :class="'t-' + trendTokens.cls"
+              :title="trendTokens.arrow === 'none' ? t('trendNoData') : t('trendVsPrev')"
+            >
+              <span class="aw-trend-arrow" :data-dir="trendTokens.arrow"></span>{{ trendTokens.text }}
+            </span>
           </div>
           <div class="aw-kpi">
             <div class="aw-kpi-val">{{ data.totals.sessions }}</div>
@@ -629,31 +844,131 @@ onMounted(async () => {
             <div class="aw-kpi-val">{{ data.subagent_summary.subagent_messages }}</div>
             <div class="aw-kpi-lbl">{{ t("subagentKpiLabel") }}</div>
           </div>
+          <div
+            v-if="data.totals.input + data.totals.cache_read > 0"
+            class="aw-kpi"
+            :title="t('kpiHitRatioHint')"
+          >
+            <div class="aw-kpi-val">{{ (data.totals.cache_hit_ratio * 100).toFixed(0) }}%</div>
+            <div class="aw-kpi-lbl">{{ t("kpiHitRatio") }}</div>
+            <span
+              class="aw-trend"
+              :class="'t-' + trendCacheHit.cls"
+              :title="trendCacheHit.arrow === 'none' ? t('trendNoData') : t('trendVsPrev')"
+            >
+              <span class="aw-trend-arrow" :data-dir="trendCacheHit.arrow"></span>{{ trendCacheHit.text }}
+            </span>
+          </div>
+          <div class="aw-kpi" :title="t('kpiCacheSavingsHint')">
+            <div class="aw-kpi-val">{{ fmtCost(data.totals.cache_savings_usd) }}</div>
+            <div class="aw-kpi-lbl">{{ t("kpiCacheSavings") }}</div>
+          </div>
         </section>
 
-        <!-- Insights — tabbed: observations (factual) vs recommendations (actionable) -->
+        <!-- Session quality: service-tier split + tool error rate -->
+        <section
+          v-if="sectionVisible('quality') && hasQuality"
+          :style="{ order: sectionOrder('quality') }"
+          class="aw-kpis"
+        >
+          <div
+            v-if="data.tier_breakdown.standard_pct !== null"
+            class="aw-kpi"
+            :title="t('qualityTierHint')"
+          >
+            <div class="aw-kpi-val">{{ fmtPct(data.tier_breakdown.standard_pct) }}</div>
+            <div class="aw-kpi-lbl">{{ t("qualityTierLabel") }}</div>
+          </div>
+          <div
+            v-if="data.tool_error.error_rate !== null"
+            class="aw-kpi"
+            :class="errorRateGoalState ? 'goal-' + errorRateGoalState : ''"
+            :title="t('qualityErrorHint')"
+          >
+            <div class="aw-kpi-val">{{ fmtPct(data.tool_error.error_rate) }}</div>
+            <div class="aw-kpi-lbl">{{ t("qualityErrorLabel") }}</div>
+            <span
+              class="aw-trend"
+              :class="'t-' + trendErrorRate.cls"
+              :title="trendErrorRate.arrow === 'none' ? t('trendNoData') : t('trendVsPrev')"
+            >
+              <span class="aw-trend-arrow" :data-dir="trendErrorRate.arrow"></span>{{ trendErrorRate.text }}
+            </span>
+            <span
+              v-if="errorRateGoalState"
+              class="aw-goal"
+              :class="'goal-' + errorRateGoalState"
+            >{{ errorRateGoalState === 'ok' ? t('goalInGoal') : t('goalExceeded') }}</span>
+          </div>
+        </section>
+
+        <!-- Productivity / ROI: active time, $/hour, $/commit, $/edit -->
+        <section
+          v-if="sectionVisible('productivity') && hasProductivity"
+          :style="{ order: sectionOrder('productivity') }"
+          class="aw-kpis"
+        >
+          <div class="aw-kpi" :title="t('prodActiveTimeHint')">
+            <div class="aw-kpi-val">{{ fmtDuration(data.productivity.active_ms) }}</div>
+            <div class="aw-kpi-lbl">{{ t("prodActiveTime") }}</div>
+          </div>
+          <div
+            class="aw-kpi"
+            :class="costPerHourGoalState ? 'goal-' + costPerHourGoalState : ''"
+            :title="data.productivity.cost_per_active_hour === null ? t('prodNoActiveTime') : ''"
+          >
+            <div class="aw-kpi-val">{{ fmtCostOrDash(data.productivity.cost_per_active_hour) }}</div>
+            <div class="aw-kpi-lbl">{{ t("prodCostPerHour") }}</div>
+            <span
+              class="aw-trend"
+              :class="'t-' + trendCostPerHour.cls"
+              :title="trendCostPerHour.arrow === 'none' ? t('trendNoData') : t('trendVsPrev')"
+            >
+              <span class="aw-trend-arrow" :data-dir="trendCostPerHour.arrow"></span>{{ trendCostPerHour.text }}
+            </span>
+            <span
+              v-if="costPerHourGoalState"
+              class="aw-goal"
+              :class="'goal-' + costPerHourGoalState"
+            >{{ costPerHourGoalState === 'ok' ? t('goalInGoal') : t('goalExceeded') }}</span>
+          </div>
+          <div
+            class="aw-kpi"
+            :title="data.productivity.tokens_per_active_minute === null ? t('prodNoActiveTime') : ''"
+          >
+            <div class="aw-kpi-val">{{ fmtTokensOrDash(data.productivity.tokens_per_active_minute) }}</div>
+            <div class="aw-kpi-lbl">{{ t("prodTokensPerMin") }}</div>
+          </div>
+          <div class="aw-kpi">
+            <div class="aw-kpi-val">{{ data.productivity.git_commits }}</div>
+            <div class="aw-kpi-lbl">{{ t("prodCommits") }}</div>
+          </div>
+          <div
+            class="aw-kpi"
+            :title="data.productivity.cost_per_commit === null ? t('prodNoCommits') : ''"
+          >
+            <div class="aw-kpi-val">{{ fmtCostOrDash(data.productivity.cost_per_commit) }}</div>
+            <div class="aw-kpi-lbl">{{ t("prodCostPerCommit") }}</div>
+          </div>
+          <div class="aw-kpi">
+            <div class="aw-kpi-val">{{ data.productivity.edits }}</div>
+            <div class="aw-kpi-lbl">{{ t("prodEdits") }}</div>
+          </div>
+          <div class="aw-kpi" :title="t('prodEditsHint')">
+            <div class="aw-kpi-val">{{ fmtCostOrDash(data.productivity.cost_per_edit) }}</div>
+            <div class="aw-kpi-lbl">{{ t("prodCostPerEdit") }}</div>
+          </div>
+        </section>
+
+        <!-- Recommendations — actionable insights (backend no longer emits observations) -->
         <section
           v-if="sectionVisible('insights') && data.insights.length"
           :style="{ order: sectionOrder('insights') }"
           class="aw-insights-block"
         >
-          <div class="aw-tabs">
-            <button
-              class="aw-tab"
-              :class="{ 'aw-tab--active': insightTab === 'recommendation' }"
-              @click="insightTab = 'recommendation'"
-            >
-              {{ t("insightTabRecommendations") }}
-              <span class="aw-tab-count">{{ recommendations.length }}</span>
-            </button>
-            <button
-              class="aw-tab"
-              :class="{ 'aw-tab--active': insightTab === 'observation' }"
-              @click="insightTab = 'observation'"
-            >
-              {{ t("insightTabObservations") }}
-              <span class="aw-tab-count">{{ observations.length }}</span>
-            </button>
+          <div class="aw-insights-hd">
+            {{ t("sectionInsights") }}
+            <span class="aw-tab-count">{{ activeInsights.length }}</span>
           </div>
           <div v-if="activeInsights.length" class="aw-insights">
             <div
@@ -1026,48 +1341,112 @@ onMounted(async () => {
   margin-top: 4px;
 }
 
+/* Period-over-period trend badge: arrow + delta%, sitting under the KPI label.
+   Colour: green = improved, red = worsened, muted = neutral / no data. */
+.aw-trend {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-top: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  padding: 2px 6px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-4, rgba(255, 255, 255, 0.5));
+}
+.aw-trend.t-good {
+  background: rgba(108, 203, 95, 0.16);
+  color: #6ccb5f;
+}
+.aw-trend.t-bad {
+  background: rgba(248, 113, 113, 0.16);
+  color: #f87171;
+}
+.aw-trend.t-neutral {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-3, rgba(255, 255, 255, 0.7));
+}
+/* Triangle arrow drawn with borders so it inherits the badge text colour. */
+.aw-trend-arrow {
+  width: 0;
+  height: 0;
+}
+.aw-trend-arrow[data-dir="up"] {
+  border-left: 3.5px solid transparent;
+  border-right: 3.5px solid transparent;
+  border-bottom: 5px solid currentColor;
+}
+.aw-trend-arrow[data-dir="down"] {
+  border-left: 3.5px solid transparent;
+  border-right: 3.5px solid transparent;
+  border-top: 5px solid currentColor;
+}
+.aw-trend-arrow[data-dir="flat"] {
+  width: 7px;
+  height: 2px;
+  background: currentColor;
+}
+.aw-trend-arrow[data-dir="none"] {
+  display: none;
+}
+
+/* Goal indicator pill on the two goal-bearing tiles. */
+.aw-goal {
+  display: inline-block;
+  margin-top: 6px;
+  margin-left: 6px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 2px 7px;
+  border-radius: 10px;
+}
+.aw-goal.goal-ok {
+  background: rgba(108, 203, 95, 0.18);
+  color: #6ccb5f;
+}
+.aw-goal.goal-exceeded {
+  background: rgba(248, 113, 113, 0.18);
+  color: #f87171;
+}
+/* Tint the whole tile border to match the goal state. */
+.aw-kpi.goal-ok {
+  border-color: rgba(108, 203, 95, 0.4);
+}
+.aw-kpi.goal-exceeded {
+  border-color: rgba(248, 113, 113, 0.45);
+}
+
 .aw-insights-block {
   display: flex;
   flex-direction: column;
   gap: 10px;
 }
-.aw-tabs {
+.aw-insights-hd {
   display: flex;
-  gap: 4px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-}
-.aw-tab {
-  background: transparent;
-  border: none;
-  color: rgba(255, 255, 255, 0.55);
-  padding: 8px 14px;
+  align-items: center;
+  gap: 8px;
   font-size: 12px;
   font-weight: 600;
-  cursor: pointer;
-  border-bottom: 2px solid transparent;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-.aw-tab:hover {
-  color: rgba(255, 255, 255, 0.85);
-}
-.aw-tab--active {
-  color: #6ccb5f;
-  border-bottom-color: #6ccb5f;
+  color: var(--text-3, rgba(255, 255, 255, 0.7));
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding-bottom: 8px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
 }
 .aw-tab-count {
-  background: rgba(255, 255, 255, 0.1);
-  color: inherit;
+  background: rgba(108, 203, 95, 0.25);
+  color: #6ccb5f;
   border-radius: 10px;
   padding: 1px 7px;
   font-size: 10px;
   font-weight: 700;
   min-width: 18px;
   text-align: center;
-}
-.aw-tab--active .aw-tab-count {
-  background: rgba(108, 203, 95, 0.25);
 }
 .aw-insights-empty {
   color: rgba(255, 255, 255, 0.45);

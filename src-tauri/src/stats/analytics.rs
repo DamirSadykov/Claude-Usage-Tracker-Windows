@@ -67,6 +67,60 @@ pub struct Totals {
     pub cost: f64,
     pub messages: i64,
     pub sessions: i64,
+    /// cache_read / (input + cache_read) ∈ [0,1]. 0.0 when input+cache_read==0.
+    #[serde(default)]
+    pub cache_hit_ratio: f64,
+    /// USD saved by the prompt cache vs. re-sending all cached context as fresh
+    /// input, priced per model family. Can be negative when cache_create
+    /// dominates (heavy churn). 0.0 for unknown models.
+    #[serde(default)]
+    pub cache_savings_usd: f64,
+}
+
+/// Service-tier split over a window. `standard` vs `non_standard` (any non-null
+/// tier that isn't "standard") vs `unknown` (NULL service_tier — old rows / not
+/// carried). A low standard-share is an indirect throttling indicator.
+#[derive(Debug, Serialize, Default)]
+pub struct TierBreakdown {
+    pub standard: i64,
+    pub non_standard: i64,
+    pub unknown: i64,
+    /// standard / (standard + non_standard) × 100, over messages with a KNOWN
+    /// tier. None when no message in the window carried a tier.
+    pub standard_pct: Option<f64>,
+}
+
+/// Tool-call failure stats over a window: total calls observed and how many
+/// returned is_error. A friction indicator. Empty when the window predates the
+/// cc_tool_result migration or nothing re-ingested yet.
+#[derive(Debug, Serialize, Default)]
+pub struct ToolErrorStats {
+    pub total: i64,
+    pub errors: i64,
+    /// errors / total × 100. None when no tool results in the window.
+    pub error_rate: Option<f64>,
+}
+
+/// Productivity / ROI over a window. Active time is real wall-clock turn time
+/// (`turn_duration.durationMs`, capped per turn), a main-thread quantity. The
+/// per-X derivatives are Option so the UI renders "—" rather than Infinity when
+/// the denominator is zero (no active time / no commits / no edits).
+#[derive(Debug, Serialize, Default)]
+pub struct Productivity {
+    /// SUM(MIN(duration_ms, MAX_TURN_MS)) over main-thread turns (is_subagent=0).
+    pub active_ms: i64,
+    pub active_minutes: f64,
+    pub active_hours: f64,
+    /// COUNT of main-thread turns in the window.
+    pub turns: i64,
+    pub git_commits: i64,
+    pub git_pushes: i64,
+    /// SUM(cc_tool_use.n) for Edit/Write/MultiEdit.
+    pub edits: i64,
+    pub cost_per_active_hour: Option<f64>,
+    pub tokens_per_active_minute: Option<f64>,
+    pub cost_per_commit: Option<f64>,
+    pub cost_per_edit: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -82,10 +136,34 @@ pub struct Analytics {
     pub totals: Totals,
 }
 
+/// Trend headline metrics over one window, used by the period-comparison badges
+/// ("better / worse than the previous window"). A deliberately small subset of
+/// what the dashboard computes — just the five numbers the trend UI diffs. The
+/// last two are Option so the UI shows "—" rather than a misleading 0 when there
+/// were no tool calls / no measurable active time in the window.
+#[derive(Debug, Serialize, Default)]
+pub struct TrendMetrics {
+    pub cost: f64,
+    pub total_tokens: i64,
+    /// cache_read / (input + cache_read) ∈ [0,1]. 0.0 when input+cache_read==0.
+    pub cache_hit_ratio: f64,
+    /// errors / total ∈ [0,1] (fraction, NOT percent). None when no tool results
+    /// in the window. NB: `ToolErrorStats.error_rate` is a percent (0..100); this
+    /// trend metric is the raw fraction so it composes with `goal_error_rate_max`.
+    pub error_rate: Option<f64>,
+    /// USD per hour of measured active (turn) time. None when there was no
+    /// measurable active time in the window.
+    pub cost_per_active_hour: Option<f64>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct PeriodCompare {
     pub current: Totals,
     pub previous: Totals,
+    /// Trend headline metrics for the current window (for the "vs previous" badges).
+    pub current_trend: TrendMetrics,
+    /// Trend headline metrics for the previous window of equal length.
+    pub previous_trend: TrendMetrics,
 }
 
 /// One subagent group (by `agent_name`, or "<unnamed>" when the transcript
@@ -150,6 +228,14 @@ pub struct AnalyticsExt {
     /// invoked. Empty when the period predates the tool-tracking migration or
     /// no transcripts in the window have been re-ingested yet.
     pub tool_breakdown: Vec<ToolUsage>,
+    /// Service-tier split over the window (standard vs non-standard vs unknown).
+    /// Indirect throttling signal.
+    pub tier_breakdown: TierBreakdown,
+    /// Tool-call failure stats over the window. Friction indicator.
+    pub tool_error: ToolErrorStats,
+    /// Productivity / ROI over the window: active time, $/active hour, $/commit,
+    /// $/edit, tokens/active minute.
+    pub productivity: Productivity,
 }
 
 /// Aggregate use of one tool (e.g. "Edit", "Bash", "Read") over a window:
@@ -161,8 +247,58 @@ pub struct ToolUsage {
     pub messages: i64,
 }
 
+/// Per-turn cap on active time when summing. `turn_duration.durationMs` reaches
+/// millions of ms in real data (a turn with a long Bash build/test), which would
+/// distort "active operator time" — the operator wasn't watching one turn for 2h.
+const MAX_TURN_MS: i64 = 30 * 60 * 1000; // 30 minutes
+
+/// cache_read / (input + cache_read); 0.0 when the denominator is 0. The
+/// denominator deliberately excludes cache_create and output — it answers "of the
+/// context the model read on input, what share came from cache".
+fn hit_ratio(input: i64, cache_read: i64) -> f64 {
+    let den = (input + cache_read) as f64;
+    if den > 0.0 {
+        cache_read as f64 / den
+    } else {
+        0.0
+    }
+}
+
+/// Σ over models of cache savings vs. a no-cache world, priced per family:
+/// savings = cache_read·pin·0.9 − cache_create·pin·0.25, scaled by 1e-6. Per-model
+/// because the input price `pin` differs by family. Unknown models contribute 0
+/// (no price). May be negative (heavy cache_create, little cache_read).
+fn cache_savings_for(
+    conn: &Connection,
+    from: &str,
+    to: &str,
+    project: Option<&str>,
+) -> Result<f64, rusqlite::Error> {
+    let proj = if project.is_some() { " AND project = ?3" } else { "" };
+    let sql = format!(
+        "SELECT model, COALESCE(SUM(cache_read),0), COALESCE(SUM(cache_create),0)
+         FROM cc_usage WHERE ts >= ?1 AND ts < ?2{proj}
+         GROUP BY model"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let map = |r: &rusqlite::Row| -> rusqlite::Result<(String, i64, i64)> {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+    };
+    let rows: Vec<(String, i64, i64)> = match project {
+        Some(p) => stmt.query_map(params![from, to, p], map)?.collect::<Result<_, _>>()?,
+        None => stmt.query_map(params![from, to], map)?.collect::<Result<_, _>>()?,
+    };
+    let mut savings = 0.0_f64;
+    for (model, cr, cc) in rows {
+        if let Some((pin, _pout)) = crate::cc::price_per_mtok(&model) {
+            savings += (cr as f64 * pin * 0.9 - cc as f64 * pin * 0.25) / 1_000_000.0;
+        }
+    }
+    Ok(savings)
+}
+
 fn totals_for(conn: &Connection, from: &str, to: &str) -> Result<Totals, rusqlite::Error> {
-    conn.query_row(
+    let mut totals = conn.query_row(
         "SELECT COALESCE(SUM(input),0), COALESCE(SUM(output),0),
                 COALESCE(SUM(cache_create),0), COALESCE(SUM(cache_read),0),
                 COALESCE(SUM(cost),0.0), COUNT(*), COUNT(DISTINCT session_id)
@@ -182,9 +318,204 @@ fn totals_for(conn: &Connection, from: &str, to: &str) -> Result<Totals, rusqlit
                 cost: r.get(4)?,
                 messages: r.get(5)?,
                 sessions: r.get(6)?,
+                cache_hit_ratio: hit_ratio(input, cr),
+                cache_savings_usd: 0.0,
             })
         },
-    )
+    )?;
+    totals.cache_savings_usd = cache_savings_for(conn, from, to, None)?;
+    Ok(totals)
+}
+
+/// Tool-call error fraction over `[from, to)`, window-wide (not project-scoped —
+/// tool results carry no project, matching the `analytics_ext` tool_error
+/// aggregate). Returns (total, errors, error_rate) where error_rate ∈ [0,1] is
+/// None when no tool results fell in the window. NB: this is a FRACTION (0..1),
+/// whereas `ToolErrorStats.error_rate` is a percent (0..100).
+fn tool_error_fraction(
+    conn: &Connection,
+    from: &str,
+    to: &str,
+) -> Result<(i64, i64, Option<f64>), rusqlite::Error> {
+    let (total, errors): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(is_error), 0)
+         FROM cc_tool_result WHERE ts >= ?1 AND ts < ?2",
+        params![from, to],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let error_rate = if total > 0 {
+        Some(errors as f64 / total as f64)
+    } else {
+        None
+    };
+    Ok((total, errors, error_rate))
+}
+
+/// The five headline trend metrics over `[from, to)`, reusing `totals_for`
+/// (cost / tokens / cache-hit), `productivity_for` (cost-per-active-hour) and the
+/// window-wide tool-error aggregate. Both `error_rate` and `cost_per_active_hour`
+/// are None when their denominator is empty so the trend UI renders "—".
+fn trend_metrics_for(
+    conn: &Connection,
+    from: &str,
+    to: &str,
+) -> Result<TrendMetrics, rusqlite::Error> {
+    let totals = totals_for(conn, from, to)?;
+    let productivity =
+        productivity_for(conn, from, to, None, totals.cost, totals.total_tokens)?;
+    let (_total, _errors, error_rate) = tool_error_fraction(conn, from, to)?;
+    Ok(TrendMetrics {
+        cost: totals.cost,
+        total_tokens: totals.total_tokens,
+        cache_hit_ratio: totals.cache_hit_ratio,
+        error_rate,
+        cost_per_active_hour: productivity.cost_per_active_hour,
+    })
+}
+
+/// Productivity / ROI aggregate over `[from, to)`, optionally scoped to a
+/// project. Active time comes from `cc_turn` (main-thread only, capped per turn),
+/// commits/pushes from `cc_usage`, edits from `cc_tool_use`. The per-X
+/// derivatives divide the already-computed window `cost` / `total_tokens` and are
+/// None when the denominator is zero. `proj_clause` must match the caller's
+/// `?3` convention (" AND project = ?3" or "").
+fn productivity_for(
+    conn: &Connection,
+    from: &str,
+    to: &str,
+    project: Option<&str>,
+    cost: f64,
+    total_tokens: i64,
+) -> Result<Productivity, rusqlite::Error> {
+    // Active time + turn count (main-thread only). is_subagent IS NOT 1 also
+    // catches NULLs from rows stored without the flag.
+    let proj = if project.is_some() { " AND project = ?4" } else { "" };
+    let active_sql = format!(
+        "SELECT COALESCE(SUM(MIN(duration_ms, ?3)), 0), COUNT(*)
+         FROM cc_turn
+         WHERE ts >= ?1 AND ts < ?2 AND COALESCE(is_subagent, 0) = 0{proj}"
+    );
+    let (active_ms, turns): (i64, i64) = match project {
+        Some(p) => conn.query_row(&active_sql, params![from, to, MAX_TURN_MS, p], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?,
+        None => conn.query_row(&active_sql, params![from, to, MAX_TURN_MS], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?,
+    };
+
+    // git commits / pushes from cc_usage.
+    let proj3 = if project.is_some() { " AND project = ?3" } else { "" };
+    let git_sql = format!(
+        "SELECT COALESCE(SUM(git_commits), 0), COALESCE(SUM(git_pushes), 0)
+         FROM cc_usage WHERE ts >= ?1 AND ts < ?2{proj3}"
+    );
+    let (git_commits, git_pushes): (i64, i64) = match project {
+        Some(p) => conn.query_row(&git_sql, params![from, to, p], |r| Ok((r.get(0)?, r.get(1)?)))?,
+        None => conn.query_row(&git_sql, params![from, to], |r| Ok((r.get(0)?, r.get(1)?)))?,
+    };
+
+    // Edits = Edit + Write + MultiEdit calls (project-aware via the cc_usage join).
+    let proj_cu = if project.is_some() { " AND cu.project = ?3" } else { "" };
+    let edits_sql = format!(
+        "SELECT COALESCE(SUM(tu.n), 0)
+         FROM cc_tool_use tu JOIN cc_usage cu USING (message_id)
+         WHERE cu.ts >= ?1 AND cu.ts < ?2
+           AND tu.tool_name IN ('Edit','Write','MultiEdit'){proj_cu}"
+    );
+    let edits: i64 = match project {
+        Some(p) => conn.query_row(&edits_sql, params![from, to, p], |r| r.get(0))?,
+        None => conn.query_row(&edits_sql, params![from, to], |r| r.get(0))?,
+    };
+
+    let active_minutes = active_ms as f64 / 60_000.0;
+    let active_hours = active_ms as f64 / 3_600_000.0;
+    // "Has active time" floor: at least one second of measured turn time.
+    let has_active = active_ms >= 1000;
+    let cost_per_active_hour = if has_active && active_hours > 0.0 {
+        Some(cost / active_hours)
+    } else {
+        None
+    };
+    let tokens_per_active_minute = if has_active && active_minutes > 0.0 {
+        Some(total_tokens as f64 / active_minutes)
+    } else {
+        None
+    };
+    let cost_per_commit = if git_commits > 0 {
+        Some(cost / git_commits as f64)
+    } else {
+        None
+    };
+    let cost_per_edit = if edits > 0 {
+        Some(cost / edits as f64)
+    } else {
+        None
+    };
+
+    Ok(Productivity {
+        active_ms,
+        active_minutes,
+        active_hours,
+        turns,
+        git_commits,
+        git_pushes,
+        edits,
+        cost_per_active_hour,
+        tokens_per_active_minute,
+        cost_per_commit,
+        cost_per_edit,
+    })
+}
+
+/// Per-session $/active-hour, used by the `low_roi` insight to compare the window
+/// rate against the typical session rate. Returns (sorted ascending) rates for
+/// sessions with measurable active time AND positive cost.
+fn session_roi_rates(
+    conn: &Connection,
+    from: &str,
+    to: &str,
+    project: Option<&str>,
+) -> Result<Vec<f64>, rusqlite::Error> {
+    let proj_t = if project.is_some() { " AND project = ?4" } else { "" };
+    let proj_c = if project.is_some() { " AND project = ?3" } else { "" };
+    // Active time per session (capped per turn, main-thread), joined with the
+    // session's main-thread cost.
+    let sql = format!(
+        "WITH t AS (
+            SELECT session_id, SUM(MIN(duration_ms, ?3)) AS ams
+            FROM cc_turn
+            WHERE ts >= ?1 AND ts < ?2 AND COALESCE(is_subagent,0) = 0
+              AND session_id IS NOT NULL{proj_t}
+            GROUP BY session_id
+         ),
+         c AS (
+            SELECT session_id, SUM(cost) AS cost
+            FROM cc_usage
+            WHERE ts >= ?1 AND ts < ?2 AND is_subagent = 0
+              AND session_id IS NOT NULL{proj_c}
+            GROUP BY session_id
+         )
+         SELECT t.ams, c.cost
+         FROM t JOIN c USING (session_id)
+         WHERE t.ams > 0 AND c.cost > 0"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let map = |r: &rusqlite::Row| -> rusqlite::Result<(i64, f64)> { Ok((r.get(0)?, r.get(1)?)) };
+    let rows: Vec<(i64, f64)> = match project {
+        Some(p) => stmt
+            .query_map(params![from, to, MAX_TURN_MS, p], map)?
+            .collect::<Result<_, _>>()?,
+        None => stmt
+            .query_map(params![from, to, MAX_TURN_MS], map)?
+            .collect::<Result<_, _>>()?,
+    };
+    let mut rates: Vec<f64> = rows
+        .into_iter()
+        .map(|(ams, cost)| cost / (ams as f64 / 3_600_000.0))
+        .collect();
+    rates.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(rates)
 }
 
 /// Sessions in `[from, to)`, optionally restricted to a project. Used by the
@@ -380,6 +711,8 @@ impl StatsDb {
         Ok(PeriodCompare {
             current: totals_for(&conn, cur_from, cur_to)?,
             previous: totals_for(&conn, prev_from, prev_to)?,
+            current_trend: trend_metrics_for(&conn, cur_from, cur_to)?,
+            previous_trend: trend_metrics_for(&conn, prev_from, prev_to)?,
         })
     }
 
@@ -422,12 +755,16 @@ impl StatsDb {
                     cost: r.get(4)?,
                     messages: r.get(5)?,
                     sessions: r.get(6)?,
+                    cache_hit_ratio: hit_ratio(input, cr),
+                    cache_savings_usd: 0.0,
                 })
             };
-            match project {
+            let mut t = match project {
                 Some(p) => stmt.query_row(params![from, to, p], map_row)?,
                 None => stmt.query_row(params![from, to], map_row)?,
-            }
+            };
+            t.cache_savings_usd = cache_savings_for(&conn, from, to, project)?;
+            t
         };
 
         // --- daily series ---
@@ -671,18 +1008,67 @@ impl StatsDb {
             }
         };
 
+        // --- service-tier breakdown (project-aware) ---
+        let tier_breakdown = {
+            let mut stmt = prepare_proj(
+                "SELECT
+                    COALESCE(SUM(CASE WHEN service_tier = 'standard' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN service_tier IS NOT NULL AND service_tier <> 'standard' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN service_tier IS NULL THEN 1 ELSE 0 END), 0)
+                 FROM cc_usage WHERE ts >= ?1 AND ts < ?2{proj}"
+                    .to_string(),
+            )?;
+            let map_row = |r: &rusqlite::Row| -> rusqlite::Result<(i64, i64, i64)> {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            };
+            let (standard, non_standard, unknown) = match project {
+                Some(p) => stmt.query_row(params![from, to, p], map_row)?,
+                None => stmt.query_row(params![from, to], map_row)?,
+            };
+            let known = standard + non_standard;
+            let standard_pct = if known > 0 {
+                Some(standard as f64 / known as f64 * 100.0)
+            } else {
+                None
+            };
+            TierBreakdown {
+                standard,
+                non_standard,
+                unknown,
+                standard_pct,
+            }
+        };
+
+        // --- tool error rate (window-wide; not project-filtered — tool_use_id is
+        // not attributed to a project, only via session_id, deliberately deferred) ---
+        let tool_error = {
+            let (total, errors, frac) = tool_error_fraction(&conn, from, to)?;
+            ToolErrorStats {
+                total,
+                errors,
+                // ToolErrorStats exposes the rate as a percent (0..100).
+                error_rate: frac.map(|f| f * 100.0),
+            }
+        };
+
+        // --- productivity / ROI (project-aware) ---
+        let productivity =
+            productivity_for(&conn, from, to, project, totals.cost, totals.total_tokens)?;
+        let session_rates = session_roi_rates(&conn, from, to, project)?;
+
         let efficacy = subagent_efficacy(&conn, from, to, project)?;
         let insights = build_insights(
             &totals,
-            &by_project,
             &by_subagent,
             &subagent_summary,
-            &daily,
             &by_model,
             &sessions,
             efficacy.as_ref(),
             &cold_rewrites,
             &tool_breakdown,
+            &tool_error,
+            &productivity,
+            &session_rates,
         );
 
         Ok(AnalyticsExt {
@@ -698,6 +1084,9 @@ impl StatsDb {
             insights,
             projects,
             tool_breakdown,
+            tier_breakdown,
+            tool_error,
+            productivity,
         })
     }
 }
@@ -789,90 +1178,49 @@ fn subagent_efficacy(
 
 /// Deterministic insight builder. Each rule is a small if-let on aggregates;
 /// keys point at i18n entries so the same insight reads fluently in en/ru.
+#[allow(clippy::too_many_arguments)]
 fn build_insights(
     totals: &Totals,
-    by_project: &[ProjectUsage],
     by_subagent: &[SubagentUsage],
     subagent: &SubagentSummary,
-    daily: &[DailyPoint],
     by_model: &[ModelUsage],
     sessions: &[SessionUsage],
     efficacy: Option<&SubagentEfficacy>,
     cold_rewrites: &[(String, Option<String>, f64, String)],
     tool_breakdown: &[ToolUsage],
+    tool_error: &ToolErrorStats,
+    productivity: &Productivity,
+    session_rates: &[f64],
 ) -> Vec<Insight> {
     use serde_json::json;
     let mut out = Vec::new();
 
-    if let Some(top) = by_project.iter().filter(|p| p.cost > 0.0).next() {
+    // --- low cache hit ratio (cache underused) ---
+    // With enough context volume, a low read-from-cache ratio means the prefix is
+    // being rebuilt instead of reused — idle TTL expiry, compaction, or model
+    // switching. Distinct from cache_churn (which counts write share): this fires
+    // on the aggregate "cache isn't paying off" symptom. Below ~1M tokens the
+    // ratio is statistically noisy, so we require volume first.
+    const LOW_CACHE_HIT_RATIO: f64 = 0.50;
+    const LOW_CACHE_HIT_MIN_TOKENS: i64 = 1_000_000;
+    let read_input = totals.input + totals.cache_read;
+    if read_input > LOW_CACHE_HIT_MIN_TOKENS && totals.cache_hit_ratio < LOW_CACHE_HIT_RATIO {
         out.push(Insight {
-            kind: "top_project".into(),
-            label_key: "insightTopProject".into(),
+            kind: "low_cache_hit".into(),
+            label_key: "insightLowCacheHit".into(),
             params: json!({
-                "project": top.project.clone().unwrap_or_else(|| "—".into()),
-                "cost": top.cost,
-                "share_pct": pct(top.cost, totals.cost),
+                "hit_pct": totals.cache_hit_ratio * 100.0,
+                "savings": totals.cache_savings_usd,
             }),
-            category: "observation",
+            category: "recommendation",
         });
-    }
-
-    let cache_tokens = totals.cache_create + totals.cache_read;
-    if totals.total_tokens > 0 {
-        let share = (cache_tokens as f64) / (totals.total_tokens as f64) * 100.0;
-        if share >= 60.0 {
-            out.push(Insight {
-                kind: "cache_share".into(),
-                label_key: "insightCacheShare".into(),
-                params: json!({ "pct": share }),
-                category: "observation",
-            });
-        }
-    }
-
-    let total_cost = subagent.subagent_cost + subagent.main_cost;
-    if total_cost > 0.0 && subagent.subagent_cost > 0.0 {
-        out.push(Insight {
-            kind: "subagent_share".into(),
-            label_key: "insightSubagentShare".into(),
-            params: json!({
-                "pct": subagent.subagent_cost / total_cost * 100.0,
-                "messages": subagent.subagent_messages,
-                "sessions": subagent.subagent_sessions,
-            }),
-            category: "observation",
-        });
-    }
-    if let Some(top_agent) = by_subagent.iter().next() {
-        if top_agent.cost > 0.0 {
-            out.push(Insight {
-                kind: "top_subagent".into(),
-                label_key: "insightTopSubagent".into(),
-                params: json!({
-                    "name": top_agent.agent_name,
-                    "cost": top_agent.cost,
-                }),
-                category: "observation",
-            });
-        }
-    }
-
-    if let Some(peak) = daily.iter().max_by(|a, b| a.cost.partial_cmp(&b.cost).unwrap_or(std::cmp::Ordering::Equal)) {
-        if peak.cost > 0.0 {
-            out.push(Insight {
-                kind: "peak_day".into(),
-                label_key: "insightPeakDay".into(),
-                params: json!({ "date": peak.date, "cost": peak.cost }),
-                category: "observation",
-            });
-        }
     }
 
     // --- tool-mix rules ---
     // Surface the existing tool_breakdown aggregate: short sessions are noisy,
     // so require ≥50 total calls before flagging anything. Edit/Write/MultiEdit
     // dominating means the operator is barreling through changes without
-    // re-reading; Bash dominating usually means CI/debug work.
+    // re-reading.
     let total_calls: i64 = tool_breakdown.iter().map(|t| t.calls).sum();
     if total_calls >= 50 {
         let writes: i64 = tool_breakdown
@@ -887,20 +1235,6 @@ fn build_insights(
                 label_key: "insightToolHeavyWrites".into(),
                 params: json!({ "pct": writes_pct, "total_calls": total_calls }),
                 category: "recommendation",
-            });
-        }
-        let bash: i64 = tool_breakdown
-            .iter()
-            .filter(|t| t.tool_name == "Bash")
-            .map(|t| t.calls)
-            .sum();
-        let bash_pct = bash as f64 / total_calls as f64 * 100.0;
-        if bash_pct >= 40.0 {
-            out.push(Insight {
-                kind: "bash_heavy".into(),
-                label_key: "insightBashHeavy".into(),
-                params: json!({ "pct": bash_pct, "total_calls": total_calls }),
-                category: "observation",
             });
         }
     }
@@ -1080,35 +1414,6 @@ fn build_insights(
         }
     }
 
-    // --- expensive session ---
-    // A single session that ate ≥$50 OR ≥40% of the period's spend (when total
-    // is meaningful, >$5). Complements long_session — that one fires on time
-    // and turn count; this one fires on raw dollar share regardless of length.
-    let expensive: Vec<&SessionUsage> = {
-        let mut v: Vec<&SessionUsage> = sessions
-            .iter()
-            .filter(|s| {
-                s.cost >= 50.0 || (totals.cost > 5.0 && s.cost / totals.cost >= 0.40)
-            })
-            .collect();
-        v.sort_by(|a, b| b.cost.partial_cmp(&a.cost).unwrap_or(std::cmp::Ordering::Equal));
-        v
-    };
-    if let Some(top) = expensive.first() {
-        let share = if totals.cost > 0.0 { top.cost / totals.cost * 100.0 } else { 0.0 };
-        out.push(Insight {
-            kind: "expensive_session".into(),
-            label_key: "insightExpensiveSession".into(),
-            params: json!({
-                "session": top.session_id.chars().take(8).collect::<String>(),
-                "cost": top.cost,
-                "share_pct": share,
-                "affected": affected_json(&expensive, 5),
-            }),
-            category: "observation",
-        });
-    }
-
     // --- subagent efficacy ---
     // "Does spawning a subagent pay off?" — compare main-loop cost-per-message
     // in sessions that ran ≥1 subagent vs sessions that didn't. Report only
@@ -1155,7 +1460,74 @@ fn build_insights(
         }
     }
 
+    // --- tool friction ---
+    // A high tool-error rate means the model keeps hitting the environment:
+    // missing paths, failing commands, flaky shells. ≥15% over ≥30 calls is
+    // notable friction; below those thresholds it's normal iterative noise.
+    const TOOL_ERROR_PCT: f64 = 15.0;
+    const TOOL_ERROR_MIN: i64 = 30;
+    if let Some(rate) = tool_error.error_rate {
+        if tool_error.total >= TOOL_ERROR_MIN && rate >= TOOL_ERROR_PCT {
+            out.push(Insight {
+                kind: "tool_error_rate".into(),
+                label_key: "insightToolErrorRate".into(),
+                params: json!({
+                    "rate": rate,
+                    "errors": tool_error.errors,
+                    "total": tool_error.total,
+                }),
+                category: "recommendation",
+            });
+        }
+    }
+
+    // --- low ROI vs. the typical session ---
+    // Catches low return on active work: a window that burned much more per active
+    // hour than this operator's typical session. Relative (median of per-session
+    // $/active-hour) so it doesn't assume an absolute "normal" rate. Needs ≥5
+    // sessions with measurable active time for a trustworthy median, plus an
+    // absolute floor so tiny periods don't fire.
+    const MIN_SESSIONS_FOR_ROI: usize = 5;
+    const LOW_ROI_FACTOR: f64 = 2.0;
+    const LOW_ROI_MIN_COST: f64 = 5.0;
+    const LOW_ROI_MIN_HOURS: f64 = 0.25;
+    if session_rates.len() >= MIN_SESSIONS_FOR_ROI {
+        if let Some(per_h) = productivity.cost_per_active_hour {
+            let median = median_sorted(session_rates);
+            if median > 0.0
+                && totals.cost >= LOW_ROI_MIN_COST
+                && productivity.active_hours >= LOW_ROI_MIN_HOURS
+                && per_h >= LOW_ROI_FACTOR * median
+            {
+                out.push(Insight {
+                    kind: "low_roi".into(),
+                    label_key: "insightLowRoi".into(),
+                    params: json!({
+                        "cost": totals.cost,
+                        "active_h": productivity.active_hours,
+                        "per_h": per_h,
+                        "median_h": median,
+                    }),
+                    category: "recommendation",
+                });
+            }
+        }
+    }
+
     out
+}
+
+/// Median of an already-ascending-sorted slice. 0.0 for empty.
+fn median_sorted(sorted: &[f64]) -> f64 {
+    let n = sorted.len();
+    if n == 0 {
+        return 0.0;
+    }
+    if n % 2 == 1 {
+        sorted[n / 2]
+    } else {
+        (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+    }
 }
 
 /// Compact JSON list of sessions for the UI to render under a recommendation
@@ -1182,8 +1554,4 @@ fn parse_duration_hours(start: &str, end: &str) -> Option<i64> {
     let secs = (e - s).num_seconds();
     if secs < 0 { return Some(0); }
     Some(secs / 3600)
-}
-
-fn pct(part: f64, total: f64) -> f64 {
-    if total > 0.0 { part / total * 100.0 } else { 0.0 }
 }

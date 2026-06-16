@@ -74,6 +74,8 @@ interface Totals {
   cost: number;
   messages: number;
   sessions: number;
+  cache_hit_ratio: number; // 0..1
+  cache_savings_usd: number; // can be < 0
 }
 interface Analytics {
   daily: DailyPoint[];

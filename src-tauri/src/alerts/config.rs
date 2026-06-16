@@ -129,6 +129,20 @@ pub struct AppConfig {
     // reverts the mini to the original two-row 5h/7d bars. Gates the sysmon loop.
     #[serde(default = "default_true")]
     pub system_info_enabled: bool,
+    // Optional efficiency goals (issue: trend/goals). Pure thresholds — the
+    // backend only stores them; the dashboard compares the live metric from
+    // `get_analytics_ext` against the goal and colours the result. None = no goal
+    // set. Distinct from `daily_budget` (a spend cap with its own alerting).
+    //
+    // Max $ per active hour the user wants to stay under (Productivity
+    // `cost_per_active_hour`, same USD/hour unit).
+    #[serde(default)]
+    pub goal_cost_per_hour_max: Option<f64>,
+    // Max acceptable tool error-rate, as a FRACTION 0..1 (e.g. 0.10 = 10%). The
+    // frontend compares against `ToolErrorStats.error_rate`, which is a percent
+    // (0..100), so it scales one side before the check.
+    #[serde(default)]
+    pub goal_error_rate_max: Option<f64>,
 }
 
 fn default_true() -> bool {
@@ -167,6 +181,73 @@ impl Default for AppConfig {
             runtime_insights_enabled: false,
             runtime_insight_kinds: default_runtime_insight_kinds(),
             system_info_enabled: true,
+            goal_cost_per_hour_max: None,
+            goal_error_rate_max: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal JSON the frontend store sends — only the always-present fields.
+    /// Everything `#[serde(default)]` (including the new goal thresholds) must
+    /// fill in, so an old settings.json written before these fields existed still
+    /// deserializes cleanly.
+    const BASE_JSON: &str = r#"{
+        "session_key": "k",
+        "org_id": "o",
+        "refresh_interval": 60,
+        "auto_start_session": false,
+        "project_id": "",
+        "session_thresholds": [25.0, 50.0, 75.0],
+        "weekly_thresholds": [25.0, 50.0, 75.0],
+        "notifications_enabled": false,
+        "forecast_minutes": 30.0,
+        "quiet_hours_enabled": false,
+        "quiet_hours_start": "23:00",
+        "quiet_hours_end": "08:00",
+        "alert_tiers": {
+            "five_hour": true, "seven_day": true, "seven_day_opus": true,
+            "seven_day_sonnet": true, "extra_usage": true
+        },
+        "alert_types": { "threshold": true, "reset": true, "forecast": true }
+    }"#;
+
+    #[test]
+    fn old_config_without_goals_defaults_to_none() {
+        // A settings.json predating the goal fields must not fail to parse.
+        let cfg: AppConfig = serde_json::from_str(BASE_JSON).expect("base config parses");
+        assert_eq!(cfg.goal_cost_per_hour_max, None);
+        assert_eq!(cfg.goal_error_rate_max, None);
+    }
+
+    #[test]
+    fn goals_round_trip_through_json() {
+        // With the goals present they carry through verbatim.
+        let with_goals = BASE_JSON.replace(
+            "\"alert_types\": { \"threshold\": true, \"reset\": true, \"forecast\": true }",
+            "\"alert_types\": { \"threshold\": true, \"reset\": true, \"forecast\": true },
+             \"goal_cost_per_hour_max\": 12.5,
+             \"goal_error_rate_max\": 0.1",
+        );
+        let cfg: AppConfig = serde_json::from_str(&with_goals).expect("config with goals parses");
+        assert_eq!(cfg.goal_cost_per_hour_max, Some(12.5));
+        assert_eq!(cfg.goal_error_rate_max, Some(0.1));
+    }
+
+    #[test]
+    fn explicit_null_goals_deserialize_to_none() {
+        // The frontend serialises an unset Option as null; that must be None.
+        let with_null = BASE_JSON.replace(
+            "\"alert_types\": { \"threshold\": true, \"reset\": true, \"forecast\": true }",
+            "\"alert_types\": { \"threshold\": true, \"reset\": true, \"forecast\": true },
+             \"goal_cost_per_hour_max\": null,
+             \"goal_error_rate_max\": null",
+        );
+        let cfg: AppConfig = serde_json::from_str(&with_null).expect("config with null goals parses");
+        assert_eq!(cfg.goal_cost_per_hour_max, None);
+        assert_eq!(cfg.goal_error_rate_max, None);
     }
 }
