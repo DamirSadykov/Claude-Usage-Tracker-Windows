@@ -41,17 +41,25 @@ function main() {
   if (!todos.length) return;
 
   const project = path.basename(String(cwd).replace(/[\\/]+$/, ""));
+  // Kanban columns the tracker recognizes. Legacy `pending` (written before the
+  // columns existed) is shown as `backlog`, matching the tracker's own load-time
+  // migration, so Claude only ever sees a real column.
+  const COLUMNS = ["backlog", "queue", "in_progress", "review", "done"];
+  const col = (s) => (COLUMNS.includes(s) ? s : "backlog");
   // Show todos tied to this project, plus project-less (global) ones; only
-  // those still open (pending / in_progress).
+  // those still open (anything but `done`).
   const active = todos.filter(
     (t) =>
       t &&
-      t.status !== "done" &&
+      col(t.status) !== "done" &&
       (!t.project || t.project === project),
   );
   if (!active.length) return;
 
-  const rank = (s) => (s === "in_progress" ? 0 : 1);
+  // Surface what the user is closest to finishing first: in_progress, then
+  // review, then queued, then backlog.
+  const order = { in_progress: 0, review: 1, queue: 2, backlog: 3 };
+  const rank = (s) => order[col(s)] ?? 3;
   active.sort(
     (a, b) =>
       rank(a.status) - rank(b.status) ||
@@ -68,7 +76,7 @@ function main() {
     const desc = t.description
       ? ` — ${String(t.description).split("\n")[0].slice(0, 140)}`
       : "";
-    return `- [${t.status}] ${t.subject}${meta}${desc}  ⟨id:${t.id}⟩`;
+    return `- [${col(t.status)}] ${t.subject}${meta}${desc}  ⟨id:${t.id}⟩`;
   });
 
   // Plain stdout on exit 0 is the most robust way to inject SessionStart
@@ -78,7 +86,7 @@ function main() {
     lines.join("\n"),
     "",
     `These are the USER's todos, not your working task list. File: ${file}`,
-    `When the user says a task is done / in progress, update that task's "status" in this JSON file (pending | in_progress | done), matching by the ⟨id⟩. Do NOT change other fields (subject / description / plan / estimate_minutes / scheduled_for / project) unless the user explicitly asks. Edit surgically and keep the JSON format intact.`,
+    `When the user says a task moved (e.g. done / in progress / in review), update that task's "status" in this JSON file to one of the kanban columns (backlog | queue | in_progress | review | done), matching by the ⟨id⟩. Do NOT change other fields (subject / description / plan / estimate_minutes / scheduled_for / project) unless the user explicitly asks. Edit surgically and keep the JSON format intact.`,
   ].join("\n");
 
   process.stdout.write(context + "\n");
