@@ -49,6 +49,19 @@
         "decorations": true,
         "center": true,
         "visible": false
+      },
+      {
+        "label": "todos",
+        "url": "index.html#todos",
+        "title": "Claude Usage — Tasks",
+        "width": 720,
+        "height": 760,
+        "minWidth": 520,
+        "minHeight": 480,
+        "resizable": true,
+        "decorations": true,
+        "center": true,
+        "visible": false
       }
     ],
     "trayIcon": {

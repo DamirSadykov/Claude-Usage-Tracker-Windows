@@ -5,6 +5,7 @@ pub mod report;
 pub mod stats;
 pub mod status;
 pub mod sysmon;
+pub mod todos;
 pub mod usage;
 
 use std::collections::HashSet;
@@ -958,6 +959,80 @@ fn report_frontend_error(app: AppHandle, summary: String, detail: String) {
     record_diag(&app, "frontend", &summary, detail);
 }
 
+// --- Todo / task-manager ---
+//
+// The tracker owns `todos.json` (in the app data dir): the user manages todos in
+// the app, and a Claude Code SessionStart hook reads the same file to surface the
+// active ones for the current project. See `todos.rs` for the schema/contract.
+
+/// Path to the shared todo store, creating the app data dir if needed.
+fn todos_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).ok();
+    Ok(dir.join("todos.json"))
+}
+
+#[tauri::command]
+fn get_todos(app: AppHandle) -> Result<Vec<todos::Todo>, String> {
+    Ok(todos::load(&todos_path(&app)?).todos)
+}
+
+/// Distinct project names the tracker has seen (from cc_usage), for the
+/// task-manager's project picker. Empty if analytics has never ingested.
+#[tauri::command]
+fn get_cc_projects(stats: tauri::State<'_, Arc<StatsDb>>) -> Result<Vec<String>, String> {
+    stats.cc_projects().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn upsert_todo(app: AppHandle, todo: todos::Todo) -> Result<Vec<todos::Todo>, String> {
+    if !todos::is_valid_status(&todo.status) {
+        return Err(format!("invalid status: {}", todo.status));
+    }
+    let path = todos_path(&app)?;
+    let mut file = todos::load(&path);
+    todos::upsert(&mut file, todo, &chrono::Utc::now().to_rfc3339());
+    todos::save(&path, &file)?;
+    Ok(file.todos)
+}
+
+#[tauri::command]
+fn delete_todo(app: AppHandle, id: String) -> Result<Vec<todos::Todo>, String> {
+    let path = todos_path(&app)?;
+    let mut file = todos::load(&path);
+    todos::delete(&mut file, &id);
+    todos::save(&path, &file)?;
+    Ok(file.todos)
+}
+
+#[tauri::command]
+fn set_todo_status(
+    app: AppHandle,
+    id: String,
+    status: String,
+) -> Result<Vec<todos::Todo>, String> {
+    if !todos::is_valid_status(&status) {
+        return Err(format!("invalid status: {status}"));
+    }
+    let path = todos_path(&app)?;
+    let mut file = todos::load(&path);
+    todos::set_status(&mut file, &id, &status, &chrono::Utc::now().to_rfc3339());
+    todos::save(&path, &file)?;
+    Ok(file.todos)
+}
+
+/// Show the standalone Todo window (declared hidden in tauri.conf.json).
+#[tauri::command]
+fn open_todo_window(app: AppHandle) {
+    if let Some(win) = app.get_webview_window("todos") {
+        let _ = win.unminimize();
+        let _ = win.show();
+        let _ = win.set_focus();
+    } else {
+        warn!("todos window not found");
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     report::install_panic_hook();
@@ -1136,6 +1211,18 @@ pub fn run() {
                 });
             }
 
+            // Todos window: same hide-on-[X] as analytics, so `open_todo_window`
+            // can always show+focus the live webview instead of finding it gone.
+            if let Some(window) = app.get_webview_window("todos") {
+                let w = window.clone();
+                window.on_window_event(move |event| {
+                    if let WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = w.hide();
+                    }
+                });
+            }
+
             spawn_poll_loop(app.handle().clone(), notify);
             spawn_status_loop(app.handle().clone());
             spawn_sysmon_loop(app.handle().clone());
@@ -1167,6 +1254,12 @@ pub fn run() {
             open_analytics_window,
             get_analytics_ext,
             export_analytics_json,
+            get_todos,
+            get_cc_projects,
+            upsert_todo,
+            delete_todo,
+            set_todo_status,
+            open_todo_window,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

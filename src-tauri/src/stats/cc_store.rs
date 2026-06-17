@@ -64,6 +64,21 @@ pub struct TurnRow {
 }
 
 impl StatsDb {
+    /// Distinct non-empty project names ever seen in `cc_usage`, alphabetical.
+    /// Powers the task-manager's project picker so the user can pick a project
+    /// the tracker already knows about instead of retyping it.
+    pub fn cc_projects(&self) -> Result<Vec<String>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT project FROM cc_usage \
+             WHERE project IS NOT NULL AND project <> '' ORDER BY project",
+        )?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Dedup-insert a batch of usage rows. Returns how many were newly inserted
     /// (existing message ids are ignored). Runs in one transaction for speed.
     pub fn cc_upsert(&self, rows: &[CcUsageRow]) -> Result<usize, rusqlite::Error> {

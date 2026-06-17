@@ -7,6 +7,7 @@ import UsagePanel from "./components/UsagePanel.vue";
 import MiniPanel from "./components/MiniPanel.vue";
 import AnalyticsPanel from "./components/AnalyticsPanel.vue";
 import AnalyticsWindow from "./components/AnalyticsWindow.vue";
+import TodoWindow from "./components/TodoWindow.vue";
 import FocusControls from "./components/FocusControls.vue";
 import ServiceStatusBar from "./components/ServiceStatusBar.vue";
 import AboutPanel from "./components/AboutPanel.vue";
@@ -25,6 +26,7 @@ import { useUpdater, initUpdater } from "./updater";
 
 const isMini = window.location.hash === "#mini";
 const isAnalytics = window.location.hash === "#analytics";
+const isTodos = window.location.hash === "#todos";
 
 export interface UsageTier {
     percent_used: number;
@@ -616,6 +618,14 @@ function toggleAnalytics() {
     }
 }
 
+async function openTodos() {
+    await invoke("open_todo_window");
+    // The todos window is a separate WebView (may detect a different navigator
+    // language); push our current locale so it always matches this window.
+    const { emit } = await import("@tauri-apps/api/event");
+    await emit("todos-locale", locale.value);
+}
+
 function toggleAbout() {
     showAbout.value = !showAbout.value;
     if (showAbout.value) {
@@ -643,6 +653,7 @@ async function toggleMini() {
 onMounted(async () => {
     if (isMini) return; // the mini window self-initializes via MiniPanel
     if (isAnalytics) return; // the analytics window has its own init flow
+    if (isTodos) return; // the todos window self-initializes via TodoWindow
 
     await loadSettings();
 
@@ -741,6 +752,7 @@ onUnmounted(() => {
 <template>
     <MiniPanel v-if="isMini" />
     <AnalyticsWindow v-else-if="isAnalytics" />
+    <TodoWindow v-else-if="isTodos" />
     <div v-else class="flyout accent-claude">
         <!-- Header -->
         <div class="fly-hd">
@@ -805,6 +817,19 @@ onUnmounted(() => {
                         <rect x="4" y="8" width="2.5" height="4" rx="0.5"/>
                         <rect x="7.5" y="5" width="2.5" height="7" rx="0.5"/>
                         <rect x="11" y="9" width="2.5" height="3" rx="0.5"/>
+                    </svg>
+                </button>
+                <button
+                    class="icon-btn"
+                    @click="openTodos"
+                    :title="t('tasks')"
+                    v-if="!showSettings && !showAbout"
+                >
+                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
+                        <path d="M2 4l1.3 1.3L6 2.5" stroke-linecap="round" stroke-linejoin="round"/>
+                        <path d="M2 11l1.3 1.3L6 9.5" stroke-linecap="round" stroke-linejoin="round"/>
+                        <line x1="8.5" y1="4" x2="14" y2="4" stroke-linecap="round"/>
+                        <line x1="8.5" y1="11" x2="14" y2="11" stroke-linecap="round"/>
                     </svg>
                 </button>
                 <button

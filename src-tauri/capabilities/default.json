@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Default permissions for the app",
-  "windows": ["main", "mini", "analytics"],
+  "windows": ["main", "mini", "analytics", "todos"],
   "permissions": [
     "core:default",
     "core:window:default",
