@@ -28,6 +28,39 @@ pub struct CcUsageRow {
     /// Tool-use blocks in this message, grouped by tool name (e.g. ("Edit", 3),
     /// ("Bash", 1)). Empty when the message had no tool calls.
     pub tool_uses: Vec<(String, i64)>,
+    /// Service tier the API billed this message at ("standard" / "priority" /
+    /// "batch"). None when the transcript line didn't carry it. A low
+    /// standard-share is an indirect throttling indicator.
+    pub service_tier: Option<String>,
+    /// `git commit` invocations seen in this message's Bash tool_use blocks.
+    /// Only the COUNT is stored — never the command text (privacy contract).
+    pub git_commits: i64,
+    /// `git push` invocations seen in this message's Bash tool_use blocks.
+    pub git_pushes: i64,
+}
+
+/// One tool-call outcome parsed from a `type:"user"` transcript line. We store
+/// the id + timestamp + the is_error flag only — never the tool output content.
+#[derive(Debug, Clone)]
+pub struct ToolResultRow {
+    pub tool_use_id: String,
+    pub session_id: Option<String>,
+    pub ts: String,
+    pub is_error: bool,
+}
+
+/// One `turn_duration` system line: the real wall-clock active time of a turn,
+/// deduped by its uuid. `is_subagent` mirrors `isSidechain` (in practice always
+/// false — subagents don't emit turn_duration); `project` is the cwd basename.
+#[derive(Debug, Clone)]
+pub struct TurnRow {
+    pub uuid: String,
+    pub session_id: Option<String>,
+    pub ts: String,
+    pub duration_ms: i64,
+    pub message_count: i64,
+    pub is_subagent: bool,
+    pub project: Option<String>,
 }
 
 impl StatsDb {
@@ -41,18 +74,23 @@ impl StatsDb {
             let mut stmt = tx.prepare(
                 "INSERT OR IGNORE INTO cc_usage
                  (message_id, ts, model, input, output, cache_create, cache_read, cost,
-                  session_id, project, is_subagent, agent_name)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                  session_id, project, is_subagent, agent_name,
+                  service_tier, git_commits, git_pushes)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
             )?;
-            // Backfill `project` / `is_subagent` / `agent_name` onto rows stored
-            // before those columns existed. INSERT OR IGNORE leaves an existing
-            // message untouched, so without this a re-ingest would never
-            // attribute already-stored messages.
+            // Backfill `project` / `is_subagent` / `agent_name` / `service_tier` /
+            // git counters onto rows stored before those columns existed. INSERT
+            // OR IGNORE leaves an existing message untouched, so without this a
+            // re-ingest would never attribute already-stored messages. git counts
+            // use MAX (NOT NULL DEFAULT 0) — take the larger of old and new.
             let mut backfill = tx.prepare(
                 "UPDATE cc_usage
-                    SET project     = COALESCE(project, ?2),
-                        is_subagent = CASE WHEN ?3 = 1 THEN 1 ELSE is_subagent END,
-                        agent_name  = COALESCE(agent_name, ?4)
+                    SET project      = COALESCE(project, ?2),
+                        is_subagent  = CASE WHEN ?3 = 1 THEN 1 ELSE is_subagent END,
+                        agent_name   = COALESCE(agent_name, ?4),
+                        service_tier = COALESCE(service_tier, ?5),
+                        git_commits  = MAX(git_commits, ?6),
+                        git_pushes   = MAX(git_pushes, ?7)
                   WHERE message_id = ?1",
             )?;
             // Per-message tool-use rows are inserted once per (message_id, tool).
@@ -75,16 +113,77 @@ impl StatsDb {
                     r.project,
                     r.is_subagent as i64,
                     r.agent_name,
+                    r.service_tier,
+                    r.git_commits,
+                    r.git_pushes,
                 ])?;
                 backfill.execute(params![
                     r.message_id,
                     r.project,
                     r.is_subagent as i64,
                     r.agent_name,
+                    r.service_tier,
+                    r.git_commits,
+                    r.git_pushes,
                 ])?;
                 for (tool, n) in &r.tool_uses {
                     tool_stmt.execute(params![r.message_id, tool, n])?;
                 }
+            }
+        }
+        tx.commit()?;
+        Ok(inserted)
+    }
+
+    /// Dedup-insert a batch of tool-result outcomes. Dedup is by `tool_use_id`
+    /// (one result per call), so re-ingesting the same transcript is a no-op.
+    /// Returns how many rows were newly inserted. Stores only the is_error flag +
+    /// ids/ts — never the tool output content.
+    pub fn cc_tool_result_upsert(&self, rows: &[ToolResultRow]) -> Result<usize, rusqlite::Error> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut inserted = 0;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO cc_tool_result (tool_use_id, session_id, ts, is_error)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for r in rows {
+                inserted += stmt.execute(params![
+                    r.tool_use_id,
+                    r.session_id,
+                    r.ts,
+                    r.is_error as i64,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(inserted)
+    }
+
+    /// Dedup-insert a batch of turn-duration rows. Dedup is by `uuid`, so
+    /// re-ingesting the same transcript is a no-op. Returns how many rows were
+    /// newly inserted.
+    pub fn cc_turn_upsert(&self, rows: &[TurnRow]) -> Result<usize, rusqlite::Error> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut inserted = 0;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO cc_turn
+                 (uuid, session_id, ts, duration_ms, message_count, is_subagent, project)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+            for r in rows {
+                inserted += stmt.execute(params![
+                    r.uuid,
+                    r.session_id,
+                    r.ts,
+                    r.duration_ms,
+                    r.message_count,
+                    r.is_subagent as i64,
+                    r.project,
+                ])?;
             }
         }
         tx.commit()?;

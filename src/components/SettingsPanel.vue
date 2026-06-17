@@ -67,6 +67,10 @@ const props = defineProps<{
   dailyBudgetEnabled: boolean;
   dailyBudget: number;
   suggestedBudget: number | null;
+  // Efficiency goals. cost/hour is USD/hour; errorRateMax is a FRACTION 0..1
+  // (matching AppConfig). The error-rate input below shows/edits a percent.
+  goalCostPerHourMax: number | null;
+  goalErrorRateMax: number | null;
   serviceStatusEnabled: boolean;
   serviceStatusInterval: number;
   serviceStatusNotify: boolean;
@@ -95,6 +99,8 @@ const emit = defineEmits<{
     ccAnalyticsEnabled: boolean;
     dailyBudgetEnabled: boolean;
     dailyBudget: number;
+    goalCostPerHourMax: number | null;
+    goalErrorRateMax: number | null;
     serviceStatusEnabled: boolean;
     serviceStatusInterval: number;
     serviceStatusNotify: boolean;
@@ -126,6 +132,13 @@ const localTypes = ref<AlertTypes>(normalizeAlertTypes(props.alertTypes));
 const localCc = ref(props.ccAnalyticsEnabled);
 const localBudgetEnabled = ref(props.dailyBudgetEnabled);
 const localBudget = ref(props.dailyBudget);
+// Goals are optional: empty string = unset (null). cost/hour is edited in USD
+// as stored; error-rate is stored as a fraction 0..1 but edited as a percent
+// (×100 on load, ÷100 on save) so the user types "10" for 10%.
+const localGoalCostPerHour = ref<number | "">(props.goalCostPerHourMax ?? "");
+const localGoalErrorRatePct = ref<number | "">(
+  props.goalErrorRateMax === null ? "" : props.goalErrorRateMax * 100,
+);
 const localSvcEnabled = ref(props.serviceStatusEnabled);
 const localSvcInterval = ref(props.serviceStatusInterval);
 const localSvcNotify = ref(props.serviceStatusNotify);
@@ -156,6 +169,8 @@ watch(() => props.alertTypes, (v) => (localTypes.value = normalizeAlertTypes(v))
 watch(() => props.ccAnalyticsEnabled, (v) => (localCc.value = v));
 watch(() => props.dailyBudgetEnabled, (v) => (localBudgetEnabled.value = v));
 watch(() => props.dailyBudget, (v) => (localBudget.value = v));
+watch(() => props.goalCostPerHourMax, (v) => (localGoalCostPerHour.value = v ?? ""));
+watch(() => props.goalErrorRateMax, (v) => (localGoalErrorRatePct.value = v === null ? "" : v * 100));
 watch(() => props.serviceStatusEnabled, (v) => (localSvcEnabled.value = v));
 watch(() => props.serviceStatusInterval, (v) => (localSvcInterval.value = v));
 watch(() => props.serviceStatusNotify, (v) => (localSvcNotify.value = v));
@@ -311,7 +326,15 @@ function applySuggestion() {
   localBudget.value = Math.round(props.suggestedBudget);
 }
 
+// Empty / non-positive goal input → null (goal disabled). A goal of 0 would be
+// impossible to stay under, so we treat ≤0 as "unset" too.
+function goalOrNull(v: number | ""): number | null {
+  if (v === "" || !Number.isFinite(Number(v)) || Number(v) <= 0) return null;
+  return Number(v);
+}
+
 function handleSave() {
+  const errPct = goalOrNull(localGoalErrorRatePct.value);
   emit("save", {
     sessionKey: localSessionKey.value.trim(),
     orgId: localOrgId.value.trim(),
@@ -330,6 +353,9 @@ function handleSave() {
     ccAnalyticsEnabled: localCc.value,
     dailyBudgetEnabled: localBudgetEnabled.value,
     dailyBudget: Math.round(localBudget.value) || 0,
+    goalCostPerHourMax: goalOrNull(localGoalCostPerHour.value),
+    // UI edits a percent; AppConfig stores a fraction 0..1.
+    goalErrorRateMax: errPct === null ? null : errPct / 100,
     serviceStatusEnabled: localSvcEnabled.value,
     serviceStatusInterval: localSvcInterval.value,
     serviceStatusNotify: localSvcNotify.value,
@@ -772,6 +798,37 @@ function handleSave() {
           <button type="button" class="suggest-btn" @click="applySuggestion">
             {{ t('budgetSuggestApply') }}
           </button>
+        </div>
+      </div>
+
+      <!-- Efficiency goals (optional thresholds, shown on dashboard tiles) -->
+      <div class="card">
+        <div class="field-label">{{ t('goalsTitle') }}</div>
+        <div class="field-hint" style="margin-top: 0; margin-bottom: 10px">
+          {{ t('goalsDesc') }}
+        </div>
+        <div class="goal-field">
+          <div class="field-label" style="margin-bottom: 6px">{{ t('goalCostPerHour') }}</div>
+          <input
+            v-model.number="localGoalCostPerHour"
+            type="number"
+            class="field-input"
+            min="0"
+            step="1"
+            :placeholder="t('goalCostPerHourPlaceholder')"
+          />
+        </div>
+        <div class="goal-field" style="margin-top: 12px">
+          <div class="field-label" style="margin-bottom: 6px">{{ t('goalErrorRate') }}</div>
+          <input
+            v-model.number="localGoalErrorRatePct"
+            type="number"
+            class="field-input"
+            min="0"
+            max="100"
+            step="1"
+            :placeholder="t('goalErrorRatePlaceholder')"
+          />
         </div>
       </div>
       </template>

@@ -11,6 +11,8 @@ export interface DashboardSectionDef {
 
 export const DASHBOARD_SECTIONS: DashboardSectionDef[] = [
   { id: "kpi", labelKey: "sectionKpi" },
+  { id: "quality", labelKey: "sectionQuality" },
+  { id: "productivity", labelKey: "sectionProductivity" },
   { id: "insights", labelKey: "sectionInsights" },
   { id: "charts", labelKey: "sectionCharts" },
   { id: "subagents", labelKey: "sectionSubagents" },

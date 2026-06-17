@@ -3,6 +3,9 @@
 // rule there means adding one entry here. SettingsPanel.vue reads from this
 // file to render the per-kind toggle list.
 
+// Backend now emits only "recommendation" insights; the "observation" category
+// is retained in the type so any persisted/legacy data still type-checks, but no
+// catalog entry uses it anymore.
 export type InsightCategory = "observation" | "recommendation";
 
 export interface InsightKindDef {
@@ -18,14 +21,6 @@ export interface InsightKindDef {
 }
 
 export const INSIGHT_KINDS: InsightKindDef[] = [
-  // observations — what happened
-  { kind: "top_project", category: "observation", labelKey: "insightTopProject", shortLabelKey: "insightLabelTopProject" },
-  { kind: "cache_share", category: "observation", labelKey: "insightCacheShare", shortLabelKey: "insightLabelCacheShare" },
-  { kind: "subagent_share", category: "observation", labelKey: "insightSubagentShare", shortLabelKey: "insightLabelSubagentShare" },
-  { kind: "top_subagent", category: "observation", labelKey: "insightTopSubagent", shortLabelKey: "insightLabelTopSubagent" },
-  { kind: "peak_day", category: "observation", labelKey: "insightPeakDay", shortLabelKey: "insightLabelPeakDay" },
-  { kind: "bash_heavy", category: "observation", labelKey: "insightBashHeavy", shortLabelKey: "insightLabelBashHeavy" },
-
   // recommendations — what to change
   { kind: "cache_churn", category: "recommendation", labelKey: "insightCacheChurn", shortLabelKey: "insightLabelCacheChurn" },
   { kind: "bloated_session", category: "recommendation", labelKey: "insightBloatedSession", shortLabelKey: "insightLabelBloatedSession" },
@@ -40,10 +35,9 @@ export const INSIGHT_KINDS: InsightKindDef[] = [
   { kind: "subagent_efficacy", category: "recommendation", labelKey: "insightSubagentEfficacyHelp", shortLabelKey: "insightLabelSubagentEfficacy" },
   { kind: "tool_heavy_writes", category: "recommendation", labelKey: "insightToolHeavyWrites", shortLabelKey: "insightLabelToolHeavyWrites" },
   { kind: "subagent_no_attribution", category: "recommendation", labelKey: "insightSubagentNoAttribution", shortLabelKey: "insightLabelSubagentNoAttribution" },
-
-  // expensive_session is an observation, not a recommendation — the user
-  // doesn't need to "do" anything, but the session is worth opening.
-  { kind: "expensive_session", category: "observation", labelKey: "insightExpensiveSession", shortLabelKey: "insightLabelExpensiveSession" },
+  { kind: "low_cache_hit", category: "recommendation", labelKey: "insightLowCacheHit", shortLabelKey: "insightLabelLowCacheHit" },
+  { kind: "tool_error_rate", category: "recommendation", labelKey: "insightToolErrorRate", shortLabelKey: "insightLabelToolErrorRate" },
+  { kind: "low_roi", category: "recommendation", labelKey: "insightLowRoi", shortLabelKey: "insightLabelLowRoi" },
 ];
 
 export function findInsightKind(kind: string): InsightKindDef | undefined {
