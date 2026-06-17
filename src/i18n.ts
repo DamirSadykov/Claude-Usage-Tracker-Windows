@@ -271,6 +271,29 @@ const messages = {
     prodCostPerEdit: "$/edit",
     prodNoCommits: "No git commit/push detected in this period.",
     prodNoActiveTime: "No active-time turns recorded yet for this period.",
+    // --- detailed per-tile help (rendered via the shared markdown renderer) ---
+    kpiHitRatioHelp:
+      "## What it is\nShare of the input context that was read from the prompt cache instead of being sent again as fresh input.\n\n## How it's computed\n`cache_read / (input + cache_read)`. Cached reads are billed at about ×0.1 of the normal input price, so the more of your context comes from cache, the cheaper each turn is.",
+    kpiCacheSavingsHelp:
+      "## What it is\nThe dollar amount the prompt cache saved over the period.\n\n## How it's computed\nThe difference between paying the full input price (×1.0) for the cached context vs. reading it from cache (×0.1), minus the cache-write surcharge (×1.25) you pay the first time something is stored.",
+    qualityTierHelp:
+      "## What it is\nShare of requests served on the `standard` service tier rather than a priority or batch tier.\n\n## How it's computed\nCount of `standard`-tier requests divided by all requests with a known tier.",
+    qualityErrorHelp:
+      "## What it is\nShare of tool calls that came back as an error.\n\n## How it's computed\nNumber of tool results flagged `is_error` divided by all tool calls.",
+    prodActiveTimeHelp:
+      "## What it is\nThe real working time of the model over the period — not the calendar span of the session.\n\n## How it's computed\nThe sum of each turn's real duration (`turn_duration`), with every turn capped at 30 minutes. The cap stops a turn left idle for hours from inflating the total.",
+    prodCostPerHourHelp:
+      "## What it is\nThe cost of one hour of the model's *actual* working time. The headline efficiency number.\n\n## How it's computed\nCost over the period divided by active hours. Active hours are the sum of real turn durations (`turn_duration`), with each turn capped at 30 minutes. This is **not** the session span from first to last message — that span includes idle gaps where you were away. It's the real working time of the model.\n\n## Direction\n**Lower is better** — fewer dollars per hour of productive work. A high value flags that an hour of work is expensive, usually because of: a bloated context (every turn re-reads a large prompt from cache), an expensive model, or little useful output for the money spent.",
+    prodTokensPerMinHelp:
+      "## What it is\nThroughput — how many tokens were pushed through per minute of working time.\n\n## How it's computed\nAll tokens (input + output + cache) divided by active minutes (the same capped working time behind active time).",
+    prodCommitsHelp:
+      "## What it is\nNumber of git commits made during the period.\n\n## How it's computed\nCounted from `git commit` invocations seen in the transcript.",
+    prodCostPerCommitHelp:
+      "## What it is\nA rough ROI figure: how much one git commit cost.\n\n## How it's computed\nCost over the period divided by the number of git commits.",
+    prodEditsHelp:
+      "## What it is\nNumber of file edits the assistant made.\n\n## How it's computed\nCount of `Edit` / `Write` / `MultiEdit` tool calls. An edit is one editing-tool call, **not** a line of code.",
+    prodCostPerEditHelp:
+      "## What it is\nA rough ROI figure: how much one file edit cost.\n\n## How it's computed\nCost over the period divided by the number of edits (`Edit` / `Write` / `MultiEdit` calls — not lines of code).",
     unitHourShort: "h",
     unitMinShort: "min",
     unitSecShort: "s",
@@ -599,6 +622,29 @@ const messages = {
     prodCostPerEdit: "$/правку",
     prodNoCommits: "За период не обнаружено git commit/push.",
     prodNoActiveTime: "За период ещё нет ходов с активным временем.",
+    // --- развёрнутые пояснения к плиткам (рендерятся общим markdown-рендерером) ---
+    kpiHitRatioHelp:
+      "## Что это\nДоля входного контекста, прочитанная из кеша промптов, а не отправленная заново как свежий ввод.\n\n## Как считается\n`cache_read / (input + cache_read)`. Чтение из кеша стоит примерно ×0.1 от обычной цены ввода, поэтому чем большая часть контекста берётся из кеша, тем дешевле обходится каждый ход.",
+    kpiCacheSavingsHelp:
+      "## Что это\nСколько долларов сэкономил кеш промптов за период.\n\n## Как считается\nРазница между полной ценой ввода (×1.0) за контекст и чтением его из кеша (×0.1), за вычетом наценки на запись в кеш (×1.25), которую платят при первом сохранении.",
+    qualityTierHelp:
+      "## Что это\nДоля запросов, обслуженных по обычному сервис-тарифу (`standard`), а не по приоритетному или пакетному.\n\n## Как считается\nЧисло запросов тарифа `standard`, делённое на все запросы с известным тарифом.",
+    qualityErrorHelp:
+      "## Что это\nДоля вызовов инструментов, вернувших ошибку.\n\n## Как считается\nЧисло результатов с пометкой `is_error`, делённое на все вызовы инструментов.",
+    prodActiveTimeHelp:
+      "## Что это\nРеальное рабочее время модели за период, а не календарная длительность сессии.\n\n## Как считается\nСумма реального времени каждого хода (`turn_duration`), причём каждый ход капается 30 минутами. Кап не даёт ходу, простоявшему без дела часами, раздуть итог.",
+    prodCostPerHourHelp:
+      "## Что это\nСтоимость одного часа *реальной* работы модели. Главный показатель эффективности.\n\n## Как считается\nСтоимость за период, делённая на активные часы. Активные часы — это сумма реального времени ходов (`turn_duration`), причём каждый ход капается 30 минутами. Это **не** длительность сессии от первого до последнего сообщения — там есть простой, когда вас не было. Это реальное рабочее время модели.\n\n## Куда лучше\n**Меньше — лучше**: меньше денег за час продуктивной работы. Высокое значение сигналит, что час работы дорогой, обычно из-за: раздутого контекста (каждый ход перечитывает большой промпт из кеша), дорогой модели или малого полезного выхлопа за потраченные деньги.",
+    prodTokensPerMinHelp:
+      "## Что это\nПропускная способность — сколько токенов прокачано за минуту рабочего времени.\n\n## Как считается\nВсе токены (ввод + вывод + кеш), делённые на активные минуты (то же капнутое рабочее время, что и за активным временем).",
+    prodCommitsHelp:
+      "## Что это\nЧисло git-коммитов за период.\n\n## Как считается\nСчитается по вызовам `git commit` в транскрипте.",
+    prodCostPerCommitHelp:
+      "## Что это\nГрубый показатель ROI: во сколько обошёлся один git-коммит.\n\n## Как считается\nСтоимость за период, делённая на число git-коммитов.",
+    prodEditsHelp:
+      "## Что это\nЧисло правок файлов, сделанных ассистентом.\n\n## Как считается\nЧисло вызовов инструментов `Edit` / `Write` / `MultiEdit`. Правка — это один вызов инструмента редактирования, а **не** строка кода.",
+    prodCostPerEditHelp:
+      "## Что это\nГрубый показатель ROI: во сколько обошлась одна правка файла.\n\n## Как считается\nСтоимость за период, делённая на число правок (вызовы `Edit` / `Write` / `MultiEdit`, а не строки кода).",
     unitHourShort: "ч",
     unitMinShort: "мин",
     unitSecShort: "с",

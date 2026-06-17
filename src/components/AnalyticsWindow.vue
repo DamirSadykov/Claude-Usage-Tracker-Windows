@@ -4,10 +4,11 @@
 // extended bundle from `get_analytics_ext`, with a project + date-range filter
 // and an "export JSON" affordance so the user can pipe the aggregates into
 // their Claude Code CLI for higher-order insights.
-import { ref, computed, onMounted, watch, nextTick } from "vue";
+import { ref, computed, onMounted, onUnmounted, watch, nextTick } from "vue";
 import { useI18n } from "vue-i18n";
 import { invoke } from "@tauri-apps/api/core";
 import { getInsightHelpHtml, hasInsightHelp } from "../insightHelp";
+import { renderInsightHelp } from "../insightHelp/render";
 import { reconcileSectionPrefs, type SectionPref } from "../dashboardSections";
 import { fmtDateTime, fmtDay } from "../dateFormat";
 import {
@@ -701,6 +702,173 @@ function helpHtml(kind: string): string {
   return getInsightHelpHtml(kind, locale.value);
 }
 
+// --- per-tile metric help (KPI tiles) ---
+// Same text source as before: each tile has an `<key>Help` i18n string written
+// in the lightweight markdown the insight renderer understands (## headings,
+// `- ` bullets, **bold**, `inline code`), piped through the shared renderer.
+// Rendered HTML is memoised per key+locale so re-opening a tile is free.
+//
+// Display is a floating popover (Teleport to <body> + position: fixed) instead
+// of an inline body, so opening a tile's help never changes the tile's height,
+// reflows the KPI grid, or extends the scroll area of `.aw-main`. At most one
+// popover is open at a time.
+const TILE_HELP_CACHE = new Map<string, string>();
+function tileHelpHtml(key: string): string {
+  const cacheKey = `${key}.${locale.value}`;
+  const cached = TILE_HELP_CACHE.get(cacheKey);
+  if (cached !== undefined) return cached;
+  const html = renderInsightHelp(t(key));
+  TILE_HELP_CACHE.set(cacheKey, html);
+  return html;
+}
+
+// Currently open tile popover: which `<key>Help` i18n key, the fixed-position
+// style computed from the trigger + the popover's REAL measured size, and a
+// `visibility` flag. The popover mounts hidden (visibility:hidden) so we can
+// measure its rendered height/width on `nextTick`, then compute the final
+// top/left and reveal it — this avoids relying on a fixed height estimate that
+// clips long content near the window edge.
+interface TilePopoverStyle {
+  top: string;
+  left: string;
+  maxWidth: string;
+  maxHeight: string;
+  visibility: "hidden" | "visible";
+}
+const tilePopover = ref<{
+  key: string;
+  style: TilePopoverStyle;
+} | null>(null);
+// The trigger button's rect, captured at open time, used to position the
+// popover once its real size is known.
+let tilePopoverAnchor: DOMRect | null = null;
+// The popover element (Teleported) — used to exclude it from click-outside and
+// to measure the rendered popover.
+const tilePopoverEl = ref<HTMLElement | null>(null);
+
+const POPOVER_WIDTH = 420; // 1.5× base width; matches max-width in CSS
+const POPOVER_GAP = 8; // gap between trigger and popover
+const VIEWPORT_MARGIN = 8; // keep this far from window edges
+
+// First-pass style: position the popover roughly below the trigger but keep it
+// hidden so it can be measured without flashing. Width is capped to the
+// viewport; height is left unconstrained so we can read the natural height.
+function provisionalPopoverStyle(r: DOMRect): TilePopoverStyle {
+  const vw = window.innerWidth;
+  const width = Math.min(POPOVER_WIDTH, vw - VIEWPORT_MARGIN * 2);
+  let left = r.right - width;
+  if (left < VIEWPORT_MARGIN) left = r.left;
+  left = Math.max(VIEWPORT_MARGIN, Math.min(left, vw - width - VIEWPORT_MARGIN));
+  return {
+    top: `${Math.round(r.bottom + POPOVER_GAP)}px`,
+    left: `${Math.round(left)}px`,
+    maxWidth: `${Math.round(width)}px`,
+    maxHeight: "none",
+    visibility: "hidden",
+  };
+}
+
+// Final style, computed from the trigger rect + the popover's REAL rendered
+// size. Flips vertically by real height, caps height to the available space at
+// the chosen edge (with inner scroll), and clamps both axes inside the viewport.
+function finalPopoverStyle(r: DOMRect, popH: number): TilePopoverStyle {
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const width = Math.min(POPOVER_WIDTH, vw - VIEWPORT_MARGIN * 2);
+
+  // Horizontal: anchor the popover's right edge to the button (the `?` lives in
+  // the tile's top-right) so it opens leftwards; flip rightwards if it clips.
+  let left = r.right - width;
+  if (left < VIEWPORT_MARGIN) left = r.left;
+  left = Math.max(VIEWPORT_MARGIN, Math.min(left, vw - width - VIEWPORT_MARGIN));
+
+  // Vertical: real space on each side of the trigger (minus the gap + margin).
+  const spaceBelow = vh - r.bottom - POPOVER_GAP - VIEWPORT_MARGIN;
+  const spaceAbove = r.top - POPOVER_GAP - VIEWPORT_MARGIN;
+
+  let top: number;
+  let maxHeight: number;
+  if (popH <= spaceBelow) {
+    // Fits fully below.
+    top = r.bottom + POPOVER_GAP;
+    maxHeight = spaceBelow;
+  } else if (popH <= spaceAbove) {
+    // Doesn't fit below but fits fully above — open upwards.
+    top = r.top - POPOVER_GAP - popH;
+    maxHeight = spaceAbove;
+  } else if (spaceBelow >= spaceAbove) {
+    // Fits neither side fully — pick the side with more room and cap the height
+    // to it, letting the popover scroll internally.
+    top = r.bottom + POPOVER_GAP;
+    maxHeight = spaceBelow;
+  } else {
+    maxHeight = spaceAbove;
+    top = r.top - POPOVER_GAP - maxHeight;
+  }
+
+  // Final clamp: guarantee the whole popover stays on-screen. effectiveH is the
+  // smaller of the natural height and the cap we applied.
+  const effectiveH = Math.min(popH, maxHeight);
+  top = Math.max(VIEWPORT_MARGIN, Math.min(top, vh - effectiveH - VIEWPORT_MARGIN));
+
+  return {
+    top: `${Math.round(top)}px`,
+    left: `${Math.round(left)}px`,
+    maxWidth: `${Math.round(width)}px`,
+    maxHeight: `${Math.floor(maxHeight)}px`,
+    visibility: "visible",
+  };
+}
+
+async function toggleTilePopover(key: string, ev: MouseEvent) {
+  if (tilePopover.value?.key === key) {
+    closeTilePopover();
+    return;
+  }
+  const btn = ev.currentTarget as HTMLElement;
+  const rect = btn.getBoundingClientRect();
+  tilePopoverAnchor = rect;
+  // Phase 1: mount hidden with a provisional position so it can be measured.
+  tilePopover.value = { key, style: provisionalPopoverStyle(rect) };
+  // Phase 2: after the popover renders, measure its real size and finalize.
+  await nextTick();
+  const el = tilePopoverEl.value;
+  if (!el || !tilePopover.value || tilePopover.value.key !== key || !tilePopoverAnchor) return;
+  const pr = el.getBoundingClientRect();
+  tilePopover.value = {
+    key,
+    style: finalPopoverStyle(tilePopoverAnchor, pr.height || el.offsetHeight),
+  };
+}
+
+function closeTilePopover() {
+  tilePopover.value = null;
+  tilePopoverAnchor = null;
+}
+
+function onTilePopoverKeydown(ev: KeyboardEvent) {
+  if (ev.key === "Escape" && tilePopover.value) {
+    closeTilePopover();
+  }
+}
+
+function onTilePopoverPointerDown(ev: MouseEvent) {
+  if (!tilePopover.value) return;
+  const target = ev.target as Node;
+  // Clicks on the popover itself stay open. Clicks on a `?` trigger are handled
+  // by `toggleTilePopover` (which fires its own toggle) — so ignore them here to
+  // avoid a close-then-reopen double toggle.
+  if (tilePopoverEl.value?.contains(target)) return;
+  if (target instanceof Element && target.closest(".aw-kpi-help")) return;
+  closeTilePopover();
+}
+
+function onTilePopoverDismissScroll() {
+  // Position is computed from the live rect; rather than chase it on scroll,
+  // just close the popover (allowed by spec) to keep behaviour predictable.
+  if (tilePopover.value) closeTilePopover();
+}
+
 // --- dashboard layout: section visibility + order ---
 // Persisted in settings.json under `dashboardSections`. Settings panel writes,
 // we read on mount. Visibility is enforced with v-if; order is enforced via
@@ -764,11 +932,25 @@ const visibleTools = computed(() => {
 watch([dateFrom, dateTo, projectFilter], load);
 watch(locale, () => renderCharts());
 onMounted(async () => {
+  // Tile-help popover dismissal: Esc, outside click, and any scroll/resize
+  // (capture phase catches scrolls inside `.aw-main`, the inner scroll area).
+  document.addEventListener("keydown", onTilePopoverKeydown);
+  document.addEventListener("mousedown", onTilePopoverPointerDown, true);
+  window.addEventListener("scroll", onTilePopoverDismissScroll, true);
+  window.addEventListener("resize", onTilePopoverDismissScroll);
+
   await loadLocaleFromStore();
   await loadIgnored();
   await loadSectionPrefs();
   await loadGoals();
   await load();
+});
+
+onUnmounted(() => {
+  document.removeEventListener("keydown", onTilePopoverKeydown);
+  document.removeEventListener("mousedown", onTilePopoverPointerDown, true);
+  window.removeEventListener("scroll", onTilePopoverDismissScroll, true);
+  window.removeEventListener("resize", onTilePopoverDismissScroll);
 });
 </script>
 
@@ -849,6 +1031,12 @@ onMounted(async () => {
             class="aw-kpi"
             :title="t('kpiHitRatioHint')"
           >
+            <button
+              class="aw-kpi-help"
+              :title="t(tilePopover?.key === 'kpiHitRatioHelp' ? 'hideHelp' : 'showHelp')"
+              :aria-expanded="tilePopover?.key === 'kpiHitRatioHelp'"
+              @click="toggleTilePopover('kpiHitRatioHelp', $event)"
+            >?</button>
             <div class="aw-kpi-val">{{ (data.totals.cache_hit_ratio * 100).toFixed(0) }}%</div>
             <div class="aw-kpi-lbl">{{ t("kpiHitRatio") }}</div>
             <span
@@ -860,6 +1048,12 @@ onMounted(async () => {
             </span>
           </div>
           <div class="aw-kpi" :title="t('kpiCacheSavingsHint')">
+            <button
+              class="aw-kpi-help"
+              :title="t(tilePopover?.key === 'kpiCacheSavingsHelp' ? 'hideHelp' : 'showHelp')"
+              :aria-expanded="tilePopover?.key === 'kpiCacheSavingsHelp'"
+              @click="toggleTilePopover('kpiCacheSavingsHelp', $event)"
+            >?</button>
             <div class="aw-kpi-val">{{ fmtCost(data.totals.cache_savings_usd) }}</div>
             <div class="aw-kpi-lbl">{{ t("kpiCacheSavings") }}</div>
           </div>
@@ -876,6 +1070,12 @@ onMounted(async () => {
             class="aw-kpi"
             :title="t('qualityTierHint')"
           >
+            <button
+              class="aw-kpi-help"
+              :title="t(tilePopover?.key === 'qualityTierHelp' ? 'hideHelp' : 'showHelp')"
+              :aria-expanded="tilePopover?.key === 'qualityTierHelp'"
+              @click="toggleTilePopover('qualityTierHelp', $event)"
+            >?</button>
             <div class="aw-kpi-val">{{ fmtPct(data.tier_breakdown.standard_pct) }}</div>
             <div class="aw-kpi-lbl">{{ t("qualityTierLabel") }}</div>
           </div>
@@ -885,6 +1085,12 @@ onMounted(async () => {
             :class="errorRateGoalState ? 'goal-' + errorRateGoalState : ''"
             :title="t('qualityErrorHint')"
           >
+            <button
+              class="aw-kpi-help"
+              :title="t(tilePopover?.key === 'qualityErrorHelp' ? 'hideHelp' : 'showHelp')"
+              :aria-expanded="tilePopover?.key === 'qualityErrorHelp'"
+              @click="toggleTilePopover('qualityErrorHelp', $event)"
+            >?</button>
             <div class="aw-kpi-val">{{ fmtPct(data.tool_error.error_rate) }}</div>
             <div class="aw-kpi-lbl">{{ t("qualityErrorLabel") }}</div>
             <span
@@ -909,6 +1115,12 @@ onMounted(async () => {
           class="aw-kpis"
         >
           <div class="aw-kpi" :title="t('prodActiveTimeHint')">
+            <button
+              class="aw-kpi-help"
+              :title="t(tilePopover?.key === 'prodActiveTimeHelp' ? 'hideHelp' : 'showHelp')"
+              :aria-expanded="tilePopover?.key === 'prodActiveTimeHelp'"
+              @click="toggleTilePopover('prodActiveTimeHelp', $event)"
+            >?</button>
             <div class="aw-kpi-val">{{ fmtDuration(data.productivity.active_ms) }}</div>
             <div class="aw-kpi-lbl">{{ t("prodActiveTime") }}</div>
           </div>
@@ -917,6 +1129,12 @@ onMounted(async () => {
             :class="costPerHourGoalState ? 'goal-' + costPerHourGoalState : ''"
             :title="data.productivity.cost_per_active_hour === null ? t('prodNoActiveTime') : ''"
           >
+            <button
+              class="aw-kpi-help"
+              :title="t(tilePopover?.key === 'prodCostPerHourHelp' ? 'hideHelp' : 'showHelp')"
+              :aria-expanded="tilePopover?.key === 'prodCostPerHourHelp'"
+              @click="toggleTilePopover('prodCostPerHourHelp', $event)"
+            >?</button>
             <div class="aw-kpi-val">{{ fmtCostOrDash(data.productivity.cost_per_active_hour) }}</div>
             <div class="aw-kpi-lbl">{{ t("prodCostPerHour") }}</div>
             <span
@@ -936,10 +1154,22 @@ onMounted(async () => {
             class="aw-kpi"
             :title="data.productivity.tokens_per_active_minute === null ? t('prodNoActiveTime') : ''"
           >
+            <button
+              class="aw-kpi-help"
+              :title="t(tilePopover?.key === 'prodTokensPerMinHelp' ? 'hideHelp' : 'showHelp')"
+              :aria-expanded="tilePopover?.key === 'prodTokensPerMinHelp'"
+              @click="toggleTilePopover('prodTokensPerMinHelp', $event)"
+            >?</button>
             <div class="aw-kpi-val">{{ fmtTokensOrDash(data.productivity.tokens_per_active_minute) }}</div>
             <div class="aw-kpi-lbl">{{ t("prodTokensPerMin") }}</div>
           </div>
           <div class="aw-kpi">
+            <button
+              class="aw-kpi-help"
+              :title="t(tilePopover?.key === 'prodCommitsHelp' ? 'hideHelp' : 'showHelp')"
+              :aria-expanded="tilePopover?.key === 'prodCommitsHelp'"
+              @click="toggleTilePopover('prodCommitsHelp', $event)"
+            >?</button>
             <div class="aw-kpi-val">{{ data.productivity.git_commits }}</div>
             <div class="aw-kpi-lbl">{{ t("prodCommits") }}</div>
           </div>
@@ -947,14 +1177,32 @@ onMounted(async () => {
             class="aw-kpi"
             :title="data.productivity.cost_per_commit === null ? t('prodNoCommits') : ''"
           >
+            <button
+              class="aw-kpi-help"
+              :title="t(tilePopover?.key === 'prodCostPerCommitHelp' ? 'hideHelp' : 'showHelp')"
+              :aria-expanded="tilePopover?.key === 'prodCostPerCommitHelp'"
+              @click="toggleTilePopover('prodCostPerCommitHelp', $event)"
+            >?</button>
             <div class="aw-kpi-val">{{ fmtCostOrDash(data.productivity.cost_per_commit) }}</div>
             <div class="aw-kpi-lbl">{{ t("prodCostPerCommit") }}</div>
           </div>
           <div class="aw-kpi">
+            <button
+              class="aw-kpi-help"
+              :title="t(tilePopover?.key === 'prodEditsHelp' ? 'hideHelp' : 'showHelp')"
+              :aria-expanded="tilePopover?.key === 'prodEditsHelp'"
+              @click="toggleTilePopover('prodEditsHelp', $event)"
+            >?</button>
             <div class="aw-kpi-val">{{ data.productivity.edits }}</div>
             <div class="aw-kpi-lbl">{{ t("prodEdits") }}</div>
           </div>
           <div class="aw-kpi" :title="t('prodEditsHint')">
+            <button
+              class="aw-kpi-help"
+              :title="t(tilePopover?.key === 'prodCostPerEditHelp' ? 'hideHelp' : 'showHelp')"
+              :aria-expanded="tilePopover?.key === 'prodCostPerEditHelp'"
+              @click="toggleTilePopover('prodCostPerEditHelp', $event)"
+            >?</button>
             <div class="aw-kpi-val">{{ fmtCostOrDash(data.productivity.cost_per_edit) }}</div>
             <div class="aw-kpi-lbl">{{ t("prodCostPerEdit") }}</div>
           </div>
@@ -1206,6 +1454,20 @@ onMounted(async () => {
         <textarea readonly :value="exportText"></textarea>
       </div>
     </div>
+
+    <!-- KPI tile help popover — Teleported to <body> with position: fixed so it
+         floats above the layout without changing tile height, reflowing the KPI
+         grid, or extending the scroll area. Positioned from the trigger's rect. -->
+    <Teleport to="body">
+      <div
+        v-if="tilePopover"
+        ref="tilePopoverEl"
+        class="aw-tile-popover aw-insight-help-body"
+        role="dialog"
+        :style="tilePopover.style"
+        v-html="tileHelpHtml(tilePopover.key)"
+      ></div>
+    </Teleport>
   </div>
 </template>
 
@@ -1322,11 +1584,66 @@ onMounted(async () => {
   gap: 10px;
 }
 .aw-kpi {
+  position: relative;
   background: rgba(255, 255, 255, 0.03);
   border: 1px solid var(--stroke-strong, rgba(255, 255, 255, 0.08));
   border-radius: 8px;
   padding: 12px;
   text-align: center;
+}
+/* `?` help toggle on a KPI tile — reuses the insight-card help affordance, but
+   pinned to the tile's top-right corner so it doesn't disturb the centred
+   value/label. Opening it shows the floating `.aw-tile-popover` (Teleported to
+   <body>), so the tile's height never changes. */
+.aw-kpi-help {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  color: rgba(255, 255, 255, 0.45);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  cursor: pointer;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.aw-kpi-help:hover,
+.aw-kpi-help[aria-expanded="true"] {
+  color: rgba(255, 255, 255, 0.95);
+  border-color: rgba(255, 255, 255, 0.55);
+  background: rgba(255, 255, 255, 0.06);
+}
+/* Floating help popover for KPI tiles. Teleported to <body> and fixed-position
+   (coordinates set inline from the trigger's bounding rect, with edge clamping
+   + flip in JS), so it never affects the tile/grid layout or the scroll area.
+   Reuses the insight help-body typography via the shared `.aw-insight-help-body`
+   class; this rule only adds the floating-card chrome. */
+/* Two classes so this beats `.aw-insight-help-body` (defined later in the file,
+   equal specificity) — otherwise its `padding: 4px` would override the X padding. */
+.aw-tile-popover.aw-insight-help-body {
+  position: fixed;
+  z-index: 1000;
+  width: max-content;
+  max-width: 420px; /* 1.5× base; JS may shrink this further via inline style near edges */
+  /* max-height is set inline from JS to the real space available at the chosen
+     edge (it can't be a static vh — that ignores the trigger's position). */
+  overflow-y: auto;
+  text-align: left;
+  padding: 12px 20px;
+  background: var(--bg-2, #232323);
+  border: 1px solid var(--stroke-strong, rgba(255, 255, 255, 0.14));
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  /* Override the inline-body's top divider — the popover is a standalone card. */
+  border-top: 1px solid var(--stroke-strong, rgba(255, 255, 255, 0.14));
+  margin-top: 0;
 }
 .aw-kpi-val {
   font-size: 22px;
