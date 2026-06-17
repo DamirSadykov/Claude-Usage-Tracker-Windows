@@ -13,6 +13,14 @@
 
 import { readFileSync } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+// The mutation CLI ships next to this hook; resolve its absolute path so the
+// contract below can hand Claude an exact, copy-pasteable command.
+const CLI = path.join(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "cc-todos.mjs",
+);
 
 function main() {
   // SessionStart hooks receive a JSON payload on stdin (session_id, cwd,
@@ -85,8 +93,11 @@ function main() {
     `User's active tasks from the Claude Usage Tracker (project "${project}"; the tracker is the source of truth):`,
     lines.join("\n"),
     "",
-    `These are the USER's todos, not your working task list. File: ${file}`,
-    `When the user says a task moved (e.g. done / in progress / in review), update that task's "status" in this JSON file to one of the kanban columns (backlog | queue | in_progress | review | done), matching by the ⟨id⟩. Do NOT change other fields (subject / description / plan / estimate_minutes / scheduled_for / project) unless the user explicitly asks. Edit surgically and keep the JSON format intact.`,
+    `These are the USER's todos, not your working task list.`,
+    `When the user says a task moved (e.g. done / in progress / in review), change its status with the tracker's CLI — do NOT hand-edit todos.json (the tracker may write it concurrently, and a malformed edit breaks the shared file):`,
+    `    node "${CLI}" set-status <id> <status>`,
+    `where <status> is one kanban column: backlog | queue | in_progress | review | done, and <id> is the ⟨id⟩ shown above. The CLI validates the status and writes atomically. Run \`node "${CLI}" list\` to see current tasks. Editing other fields (subject / description / plan / estimate_minutes / scheduled_for / project) is not supported by the CLI and should be left to the user.`,
+    `Source of truth file (read-only for you): ${file}`,
   ].join("\n");
 
   process.stdout.write(context + "\n");
