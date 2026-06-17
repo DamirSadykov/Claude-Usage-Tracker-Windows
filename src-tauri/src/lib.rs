@@ -1033,6 +1033,37 @@ fn open_todo_window(app: AppHandle) {
     }
 }
 
+/// Background watcher: poll `todos.json`'s mtime and emit `todos-file-changed`
+/// whenever it changes on disk, so an open Todo window can live-reload after an
+/// external edit (the cc-todos CLI, a Claude session, or a hand-edit). Polling
+/// (rather than a filesystem-notify crate) is deliberate: writes land via
+/// temp-file + rename, which would invalidate a watch on the file path itself,
+/// and one mtime stat every ~1.5s is far cheaper than the churn a notifier would
+/// add. The tracker's own writes also fire this, but the frontend reload is
+/// silent and idempotent, so the echo is harmless.
+fn spawn_todos_watch(app: AppHandle) {
+    std::thread::spawn(move || {
+        let path = match todos_path(&app) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let modified = |p: &PathBuf| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+        let mut last: Option<SystemTime> = modified(&path);
+        loop {
+            std::thread::sleep(Duration::from_millis(1500));
+            let current = modified(&path);
+            if current.is_none() {
+                // File briefly absent (mid-rename) or never created — remember
+                // so its (re)appearance counts as a change, but don't report it.
+                last = None;
+            } else if current != last {
+                last = current;
+                let _ = app.emit("todos-file-changed", ());
+            }
+        }
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     report::install_panic_hook();
@@ -1226,6 +1257,7 @@ pub fn run() {
             spawn_poll_loop(app.handle().clone(), notify);
             spawn_status_loop(app.handle().clone());
             spawn_sysmon_loop(app.handle().clone());
+            spawn_todos_watch(app.handle().clone());
 
             Ok(())
         })

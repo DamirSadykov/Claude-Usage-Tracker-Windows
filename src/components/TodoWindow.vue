@@ -81,6 +81,11 @@ const search = ref("");
 const dragId = ref<string | null>(null);
 const overCol = ref<string | null>(null);
 
+// Live reload: a watcher in the backend emits `todos-file-changed` when
+// todos.json changes on disk (CLI / Claude / hand-edit). We defer the reload
+// while a drag or the form is open so it never yanks state from under the user.
+const pendingReload = ref(false);
+
 // Form state (doubles as create + edit). editingId === null → creating.
 const editingId = ref<string | null>(null);
 const fSubject = ref("");
@@ -181,15 +186,31 @@ const openCount = computed(
   () => todos.value.filter((t) => t.status !== "done").length,
 );
 
-async function loadTodos() {
-  loading.value = true;
+async function loadTodos(silent = false) {
+  if (!silent) loading.value = true;
   try {
     todos.value = await invoke<Todo[]>("get_todos");
     errorMsg.value = "";
   } catch (e) {
     errorMsg.value = String(e);
   } finally {
-    loading.value = false;
+    if (!silent) loading.value = false;
+  }
+}
+
+// Reload now if it's safe; otherwise mark it pending until the drag/form ends.
+function requestReload() {
+  if (dragId.value || formOpen.value) {
+    pendingReload.value = true;
+    return;
+  }
+  void loadTodos(true);
+}
+// Run a deferred reload once the user is no longer mid-interaction.
+function flushPendingReload() {
+  if (pendingReload.value && !dragId.value && !formOpen.value) {
+    pendingReload.value = false;
+    void loadTodos(true);
   }
 }
 
@@ -203,6 +224,7 @@ function resetForm() {
   fProject.value = "";
   formStatus.value = "backlog";
   formOpen.value = false;
+  flushPendingReload();
 }
 
 function startNew(colId = "backlog") {
@@ -291,6 +313,7 @@ function onDragStart(todo: Todo, e: DragEvent) {
 function onDragEnd() {
   dragId.value = null;
   overCol.value = null;
+  flushPendingReload();
 }
 function onColDragOver(colId: string, e: DragEvent) {
   if (!dragId.value) return;
@@ -330,6 +353,7 @@ function fmtEstimate(min: number | null | undefined) {
 }
 
 let unlistenLocale: (() => void) | null = null;
+let unlistenTodos: (() => void) | null = null;
 
 onMounted(async () => {
   await loadLocaleFromStore();
@@ -340,6 +364,10 @@ onMounted(async () => {
   unlistenLocale = await listen<string>("todos-locale", (e) => {
     applyLocale(e.payload);
   });
+  // Live reload: the backend watcher fires this whenever todos.json changes on
+  // disk (CLI / Claude / hand-edit), so the board stays in sync without a manual
+  // refresh.
+  unlistenTodos = await listen("todos-file-changed", () => requestReload());
   await loadTodos();
   try {
     knownProjects.value = await invoke<string[]>("get_cc_projects");
@@ -350,6 +378,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   if (unlistenLocale) unlistenLocale();
+  if (unlistenTodos) unlistenTodos();
 });
 </script>
 
