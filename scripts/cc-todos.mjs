@@ -10,6 +10,8 @@
 // `todos.rs::STATUSES` and the kanban columns in TodoWindow.vue.
 //
 // Commands:
+//   add "<subject>" [--project <name>] [--status <status>] [--description <text>]
+//                   [--plan <text>] [--estimate <min>] [--scheduled <YYYY-MM-DD>]
 //   set-status <id> <status>        status ∈ backlog|queue|in_progress|review|done
 //   list [--project <name>] [--json]
 //
@@ -17,6 +19,7 @@
 // caller can tell success from failure.
 
 import { readFileSync, writeFileSync, renameSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import path from "node:path";
 
 // Kanban columns, in board order. Keep in lockstep with todos.rs::STATUSES.
@@ -75,6 +78,67 @@ function cmdSetStatus(id, status) {
   process.stdout.write(`ok: ${id} -> ${status}\n`);
 }
 
+// Minimal `--flag value` parser: collects positional args and flag pairs.
+// A flag with no following value (or followed by another --flag) becomes `true`.
+function parseArgs(args) {
+  const flags = {};
+  const positional = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a.startsWith("--")) {
+      const next = args[i + 1];
+      if (next === undefined || next.startsWith("--")) {
+        flags[a.slice(2)] = true;
+      } else {
+        flags[a.slice(2)] = next;
+        i++;
+      }
+    } else {
+      positional.push(a);
+    }
+  }
+  return { positional, flags };
+}
+
+const ADD_USAGE =
+  'usage: cc-todos add "<subject>" [--project <name>] [--status <status>] ' +
+  "[--description <text>] [--plan <text>] [--estimate <min>] [--scheduled <YYYY-MM-DD>]";
+
+// Create a new todo. Mirrors the field set the tracker writes (todos.rs / the
+// TodoWindow form): id is a fresh UUID, created_at/updated_at stamped now,
+// status defaults to backlog. Appends and writes atomically.
+function cmdAdd(args) {
+  const { positional, flags } = parseArgs(args);
+  const subject = String(positional[0] ?? flags.subject ?? "").trim();
+  if (!subject) fail(ADD_USAGE);
+  const status = String(flags.status ?? "backlog");
+  if (!STATUSES.includes(status))
+    fail(`invalid status "${status}". valid: ${STATUSES.join(" | ")}`);
+  let estimate = null;
+  if (flags.estimate != null && flags.estimate !== true) {
+    const n = Number(flags.estimate);
+    if (Number.isFinite(n)) estimate = Math.max(0, Math.round(n));
+  }
+  const now = new Date().toISOString();
+  const todo = {
+    id: randomUUID(),
+    subject,
+    description: typeof flags.description === "string" ? flags.description : "",
+    status,
+    estimate_minutes: estimate,
+    scheduled_for: typeof flags.scheduled === "string" ? flags.scheduled : null,
+    plan: typeof flags.plan === "string" ? flags.plan : "",
+    project: typeof flags.project === "string" ? flags.project : null,
+    created_at: now,
+    updated_at: now,
+  };
+  const file = todosPath();
+  const data = load(file);
+  data.todos.push(todo);
+  save(file, data);
+  process.stdout.write(`ok: added ${todo.id} [${status}] ${subject}\n`);
+}
+
 function cmdList(args) {
   const file = todosPath();
   let todos = load(file).todos.filter(Boolean);
@@ -99,6 +163,8 @@ function cmdList(args) {
 function usage(code) {
   process.stdout.write(
     "cc-todos - Claude Usage Tracker todo CLI\n\n" +
+      '  add "<subject>" [--project <name>] [--status <status>]\n' +
+      "                  [--description <text>] [--plan <text>] [--estimate <min>] [--scheduled <YYYY-MM-DD>]\n" +
       "  set-status <id> <status>        status ∈ " +
       STATUSES.join(" | ") +
       "\n" +
@@ -109,6 +175,9 @@ function usage(code) {
 
 const [cmd, ...rest] = process.argv.slice(2);
 switch (cmd) {
+  case "add":
+    cmdAdd(rest);
+    break;
   case "set-status":
     cmdSetStatus(rest[0], rest[1]);
     break;

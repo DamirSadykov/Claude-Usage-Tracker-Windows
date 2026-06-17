@@ -232,6 +232,8 @@ function startNew(colId = "backlog") {
   formStatus.value = colId;
   if (projectFilter.value) fProject.value = projectFilter.value;
   formOpen.value = true;
+  // Pull fresh in case the window was already focused when a new project landed.
+  void refreshKnownProjects();
 }
 
 function startEdit(todo: Todo) {
@@ -354,6 +356,30 @@ function fmtEstimate(min: number | null | undefined) {
 
 let unlistenLocale: (() => void) | null = null;
 let unlistenTodos: (() => void) | null = null;
+let unlistenFocus: (() => void) | null = null;
+
+// Refresh the project picker from cc_usage. The todos window is a persisted
+// webview (created once at startup, then shown/hidden), so `onMounted` runs a
+// single time — without re-pulling, a project first used after launch never
+// reaches the picker. We also kick a background ingest (like the Analytics
+// window) so a brand-new project lands in cc_usage even if Analytics was never
+// opened this session.
+async function refreshKnownProjects() {
+  try {
+    knownProjects.value = await invoke<string[]>("get_cc_projects");
+  } catch {
+    // analytics never ingested → keep the todo-derived fallback
+  }
+  invoke("ingest_cc_usage")
+    .then(async (n) => {
+      if (typeof n === "number" && n > 0) {
+        try {
+          knownProjects.value = await invoke<string[]>("get_cc_projects");
+        } catch {}
+      }
+    })
+    .catch(() => {});
+}
 
 onMounted(async () => {
   await loadLocaleFromStore();
@@ -369,16 +395,19 @@ onMounted(async () => {
   // refresh.
   unlistenTodos = await listen("todos-file-changed", () => requestReload());
   await loadTodos();
-  try {
-    knownProjects.value = await invoke<string[]>("get_cc_projects");
-  } catch {
-    // analytics never ingested → fall back to projects already used in todos
-  }
+  await refreshKnownProjects();
+  // Persisted webview: refresh the picker each time the window is brought to
+  // front, so a project used since the last view (now in cc_usage) shows up.
+  const { getCurrentWindow } = await import("@tauri-apps/api/window");
+  unlistenFocus = await getCurrentWindow().onFocusChanged(({ payload: focused }) => {
+    if (focused) void refreshKnownProjects();
+  });
 });
 
 onUnmounted(() => {
   if (unlistenLocale) unlistenLocale();
   if (unlistenTodos) unlistenTodos();
+  if (unlistenFocus) unlistenFocus();
 });
 </script>
 
