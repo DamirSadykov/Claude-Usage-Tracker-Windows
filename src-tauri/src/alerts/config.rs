@@ -107,6 +107,12 @@ pub struct AppConfig {
     // Snooze: while `now < muted_until`, alerts are queued like quiet hours.
     #[serde(default)]
     pub notifications_muted_until: Option<String>,
+    // Todo status notifications: toast when a todo moves into review/done by an
+    // EXTERNAL writer (the cc-todos CLI / a Claude session). Independent of
+    // `notifications_enabled` (which gates usage alerts) so a task-manager-only
+    // user gets these without turning on usage notifications. On by default.
+    #[serde(default = "default_true")]
+    pub todo_notifications_enabled: bool,
     // Claude service-status indicator (status.claude.com). Independent of the
     // usage poll loop and of `notifications_enabled`.
     #[serde(default = "default_true")]
@@ -175,6 +181,7 @@ impl Default for AppConfig {
             daily_budget_enabled: false,
             daily_budget: 0.0,
             notifications_muted_until: None,
+            todo_notifications_enabled: true,
             service_status_enabled: true,
             service_status_interval: 90,
             service_status_notify: true,

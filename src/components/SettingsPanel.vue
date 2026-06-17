@@ -74,6 +74,7 @@ const props = defineProps<{
   serviceStatusEnabled: boolean;
   serviceStatusInterval: number;
   serviceStatusNotify: boolean;
+  todoNotificationsEnabled: boolean;
   systemInfoEnabled: boolean;
   runtimeInsightsEnabled: boolean;
   runtimeInsightKinds: string[];
@@ -104,6 +105,7 @@ const emit = defineEmits<{
     serviceStatusEnabled: boolean;
     serviceStatusInterval: number;
     serviceStatusNotify: boolean;
+    todoNotificationsEnabled: boolean;
     systemInfoEnabled: boolean;
     locale: string;
   }];
@@ -142,6 +144,7 @@ const localGoalErrorRatePct = ref<number | "">(
 const localSvcEnabled = ref(props.serviceStatusEnabled);
 const localSvcInterval = ref(props.serviceStatusInterval);
 const localSvcNotify = ref(props.serviceStatusNotify);
+const localTodoNotify = ref(props.todoNotificationsEnabled);
 const localSystemInfo = ref(props.systemInfoEnabled);
 const localLocale = ref(props.locale);
 
@@ -174,6 +177,7 @@ watch(() => props.goalErrorRateMax, (v) => (localGoalErrorRatePct.value = v === 
 watch(() => props.serviceStatusEnabled, (v) => (localSvcEnabled.value = v));
 watch(() => props.serviceStatusInterval, (v) => (localSvcInterval.value = v));
 watch(() => props.serviceStatusNotify, (v) => (localSvcNotify.value = v));
+watch(() => props.todoNotificationsEnabled, (v) => (localTodoNotify.value = v));
 watch(() => props.systemInfoEnabled, (v) => (localSystemInfo.value = v));
 watch(() => props.locale, (v) => (localLocale.value = v));
 
@@ -359,6 +363,7 @@ function handleSave() {
     serviceStatusEnabled: localSvcEnabled.value,
     serviceStatusInterval: localSvcInterval.value,
     serviceStatusNotify: localSvcNotify.value,
+    todoNotificationsEnabled: localTodoNotify.value,
     systemInfoEnabled: localSystemInfo.value,
     locale: localLocale.value,
   });
@@ -743,6 +748,17 @@ function handleSave() {
           </div>
         </div>
       </template>
+
+      <!-- Todo status notifications — independent of the usage-alert toggle above -->
+      <div class="card toggle-card" @click="localTodoNotify = !localTodoNotify">
+        <div style="flex: 1; min-width: 0">
+          <div class="card-title" style="font-size: 13px">{{ t('todoNotifications') }}</div>
+          <div class="card-sub">{{ t('todoNotificationsDesc') }}</div>
+        </div>
+        <div class="toggle" :class="{ on: localTodoNotify }">
+          <div class="toggle-knob"></div>
+        </div>
+      </div>
       </template>
 
       <!-- ===== Budget & analytics ===== -->

@@ -113,6 +113,10 @@ const notificationsMutedUntil = ref<string | null>(null);
 const serviceStatusEnabled = ref(true);
 const serviceStatusInterval = ref(90);
 const serviceStatusNotify = ref(true);
+// Independent of `notificationsEnabled` (usage alerts): toasts when a todo is
+// moved into review/done by an external writer (cc-todos CLI / Claude). On by
+// default. Gated entirely in the backend watcher; here we just persist it.
+const todoNotificationsEnabled = ref(true);
 const runtimeInsightsEnabled = ref(false);
 const runtimeInsightKinds = ref<string[]>(["long_session", "cold_rewrites"]);
 const systemInfoEnabled = ref(true);
@@ -231,6 +235,8 @@ async function loadSettings() {
             (await store.get<number>("serviceStatusInterval")) ?? 90;
         serviceStatusNotify.value =
             (await store.get<boolean>("serviceStatusNotify")) ?? true;
+        todoNotificationsEnabled.value =
+            (await store.get<boolean>("todoNotificationsEnabled")) ?? true;
         runtimeInsightsEnabled.value =
             (await store.get<boolean>("runtimeInsightsEnabled")) ?? false;
         {
@@ -285,6 +291,7 @@ async function saveSettings() {
     await store.set("serviceStatusEnabled", serviceStatusEnabled.value);
     await store.set("serviceStatusInterval", serviceStatusInterval.value);
     await store.set("serviceStatusNotify", serviceStatusNotify.value);
+    await store.set("todoNotificationsEnabled", todoNotificationsEnabled.value);
     await store.set("runtimeInsightsEnabled", runtimeInsightsEnabled.value);
     await store.set("runtimeInsightKinds", [...runtimeInsightKinds.value]);
     await store.set("systemInfoEnabled", systemInfoEnabled.value);
@@ -320,6 +327,7 @@ function buildConfig() {
         service_status_enabled: serviceStatusEnabled.value,
         service_status_interval: serviceStatusInterval.value,
         service_status_notify: serviceStatusNotify.value,
+        todo_notifications_enabled: todoNotificationsEnabled.value,
         runtime_insights_enabled: runtimeInsightsEnabled.value,
         runtime_insight_kinds: [...runtimeInsightKinds.value],
         system_info_enabled: systemInfoEnabled.value,
@@ -584,6 +592,7 @@ async function handleSave(settings: {
     serviceStatusEnabled: boolean;
     serviceStatusInterval: number;
     serviceStatusNotify: boolean;
+    todoNotificationsEnabled: boolean;
     systemInfoEnabled: boolean;
     locale: string;
 }) {
@@ -609,6 +618,7 @@ async function handleSave(settings: {
     serviceStatusEnabled.value = settings.serviceStatusEnabled;
     serviceStatusInterval.value = settings.serviceStatusInterval;
     serviceStatusNotify.value = settings.serviceStatusNotify;
+    todoNotificationsEnabled.value = settings.todoNotificationsEnabled;
     systemInfoEnabled.value = settings.systemInfoEnabled;
     locale.value = settings.locale;
     // The backend re-arms its alert engine on disable (see `configure`).
@@ -1015,6 +1025,7 @@ onUnmounted(() => {
             :service-status-enabled="serviceStatusEnabled"
             :service-status-interval="serviceStatusInterval"
             :service-status-notify="serviceStatusNotify"
+            :todo-notifications-enabled="todoNotificationsEnabled"
             :system-info-enabled="systemInfoEnabled"
             :runtime-insights-enabled="runtimeInsightsEnabled"
             :runtime-insight-kinds="runtimeInsightKinds"

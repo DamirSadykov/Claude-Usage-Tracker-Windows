@@ -1132,12 +1132,14 @@ fn spawn_todos_watch(app: AppHandle) {
             if alerts.is_empty() {
                 continue;
             }
-            // Reuse the master notifications toggle as the gate.
+            // Gated by a dedicated toggle, independent of `notifications_enabled`
+            // (which gates usage alerts), so a task-manager-only user can get
+            // these without turning on usage notifications.
             let enabled = app
                 .state::<Mutex<AppConfig>>()
                 .lock()
                 .unwrap()
-                .notifications_enabled;
+                .todo_notifications_enabled;
             if enabled {
                 for a in alerts {
                     let _ = app.emit("todo-status-alert", a);
