@@ -11,11 +11,6 @@ import {
 import type { AlertTiers, AlertTierKey, AlertTypes, AlertTypeKey } from "../thresholds";
 import { useUpdater } from "../updater";
 import { INSIGHT_KINDS } from "../insightKinds";
-import {
-  DASHBOARD_SECTIONS,
-  reconcileSectionPrefs,
-  type SectionPref,
-} from "../dashboardSections";
 
 const TIER_LABELS: Record<AlertTierKey, string> = {
   five_hour: "session5h",
@@ -35,7 +30,7 @@ const { t } = useI18n();
 
 // Settings are grouped into topic tabs. A future iteration may promote this to
 // a dedicated settings window with the same sections (see issue discussion).
-type SettingsTab = "account" | "limits" | "notifications" | "budget" | "insights" | "dashboard" | "updates";
+type SettingsTab = "account" | "limits" | "notifications" | "budget" | "insights" | "updates";
 const tab = ref<SettingsTab>("account");
 
 const {
@@ -254,57 +249,6 @@ function toggleRuntime(kind: string) {
 
 onMounted(loadIgnoredInsights);
 
-// --- Dashboard section prefs ---
-// Stored as a single `dashboardSections` array of {id, visible} preserving
-// order. AnalyticsWindow reads the same key, so reorder/hide is reflected on
-// the next refresh of that window. We never thread this through props/save —
-// it's analytics-window-local config.
-const sectionPrefs = ref<SectionPref[]>([]);
-
-async function loadSectionPrefs() {
-  try {
-    const { load: loadStore } = await import("@tauri-apps/plugin-store");
-    const store = await loadStore("settings.json");
-    const raw = await store.get<unknown>("dashboardSections");
-    sectionPrefs.value = reconcileSectionPrefs(raw);
-  } catch {
-    sectionPrefs.value = reconcileSectionPrefs(null);
-  }
-}
-
-async function saveSectionPrefs() {
-  try {
-    const { load: loadStore } = await import("@tauri-apps/plugin-store");
-    const store = await loadStore("settings.json");
-    await store.set("dashboardSections", JSON.parse(JSON.stringify(sectionPrefs.value)));
-    await store.save();
-  } catch {}
-}
-
-function sectionLabel(id: string): string {
-  const def = DASHBOARD_SECTIONS.find((s) => s.id === id);
-  return def ? t(def.labelKey) : id;
-}
-
-function toggleSection(id: string) {
-  const s = sectionPrefs.value.find((x) => x.id === id);
-  if (!s) return;
-  s.visible = !s.visible;
-  saveSectionPrefs();
-}
-
-function moveSection(id: string, delta: -1 | 1) {
-  const i = sectionPrefs.value.findIndex((s) => s.id === id);
-  const j = i + delta;
-  if (i < 0 || j < 0 || j >= sectionPrefs.value.length) return;
-  const arr = [...sectionPrefs.value];
-  [arr[i], arr[j]] = [arr[j], arr[i]];
-  sectionPrefs.value = arr;
-  saveSectionPrefs();
-}
-
-onMounted(loadSectionPrefs);
-
 // Keep each threshold triple strictly ascending with a 1% gap so the colour
 // bands can't overlap. Fixed slider scale (5..99) + clamping — dynamic min/max
 // would make neighbouring thumbs visually drift when their range changes.
@@ -438,20 +382,6 @@ function handleSave() {
           <line x1="7" y1="14.8" x2="9" y2="14.8" stroke-linecap="round" />
         </svg>
         <span>{{ t('tabInsights') }}</span>
-      </button>
-      <button
-        type="button"
-        class="settings-tab"
-        :class="{ active: tab === 'dashboard' }"
-        @click="tab = 'dashboard'"
-      >
-        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4">
-          <rect x="2.5" y="2.5" width="5" height="6" rx="1" />
-          <rect x="8.5" y="2.5" width="5" height="3" rx="1" />
-          <rect x="2.5" y="9.5" width="5" height="4" rx="1" />
-          <rect x="8.5" y="6.5" width="5" height="7" rx="1" />
-        </svg>
-        <span>{{ t('tabDashboard') }}</span>
       </button>
       <button
         type="button"
@@ -905,51 +835,6 @@ function handleSave() {
               class="insight-na"
               :title="t('runtimeInsightUnavailable')"
             >—</span>
-          </div>
-        </div>
-      </div>
-      </template>
-
-      <!-- ===== Dashboard layout ===== -->
-      <template v-if="tab === 'dashboard'">
-      <div class="card">
-        <div class="field-label">{{ t('dashboardSettingsTitle') }}</div>
-        <div class="field-hint" style="margin-top: 0; margin-bottom: 4px">
-          {{ t('dashboardSettingsDesc') }}
-        </div>
-      </div>
-
-      <div class="card">
-        <div
-          v-for="(pref, idx) in sectionPrefs"
-          :key="pref.id"
-          class="tier-row dash-row"
-        >
-          <div class="dash-order">
-            <button
-              type="button"
-              class="dash-move"
-              :disabled="idx === 0"
-              :title="t('moveUp')"
-              @click="moveSection(pref.id, -1)"
-            >▲</button>
-            <button
-              type="button"
-              class="dash-move"
-              :disabled="idx === sectionPrefs.length - 1"
-              :title="t('moveDown')"
-              @click="moveSection(pref.id, 1)"
-            >▼</button>
-          </div>
-          <span class="tier-name" @click="toggleSection(pref.id)">
-            {{ sectionLabel(pref.id) }}
-          </span>
-          <div
-            class="toggle"
-            :class="{ on: pref.visible }"
-            @click="toggleSection(pref.id)"
-          >
-            <div class="toggle-knob"></div>
           </div>
         </div>
       </div>

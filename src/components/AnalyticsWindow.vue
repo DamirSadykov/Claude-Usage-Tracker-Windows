@@ -3,13 +3,13 @@
 // `#analytics` hash (see tauri.conf.json `analytics` window). Pulls a single
 // extended bundle from `get_analytics_ext`, with a project + date-range filter
 // and an "export JSON" affordance so the user can pipe the aggregates into
-// their Claude Code CLI for higher-order insights.
+// their Claude Code CLI for higher-order insights. The content is split across
+// five tabs (Overview / Trends / Sessions / Tools / Insights).
 import { ref, computed, onMounted, onUnmounted, watch, nextTick } from "vue";
 import { useI18n } from "vue-i18n";
 import { invoke } from "@tauri-apps/api/core";
 import { getInsightHelpHtml, hasInsightHelp } from "../insightHelp";
 import { renderInsightHelp } from "../insightHelp/render";
-import { reconcileSectionPrefs, type SectionPref } from "../dashboardSections";
 import { fmtDateTime, fmtDay } from "../dateFormat";
 import {
   Chart,
@@ -433,12 +433,45 @@ function setRange(days: number) {
   dateFrom.value = daysAgo(days);
   dateTo.value = today();
 }
+// Which preset (if any) the current from/to range matches, for the active
+// highlight on the segmented control. null = a custom range was picked.
+const activeRange = computed<number | null>(() => {
+  if (dateTo.value !== today()) return null;
+  for (const d of [7, 30, 90]) if (dateFrom.value === daysAgo(d)) return d;
+  return null;
+});
 
 // --- charts ---
-const costCanvas = ref<HTMLCanvasElement | null>(null);
-const tokenCanvas = ref<HTMLCanvasElement | null>(null);
+// The cost chart appears on both the Overview and Trends tabs. The tabs are
+// `v-if`-gated, so only one of the two cost canvases is ever mounted at a time —
+// a single Chart instance bound to whichever is live is enough. The tokens
+// chart lives only on Trends.
+const costCanvas = ref<HTMLCanvasElement | null>(null); // Overview
+const costCanvas2 = ref<HTMLCanvasElement | null>(null); // Trends
+const tokenCanvas = ref<HTMLCanvasElement | null>(null); // Trends
 let costChart: Chart | null = null;
 let tokenChart: Chart | null = null;
+
+// Vertical crosshair drawn at the hovered x-position on the cost chart. Paired
+// with `interaction: { mode: "index", intersect: false }` so the tooltip (the
+// value readout) and this guide line both track the cursor anywhere along x.
+const costCrosshair = {
+  id: "costCrosshair",
+  afterDraw(chart: Chart) {
+    const active = chart.tooltip?.getActiveElements?.() ?? [];
+    if (!active.length) return;
+    const x = (active[0].element as unknown as { x: number }).x;
+    const { ctx, chartArea } = chart;
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(x, chartArea.top);
+    ctx.lineTo(x, chartArea.bottom);
+    ctx.lineWidth = 1;
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.28)";
+    ctx.stroke();
+    ctx.restore();
+  },
+};
 
 function renderCharts() {
   const d = data.value;
@@ -449,10 +482,12 @@ function renderCharts() {
 
   // Cost over time (single line). Extra-usage credit history isn't available
   // per-day from the API, so this charts CC spend — which is what drives most
-  // of the extra-usage curve in practice.
-  if (costCanvas.value) {
+  // of the extra-usage curve in practice. Render into whichever cost canvas the
+  // active tab has mounted (Overview or Trends).
+  const costEl = costCanvas.value || costCanvas2.value;
+  if (costEl) {
     costChart?.destroy();
-    costChart = new Chart(costCanvas.value, {
+    costChart = new Chart(costEl, {
       type: "line",
       data: {
         labels,
@@ -470,6 +505,9 @@ function renderCharts() {
       },
       options: {
         ...chartOpts("$"),
+        // Hover anywhere over a day → highlight that point + show its value,
+        // not only when the cursor sits exactly on the 2px dot.
+        interaction: { mode: "index", intersect: false },
         plugins: {
           legend: { display: false },
           // Default tooltip prints the raw JS number ("$2.90000000000004").
@@ -477,6 +515,7 @@ function renderCharts() {
           tooltip: { callbacks: { label: (c) => fmtCost(Number(c.parsed.y) || 0) } },
         },
       },
+      plugins: [costCrosshair],
     });
   }
 
@@ -869,32 +908,19 @@ function onTilePopoverDismissScroll() {
   if (tilePopover.value) closeTilePopover();
 }
 
-// --- dashboard layout: section visibility + order ---
-// Persisted in settings.json under `dashboardSections`. Settings panel writes,
-// we read on mount. Visibility is enforced with v-if; order is enforced via
-// CSS `order` on the flex `<main>` container so we don't have to reshuffle the
-// DOM (each section keeps its own Vue keep-alive identity and chart canvas).
-const sectionPrefs = ref<SectionPref[]>(reconcileSectionPrefs(null));
-
-async function loadSectionPrefs() {
-  try {
-    const { load: loadStore } = await import("@tauri-apps/plugin-store");
-    const store = await loadStore("settings.json");
-    const raw = await store.get<unknown>("dashboardSections");
-    sectionPrefs.value = reconcileSectionPrefs(raw);
-  } catch {
-    sectionPrefs.value = reconcileSectionPrefs(null);
-  }
-}
-
-function sectionVisible(id: string): boolean {
-  return sectionPrefs.value.find((s) => s.id === id)?.visible ?? true;
-}
-
-function sectionOrder(id: string): number {
-  const i = sectionPrefs.value.findIndex((s) => s.id === id);
-  return i >= 0 ? i : 999;
-}
+// --- tabs ---
+// The single-scroll dashboard is split into five tabs. Section order/visibility
+// (the old `dashboardSections` machinery) is dropped — the tab structure fixes
+// where each section lives.
+type TabId = "overview" | "trends" | "sessions" | "tools" | "insights";
+const activeTab = ref<TabId>("overview");
+const tabs = computed<{ id: TabId; label: string; count?: number }[]>(() => [
+  { id: "overview", label: t("awTabOverview") },
+  { id: "trends", label: t("awTabTrends") },
+  { id: "sessions", label: t("awTabSessions") },
+  { id: "tools", label: t("awTabTools") },
+  { id: "insights", label: t("awTabInsights"), count: activeInsights.value.length },
+]);
 
 // --- session quality + productivity: hide sections with no data ---
 // Quality shows only when at least one of its two metrics is known (non-null),
@@ -931,6 +957,11 @@ const visibleTools = computed(() => {
 
 watch([dateFrom, dateTo, projectFilter], load);
 watch(locale, () => renderCharts());
+// Tabs are `v-if`-gated, so switching to a tab with charts remounts its
+// canvases — re-render once the new DOM is in place.
+watch(activeTab, () => {
+  void nextTick().then(renderCharts);
+});
 onMounted(async () => {
   // Tile-help popover dismissal: Esc, outside click, and any scroll/resize
   // (capture phase catches scrolls inside `.aw-main`, the inner scroll area).
@@ -941,7 +972,6 @@ onMounted(async () => {
 
   await loadLocaleFromStore();
   await loadIgnored();
-  await loadSectionPrefs();
   await loadGoals();
   await load();
 });
@@ -960,9 +990,9 @@ onUnmounted(() => {
       <h1>{{ t("analytics") }}</h1>
       <div class="aw-filters">
         <div class="aw-presets">
-          <button @click="setRange(7)">{{ t("range7d") }}</button>
-          <button @click="setRange(30)">{{ t("range30d") }}</button>
-          <button @click="setRange(90)">90d</button>
+          <button :class="{ active: activeRange === 7 }" @click="setRange(7)">{{ t("range7d") }}</button>
+          <button :class="{ active: activeRange === 30 }" @click="setRange(30)">{{ t("range30d") }}</button>
+          <button :class="{ active: activeRange === 90 }" @click="setRange(90)">{{ t("range90d") }}</button>
         </div>
         <label>
           {{ t("from") }}
@@ -985,458 +1015,474 @@ onUnmounted(() => {
       </div>
     </header>
 
+    <nav v-if="data" class="aw-tabs">
+      <button
+        v-for="tb in tabs"
+        :key="tb.id"
+        class="aw-tab"
+        :class="{ active: activeTab === tb.id }"
+        @click="activeTab = tb.id"
+      >
+        {{ tb.label }}<span v-if="tb.count != null" class="aw-tab-cnt">{{ tb.count }}</span>
+      </button>
+    </nav>
+
     <main class="aw-main">
       <div v-if="error" class="aw-empty">{{ error }}</div>
       <div v-else-if="loading && !data" class="aw-empty">{{ t("loading") }}</div>
 
       <template v-else-if="data">
-        <!-- KPI summary -->
-        <section
-          v-if="sectionVisible('kpi')"
-          :style="{ order: sectionOrder('kpi') }"
-          class="aw-kpis"
-        >
-          <div class="aw-kpi">
-            <div class="aw-kpi-val">{{ fmtCost(data.totals.cost) }}</div>
-            <div class="aw-kpi-lbl">{{ t("analyticsTotal") }}</div>
-            <span
-              class="aw-trend"
-              :class="'t-' + trendCost.cls"
-              :title="trendCost.arrow === 'none' ? t('trendNoData') : t('trendVsPrev')"
-            >
-              <span class="aw-trend-arrow" :data-dir="trendCost.arrow"></span>{{ trendCost.text }}
-            </span>
-          </div>
-          <div class="aw-kpi">
-            <div class="aw-kpi-val">{{ fmtTokens(data.totals.total_tokens) }}</div>
-            <div class="aw-kpi-lbl">{{ t("metricTokens") }}</div>
-            <span
-              class="aw-trend"
-              :class="'t-' + trendTokens.cls"
-              :title="trendTokens.arrow === 'none' ? t('trendNoData') : t('trendVsPrev')"
-            >
-              <span class="aw-trend-arrow" :data-dir="trendTokens.arrow"></span>{{ trendTokens.text }}
-            </span>
-          </div>
-          <div class="aw-kpi">
-            <div class="aw-kpi-val">{{ data.totals.sessions }}</div>
-            <div class="aw-kpi-lbl">{{ t("analyticsPerSession") }}</div>
-          </div>
-          <div class="aw-kpi" :title="t('subagentKpiHint')">
-            <div class="aw-kpi-val">{{ data.subagent_summary.subagent_messages }}</div>
-            <div class="aw-kpi-lbl">{{ t("subagentKpiLabel") }}</div>
-          </div>
-          <div
-            v-if="data.totals.input + data.totals.cache_read > 0"
-            class="aw-kpi"
-            :title="t('kpiHitRatioHint')"
-          >
-            <button
-              class="aw-kpi-help"
-              :title="t(tilePopover?.key === 'kpiHitRatioHelp' ? 'hideHelp' : 'showHelp')"
-              :aria-expanded="tilePopover?.key === 'kpiHitRatioHelp'"
-              @click="toggleTilePopover('kpiHitRatioHelp', $event)"
-            >?</button>
-            <div class="aw-kpi-val">{{ (data.totals.cache_hit_ratio * 100).toFixed(0) }}%</div>
-            <div class="aw-kpi-lbl">{{ t("kpiHitRatio") }}</div>
-            <span
-              class="aw-trend"
-              :class="'t-' + trendCacheHit.cls"
-              :title="trendCacheHit.arrow === 'none' ? t('trendNoData') : t('trendVsPrev')"
-            >
-              <span class="aw-trend-arrow" :data-dir="trendCacheHit.arrow"></span>{{ trendCacheHit.text }}
-            </span>
-          </div>
-          <div class="aw-kpi" :title="t('kpiCacheSavingsHint')">
-            <button
-              class="aw-kpi-help"
-              :title="t(tilePopover?.key === 'kpiCacheSavingsHelp' ? 'hideHelp' : 'showHelp')"
-              :aria-expanded="tilePopover?.key === 'kpiCacheSavingsHelp'"
-              @click="toggleTilePopover('kpiCacheSavingsHelp', $event)"
-            >?</button>
-            <div class="aw-kpi-val">{{ fmtCost(data.totals.cache_savings_usd) }}</div>
-            <div class="aw-kpi-lbl">{{ t("kpiCacheSavings") }}</div>
-          </div>
-        </section>
-
-        <!-- Session quality: service-tier split + tool error rate -->
-        <section
-          v-if="sectionVisible('quality') && hasQuality"
-          :style="{ order: sectionOrder('quality') }"
-          class="aw-kpis"
-        >
-          <div
-            v-if="data.tier_breakdown.standard_pct !== null"
-            class="aw-kpi"
-            :title="t('qualityTierHint')"
-          >
-            <button
-              class="aw-kpi-help"
-              :title="t(tilePopover?.key === 'qualityTierHelp' ? 'hideHelp' : 'showHelp')"
-              :aria-expanded="tilePopover?.key === 'qualityTierHelp'"
-              @click="toggleTilePopover('qualityTierHelp', $event)"
-            >?</button>
-            <div class="aw-kpi-val">{{ fmtPct(data.tier_breakdown.standard_pct) }}</div>
-            <div class="aw-kpi-lbl">{{ t("qualityTierLabel") }}</div>
-          </div>
-          <div
-            v-if="data.tool_error.error_rate !== null"
-            class="aw-kpi"
-            :class="errorRateGoalState ? 'goal-' + errorRateGoalState : ''"
-            :title="t('qualityErrorHint')"
-          >
-            <button
-              class="aw-kpi-help"
-              :title="t(tilePopover?.key === 'qualityErrorHelp' ? 'hideHelp' : 'showHelp')"
-              :aria-expanded="tilePopover?.key === 'qualityErrorHelp'"
-              @click="toggleTilePopover('qualityErrorHelp', $event)"
-            >?</button>
-            <div class="aw-kpi-val">{{ fmtPct(data.tool_error.error_rate) }}</div>
-            <div class="aw-kpi-lbl">{{ t("qualityErrorLabel") }}</div>
-            <span
-              class="aw-trend"
-              :class="'t-' + trendErrorRate.cls"
-              :title="trendErrorRate.arrow === 'none' ? t('trendNoData') : t('trendVsPrev')"
-            >
-              <span class="aw-trend-arrow" :data-dir="trendErrorRate.arrow"></span>{{ trendErrorRate.text }}
-            </span>
-            <span
-              v-if="errorRateGoalState"
-              class="aw-goal"
-              :class="'goal-' + errorRateGoalState"
-            >{{ errorRateGoalState === 'ok' ? t('goalInGoal') : t('goalExceeded') }}</span>
-          </div>
-        </section>
-
-        <!-- Productivity / ROI: active time, $/hour, $/commit, $/edit -->
-        <section
-          v-if="sectionVisible('productivity') && hasProductivity"
-          :style="{ order: sectionOrder('productivity') }"
-          class="aw-kpis"
-        >
-          <div class="aw-kpi" :title="t('prodActiveTimeHint')">
-            <button
-              class="aw-kpi-help"
-              :title="t(tilePopover?.key === 'prodActiveTimeHelp' ? 'hideHelp' : 'showHelp')"
-              :aria-expanded="tilePopover?.key === 'prodActiveTimeHelp'"
-              @click="toggleTilePopover('prodActiveTimeHelp', $event)"
-            >?</button>
-            <div class="aw-kpi-val">{{ fmtDuration(data.productivity.active_ms) }}</div>
-            <div class="aw-kpi-lbl">{{ t("prodActiveTime") }}</div>
-          </div>
-          <div
-            class="aw-kpi"
-            :class="costPerHourGoalState ? 'goal-' + costPerHourGoalState : ''"
-            :title="data.productivity.cost_per_active_hour === null ? t('prodNoActiveTime') : ''"
-          >
-            <button
-              class="aw-kpi-help"
-              :title="t(tilePopover?.key === 'prodCostPerHourHelp' ? 'hideHelp' : 'showHelp')"
-              :aria-expanded="tilePopover?.key === 'prodCostPerHourHelp'"
-              @click="toggleTilePopover('prodCostPerHourHelp', $event)"
-            >?</button>
-            <div class="aw-kpi-val">{{ fmtCostOrDash(data.productivity.cost_per_active_hour) }}</div>
-            <div class="aw-kpi-lbl">{{ t("prodCostPerHour") }}</div>
-            <span
-              class="aw-trend"
-              :class="'t-' + trendCostPerHour.cls"
-              :title="trendCostPerHour.arrow === 'none' ? t('trendNoData') : t('trendVsPrev')"
-            >
-              <span class="aw-trend-arrow" :data-dir="trendCostPerHour.arrow"></span>{{ trendCostPerHour.text }}
-            </span>
-            <span
-              v-if="costPerHourGoalState"
-              class="aw-goal"
-              :class="'goal-' + costPerHourGoalState"
-            >{{ costPerHourGoalState === 'ok' ? t('goalInGoal') : t('goalExceeded') }}</span>
-          </div>
-          <div
-            class="aw-kpi"
-            :title="data.productivity.tokens_per_active_minute === null ? t('prodNoActiveTime') : ''"
-          >
-            <button
-              class="aw-kpi-help"
-              :title="t(tilePopover?.key === 'prodTokensPerMinHelp' ? 'hideHelp' : 'showHelp')"
-              :aria-expanded="tilePopover?.key === 'prodTokensPerMinHelp'"
-              @click="toggleTilePopover('prodTokensPerMinHelp', $event)"
-            >?</button>
-            <div class="aw-kpi-val">{{ fmtTokensOrDash(data.productivity.tokens_per_active_minute) }}</div>
-            <div class="aw-kpi-lbl">{{ t("prodTokensPerMin") }}</div>
-          </div>
-          <div class="aw-kpi">
-            <button
-              class="aw-kpi-help"
-              :title="t(tilePopover?.key === 'prodCommitsHelp' ? 'hideHelp' : 'showHelp')"
-              :aria-expanded="tilePopover?.key === 'prodCommitsHelp'"
-              @click="toggleTilePopover('prodCommitsHelp', $event)"
-            >?</button>
-            <div class="aw-kpi-val">{{ data.productivity.git_commits }}</div>
-            <div class="aw-kpi-lbl">{{ t("prodCommits") }}</div>
-          </div>
-          <div
-            class="aw-kpi"
-            :title="data.productivity.cost_per_commit === null ? t('prodNoCommits') : ''"
-          >
-            <button
-              class="aw-kpi-help"
-              :title="t(tilePopover?.key === 'prodCostPerCommitHelp' ? 'hideHelp' : 'showHelp')"
-              :aria-expanded="tilePopover?.key === 'prodCostPerCommitHelp'"
-              @click="toggleTilePopover('prodCostPerCommitHelp', $event)"
-            >?</button>
-            <div class="aw-kpi-val">{{ fmtCostOrDash(data.productivity.cost_per_commit) }}</div>
-            <div class="aw-kpi-lbl">{{ t("prodCostPerCommit") }}</div>
-          </div>
-          <div class="aw-kpi">
-            <button
-              class="aw-kpi-help"
-              :title="t(tilePopover?.key === 'prodEditsHelp' ? 'hideHelp' : 'showHelp')"
-              :aria-expanded="tilePopover?.key === 'prodEditsHelp'"
-              @click="toggleTilePopover('prodEditsHelp', $event)"
-            >?</button>
-            <div class="aw-kpi-val">{{ data.productivity.edits }}</div>
-            <div class="aw-kpi-lbl">{{ t("prodEdits") }}</div>
-          </div>
-          <div class="aw-kpi" :title="t('prodEditsHint')">
-            <button
-              class="aw-kpi-help"
-              :title="t(tilePopover?.key === 'prodCostPerEditHelp' ? 'hideHelp' : 'showHelp')"
-              :aria-expanded="tilePopover?.key === 'prodCostPerEditHelp'"
-              @click="toggleTilePopover('prodCostPerEditHelp', $event)"
-            >?</button>
-            <div class="aw-kpi-val">{{ fmtCostOrDash(data.productivity.cost_per_edit) }}</div>
-            <div class="aw-kpi-lbl">{{ t("prodCostPerEdit") }}</div>
-          </div>
-        </section>
-
-        <!-- Recommendations — actionable insights (backend no longer emits observations) -->
-        <section
-          v-if="sectionVisible('insights') && data.insights.length"
-          :style="{ order: sectionOrder('insights') }"
-          class="aw-insights-block"
-        >
-          <div class="aw-insights-hd">
-            {{ t("sectionInsights") }}
-            <span class="aw-tab-count">{{ activeInsights.length }}</span>
-          </div>
-          <div v-if="activeInsights.length" class="aw-insights">
+        <!-- ===== Overview: KPI totals + quality headline tiles + productivity + cost ===== -->
+        <div v-if="activeTab === 'overview'" class="aw-panel">
+          <div class="aw-group-hd">{{ t("sectionKpi") }}</div>
+          <section class="aw-kpis">
+            <div class="aw-kpi">
+              <div class="aw-kpi-val">{{ fmtCost(data.totals.cost) }}</div>
+              <div class="aw-kpi-lbl">{{ t("analyticsTotal") }}</div>
+              <span
+                class="aw-trend"
+                :class="'t-' + trendCost.cls"
+                :title="trendCost.arrow === 'none' ? t('trendNoData') : t('trendVsPrev')"
+              >
+                <span class="aw-trend-arrow" :data-dir="trendCost.arrow"></span>{{ trendCost.text }}
+              </span>
+            </div>
+            <div class="aw-kpi">
+              <div class="aw-kpi-val">{{ fmtTokens(data.totals.total_tokens) }}</div>
+              <div class="aw-kpi-lbl">{{ t("metricTokens") }}</div>
+              <span
+                class="aw-trend"
+                :class="'t-' + trendTokens.cls"
+                :title="trendTokens.arrow === 'none' ? t('trendNoData') : t('trendVsPrev')"
+              >
+                <span class="aw-trend-arrow" :data-dir="trendTokens.arrow"></span>{{ trendTokens.text }}
+              </span>
+            </div>
+            <div class="aw-kpi">
+              <div class="aw-kpi-val">{{ data.totals.sessions }}</div>
+              <div class="aw-kpi-lbl">{{ t("analyticsPerSession") }}</div>
+            </div>
+            <div class="aw-kpi" :title="t('subagentKpiHint')">
+              <div class="aw-kpi-val">{{ data.subagent_summary.subagent_messages }}</div>
+              <div class="aw-kpi-lbl">{{ t("subagentKpiLabel") }}</div>
+            </div>
             <div
-              v-for="ins in activeInsights"
-              :key="ins.kind"
-              class="aw-insight"
-              :data-kind="ins.kind"
-              :data-category="ins.category"
+              v-if="data.totals.input + data.totals.cache_read > 0"
+              class="aw-kpi"
+              :title="t('kpiHitRatioHint')"
             >
-              <div class="aw-insight-row">
-                <span class="aw-insight-tag">{{ t("insight") }}</span>
-                <span class="aw-insight-text">{{ insightText(ins) }}</span>
+              <button
+                class="aw-kpi-help"
+                :title="t(tilePopover?.key === 'kpiHitRatioHelp' ? 'hideHelp' : 'showHelp')"
+                :aria-expanded="tilePopover?.key === 'kpiHitRatioHelp'"
+                @click="toggleTilePopover('kpiHitRatioHelp', $event)"
+              >?</button>
+              <div class="aw-kpi-val">{{ (data.totals.cache_hit_ratio * 100).toFixed(0) }}%</div>
+              <div class="aw-kpi-lbl">{{ t("kpiHitRatio") }}</div>
+              <span
+                class="aw-trend"
+                :class="'t-' + trendCacheHit.cls"
+                :title="trendCacheHit.arrow === 'none' ? t('trendNoData') : t('trendVsPrev')"
+              >
+                <span class="aw-trend-arrow" :data-dir="trendCacheHit.arrow"></span>{{ trendCacheHit.text }}
+              </span>
+            </div>
+            <div class="aw-kpi" :title="t('kpiCacheSavingsHint')">
+              <button
+                class="aw-kpi-help"
+                :title="t(tilePopover?.key === 'kpiCacheSavingsHelp' ? 'hideHelp' : 'showHelp')"
+                :aria-expanded="tilePopover?.key === 'kpiCacheSavingsHelp'"
+                @click="toggleTilePopover('kpiCacheSavingsHelp', $event)"
+              >?</button>
+              <div class="aw-kpi-val">{{ fmtCost(data.totals.cache_savings_usd) }}</div>
+              <div class="aw-kpi-lbl">{{ t("kpiCacheSavings") }}</div>
+            </div>
+          </section>
+
+          <!-- Session quality: service-tier split + tool error rate (prominent tiles) -->
+          <section v-if="hasQuality" class="aw-kpis aw-headline">
+            <div
+              v-if="data.tier_breakdown.standard_pct !== null"
+              class="aw-kpi"
+              :title="t('qualityTierHint')"
+            >
+              <button
+                class="aw-kpi-help"
+                :title="t(tilePopover?.key === 'qualityTierHelp' ? 'hideHelp' : 'showHelp')"
+                :aria-expanded="tilePopover?.key === 'qualityTierHelp'"
+                @click="toggleTilePopover('qualityTierHelp', $event)"
+              >?</button>
+              <div class="aw-kpi-val">{{ fmtPct(data.tier_breakdown.standard_pct) }}</div>
+              <div class="aw-kpi-lbl">{{ t("qualityTierLabel") }}</div>
+            </div>
+            <div
+              v-if="data.tool_error.error_rate !== null"
+              class="aw-kpi"
+              :class="errorRateGoalState ? 'goal-' + errorRateGoalState : ''"
+              :title="t('qualityErrorHint')"
+            >
+              <button
+                class="aw-kpi-help"
+                :title="t(tilePopover?.key === 'qualityErrorHelp' ? 'hideHelp' : 'showHelp')"
+                :aria-expanded="tilePopover?.key === 'qualityErrorHelp'"
+                @click="toggleTilePopover('qualityErrorHelp', $event)"
+              >?</button>
+              <div class="aw-kpi-val">{{ fmtPct(data.tool_error.error_rate) }}</div>
+              <div class="aw-kpi-lbl">{{ t("qualityErrorLabel") }}</div>
+              <span
+                class="aw-trend"
+                :class="'t-' + trendErrorRate.cls"
+                :title="trendErrorRate.arrow === 'none' ? t('trendNoData') : t('trendVsPrev')"
+              >
+                <span class="aw-trend-arrow" :data-dir="trendErrorRate.arrow"></span>{{ trendErrorRate.text }}
+              </span>
+              <span
+                v-if="errorRateGoalState"
+                class="aw-goal"
+                :class="'goal-' + errorRateGoalState"
+              >{{ errorRateGoalState === 'ok' ? t('goalInGoal') : t('goalExceeded') }}</span>
+            </div>
+          </section>
+
+          <!-- Productivity / ROI: active time, $/hour, $/commit, $/edit -->
+          <template v-if="hasProductivity">
+            <div class="aw-group-hd">{{ t("sectionProductivity") }}</div>
+            <section class="aw-kpis">
+              <div class="aw-kpi" :title="t('prodActiveTimeHint')">
                 <button
-                  v-if="helpAvailable(ins.kind)"
-                  class="aw-insight-help"
-                  :title="t(expandedHelp.has(ins.kind) ? 'hideHelp' : 'showHelp')"
-                  :aria-expanded="expandedHelp.has(ins.kind)"
-                  @click="toggleHelp(ins.kind)"
+                  class="aw-kpi-help"
+                  :title="t(tilePopover?.key === 'prodActiveTimeHelp' ? 'hideHelp' : 'showHelp')"
+                  :aria-expanded="tilePopover?.key === 'prodActiveTimeHelp'"
+                  @click="toggleTilePopover('prodActiveTimeHelp', $event)"
                 >?</button>
-                <button
-                  class="aw-insight-x"
-                  :title="t('ignoreInsight')"
-                  @click="ignoreInsight(ins.kind)"
-                >×</button>
-              </div>
-              <ul v-if="ins.kind === 'cold_rewrites'" class="aw-cold-causes">
-                <li
-                  v-for="c in coldCauses(ins)"
-                  :key="c.cause"
-                  class="aw-cold-cause"
-                >
-                  <span class="aw-cold-cause-label">{{ c.label }}</span>
-                  <span class="aw-cold-cause-val">{{ c.n }} × {{ c.cost }}</span>
-                </li>
-              </ul>
-              <div v-if="ins.kind === 'cold_rewrites'" class="aw-cold-fix">
-                {{ t('insightColdRewritesFix') }}
+                <div class="aw-kpi-val">{{ fmtDuration(data.productivity.active_ms) }}</div>
+                <div class="aw-kpi-lbl">{{ t("prodActiveTime") }}</div>
               </div>
               <div
-                v-if="expandedHelp.has(ins.kind)"
-                class="aw-insight-help-body"
-                v-html="helpHtml(ins.kind)"
-              ></div>
-              <div v-if="affectedOf(ins).length" class="aw-affected">
-                <button class="aw-link-btn" @click="toggleAffected(ins.kind)">
-                  {{ expandedAffected.has(ins.kind) ? t('hideSessions') : t('showAffectedSessions') + ' (' + affectedOf(ins).length + ')' }}
-                </button>
-                <ul v-if="expandedAffected.has(ins.kind)" class="aw-affected-list">
-                  <li v-for="a in affectedOf(ins)" :key="a.session_id" class="aw-affected-item">
-                    <button
-                      class="aw-row-id"
-                      @click="copyId(a.session_id)"
-                      :title="t('copySession') + ': ' + a.session_id"
-                    >{{ shortId(a.session_id) }}</button>
-                    <span class="aw-row-proj">{{ projectName(a.project) }}</span>
-                    <span class="aw-row-val">{{ fmtCost(a.cost) }}</span>
-                  </li>
-                </ul>
+                class="aw-kpi"
+                :class="costPerHourGoalState ? 'goal-' + costPerHourGoalState : ''"
+                :title="data.productivity.cost_per_active_hour === null ? t('prodNoActiveTime') : ''"
+              >
+                <button
+                  class="aw-kpi-help"
+                  :title="t(tilePopover?.key === 'prodCostPerHourHelp' ? 'hideHelp' : 'showHelp')"
+                  :aria-expanded="tilePopover?.key === 'prodCostPerHourHelp'"
+                  @click="toggleTilePopover('prodCostPerHourHelp', $event)"
+                >?</button>
+                <div class="aw-kpi-val">{{ fmtCostOrDash(data.productivity.cost_per_active_hour) }}</div>
+                <div class="aw-kpi-lbl">{{ t("prodCostPerHour") }}</div>
+                <span
+                  class="aw-trend"
+                  :class="'t-' + trendCostPerHour.cls"
+                  :title="trendCostPerHour.arrow === 'none' ? t('trendNoData') : t('trendVsPrev')"
+                >
+                  <span class="aw-trend-arrow" :data-dir="trendCostPerHour.arrow"></span>{{ trendCostPerHour.text }}
+                </span>
+                <span
+                  v-if="costPerHourGoalState"
+                  class="aw-goal"
+                  :class="'goal-' + costPerHourGoalState"
+                >{{ costPerHourGoalState === 'ok' ? t('goalInGoal') : t('goalExceeded') }}</span>
               </div>
-            </div>
-          </div>
-          <div v-else class="aw-insights-empty">{{ t("insightEmpty") }}</div>
-
-          <!-- Hidden insights — restorable -->
-          <details v-if="ignoredInsights.length" class="aw-ignored">
-            <summary>{{ t('hiddenInsights') }} ({{ ignoredInsights.length }})</summary>
-            <div class="aw-ignored-list">
-              <div v-for="ins in ignoredInsights" :key="'h' + ins.kind" class="aw-ignored-row">
-                <span class="aw-ignored-text">{{ insightText(ins) }}</span>
-                <button class="aw-link-btn" @click="restoreInsight(ins.kind)">
-                  {{ t('restore') }}
-                </button>
+              <div
+                class="aw-kpi"
+                :title="data.productivity.tokens_per_active_minute === null ? t('prodNoActiveTime') : ''"
+              >
+                <button
+                  class="aw-kpi-help"
+                  :title="t(tilePopover?.key === 'prodTokensPerMinHelp' ? 'hideHelp' : 'showHelp')"
+                  :aria-expanded="tilePopover?.key === 'prodTokensPerMinHelp'"
+                  @click="toggleTilePopover('prodTokensPerMinHelp', $event)"
+                >?</button>
+                <div class="aw-kpi-val">{{ fmtTokensOrDash(data.productivity.tokens_per_active_minute) }}</div>
+                <div class="aw-kpi-lbl">{{ t("prodTokensPerMin") }}</div>
               </div>
-            </div>
-          </details>
-        </section>
+              <div class="aw-kpi">
+                <button
+                  class="aw-kpi-help"
+                  :title="t(tilePopover?.key === 'prodCommitsHelp' ? 'hideHelp' : 'showHelp')"
+                  :aria-expanded="tilePopover?.key === 'prodCommitsHelp'"
+                  @click="toggleTilePopover('prodCommitsHelp', $event)"
+                >?</button>
+                <div class="aw-kpi-val">{{ data.productivity.git_commits }}</div>
+                <div class="aw-kpi-lbl">{{ t("prodCommits") }}</div>
+              </div>
+              <div
+                class="aw-kpi"
+                :title="data.productivity.cost_per_commit === null ? t('prodNoCommits') : ''"
+              >
+                <button
+                  class="aw-kpi-help"
+                  :title="t(tilePopover?.key === 'prodCostPerCommitHelp' ? 'hideHelp' : 'showHelp')"
+                  :aria-expanded="tilePopover?.key === 'prodCostPerCommitHelp'"
+                  @click="toggleTilePopover('prodCostPerCommitHelp', $event)"
+                >?</button>
+                <div class="aw-kpi-val">{{ fmtCostOrDash(data.productivity.cost_per_commit) }}</div>
+                <div class="aw-kpi-lbl">{{ t("prodCostPerCommit") }}</div>
+              </div>
+              <div class="aw-kpi">
+                <button
+                  class="aw-kpi-help"
+                  :title="t(tilePopover?.key === 'prodEditsHelp' ? 'hideHelp' : 'showHelp')"
+                  :aria-expanded="tilePopover?.key === 'prodEditsHelp'"
+                  @click="toggleTilePopover('prodEditsHelp', $event)"
+                >?</button>
+                <div class="aw-kpi-val">{{ data.productivity.edits }}</div>
+                <div class="aw-kpi-lbl">{{ t("prodEdits") }}</div>
+              </div>
+              <div class="aw-kpi" :title="t('prodEditsHint')">
+                <button
+                  class="aw-kpi-help"
+                  :title="t(tilePopover?.key === 'prodCostPerEditHelp' ? 'hideHelp' : 'showHelp')"
+                  :aria-expanded="tilePopover?.key === 'prodCostPerEditHelp'"
+                  @click="toggleTilePopover('prodCostPerEditHelp', $event)"
+                >?</button>
+                <div class="aw-kpi-val">{{ fmtCostOrDash(data.productivity.cost_per_edit) }}</div>
+                <div class="aw-kpi-lbl">{{ t("prodCostPerEdit") }}</div>
+              </div>
+            </section>
+          </template>
 
-        <!-- Charts -->
-        <section
-          v-if="sectionVisible('charts')"
-          :style="{ order: sectionOrder('charts') }"
-          class="aw-grid"
-        >
+          <!-- Headline cost chart -->
           <div class="aw-card">
             <div class="aw-card-hd">{{ t("chartCost") }}</div>
             <div class="aw-chart"><canvas ref="costCanvas"></canvas></div>
           </div>
-          <div class="aw-card">
-            <div class="aw-card-hd">{{ t("chartTokens") }}</div>
-            <div class="aw-chart"><canvas ref="tokenCanvas"></canvas></div>
-          </div>
-        </section>
+        </div>
 
-        <!-- Subagents -->
-        <section
-          v-if="sectionVisible('subagents') && data.by_subagent.length"
-          :style="{ order: sectionOrder('subagents') }"
-          class="aw-card"
-        >
-          <div class="aw-card-hd">
-            {{ t("subagentBreakdown") }}
-            <span class="aw-sub">
-              {{ data.subagent_summary.subagent_sessions }} {{ t("subagentSessionsShort") }} ·
-              {{ fmtCost(data.subagent_summary.subagent_cost) }}
-            </span>
-          </div>
-          <table class="aw-table">
-            <thead>
-              <tr>
-                <th>{{ t("subagentAgent") }}</th>
-                <th>{{ t("subagentMessages") }}</th>
-                <th>{{ t("subagentSessions") }}</th>
-                <th>{{ t("metricTokens") }}</th>
-                <th>{{ t("analyticsTotal") }}</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="s in data.by_subagent" :key="s.agent_name">
-                <td>{{ s.agent_name }}</td>
-                <td>{{ s.messages }}</td>
-                <td>{{ s.sessions }}</td>
-                <td>{{ fmtTokens(s.total_tokens) }}</td>
-                <td>{{ fmtCost(s.cost) }}</td>
-              </tr>
-            </tbody>
-          </table>
-        </section>
+        <!-- ===== Trends: cost + tokens charts ===== -->
+        <div v-if="activeTab === 'trends'" class="aw-panel">
+          <section class="aw-grid">
+            <div class="aw-card">
+              <div class="aw-card-hd">{{ t("chartCost") }}</div>
+              <div class="aw-chart"><canvas ref="costCanvas2"></canvas></div>
+            </div>
+            <div class="aw-card">
+              <div class="aw-card-hd">{{ t("chartTokens") }}</div>
+              <div class="aw-chart"><canvas ref="tokenCanvas"></canvas></div>
+            </div>
+          </section>
+        </div>
 
-        <!-- Tool breakdown — search + top-3 by default, "Show more" reveals long tail -->
-        <section
-          v-if="sectionVisible('tools') && data.tool_breakdown.length"
-          :style="{ order: sectionOrder('tools') }"
-          class="aw-card"
-        >
-          <div class="aw-card-hd">
-            {{ t("toolBreakdown") }}
-            <span class="aw-sub">{{ t("toolBreakdownHint") }}</span>
-            <input
-              v-model="toolSearch"
-              class="aw-search"
-              type="search"
-              :placeholder="t('toolSearchPlaceholder')"
-            />
-          </div>
-          <table v-if="visibleTools.length" class="aw-table">
-            <thead>
-              <tr>
-                <th>{{ t("toolName") }}</th>
-                <th>{{ t("toolCalls") }}</th>
-                <th>{{ t("toolMessages") }}</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="tu in visibleTools" :key="tu.tool_name">
-                <td>{{ tu.tool_name }}</td>
-                <td>{{ tu.calls.toLocaleString() }}</td>
-                <td>{{ tu.messages.toLocaleString() }}</td>
-              </tr>
-            </tbody>
-          </table>
-          <div v-else class="aw-insights-empty">{{ t('toolSearchEmpty') }}</div>
-          <button
-            v-if="!toolSearch.trim() && data.tool_breakdown.length > TOOL_COLLAPSED_N"
-            class="aw-link-btn"
-            @click="toolExpanded = !toolExpanded"
-          >
-            {{ toolExpanded ? t("showLess") : t("showMore") + ' (' + (data.tool_breakdown.length - TOOL_COLLAPSED_N) + ')' }}
-          </button>
-        </section>
-
-        <!-- Costly sessions -->
-        <section
-          v-if="sectionVisible('costly')"
-          :style="{ order: sectionOrder('costly') }"
-          class="aw-grid"
-        >
-          <div class="aw-card">
-            <div class="aw-card-hd">{{ t("costlyByCost") }}</div>
-            <div class="aw-list">
-              <div v-for="s in data.costly_by_cost" :key="'c' + s.session_id" class="aw-row">
-                <div class="aw-row-line">
-                  <span class="aw-row-when">{{ fmtWhen(s.start) }}</span>
-                  <span v-if="!projectFilter" class="aw-row-proj">{{ projectName(s.project) }}</span>
-                  <button
-                    class="aw-row-id"
-                    @click="copyId(s.session_id)"
-                    :title="t('copySession') + ': ' + s.session_id"
-                  >{{ shortId(s.session_id) }}</button>
-                  <span class="aw-row-val">{{ fmtCost(s.cost) }}</span>
-                </div>
-                <div class="aw-row-bar">
-                  <span :style="{ width: (maxCost(data.costly_by_cost) ? (s.cost / maxCost(data.costly_by_cost)) * 100 : 0) + '%' }"></span>
+        <!-- ===== Sessions: costly by cost + by cache ===== -->
+        <div v-if="activeTab === 'sessions'" class="aw-panel">
+          <section class="aw-grid">
+            <div class="aw-card">
+              <div class="aw-card-hd">{{ t("costlyByCost") }}</div>
+              <div class="aw-list">
+                <div v-for="s in data.costly_by_cost" :key="'c' + s.session_id" class="aw-row">
+                  <div class="aw-row-line">
+                    <span class="aw-row-when">{{ fmtWhen(s.start) }}</span>
+                    <span v-if="!projectFilter" class="aw-row-proj">{{ projectName(s.project) }}</span>
+                    <button
+                      class="aw-row-id"
+                      @click="copyId(s.session_id)"
+                      :title="t('copySession') + ': ' + s.session_id"
+                    >{{ shortId(s.session_id) }}</button>
+                    <span class="aw-row-val">{{ fmtCost(s.cost) }}</span>
+                  </div>
+                  <div class="aw-row-bar">
+                    <span :style="{ width: (maxCost(data.costly_by_cost) ? (s.cost / maxCost(data.costly_by_cost)) * 100 : 0) + '%' }"></span>
+                  </div>
                 </div>
               </div>
             </div>
-          </div>
-          <div class="aw-card">
+            <div class="aw-card">
+              <div class="aw-card-hd">
+                {{ t("costlyByCache") }}
+                <span class="aw-sub">{{ t("costlyByCacheHint") }}</span>
+              </div>
+              <div class="aw-list">
+                <div v-for="s in data.costly_by_cache" :key="'k' + s.session_id" class="aw-row">
+                  <div class="aw-row-line">
+                    <span class="aw-row-when">{{ fmtWhen(s.start) }}</span>
+                    <span v-if="!projectFilter" class="aw-row-proj">{{ projectName(s.project) }}</span>
+                    <button
+                      class="aw-row-id"
+                      @click="copyId(s.session_id)"
+                      :title="t('copySession') + ': ' + s.session_id"
+                    >{{ shortId(s.session_id) }}</button>
+                    <span class="aw-row-val">{{ fmtTokens(s.cache_create) }}</span>
+                  </div>
+                  <div class="aw-row-bar">
+                    <span :style="{ width: (maxCache(data.costly_by_cache) ? (s.cache_create / maxCache(data.costly_by_cache)) * 100 : 0) + '%' }"></span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </section>
+        </div>
+
+        <!-- ===== Tools: tool breakdown + subagents ===== -->
+        <div v-if="activeTab === 'tools'" class="aw-panel">
+          <!-- Tool breakdown — search + top-3 by default, "Show more" reveals long tail -->
+          <section v-if="data.tool_breakdown.length" class="aw-card">
             <div class="aw-card-hd">
-              {{ t("costlyByCache") }}
-              <span class="aw-sub">{{ t("costlyByCacheHint") }}</span>
+              {{ t("toolBreakdown") }}
+              <span class="aw-sub">{{ t("toolBreakdownHint") }}</span>
+              <input
+                v-model="toolSearch"
+                class="aw-search"
+                type="search"
+                :placeholder="t('toolSearchPlaceholder')"
+              />
             </div>
-            <div class="aw-list">
-              <div v-for="s in data.costly_by_cache" :key="'k' + s.session_id" class="aw-row">
-                <div class="aw-row-line">
-                  <span class="aw-row-when">{{ fmtWhen(s.start) }}</span>
-                  <span v-if="!projectFilter" class="aw-row-proj">{{ projectName(s.project) }}</span>
-                  <button
-                    class="aw-row-id"
-                    @click="copyId(s.session_id)"
-                    :title="t('copySession') + ': ' + s.session_id"
-                  >{{ shortId(s.session_id) }}</button>
-                  <span class="aw-row-val">{{ fmtTokens(s.cache_create) }}</span>
+            <table v-if="visibleTools.length" class="aw-table">
+              <thead>
+                <tr>
+                  <th>{{ t("toolName") }}</th>
+                  <th>{{ t("toolCalls") }}</th>
+                  <th>{{ t("toolMessages") }}</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="tu in visibleTools" :key="tu.tool_name">
+                  <td>{{ tu.tool_name }}</td>
+                  <td>{{ tu.calls.toLocaleString() }}</td>
+                  <td>{{ tu.messages.toLocaleString() }}</td>
+                </tr>
+              </tbody>
+            </table>
+            <div v-else class="aw-insights-empty">{{ t('toolSearchEmpty') }}</div>
+            <button
+              v-if="!toolSearch.trim() && data.tool_breakdown.length > TOOL_COLLAPSED_N"
+              class="aw-link-btn"
+              @click="toolExpanded = !toolExpanded"
+            >
+              {{ toolExpanded ? t("showLess") : t("showMore") + ' (' + (data.tool_breakdown.length - TOOL_COLLAPSED_N) + ')' }}
+            </button>
+          </section>
+
+          <!-- Subagents -->
+          <section v-if="data.by_subagent.length" class="aw-card">
+            <div class="aw-card-hd">
+              {{ t("subagentBreakdown") }}
+              <span class="aw-sub">
+                {{ data.subagent_summary.subagent_sessions }} {{ t("subagentSessionsShort") }} ·
+                {{ fmtCost(data.subagent_summary.subagent_cost) }}
+              </span>
+            </div>
+            <table class="aw-table">
+              <thead>
+                <tr>
+                  <th>{{ t("subagentAgent") }}</th>
+                  <th>{{ t("subagentMessages") }}</th>
+                  <th>{{ t("subagentSessions") }}</th>
+                  <th>{{ t("metricTokens") }}</th>
+                  <th>{{ t("analyticsTotal") }}</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="s in data.by_subagent" :key="s.agent_name">
+                  <td>{{ s.agent_name }}</td>
+                  <td>{{ s.messages }}</td>
+                  <td>{{ s.sessions }}</td>
+                  <td>{{ fmtTokens(s.total_tokens) }}</td>
+                  <td>{{ fmtCost(s.cost) }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </section>
+
+          <div v-if="!data.tool_breakdown.length && !data.by_subagent.length" class="aw-empty-inline">
+            {{ t("insightEmpty") }}
+          </div>
+        </div>
+
+        <!-- ===== Insights: actionable recommendations ===== -->
+        <div v-if="activeTab === 'insights'" class="aw-panel">
+          <section class="aw-insights-block">
+            <div class="aw-insights-hd">
+              {{ t("sectionInsights") }}
+              <span class="aw-tab-count">{{ activeInsights.length }}</span>
+            </div>
+            <div v-if="activeInsights.length" class="aw-insights">
+              <div
+                v-for="ins in activeInsights"
+                :key="ins.kind"
+                class="aw-insight"
+                :data-kind="ins.kind"
+              >
+                <span class="aw-insight-tag">{{ t("insight") }}</span>
+                <div class="aw-insight-body">
+                  <div class="aw-insight-text">{{ insightText(ins) }}</div>
+                  <ul v-if="ins.kind === 'cold_rewrites'" class="aw-cold-causes">
+                    <li
+                      v-for="c in coldCauses(ins)"
+                      :key="c.cause"
+                      class="aw-cold-cause"
+                    >
+                      <span class="aw-cold-cause-label">{{ c.label }}</span>
+                      <span class="aw-cold-cause-val">{{ c.n }} × {{ c.cost }}</span>
+                    </li>
+                  </ul>
+                  <div v-if="ins.kind === 'cold_rewrites'" class="aw-cold-fix">
+                    {{ t('insightColdRewritesFix') }}
+                  </div>
+                  <div
+                    v-if="affectedOf(ins).length || helpAvailable(ins.kind)"
+                    class="aw-insight-links"
+                  >
+                    <button
+                      v-if="affectedOf(ins).length"
+                      class="aw-link-btn"
+                      @click="toggleAffected(ins.kind)"
+                    >
+                      {{ expandedAffected.has(ins.kind) ? t('hideSessions') : t('showAffectedSessions') + ' (' + affectedOf(ins).length + ')' }}
+                    </button>
+                    <button
+                      v-if="helpAvailable(ins.kind)"
+                      class="aw-link-btn"
+                      :aria-expanded="expandedHelp.has(ins.kind)"
+                      @click="toggleHelp(ins.kind)"
+                    >
+                      {{ t(expandedHelp.has(ins.kind) ? 'hideHelp' : 'showHelp') }}
+                    </button>
+                  </div>
+                  <ul v-if="expandedAffected.has(ins.kind)" class="aw-affected-list">
+                    <li v-for="a in affectedOf(ins)" :key="a.session_id" class="aw-affected-item">
+                      <button
+                        class="aw-row-id"
+                        @click="copyId(a.session_id)"
+                        :title="t('copySession') + ': ' + a.session_id"
+                      >{{ shortId(a.session_id) }}</button>
+                      <span class="aw-row-proj">{{ projectName(a.project) }}</span>
+                      <span class="aw-row-val">{{ fmtCost(a.cost) }}</span>
+                    </li>
+                  </ul>
+                  <div
+                    v-if="expandedHelp.has(ins.kind)"
+                    class="aw-insight-help-body"
+                    v-html="helpHtml(ins.kind)"
+                  ></div>
                 </div>
-                <div class="aw-row-bar">
-                  <span :style="{ width: (maxCache(data.costly_by_cache) ? (s.cache_create / maxCache(data.costly_by_cache)) * 100 : 0) + '%' }"></span>
-                </div>
+                <button
+                  class="aw-insight-x"
+                  :title="t('ignoreInsight')"
+                  @click="ignoreInsight(ins.kind)"
+                >
+                  <svg width="11" height="11" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round">
+                    <path d="M0 0L10 10M10 0L0 10" />
+                  </svg>
+                </button>
               </div>
             </div>
-          </div>
-        </section>
+            <div v-else class="aw-insights-empty">{{ t("insightEmpty") }}</div>
+
+            <!-- Hidden insights — restorable -->
+            <details v-if="ignoredInsights.length" class="aw-ignored">
+              <summary>{{ t('hiddenInsights') }} ({{ ignoredInsights.length }})</summary>
+              <div class="aw-ignored-list">
+                <div v-for="ins in ignoredInsights" :key="'h' + ins.kind" class="aw-ignored-row">
+                  <span class="aw-ignored-text">{{ insightText(ins) }}</span>
+                  <button class="aw-link-btn" @click="restoreInsight(ins.kind)">
+                    {{ t('restore') }}
+                  </button>
+                </div>
+              </div>
+            </details>
+          </section>
+        </div>
       </template>
     </main>
 
@@ -1479,6 +1525,11 @@ onUnmounted(() => {
   background: var(--bg, #1a1a1a);
   color: var(--text, #e8e8e8);
   font-family: var(--segoe);
+  /* Claude-code orange accent for this window's controls (matches the cost
+     chart line), instead of the app-wide Win11 blue. Overriding the token here
+     repaints every `var(--accent)` control inside the window at once. */
+  --accent: #d97757;
+  --accent-soft: rgba(217, 119, 87, 0.18);
 }
 .aw-head {
   padding: 12px 16px;
@@ -1510,15 +1561,20 @@ onUnmounted(() => {
 .aw-filters input,
 .aw-filters select {
   background: rgba(255, 255, 255, 0.04);
-  border: 1px solid var(--stroke-strong, rgba(255, 255, 255, 0.12));
-  color: var(--text, #e8e8e8);
-  border-radius: 6px;
+  border: 1px solid var(--stroke-strong);
+  color: var(--text);
+  border-radius: var(--card-radius);
   padding: 5px 8px;
   font-size: 12px;
   font-family: var(--segoe);
   /* Hints the platform to render the dropdown in a dark colour scheme so the
      OS popup menu (which the WebView can't fully restyle) picks dark fg/bg. */
   color-scheme: dark;
+}
+.aw-filters input:focus,
+.aw-filters select:focus {
+  outline: none;
+  border-color: var(--accent);
 }
 /* `<option>` is system-painted on Windows — set explicit colours so the
    dropdown isn't white-on-white in dark mode. */
@@ -1528,37 +1584,90 @@ onUnmounted(() => {
 }
 .aw-presets {
   display: inline-flex;
-  border: 1px solid var(--stroke-strong, rgba(255, 255, 255, 0.12));
-  border-radius: 6px;
+  border: 1px solid var(--stroke-strong);
+  border-radius: var(--card-radius);
   overflow: hidden;
+  background: rgba(255, 255, 255, 0.04);
 }
 .aw-presets button {
   border: none;
   background: transparent;
-  color: var(--text-3, rgba(255, 255, 255, 0.7));
-  padding: 5px 10px;
-  font-size: 12px;
-  cursor: pointer;
-}
-.aw-presets button + button {
-  border-left: 1px solid var(--stroke-strong, rgba(255, 255, 255, 0.12));
-}
-.aw-presets button:hover {
-  background: rgba(255, 255, 255, 0.05);
-  color: var(--text);
-}
-.aw-export {
-  border: 1px solid var(--accent, #d97757);
-  background: transparent;
-  color: var(--accent, #d97757);
-  border-radius: 6px;
+  color: var(--text-2);
   padding: 5px 12px;
   font-size: 12px;
+  font-family: var(--segoe);
   cursor: pointer;
+  transition: background 120ms, color 120ms;
+}
+.aw-presets button + button {
+  border-left: 1px solid var(--stroke-strong);
+}
+.aw-presets button:hover {
+  background: var(--card-bg-hover);
+  color: var(--text);
+}
+/* Active range in the segmented control — accent fill. */
+.aw-presets button.active,
+.aw-presets button.active:hover {
+  background: var(--accent);
+  color: #fff;
+}
+.aw-export {
+  border: 1px solid transparent;
+  background: var(--accent);
+  color: #fff;
+  border-radius: var(--card-radius);
+  padding: 5px 12px;
+  font-size: 12px;
+  font-family: var(--segoe);
+  cursor: pointer;
+  transition: filter 120ms;
 }
 .aw-export:hover {
-  background: var(--accent, #d97757);
-  color: #fff;
+  filter: brightness(1.1);
+}
+
+/* Tab bar under the header — one row of buttons, the active one gets an accent
+   underline (Win11 / Fluent pivot style). */
+.aw-tabs {
+  display: flex;
+  gap: 2px;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--stroke-strong);
+  flex-wrap: wrap;
+}
+.aw-tab {
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-3);
+  padding: 10px 14px;
+  font-size: 13px;
+  font-family: var(--segoe);
+  font-weight: 500;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: -1px;
+  transition: color 120ms, border-color 120ms;
+}
+.aw-tab:hover {
+  color: var(--text);
+}
+.aw-tab.active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+.aw-tab-cnt {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-radius: 10px;
+  padding: 1px 7px;
+  font-size: 10px;
+  font-weight: 700;
+  min-width: 18px;
+  text-align: center;
 }
 
 .aw-main {
@@ -1569,6 +1678,21 @@ onUnmounted(() => {
   flex-direction: column;
   gap: 16px;
 }
+/* Each tab body stacks its sections like the old single-scroll page did. */
+.aw-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+/* Small uppercase group label inside a tab panel (e.g. "KPI summary"). */
+.aw-group-hd {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-3, rgba(255, 255, 255, 0.7));
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: -6px;
+}
 .aw-empty {
   flex: 1;
   display: flex;
@@ -1577,11 +1701,26 @@ onUnmounted(() => {
   color: var(--text-4, rgba(255, 255, 255, 0.5));
   font-size: 14px;
 }
+/* Inline empty state inside a tab panel (e.g. Tools tab with no data). */
+.aw-empty-inline {
+  color: var(--text-4, rgba(255, 255, 255, 0.5));
+  font-size: 13px;
+  font-style: italic;
+  padding: 24px 4px;
+  text-align: center;
+}
 
 .aw-kpis {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 10px;
+}
+/* Two prominent headline tiles (service tier + tool error rate). */
+.aw-kpis.aw-headline {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.aw-kpis.aw-headline .aw-kpi-val {
+  font-size: 28px;
 }
 .aw-kpi {
   position: relative;
@@ -1739,9 +1878,13 @@ onUnmounted(() => {
 }
 
 .aw-insights-block {
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--stroke-strong);
+  border-radius: 8px;
+  padding: 14px 16px;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 12px;
 }
 .aw-insights-hd {
   display: flex;
@@ -1749,24 +1892,23 @@ onUnmounted(() => {
   gap: 8px;
   font-size: 12px;
   font-weight: 600;
-  color: var(--text-3, rgba(255, 255, 255, 0.7));
+  color: var(--text-3);
   text-transform: uppercase;
   letter-spacing: 0.04em;
-  padding-bottom: 8px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
 }
+/* Solid-green count pill next to the RECOMMENDATIONS title. */
 .aw-tab-count {
-  background: rgba(108, 203, 95, 0.25);
-  color: #6ccb5f;
+  background: var(--success);
+  color: #06250a;
   border-radius: 10px;
-  padding: 1px 7px;
-  font-size: 10px;
+  padding: 1px 8px;
+  font-size: 11px;
   font-weight: 700;
   min-width: 18px;
   text-align: center;
 }
 .aw-insights-empty {
-  color: rgba(255, 255, 255, 0.45);
+  color: var(--text-4);
   font-size: 12px;
   padding: 10px 4px;
   font-style: italic;
@@ -1774,47 +1916,41 @@ onUnmounted(() => {
 .aw-insights {
   display: flex;
   flex-direction: column;
-  gap: 7px;
-}
-.aw-insight {
-  background: rgba(108, 203, 95, 0.08);
-  border: 1px solid rgba(108, 203, 95, 0.35);
-  border-radius: 7px;
-  padding: 8px 12px;
-  font-size: 13px;
-  display: flex;
-  flex-direction: column;
   gap: 8px;
 }
-.aw-insight-row {
+/* Insight row: amber tag | body (text + links) | dismiss control. Neutral dark
+   card on the panel surface — not the old green-tinted box. */
+.aw-insight {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 10px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--stroke);
+  border-radius: 8px;
+  padding: 11px 12px;
+  font-size: 13px;
+}
+.aw-insight-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
 }
 .aw-insight-text {
-  flex: 1;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-2);
+  text-wrap: pretty;
 }
-.aw-insight-help {
-  background: transparent;
-  border: 1px solid rgba(255, 255, 255, 0.25);
-  color: rgba(255, 255, 255, 0.55);
-  font-size: 11px;
-  font-weight: 600;
-  line-height: 1;
-  width: 18px;
-  height: 18px;
-  border-radius: 50%;
-  cursor: pointer;
+/* Orange text links under the insight body (affected sessions / explain). */
+.aw-insight-links {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+.aw-insight-links .aw-link-btn {
   padding: 0;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-}
-.aw-insight-help:hover,
-.aw-insight-help[aria-expanded="true"] {
-  color: rgba(255, 255, 255, 0.95);
-  border-color: rgba(255, 255, 255, 0.55);
-  background: rgba(255, 255, 255, 0.06);
 }
 .aw-insight-help-body {
   color: rgba(255, 255, 255, 0.78);
@@ -1854,24 +1990,33 @@ onUnmounted(() => {
   color: rgba(255, 255, 255, 0.95);
 }
 .aw-insight-x {
-  background: transparent;
+  flex: none;
+  width: 26px;
+  height: 26px;
+  border-radius: 4px;
   border: none;
-  color: rgba(255, 255, 255, 0.4);
-  font-size: 18px;
-  line-height: 1;
+  background: transparent;
+  color: var(--text-4);
   cursor: pointer;
-  padding: 0 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 120ms, color 120ms;
 }
 .aw-insight-x:hover {
-  color: rgba(255, 255, 255, 0.85);
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text);
 }
 .aw-cold-causes {
   list-style: none;
-  margin: 8px 0 0;
+  margin: 0;
   padding: 0;
   display: flex;
   flex-direction: column;
   gap: 4px;
+  /* Cap width so the label (left) and cost (right, space-between) stay close
+     instead of stretching across the full card body. */
+  max-width: 380px;
 }
 .aw-cold-cause {
   display: flex;
@@ -1896,10 +2041,6 @@ onUnmounted(() => {
   line-height: 1.45;
   color: var(--text-3, rgba(255, 255, 255, 0.6));
   margin-top: 8px;
-}
-.aw-affected {
-  font-size: 12px;
-  padding-left: 2px;
 }
 .aw-affected-list {
   list-style: none;
@@ -1951,40 +2092,33 @@ onUnmounted(() => {
 .aw-search {
   margin-left: auto;
   background: rgba(0, 0, 0, 0.25);
-  border: 1px solid rgba(255, 255, 255, 0.12);
+  border: 1px solid var(--stroke-strong);
   color: inherit;
-  border-radius: 5px;
+  border-radius: var(--card-radius);
   padding: 4px 10px;
   font-size: 12px;
   min-width: 180px;
 }
 .aw-search:focus {
   outline: none;
-  border-color: rgba(108, 203, 95, 0.5);
-}
-.aw-insight[data-category="recommendation"] {
-  background: rgba(232, 184, 80, 0.08);
-  border-color: rgba(232, 184, 80, 0.4);
-}
-.aw-insight[data-category="recommendation"] .aw-insight-tag {
-  background: rgba(232, 184, 80, 0.3);
-  color: #e8b850;
+  border-color: var(--accent);
 }
 .aw-insight-tag {
-  background: rgba(108, 203, 95, 0.3);
-  color: #6ccb5f;
+  flex: none;
+  margin-top: 1px;
+  background: rgba(232, 184, 80, 0.18);
+  color: #e8b850;
   border-radius: 4px;
   padding: 2px 7px;
   font-size: 10px;
   text-transform: uppercase;
   letter-spacing: 0.05em;
   font-weight: 700;
-  flex-shrink: 0;
 }
 .aw-link-btn {
   background: transparent;
   border: none;
-  color: #6ccb5f;
+  color: var(--accent);
   font-size: 12px;
   padding: 8px 0 0;
   cursor: pointer;
