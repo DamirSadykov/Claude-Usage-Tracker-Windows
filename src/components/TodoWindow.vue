@@ -108,10 +108,11 @@ const projectFocus = ref(false);
 const projectSel = ref(-1);
 const projectSuggestions = computed(() => {
   const q = fProject.value.trim().toLowerCase();
+  // Show every project containing the query — including an exact match. An
+  // earlier version hid the exact match, which made "neo" vanish while "neo4j"
+  // stayed once you'd typed the shorter name in full.
   const list = q
-    ? projects.value.filter(
-        (p) => p.toLowerCase().includes(q) && p.toLowerCase() !== q,
-      )
+    ? projects.value.filter((p) => p.toLowerCase().includes(q))
     : projects.value;
   return list.slice(0, 8);
 });
