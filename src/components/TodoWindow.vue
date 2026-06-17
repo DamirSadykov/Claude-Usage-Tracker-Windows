@@ -5,6 +5,9 @@
 // data dir, and a Claude Code SessionStart hook reads that file to surface the
 // active ones for the current project. Claude only flips `status` (and edits
 // details on request) by rewriting the same file.
+//
+// The view is a kanban board: one column per status, cards drag between columns
+// (which persists the new status). Columns mirror `todos.rs::STATUSES`.
 import { ref, computed, onMounted, onUnmounted } from "vue";
 import { useI18n, type Composer } from "vue-i18n";
 import { invoke } from "@tauri-apps/api/core";
@@ -38,7 +41,7 @@ export interface Todo {
   id: string;
   subject: string;
   description: string;
-  status: "pending" | "in_progress" | "done";
+  status: string;
   estimate_minutes?: number | null;
   scheduled_for?: string | null;
   plan: string;
@@ -47,6 +50,24 @@ export interface Todo {
   updated_at: string;
 }
 
+// Kanban columns, left to right — must match `todos.rs::STATUSES`. `dot` is the
+// column's accent colour, also used for each card's left stripe.
+interface Column {
+  id: string;
+  labelKey: string;
+  dot: string;
+}
+const COLUMNS: Column[] = [
+  { id: "backlog", labelKey: "colBacklog", dot: "#9aa0aa" },
+  { id: "queue", labelKey: "colQueue", dot: "#ffc107" },
+  { id: "in_progress", labelKey: "statusInProgress", dot: "#4cc2ff" },
+  { id: "review", labelKey: "colReview", dot: "#b388ff" },
+  { id: "done", labelKey: "statusDone", dot: "#6ccb5f" },
+];
+const COL_BY_ID: Record<string, Column> = Object.fromEntries(
+  COLUMNS.map((c) => [c.id, c]),
+);
+
 const todos = ref<Todo[]>([]);
 const loading = ref(true);
 const errorMsg = ref("");
@@ -54,6 +75,11 @@ const errorMsg = ref("");
 // Filters
 const projectFilter = ref<string>(""); // "" = all
 const showDone = ref(true);
+const search = ref("");
+
+// Drag-and-drop state: id of the card being dragged + id of the column hovered.
+const dragId = ref<string | null>(null);
+const overCol = ref<string | null>(null);
 
 // Form state (doubles as create + edit). editingId === null → creating.
 const editingId = ref<string | null>(null);
@@ -63,9 +89,9 @@ const fEstimate = ref<number | null>(null);
 const fScheduled = ref("");
 const fPlan = ref("");
 const fProject = ref("");
+// Column a freshly created task lands in (set by the column's "+" button).
+const formStatus = ref("backlog");
 const formOpen = ref(false);
-
-const STATUSES = ["pending", "in_progress", "done"] as const;
 
 // Projects the tracker has seen (from cc_usage), so the picker offers real
 // projects even before any todo uses them.
@@ -113,30 +139,46 @@ function pickProjectSel() {
     selectProject(s[projectSel.value]);
 }
 
+// Todos passing the active filters (project + search + show-done), the pool the
+// board draws from. Per-column ordering is applied in `itemsFor`.
 const visible = computed(() => {
   let list = todos.value.slice();
   if (projectFilter.value) {
     list = list.filter((t) => (t.project ?? "") === projectFilter.value);
   }
   if (!showDone.value) list = list.filter((t) => t.status !== "done");
-  // Sort: in_progress first, then pending, then done; within a group by
-  // scheduled date (unscheduled last), then most recently updated.
-  const rank = (s: string) =>
-    s === "in_progress" ? 0 : s === "pending" ? 1 : 2;
-  return list.sort((a, b) => {
-    if (rank(a.status) !== rank(b.status)) return rank(a.status) - rank(b.status);
-    const da = a.scheduled_for || "9999-99-99";
-    const db = b.scheduled_for || "9999-99-99";
-    if (da !== db) return da < db ? -1 : 1;
-    return (b.updated_at || "").localeCompare(a.updated_at || "");
-  });
+  const q = search.value.trim().toLowerCase();
+  if (q) {
+    list = list.filter(
+      (t) =>
+        t.subject.toLowerCase().includes(q) ||
+        t.description.toLowerCase().includes(q) ||
+        (t.project ?? "").toLowerCase().includes(q),
+    );
+  }
+  return list;
 });
 
-const counts = computed(() => ({
-  pending: todos.value.filter((t) => t.status === "pending").length,
-  in_progress: todos.value.filter((t) => t.status === "in_progress").length,
-  done: todos.value.filter((t) => t.status === "done").length,
-}));
+// Hide the Done column when "show done" is off — there's nothing to show there.
+const boardColumns = computed(() =>
+  showDone.value ? COLUMNS : COLUMNS.filter((c) => c.id !== "done"),
+);
+
+// Cards for one column, scheduled-first then most-recently-updated.
+function itemsFor(colId: string): Todo[] {
+  return visible.value
+    .filter((t) => t.status === colId)
+    .sort((a, b) => {
+      const da = a.scheduled_for || "9999-99-99";
+      const db = b.scheduled_for || "9999-99-99";
+      if (da !== db) return da < db ? -1 : 1;
+      return (b.updated_at || "").localeCompare(a.updated_at || "");
+    });
+}
+
+const openCount = computed(
+  () => todos.value.filter((t) => t.status !== "done").length,
+);
 
 async function loadTodos() {
   loading.value = true;
@@ -158,11 +200,13 @@ function resetForm() {
   fScheduled.value = "";
   fPlan.value = "";
   fProject.value = "";
+  formStatus.value = "backlog";
   formOpen.value = false;
 }
 
-function startNew() {
+function startNew(colId = "backlog") {
   resetForm();
+  formStatus.value = colId;
   if (projectFilter.value) fProject.value = projectFilter.value;
   formOpen.value = true;
 }
@@ -188,7 +232,7 @@ async function submitForm() {
     id: editingId.value ?? crypto.randomUUID(),
     subject,
     description: fDescription.value.trim(),
-    status: existing?.status ?? "pending",
+    status: existing?.status ?? formStatus.value,
     estimate_minutes:
       fEstimate.value === null || Number.isNaN(fEstimate.value)
         ? null
@@ -207,7 +251,13 @@ async function submitForm() {
   }
 }
 
-async function setStatus(todo: Todo, status: string) {
+// Move a card to a new column. Update the local list first so the card jumps
+// instantly, then persist; on failure reload from disk to undo the optimism.
+async function moveStatus(todo: Todo, status: string) {
+  if (todo.status === status) return;
+  todos.value = todos.value.map((t) =>
+    t.id === todo.id ? { ...t, status } : t,
+  );
   try {
     todos.value = await invoke<Todo[]>("set_todo_status", {
       id: todo.id,
@@ -215,6 +265,7 @@ async function setStatus(todo: Todo, status: string) {
     });
   } catch (e) {
     errorMsg.value = String(e);
+    await loadTodos();
   }
 }
 
@@ -227,12 +278,46 @@ async function removeTodo(todo: Todo) {
   }
 }
 
+// --- Drag and drop (native HTML5) ---
+function onDragStart(todo: Todo, e: DragEvent) {
+  dragId.value = todo.id;
+  if (e.dataTransfer) {
+    e.dataTransfer.effectAllowed = "move";
+    // Some browsers require data to be set for the drag to start at all.
+    e.dataTransfer.setData("text/plain", todo.id);
+  }
+}
+function onDragEnd() {
+  dragId.value = null;
+  overCol.value = null;
+}
+function onColDragOver(colId: string, e: DragEvent) {
+  if (!dragId.value) return;
+  e.preventDefault();
+  if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+  if (overCol.value !== colId) overCol.value = colId;
+}
+function onColDragLeave(colId: string, e: DragEvent) {
+  // Ignore leaves into child elements of the same column body.
+  const related = e.relatedTarget as Node | null;
+  if (related && (e.currentTarget as HTMLElement).contains(related)) return;
+  if (overCol.value === colId) overCol.value = null;
+}
+function onColDrop(colId: string) {
+  const id = dragId.value;
+  overCol.value = null;
+  dragId.value = null;
+  if (!id) return;
+  const todo = todos.value.find((t) => t.id === id);
+  if (todo) void moveStatus(todo, colId);
+}
+
 function statusLabel(s: string) {
-  return s === "in_progress"
-    ? t("statusInProgress")
-    : s === "done"
-      ? t("statusDone")
-      : t("statusPending");
+  const c = COL_BY_ID[s];
+  return c ? t(c.labelKey) : s;
+}
+function columnColor(s: string) {
+  return COL_BY_ID[s]?.dot ?? "var(--text-4)";
 }
 
 function fmtEstimate(min: number | null | undefined) {
@@ -270,13 +355,18 @@ onUnmounted(() => {
 <template>
   <div class="tw-root">
     <header class="tw-head">
-      <h1>{{ t("tasksTitle") }}</h1>
-      <div class="tw-counts">
-        <span class="tw-chip ip">{{ counts.in_progress }} {{ t("statusInProgress") }}</span>
-        <span class="tw-chip pd">{{ counts.pending }} {{ t("statusPending") }}</span>
-        <span class="tw-chip dn">{{ counts.done }} {{ t("statusDone") }}</span>
+      <div class="tw-title">
+        <h1>{{ t("tasksTitle") }}</h1>
+        <span class="tw-open">{{ openCount }} {{ t("todoOpenItems") }}</span>
       </div>
       <div class="tw-spacer"></div>
+      <div class="tw-search">
+        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4">
+          <circle cx="7" cy="7" r="4.5" />
+          <line x1="10.5" y1="10.5" x2="14" y2="14" stroke-linecap="round" />
+        </svg>
+        <input v-model="search" class="tw-search-input" :placeholder="t('todoSearch')" />
+      </div>
       <select v-model="projectFilter" class="tw-select" :title="t('todoProject')">
         <option value="">{{ t("todoFilterAll") }}</option>
         <option v-for="p in projects" :key="p" :value="p">{{ p }}</option>
@@ -285,14 +375,95 @@ onUnmounted(() => {
         <input type="checkbox" v-model="showDone" />
         {{ t("todoShowDone") }}
       </label>
-      <button class="tw-add" @click="startNew">+ {{ t("todoAdd") }}</button>
+      <button class="tw-add" @click="startNew('backlog')">+ {{ t("todoAdd") }}</button>
     </header>
 
-    <main class="tw-main">
-      <div v-if="errorMsg" class="tw-error">{{ errorMsg }}</div>
+    <div v-if="errorMsg" class="tw-error">{{ errorMsg }}</div>
 
-      <!-- Create / edit form -->
-      <form v-if="formOpen" class="tw-form" @submit.prevent="submitForm">
+    <div v-if="loading" class="tw-empty">{{ t("loading") }}</div>
+
+    <!-- Kanban board -->
+    <main v-else class="tw-board">
+      <section
+        v-for="col in boardColumns"
+        :key="col.id"
+        class="tw-col"
+        :class="{ over: overCol === col.id }"
+        @dragover="onColDragOver(col.id, $event)"
+        @dragleave="onColDragLeave(col.id, $event)"
+        @drop.prevent="onColDrop(col.id)"
+      >
+        <div class="tw-col-head">
+          <span class="tw-col-dot" :style="{ background: col.dot }"></span>
+          <span class="tw-col-name">{{ t(col.labelKey) }}</span>
+          <span class="tw-col-count">{{ itemsFor(col.id).length }}</span>
+          <button class="tw-col-add" :title="t('todoAdd')" @click="startNew(col.id)">
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+              <path d="M8 3v10M3 8h10" />
+            </svg>
+          </button>
+        </div>
+
+        <div class="tw-col-body scroll">
+          <div v-if="!itemsFor(col.id).length" class="tw-col-empty">
+            {{ overCol === col.id ? t("todoDropHere") : t("todoColEmpty") }}
+          </div>
+
+          <article
+            v-for="todo in itemsFor(col.id)"
+            :key="todo.id"
+            class="tw-card"
+            :class="{ dragging: dragId === todo.id, done: todo.status === 'done' }"
+            :style="{ borderLeftColor: columnColor(todo.status) }"
+            draggable="true"
+            @dragstart="onDragStart(todo, $event)"
+            @dragend="onDragEnd"
+          >
+            <div class="tw-card-title">{{ todo.subject }}</div>
+            <p v-if="todo.description" class="tw-card-desc">{{ todo.description }}</p>
+
+            <div class="tw-card-meta">
+              <span v-if="todo.project" class="tw-tag">{{ todo.project }}</span>
+              <span v-if="todo.estimate_minutes != null" class="tw-chip">⏱ {{ fmtEstimate(todo.estimate_minutes) }}</span>
+              <span v-if="todo.scheduled_for" class="tw-chip">📅 {{ todo.scheduled_for }}</span>
+              <span v-if="todo.plan" class="tw-chip" :title="todo.plan">📝</span>
+            </div>
+
+            <div class="tw-card-foot">
+              <select
+                :value="todo.status"
+                class="tw-select sm"
+                @click.stop
+                @mousedown.stop
+                @change="moveStatus(todo, ($event.target as HTMLSelectElement).value)"
+              >
+                <option v-for="c in COLUMNS" :key="c.id" :value="c.id">{{ statusLabel(c.id) }}</option>
+              </select>
+              <div class="tw-card-actions">
+                <button class="tw-icon" :title="t('todoEdit')" @click.stop="startEdit(todo)" @mousedown.stop>
+                  <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M11.5 2.5l2 2L6 12l-2.5.5L4 10z" />
+                    <path d="M10.5 3.5l2 2" />
+                  </svg>
+                </button>
+                <button class="tw-icon danger" :title="t('todoDelete')" @click.stop="removeTodo(todo)" @mousedown.stop>
+                  <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M3 4.5h10" />
+                    <path d="M6.5 4.5V3.2a.7.7 0 0 1 .7-.7h1.6a.7.7 0 0 1 .7.7v1.3" />
+                    <path d="M4.3 4.5l.5 8a1 1 0 0 0 1 .95h4.4a1 1 0 0 0 1-.95l.5-8" />
+                    <path d="M6.6 7v4M9.4 7v4" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+          </article>
+        </div>
+      </section>
+    </main>
+
+    <!-- Create / edit form (modal overlay) -->
+    <div v-if="formOpen" class="tw-modal" @click.self="resetForm">
+      <form class="tw-form" @submit.prevent="submitForm">
         <div class="tw-form-title">
           {{ editingId ? t("todoEdit") : t("todoNew") }}
         </div>
@@ -309,6 +480,36 @@ onUnmounted(() => {
           :placeholder="t('todoDescription')"
           rows="2"
         ></textarea>
+        <label class="tw-field tw-ac">
+          <span>{{ t("todoProject") }}</span>
+          <input
+            v-model="fProject"
+            class="tw-input"
+            :placeholder="t('todoProjectPlaceholder')"
+            autocomplete="off"
+            @focus="projectFocus = true"
+            @input="projectFocus = true; projectSel = -1"
+            @blur="onProjectBlur"
+            @keydown.down.prevent="moveProjectSel(1)"
+            @keydown.up.prevent="moveProjectSel(-1)"
+            @keydown.enter.prevent="pickProjectSel"
+            @keydown.escape="projectFocus = false"
+          />
+          <ul
+            v-if="projectFocus && projectSuggestions.length"
+            class="tw-ac-list"
+          >
+            <li
+              v-for="(p, i) in projectSuggestions"
+              :key="p"
+              class="tw-ac-item"
+              :class="{ sel: i === projectSel }"
+              @mousedown.prevent="selectProject(p)"
+            >
+              {{ p }}
+            </li>
+          </ul>
+        </label>
         <div class="tw-row">
           <label class="tw-field">
             <span>{{ t("todoEstimate") }}</span>
@@ -318,82 +519,17 @@ onUnmounted(() => {
             <span>{{ t("todoScheduledFor") }}</span>
             <input v-model="fScheduled" class="tw-input" type="date" />
           </label>
-          <label class="tw-field tw-ac">
-            <span>{{ t("todoProject") }}</span>
-            <input
-              v-model="fProject"
-              class="tw-input"
-              :placeholder="t('todoProjectPlaceholder')"
-              autocomplete="off"
-              @focus="projectFocus = true"
-              @input="projectFocus = true; projectSel = -1"
-              @blur="onProjectBlur"
-              @keydown.down.prevent="moveProjectSel(1)"
-              @keydown.up.prevent="moveProjectSel(-1)"
-              @keydown.enter.prevent="pickProjectSel"
-              @keydown.escape="projectFocus = false"
-            />
-            <ul
-              v-if="projectFocus && projectSuggestions.length"
-              class="tw-ac-list"
-            >
-              <li
-                v-for="(p, i) in projectSuggestions"
-                :key="p"
-                class="tw-ac-item"
-                :class="{ sel: i === projectSel }"
-                @mousedown.prevent="selectProject(p)"
-              >
-                {{ p }}
-              </li>
-            </ul>
-          </label>
         </div>
         <label class="tw-field">
           <span>{{ t("todoPlan") }} <em class="tw-hint">{{ t("todoPlanHint") }}</em></span>
-          <textarea v-model="fPlan" class="tw-input tw-area" rows="3"></textarea>
+          <textarea v-model="fPlan" class="tw-input tw-area" rows="4"></textarea>
         </label>
         <div class="tw-form-actions">
           <button type="button" class="tw-btn ghost" @click="resetForm">{{ t("todoCancel") }}</button>
           <button type="submit" class="tw-btn" :disabled="!fSubject.trim()">{{ t("save") }}</button>
         </div>
       </form>
-
-      <div v-if="loading" class="tw-empty">{{ t("loading") }}</div>
-      <div v-else-if="!visible.length" class="tw-empty">{{ t("todoEmpty") }}</div>
-
-      <ul v-else class="tw-list">
-        <li
-          v-for="todo in visible"
-          :key="todo.id"
-          class="tw-item"
-          :class="todo.status"
-        >
-          <div class="tw-item-main">
-            <div class="tw-item-top">
-              <span class="tw-subject">{{ todo.subject }}</span>
-              <span v-if="todo.project" class="tw-tag">{{ todo.project }}</span>
-              <span v-if="todo.scheduled_for" class="tw-meta">📅 {{ todo.scheduled_for }}</span>
-              <span v-if="todo.estimate_minutes != null" class="tw-meta">⏱ {{ fmtEstimate(todo.estimate_minutes) }}</span>
-            </div>
-            <p v-if="todo.description" class="tw-desc">{{ todo.description }}</p>
-            <pre v-if="todo.plan" class="tw-plan">{{ todo.plan }}</pre>
-          </div>
-          <div class="tw-item-actions">
-            <select
-              :value="todo.status"
-              class="tw-select sm"
-              :class="todo.status"
-              @change="setStatus(todo, ($event.target as HTMLSelectElement).value)"
-            >
-              <option v-for="s in STATUSES" :key="s" :value="s">{{ statusLabel(s) }}</option>
-            </select>
-            <button class="tw-icon" :title="t('todoEdit')" @click="startEdit(todo)">✎</button>
-            <button class="tw-icon danger" :title="t('todoDelete')" @click="removeTodo(todo)">🗑</button>
-          </div>
-        </li>
-      </ul>
-    </main>
+    </div>
   </div>
 </template>
 
@@ -405,6 +541,7 @@ onUnmounted(() => {
   background: var(--flyout-bg, #1c1c1c);
   color: var(--text);
   font-family: var(--segoe);
+  overflow: hidden;
 }
 .tw-head {
   padding: 12px 16px;
@@ -413,32 +550,47 @@ onUnmounted(() => {
   align-items: center;
   gap: 12px;
   flex-wrap: wrap;
+  flex-shrink: 0;
 }
-.tw-head h1 {
+.tw-title {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.tw-title h1 {
   margin: 0;
   font-size: 18px;
   font-weight: 600;
 }
+.tw-open {
+  font-size: 12px;
+  color: var(--text-3);
+}
 .tw-spacer {
   flex: 1;
 }
-.tw-counts {
+.tw-search {
   display: flex;
+  align-items: center;
   gap: 6px;
+  background: var(--card-bg);
+  border: 1px solid var(--stroke-strong);
+  border-radius: 6px;
+  padding: 0 9px;
+  color: var(--text-3);
 }
-.tw-chip {
-  font-size: 11px;
-  padding: 2px 8px;
-  border-radius: 10px;
-  color: var(--text-2);
-  background: var(--track);
+.tw-search:focus-within {
+  border-color: var(--accent);
 }
-.tw-chip.ip {
-  color: var(--accent);
-  background: var(--accent-soft);
-}
-.tw-chip.dn {
-  color: var(--text-4);
+.tw-search-input {
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--text);
+  font-size: 12px;
+  font-family: var(--segoe);
+  padding: 6px 0;
+  width: 150px;
 }
 .tw-select {
   background: var(--card-bg);
@@ -451,13 +603,8 @@ onUnmounted(() => {
 }
 .tw-select.sm {
   padding: 3px 6px;
-}
-.tw-select.in_progress {
-  color: var(--accent);
-  border-color: var(--accent);
-}
-.tw-select.done {
-  color: var(--text-4);
+  font-size: 11px;
+  max-width: 110px;
 }
 .tw-toggle {
   font-size: 12px;
@@ -481,18 +628,12 @@ onUnmounted(() => {
 .tw-add:hover {
   filter: brightness(1.1);
 }
-.tw-main {
-  flex: 1;
-  overflow-y: auto;
-  padding: 16px;
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-}
 .tw-error {
   color: #f87171;
   font-size: 12px;
   word-break: break-word;
+  padding: 8px 16px 0;
+  flex-shrink: 0;
 }
 .tw-empty {
   color: var(--text-3);
@@ -501,27 +642,219 @@ onUnmounted(() => {
   padding: 40px 0;
 }
 
-/* Form */
-.tw-form {
+/* Board */
+.tw-board {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  gap: 12px;
+  padding: 14px 16px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  align-items: stretch;
+}
+.tw-col {
+  flex: 1 1 0;
+  min-width: 188px;
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  padding: 14px;
-  border: 1px solid var(--stroke-strong);
-  border-radius: var(--card-radius);
-  background: var(--card-bg);
+  min-height: 0;
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--stroke);
+  border-radius: 10px;
+  transition: border-color 120ms, background 120ms;
 }
-.tw-form-title {
-  font-size: 13px;
+.tw-col.over {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.tw-col-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  flex-shrink: 0;
+}
+.tw-col-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.tw-col-name {
+  font-size: 12px;
   font-weight: 600;
   color: var(--text-2);
 }
-.tw-input {
+.tw-col-count {
+  font-size: 11px;
+  color: var(--text-3);
+  background: var(--track);
+  border-radius: 9px;
+  padding: 1px 7px;
+  min-width: 18px;
+  text-align: center;
+}
+.tw-col-add {
+  margin-left: auto;
+  background: transparent;
+  border: none;
+  color: var(--text-3);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  padding: 2px;
+  border-radius: 4px;
+}
+.tw-col-add:hover {
+  color: var(--text);
+  background: var(--card-bg-hover);
+}
+.tw-col-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 4px 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.tw-col-empty {
+  color: var(--text-4);
+  font-size: 12px;
+  text-align: center;
+  padding: 18px 6px;
+  border: 1px dashed var(--stroke-strong);
+  border-radius: 8px;
+  margin: 2px;
+}
+
+/* Card */
+.tw-card {
+  background: var(--card-bg);
+  border: 1px solid var(--stroke-strong);
+  border-left: 3px solid var(--text-4);
+  border-radius: var(--card-radius);
+  padding: 10px 11px;
+  cursor: grab;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.tw-card:hover {
+  background: var(--card-bg-hover);
+}
+.tw-card.dragging {
+  opacity: 0.4;
+  cursor: grabbing;
+}
+.tw-card.done .tw-card-title {
+  text-decoration: line-through;
+  color: var(--text-3);
+}
+.tw-card-title {
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.35;
+  word-break: break-word;
+}
+.tw-card-desc {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--text-3);
+  line-height: 1.4;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-word;
+}
+.tw-card-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  align-items: center;
+}
+.tw-tag {
+  font-size: 10.5px;
+  color: var(--text-2);
+  background: var(--track);
+  padding: 1px 7px;
+  border-radius: 8px;
+}
+.tw-chip {
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+.tw-card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  margin-top: 1px;
+}
+.tw-card-actions {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+}
+.tw-icon {
+  background: transparent;
+  border: 1px solid var(--stroke-strong);
+  color: var(--text-3);
+  border-radius: 5px;
+  width: 26px;
+  height: 26px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.tw-icon:hover {
+  background: var(--card-bg-hover);
+  color: var(--text);
+}
+.tw-icon.danger:hover {
+  border-color: #f87171;
+  color: #f87171;
+}
+
+/* Modal form */
+.tw-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 32px 20px;
+  overflow-y: auto;
+}
+.tw-form {
+  width: 100%;
+  max-width: 680px;
+  display: flex;
+  flex-direction: column;
+  gap: 13px;
+  padding: 22px;
+  border: 1px solid var(--stroke-strong);
+  border-radius: 10px;
   background: var(--flyout-bg);
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
+}
+.tw-form-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-2);
+  margin-bottom: 2px;
+}
+.tw-input {
+  background: var(--card-bg);
   color: var(--text);
   border: 1px solid var(--stroke-strong);
   border-radius: 5px;
-  padding: 7px 9px;
+  padding: 9px 11px;
   font-size: 13px;
   font-family: var(--segoe);
   width: 100%;
@@ -608,102 +941,5 @@ onUnmounted(() => {
   background: transparent;
   color: var(--text-3);
   border: 1px solid var(--stroke-strong);
-}
-
-/* List */
-.tw-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-.tw-item {
-  display: flex;
-  gap: 12px;
-  align-items: flex-start;
-  padding: 12px 14px;
-  border: 1px solid var(--stroke-strong);
-  border-left: 3px solid var(--text-4);
-  border-radius: var(--card-radius);
-  background: var(--card-bg);
-}
-.tw-item.in_progress {
-  border-left-color: var(--accent);
-}
-.tw-item.done {
-  opacity: 0.6;
-}
-.tw-item.done .tw-subject {
-  text-decoration: line-through;
-}
-.tw-item-main {
-  flex: 1;
-  min-width: 0;
-}
-.tw-item-top {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-.tw-subject {
-  font-size: 14px;
-  font-weight: 500;
-}
-.tw-tag {
-  font-size: 11px;
-  color: var(--text-3);
-  background: var(--track);
-  padding: 1px 7px;
-  border-radius: 8px;
-}
-.tw-meta {
-  font-size: 11px;
-  color: var(--text-3);
-}
-.tw-desc {
-  margin: 6px 0 0;
-  font-size: 12px;
-  color: var(--text-2);
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-.tw-plan {
-  margin: 6px 0 0;
-  font-size: 11.5px;
-  color: var(--text-3);
-  background: var(--flyout-bg);
-  border: 1px solid var(--stroke);
-  border-radius: 4px;
-  padding: 8px;
-  white-space: pre-wrap;
-  word-break: break-word;
-  font-family: var(--segoe);
-}
-.tw-item-actions {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-shrink: 0;
-}
-.tw-icon {
-  background: transparent;
-  border: 1px solid var(--stroke-strong);
-  color: var(--text-3);
-  border-radius: 5px;
-  width: 28px;
-  height: 28px;
-  cursor: pointer;
-  font-size: 13px;
-}
-.tw-icon:hover {
-  background: var(--card-bg-hover);
-  color: var(--text);
-}
-.tw-icon.danger:hover {
-  border-color: #f87171;
-  color: #f87171;
 }
 </style>
