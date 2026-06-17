@@ -366,6 +366,27 @@ async function serviceToast(a: { kind: string; text: string }) {
     await notify(title, a.text);
 }
 
+// A todo moved into review/done by an external writer (the cc-todos CLI or a
+// Claude session). The backend already gated this on `notifications_enabled` and
+// only emits for external changes; here we just honour an active mute and show
+// the toast.
+async function todoToast(a: {
+    subject: string;
+    status: string;
+    project: string | null;
+}) {
+    if (
+        notificationsMutedUntil.value &&
+        Date.now() < new Date(notificationsMutedUntil.value).getTime()
+    ) {
+        return;
+    }
+    const title =
+        a.status === "done" ? t("todoAlertDone") : t("todoAlertReview");
+    const body = a.project ? `${a.subject} · ${a.project}` : a.subject;
+    await notify(title, body);
+}
+
 // Consumption since local midnight, in the unit implied by ccAnalyticsEnabled
 // ($ from CC analytics, else % of the weekly limit). Uses existing commands.
 async function loadTodaySpent() {
@@ -687,6 +708,12 @@ onMounted(async () => {
             "service-alert",
             (e) => {
                 void serviceToast(e.payload);
+            },
+        ),
+        await listen<{ subject: string; status: string; project: string | null }>(
+            "todo-status-alert",
+            (e) => {
+                void todoToast(e.payload);
             },
         ),
         await listen<string>("project-resolved", async (e) => {

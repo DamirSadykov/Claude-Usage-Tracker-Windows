@@ -8,7 +8,7 @@ pub mod sysmon;
 pub mod todos;
 pub mod usage;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -984,25 +984,59 @@ fn get_cc_projects(stats: tauri::State<'_, Arc<StatsDb>>) -> Result<Vec<String>,
     stats.cc_projects().map_err(|e| e.to_string())
 }
 
+/// Last-seen `id -> status` map, shared between the file watcher and the write
+/// commands. The watcher diffs the file against this to fire review/done alerts;
+/// the commands refresh it under the same lock right after they write, so the
+/// tracker's OWN edits never look like an external change (see `spawn_todos_watch`).
+#[derive(Default)]
+struct TodoSnapshot(Mutex<HashMap<String, String>>);
+
+/// Pushed to the main window when a todo moves into `review`/`done` by an
+/// external writer (the cc-todos CLI, a Claude session, a hand-edit).
+#[derive(Serialize, Clone)]
+struct TodoStatusAlert {
+    subject: String,
+    status: String,
+    project: Option<String>,
+}
+
+fn todo_status_map(file: &todos::TodoFile) -> HashMap<String, String> {
+    file.todos
+        .iter()
+        .map(|t| (t.id.clone(), t.status.clone()))
+        .collect()
+}
+
+/// Mutate the todo store atomically AND keep [`TodoSnapshot`] in lockstep. The
+/// snapshot is updated under the same lock the watcher takes, spanning the file
+/// write, so the watcher can never observe the new file with a stale snapshot
+/// and mistake the tracker's own write for an external one.
+fn write_todos_locked(
+    app: &AppHandle,
+    mutate: impl FnOnce(&mut todos::TodoFile),
+) -> Result<Vec<todos::Todo>, String> {
+    let path = todos_path(app)?;
+    let snap = app.state::<TodoSnapshot>();
+    let mut guard = snap.0.lock().unwrap();
+    let mut file = todos::load(&path);
+    mutate(&mut file);
+    todos::save(&path, &file)?;
+    *guard = todo_status_map(&file);
+    Ok(file.todos)
+}
+
 #[tauri::command]
 fn upsert_todo(app: AppHandle, todo: todos::Todo) -> Result<Vec<todos::Todo>, String> {
     if !todos::is_valid_status(&todo.status) {
         return Err(format!("invalid status: {}", todo.status));
     }
-    let path = todos_path(&app)?;
-    let mut file = todos::load(&path);
-    todos::upsert(&mut file, todo, &chrono::Utc::now().to_rfc3339());
-    todos::save(&path, &file)?;
-    Ok(file.todos)
+    let now = chrono::Utc::now().to_rfc3339();
+    write_todos_locked(&app, move |file| todos::upsert(file, todo, &now))
 }
 
 #[tauri::command]
 fn delete_todo(app: AppHandle, id: String) -> Result<Vec<todos::Todo>, String> {
-    let path = todos_path(&app)?;
-    let mut file = todos::load(&path);
-    todos::delete(&mut file, &id);
-    todos::save(&path, &file)?;
-    Ok(file.todos)
+    write_todos_locked(&app, move |file| todos::delete(file, &id))
 }
 
 #[tauri::command]
@@ -1014,11 +1048,10 @@ fn set_todo_status(
     if !todos::is_valid_status(&status) {
         return Err(format!("invalid status: {status}"));
     }
-    let path = todos_path(&app)?;
-    let mut file = todos::load(&path);
-    todos::set_status(&mut file, &id, &status, &chrono::Utc::now().to_rfc3339());
-    todos::save(&path, &file)?;
-    Ok(file.todos)
+    let now = chrono::Utc::now().to_rfc3339();
+    write_todos_locked(&app, move |file| {
+        todos::set_status(file, &id, &status, &now);
+    })
 }
 
 /// Show the standalone Todo window (declared hidden in tauri.conf.json).
@@ -1033,14 +1066,18 @@ fn open_todo_window(app: AppHandle) {
     }
 }
 
-/// Background watcher: poll `todos.json`'s mtime and emit `todos-file-changed`
-/// whenever it changes on disk, so an open Todo window can live-reload after an
-/// external edit (the cc-todos CLI, a Claude session, or a hand-edit). Polling
-/// (rather than a filesystem-notify crate) is deliberate: writes land via
-/// temp-file + rename, which would invalidate a watch on the file path itself,
-/// and one mtime stat every ~1.5s is far cheaper than the churn a notifier would
-/// add. The tracker's own writes also fire this, but the frontend reload is
-/// silent and idempotent, so the echo is harmless.
+/// Background watcher: poll `todos.json`'s mtime and, on change, (1) emit
+/// `todos-file-changed` so an open Todo window can live-reload, and (2) diff the
+/// file against [`TodoSnapshot`] to fire a `todo-status-alert` when a todo moves
+/// into `review`/`done` by an EXTERNAL writer (the cc-todos CLI, a Claude
+/// session, a hand-edit). The tracker's own writes refresh the snapshot under
+/// the same lock (see `write_todos_locked`), so they never produce an alert.
+///
+/// Polling (rather than a filesystem-notify crate) is deliberate: writes land
+/// via temp-file + rename, which would invalidate a watch on the file path
+/// itself, and one mtime stat every ~1.5s is far cheaper than the churn a
+/// notifier would add. The live-reload echo from the tracker's own writes is
+/// harmless (the frontend reload is silent and idempotent).
 fn spawn_todos_watch(app: AppHandle) {
     std::thread::spawn(move || {
         let path = match todos_path(&app) {
@@ -1048,6 +1085,12 @@ fn spawn_todos_watch(app: AppHandle) {
             Err(_) => return,
         };
         let modified = |p: &PathBuf| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+        // Seed the snapshot so pre-existing review/done todos don't alert on the
+        // first observed change.
+        {
+            let snap = app.state::<TodoSnapshot>();
+            *snap.0.lock().unwrap() = todo_status_map(&todos::load(&path));
+        }
         let mut last: Option<SystemTime> = modified(&path);
         loop {
             std::thread::sleep(Duration::from_millis(1500));
@@ -1056,9 +1099,49 @@ fn spawn_todos_watch(app: AppHandle) {
                 // File briefly absent (mid-rename) or never created — remember
                 // so its (re)appearance counts as a change, but don't report it.
                 last = None;
-            } else if current != last {
-                last = current;
-                let _ = app.emit("todos-file-changed", ());
+                continue;
+            }
+            if current == last {
+                continue;
+            }
+            last = current;
+            let _ = app.emit("todos-file-changed", ());
+
+            // Diff statuses under the snapshot lock, spanning the file read, so a
+            // concurrent command's write+snapshot-update is fully serialized
+            // against us and can't look external.
+            let alerts: Vec<TodoStatusAlert> = {
+                let snap = app.state::<TodoSnapshot>();
+                let mut guard = snap.0.lock().unwrap();
+                let file = todos::load(&path);
+                let mut out = Vec::new();
+                for t in &file.todos {
+                    let into_target = t.status == "review" || t.status == "done";
+                    let changed = guard.get(&t.id).map(|s| s != &t.status).unwrap_or(false);
+                    if into_target && changed {
+                        out.push(TodoStatusAlert {
+                            subject: t.subject.clone(),
+                            status: t.status.clone(),
+                            project: t.project.clone(),
+                        });
+                    }
+                }
+                *guard = todo_status_map(&file);
+                out
+            };
+            if alerts.is_empty() {
+                continue;
+            }
+            // Reuse the master notifications toggle as the gate.
+            let enabled = app
+                .state::<Mutex<AppConfig>>()
+                .lock()
+                .unwrap()
+                .notifications_enabled;
+            if enabled {
+                for a in alerts {
+                    let _ = app.emit("todo-status-alert", a);
+                }
             }
         }
     });
@@ -1141,6 +1224,7 @@ pub fn run() {
             app.manage(Mutex::new(AppConfig::default()));
             app.manage(Mutex::new(AlertEngine::new()));
             app.manage(Arc::new(Mutex::new(StatusState::default())));
+            app.manage(TodoSnapshot::default());
             let notify = Arc::new(Notify::new());
             app.manage(notify.clone());
 
