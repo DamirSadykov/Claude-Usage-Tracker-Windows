@@ -1,6 +1,7 @@
 pub mod alerts;
 pub mod cc;
 pub mod domain;
+pub mod project_groups;
 pub mod report;
 pub mod stats;
 pub mod status;
@@ -1029,6 +1030,38 @@ fn remove_project_link(
     Ok(())
 }
 
+// --- Project association groups (issue #13, "who works with whom") ---
+//
+// Stored in `project-groups.json` next to `todos.json` so the cc-todos CLI (plain
+// Node) can read it too — see project_groups.rs.
+
+/// Path to the association-groups store, creating the app data dir if needed.
+fn project_groups_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).ok();
+    Ok(dir.join("project-groups.json"))
+}
+
+/// All association groups (peer "works-with" sets — not a stat merge).
+#[tauri::command]
+fn get_project_groups(app: AppHandle) -> Result<Vec<project_groups::ProjectGroup>, String> {
+    Ok(project_groups::load(&project_groups_path(&app)?).groups)
+}
+
+/// Replace the whole set of association groups (the UI sends the full list).
+/// Normalized + persisted atomically; broadcasts `project-groups-changed` so every
+/// window re-reads.
+#[tauri::command]
+fn save_project_groups(
+    groups: Vec<project_groups::ProjectGroup>,
+    app: AppHandle,
+) -> Result<(), String> {
+    let file = project_groups::ProjectGroupsFile { version: 1, groups };
+    project_groups::save(&project_groups_path(&app)?, &file)?;
+    let _ = app.emit("project-groups-changed", ());
+    Ok(())
+}
+
 /// Last-seen `id -> status` map, shared between the file watcher and the write
 /// commands. The watcher diffs the file against this to fire review/done alerts;
 /// the commands refresh it under the same lock right after they write, so the
@@ -1432,6 +1465,8 @@ pub fn run() {
             get_project_links,
             set_project_link,
             remove_project_link,
+            get_project_groups,
+            save_project_groups,
             upsert_todo,
             delete_todo,
             set_todo_status,

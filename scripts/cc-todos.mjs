@@ -48,6 +48,37 @@ function load(file) {
   }
 }
 
+// Association groups live next to todos.json (project-groups.json), written by
+// the app. Sibling of `todosPath`. See src-tauri/src/project_groups.rs.
+function groupsPath() {
+  const appData =
+    process.env.APPDATA ||
+    path.join(process.env.USERPROFILE || "", "AppData", "Roaming");
+  return path.join(appData, "com.claude-usage-tracker.app", "project-groups.json");
+}
+
+// Forgiving load: missing/corrupt yields an empty set (mirrors project_groups.rs).
+function loadGroups() {
+  try {
+    const data = JSON.parse(readFileSync(groupsPath(), "utf8"));
+    return Array.isArray(data?.groups) ? data.groups : [];
+  } catch {
+    return [];
+  }
+}
+
+// Projects that work WITH `project` (issue #13): the union of co-members across
+// every association group that contains it, minus the project itself.
+function relatedProjects(project) {
+  const set = new Set();
+  for (const g of loadGroups()) {
+    const members = Array.isArray(g.projects) ? g.projects : [];
+    if (!members.includes(project)) continue;
+    for (const p of members) if (p !== project) set.add(p);
+  }
+  return [...set].sort();
+}
+
 // Atomic write: serialize to a sibling temp file, then rename over the target
 // (rename replaces the destination on Windows). 2-space pretty-print matches the
 // tracker's serde output so hand-readable diffs stay stable.
@@ -103,7 +134,7 @@ function parseArgs(args) {
 }
 
 const ADD_USAGE =
-  'usage: cc-todos add "<subject>" [--project <name>] [--status <status>] ' +
+  'usage: cc-todos add "<subject>" [--project <name>] [--from <project>] [--status <status>] ' +
   "[--description <text>] [--plan <text>] [--estimate <min>] [--scheduled <YYYY-MM-DD>] [--by user|claude]";
 
 // Create a new todo. Mirrors the field set the tracker writes (todos.rs / the
@@ -124,6 +155,16 @@ function cmdAdd(args) {
   const now = new Date().toISOString();
   const file = todosPath();
   const data = load(file);
+  const target = typeof flags.project === "string" ? flags.project : null;
+  // Provenance (issue #13): the project this task was filed FROM. Auto-derived
+  // from the session's working directory — the CLI runs in the project's cwd, so
+  // basename(cwd) is the current project — but only when the task targets a
+  // DIFFERENT project (cross-project). Same-project adds leave it empty; --from
+  // overrides the auto value.
+  const cwdProject = path.basename(process.cwd().replace(/[\\/]+$/, ""));
+  let from =
+    typeof flags.from === "string" && flags.from.trim() ? flags.from.trim() : null;
+  if (from === null && target && target !== cwdProject) from = cwdProject;
   const todo = {
     id: randomUUID(),
     // Stable human-facing number for inline `#N` references, mirroring
@@ -136,7 +177,8 @@ function cmdAdd(args) {
     estimate_minutes: estimate,
     scheduled_for: typeof flags.scheduled === "string" ? flags.scheduled : null,
     plan: typeof flags.plan === "string" ? flags.plan : "",
-    project: typeof flags.project === "string" ? flags.project : null,
+    project: target,
+    from,
     // This CLI is Claude's interface (the hook tells Claude to use it), so a
     // task added here is AI-composed unless the caller overrides with --by user.
     created_by: typeof flags.by === "string" ? flags.by : "claude",
@@ -233,17 +275,56 @@ function cmdList(args) {
   }
 }
 
+// List the projects related to <project> via association groups, so a session in
+// one project can file a task against a sibling project (e.g. engine ↔ advmcp).
+// Plain text prints one related project per line (empty → a friendly note);
+// `--json` emits { project, related } for programmatic use.
+function cmdRelated(args) {
+  const { positional, flags } = parseArgs(args);
+  const project = String(positional[0] ?? flags.project ?? "").trim();
+  if (!project) fail("usage: cc-todos related <project> [--json]");
+  const related = relatedProjects(project);
+  if (flags.json) {
+    process.stdout.write(JSON.stringify({ project, related }, null, 2) + "\n");
+    return;
+  }
+  if (!related.length) {
+    process.stdout.write(`(no projects associated with "${project}")\n`);
+    return;
+  }
+  for (const p of related) process.stdout.write(p + "\n");
+}
+
+// List every association group and its members.
+function cmdGroups(args) {
+  const groups = loadGroups();
+  if (args.includes("--json")) {
+    process.stdout.write(JSON.stringify(groups, null, 2) + "\n");
+    return;
+  }
+  if (!groups.length) {
+    process.stdout.write("(no project groups)\n");
+    return;
+  }
+  for (const g of groups) {
+    const members = Array.isArray(g.projects) ? g.projects.join(", ") : "";
+    process.stdout.write(`${g.name}: ${members}\n`);
+  }
+}
+
 function usage(code) {
   process.stdout.write(
     "cc-todos - Claude Usage Tracker todo CLI\n\n" +
-      '  add "<subject>" [--project <name>] [--status <status>]\n' +
+      '  add "<subject>" [--project <name>] [--from <project>] [--status <status>]\n' +
       "                  [--description <text>] [--plan <text>] [--estimate <min>] [--scheduled <YYYY-MM-DD>]\n" +
       "  set-status <id> <status>        status ∈ " +
       STATUSES.join(" | ") +
       "\n" +
       '  comment add <id> --text "<body>" [--by claude|user]\n' +
       "  comment list <id> [--json]\n" +
-      "  list [--project <name>] [--json]\n",
+      "  list [--project <name>] [--json]\n" +
+      "  related <project> [--json]      projects that work with <project>\n" +
+      "  groups [--json]                 list association groups\n",
   );
   process.exit(code);
 }
@@ -261,6 +342,12 @@ switch (cmd) {
     break;
   case "list":
     cmdList(rest);
+    break;
+  case "related":
+    cmdRelated(rest);
+    break;
+  case "groups":
+    cmdGroups(rest);
     break;
   case undefined:
   case "-h":

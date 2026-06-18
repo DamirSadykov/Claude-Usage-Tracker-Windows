@@ -56,6 +56,7 @@ export interface Todo {
   scheduled_for?: string | null;
   plan: string;
   project?: string | null;
+  from?: string | null; // project this task was filed from (cross-project; issue #13)
   comments?: Comment[];
   links?: string[];
   created_by?: string; // "user" | "claude" ("" / absent = user, no AI badge)
@@ -114,16 +115,20 @@ const formOpen = ref(false);
 // Projects the tracker has seen (from cc_usage), so the picker offers real
 // projects even before any todo uses them.
 const knownProjects = ref<string[]>([]);
-const projects = computed(() => {
-  const set = new Set<string>();
-  for (const t of todos.value) if (t.project) set.add(t.project);
-  for (const p of knownProjects.value) set.add(p);
-  return [...set].sort();
-});
 
 // Merge-link badges (issue #13). A task's `project` is stored raw, so it may be a
 // canonical (absorbed others) or an alias (folded into a canonical) — need both.
 const { aliasesOf, canonicalOf } = useProjectLinks();
+
+// Project list for the filter/picker — RESOLVED to canonical names so a renamed
+// project's tasks don't split across the old and new name. `knownProjects`
+// (cc_projects) already comes canonical.
+const projects = computed(() => {
+  const set = new Set<string>();
+  for (const t of todos.value) if (t.project) set.add(canonicalOf(t.project) ?? t.project);
+  for (const p of knownProjects.value) set.add(p);
+  return [...set].sort();
+});
 
 
 // Todos passing the active filters (project + search + show-done), the pool the
@@ -131,7 +136,9 @@ const { aliasesOf, canonicalOf } = useProjectLinks();
 const visible = computed(() => {
   let list = todos.value.slice();
   if (projectFilter.value) {
-    list = list.filter((t) => (t.project ?? "") === projectFilter.value);
+    // Resolve through merge links so the canonical filter also catches tasks
+    // still tagged with a merged-away alias name.
+    list = list.filter((t) => (canonicalOf(t.project) ?? t.project ?? "") === projectFilter.value);
   }
   if (!showDone.value) list = list.filter((t) => t.status !== "done");
   const q = search.value.trim().toLowerCase();
@@ -922,6 +929,11 @@ onUnmounted(() => {
                   :merged-into="canonicalOf(todo.project)"
                 />
               </span>
+              <span
+                v-if="todo.from && todo.from !== todo.project"
+                class="tw-chip tw-from"
+                :title="t('todoFromHint')"
+              >↘ {{ t("todoFrom") }} {{ todo.from }}</span>
               <span v-if="todo.estimate_minutes != null" class="tw-chip">⏱ {{ fmtEstimate(todo.estimate_minutes) }}</span>
               <span v-if="todo.scheduled_for" class="tw-chip">📅 {{ todo.scheduled_for }}</span>
               <span v-if="todo.plan" class="tw-chip" :title="todo.plan">📝</span>
@@ -1021,6 +1033,13 @@ onUnmounted(() => {
                 clearable
               />
             </label>
+          </div>
+          <div
+            v-if="detail?.from && detail.from !== draft.project"
+            class="tw-from-note"
+            :title="t('todoFromHint')"
+          >
+            ↘ {{ t("todoFrom") }} <strong>{{ detail.from }}</strong>
           </div>
           <div class="tw-row">
             <label class="tw-field">
@@ -1461,6 +1480,23 @@ onUnmounted(() => {
 .tw-chip {
   font-size: 10.5px;
   color: var(--text-3);
+}
+/* Provenance chip — "↘ from <project>" for a cross-project task. */
+.tw-from {
+  color: var(--text-2);
+  background: var(--track);
+  padding: 1px 7px;
+  border-radius: 8px;
+  white-space: nowrap;
+}
+/* Same provenance, shown read-only in the detail/edit view. */
+.tw-from-note {
+  font-size: 12px;
+  color: var(--text-3);
+}
+.tw-from-note strong {
+  color: var(--text);
+  font-weight: 600;
 }
 .tw-card-foot {
   display: flex;
