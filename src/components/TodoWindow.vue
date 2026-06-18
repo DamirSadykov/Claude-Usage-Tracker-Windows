@@ -8,7 +8,7 @@
 //
 // The view is a kanban board: one column per status, cards drag between columns
 // (which persists the new status). Columns mirror `todos.rs::STATUSES`.
-import { ref, computed, onMounted, onUnmounted } from "vue";
+import { ref, computed, onMounted, onUnmounted, nextTick } from "vue";
 import { useI18n, type Composer } from "vue-i18n";
 import { invoke } from "@tauri-apps/api/core";
 import i18n from "../i18n";
@@ -45,6 +45,7 @@ export interface Comment {
 }
 export interface Todo {
   id: string;
+  number?: number; // stable human-facing number for inline #N references
   subject: string;
   description: string;
   status: string;
@@ -360,6 +361,7 @@ function openDetail(todo: Todo) {
     status: todo.status,
   };
   descMode.value = "edit";
+  mention.value = null;
   view.value = "detail";
 }
 
@@ -452,17 +454,28 @@ function fmtTime(iso: string | undefined) {
   });
 }
 
-// --- Mini editor: link highlighting ---
-// Split plain text into runs, marking http(s)/www URLs as links. Deliberately
-// NOT v-html: every run is rendered through Vue text interpolation (escaped),
-// links as <a> — so a crafted comment can't inject markup. The opened URL goes
-// through the backend `open_url` command, which only allows http/https.
-interface Segment {
-  text: string;
-  href: string | null;
-}
+// --- Mini editor: inline links & references (GitHub-style) ---
+// Split plain text into runs, marking URLs, task references (#N) and project
+// references (@name). Deliberately NOT v-html: every run renders through Vue
+// text interpolation (escaped) — a crafted comment can't inject markup. Opened
+// URLs go through the backend `open_url` command (http/https only); #N/@name
+// navigate inside the app.
+type Seg =
+  | { kind: "text"; text: string }
+  | { kind: "url"; text: string; href: string }
+  | { kind: "task"; text: string; number: number; subject: string }
+  | { kind: "project"; text: string; project: string };
 
-const URL_RE = /(https?:\/\/[^\s<>]+|www\.[^\s<>]+)/gi;
+// One pass: URL | #digits | @slug. Classification by which group matched.
+const TOKEN_RE = /(https?:\/\/[^\s<>]+|www\.[^\s<>]+)|#(\d+)|@([A-Za-z0-9._\-]+)/g;
+
+// Stable lookups for resolving references while rendering.
+const byNumber = computed(() => {
+  const m = new Map<number, Todo>();
+  for (const t of todos.value) if (t.number) m.set(t.number, t);
+  return m;
+});
+const projectSet = computed(() => new Set(projects.value));
 
 // Strip trailing prose punctuation that almost certainly isn't part of the URL
 // ("see https://x.com." → drop the period), while keeping a closing bracket that
@@ -489,25 +502,55 @@ function trimUrlTail(url: string): string {
   return u;
 }
 
-function linkify(text: string): Segment[] {
-  const out: Segment[] = [];
+function tokenize(text: string): Seg[] {
+  const out: Seg[] = [];
   if (!text) return out;
+  const byNum = byNumber.value;
+  const projs = projectSet.value;
   let last = 0;
-  for (const m of text.matchAll(URL_RE)) {
+  for (const m of text.matchAll(TOKEN_RE)) {
     const start = m.index ?? 0;
-    const url = trimUrlTail(m[0]);
-    if (!url) continue;
-    if (start > last) out.push({ text: text.slice(last, start), href: null });
-    const href = url.startsWith("www.") ? `https://${url}` : url;
-    out.push({ text: url, href });
-    last = start + url.length; // trimmed punctuation rejoins the next text run
+    let seg: Seg | null = null;
+    let consumed = m[0].length;
+    if (m[1]) {
+      const url = trimUrlTail(m[1]);
+      if (url) {
+        const href = url.startsWith("www.") ? `https://${url}` : url;
+        seg = { kind: "url", text: url, href };
+        consumed = url.length;
+      }
+    } else if (m[2]) {
+      const num = parseInt(m[2], 10);
+      const tt = byNum.get(num);
+      // Only a number that maps to a real task becomes a link; otherwise it's
+      // left as plain text so a stray "#5" doesn't pretend to be a reference.
+      if (tt) seg = { kind: "task", text: `#${num}`, number: num, subject: tt.subject };
+    } else if (m[3]) {
+      let proj = m[3];
+      if (!projs.has(proj)) {
+        const trimmed = proj.replace(/[._\-]+$/, "");
+        proj = projs.has(trimmed) ? trimmed : "";
+      }
+      if (proj) {
+        seg = { kind: "project", text: `@${proj}`, project: proj };
+        consumed = 1 + proj.length;
+      }
+    }
+    if (start > last) out.push({ kind: "text", text: text.slice(last, start) });
+    if (seg) {
+      out.push(seg);
+      last = start + consumed;
+    } else {
+      // Unresolved token → emit verbatim as text (trailing punct rejoins later).
+      out.push({ kind: "text", text: m[0] });
+      last = start + m[0].length;
+    }
   }
-  if (last < text.length) out.push({ text: text.slice(last), href: null });
+  if (last < text.length) out.push({ kind: "text", text: text.slice(last) });
   return out;
 }
 
-async function openLink(href: string | null) {
-  if (!href) return;
+async function openLink(href: string) {
   try {
     await invoke("open_url", { url: href });
   } catch (e) {
@@ -515,10 +558,149 @@ async function openLink(href: string | null) {
   }
 }
 
+// Navigate a #N reference to that task's detail; a @name reference back to the
+// board filtered to that project.
+function openTask(number: number) {
+  const t = byNumber.value.get(number);
+  if (t) openDetail(t);
+}
+function openProject(name: string) {
+  projectFilter.value = name;
+  closeDetail();
+}
+
 // Description has an edit/preview toggle: edit = textarea, preview = the same
-// text with links rendered clickable. Reset to edit whenever a task opens.
+// text with links/references rendered. Reset to edit whenever a task opens.
 const descMode = ref<"edit" | "preview">("edit");
-const descSegments = computed(() => linkify(draft.value.description));
+const descSegments = computed(() => tokenize(draft.value.description));
+
+// --- Inline-reference autocomplete (the "preview the task you mean" popup) ---
+// A GitHub-style trigger menu: typing `#` lists tasks (number + subject so you
+// can tell which one), `@` lists projects. It drives plain-text insertion — the
+// stored text stays `#12` / `@proj`, resolved at render time by tokenize().
+const descTextarea = ref<HTMLTextAreaElement | null>(null);
+const commentTextarea = ref<HTMLTextAreaElement | null>(null);
+interface MentionState {
+  target: "desc" | "comment";
+  trigger: "#" | "@";
+  query: string;
+  start: number; // index of the trigger char in the text
+  caret: number; // caret index (end of the query)
+  sel: number; // highlighted candidate
+}
+const mention = ref<MentionState | null>(null);
+
+interface MentionItem {
+  label: string;
+  sub: string;
+  value: string;
+}
+const mentionItems = computed<MentionItem[]>(() => {
+  const m = mention.value;
+  if (!m) return [];
+  const q = m.query.toLowerCase();
+  if (m.trigger === "#") {
+    let list = todos.value.filter((t) => t.number && t.id !== detailId.value);
+    if (q) {
+      list = list.filter(
+        (t) =>
+          String(t.number).startsWith(q) ||
+          t.subject.toLowerCase().includes(q),
+      );
+    }
+    return list
+      .slice()
+      .sort((a, b) => (a.number ?? 0) - (b.number ?? 0))
+      .slice(0, 8)
+      .map((t) => ({ label: `#${t.number}`, sub: t.subject, value: String(t.number) }));
+  }
+  let list = projects.value;
+  if (q) list = list.filter((p) => p.toLowerCase().includes(q));
+  return list.slice(0, 8).map((p) => ({ label: `@${p}`, sub: "", value: p }));
+});
+
+// On every keystroke, decide whether the caret sits inside a `#…`/`@…` token
+// (trigger at line start or after whitespace, valid chars up to the caret).
+function onMentionInput(target: "desc" | "comment", e: Event) {
+  const el = e.target as HTMLTextAreaElement;
+  const text = el.value;
+  const caret = el.selectionStart ?? text.length;
+  let triggerIdx = -1;
+  let trig: "#" | "@" | null = null;
+  for (let i = caret - 1; i >= 0; i--) {
+    const ch = text[i];
+    if (ch === "#" || ch === "@") {
+      if (i === 0 || /\s/.test(text[i - 1])) {
+        triggerIdx = i;
+        trig = ch as "#" | "@";
+      }
+      break;
+    }
+    if (/\s/.test(ch)) break;
+  }
+  if (triggerIdx >= 0 && trig) {
+    const query = text.slice(triggerIdx + 1, caret);
+    const valid =
+      trig === "#" ? /^\d*$/.test(query) : /^[A-Za-z0-9._\-]*$/.test(query);
+    mention.value = valid
+      ? { target, trigger: trig, query, start: triggerIdx, caret, sel: 0 }
+      : null;
+  } else {
+    mention.value = null;
+  }
+}
+
+async function pickMention(item: MentionItem) {
+  const m = mention.value;
+  if (!m) return;
+  const insert = (m.trigger === "#" ? `#${item.value}` : `@${item.value}`) + " ";
+  const apply = (text: string) =>
+    text.slice(0, m.start) + insert + text.slice(m.caret);
+  if (m.target === "desc") draft.value.description = apply(draft.value.description);
+  else newComment.value = apply(newComment.value);
+  const newCaret = m.start + insert.length;
+  mention.value = null;
+  await nextTick();
+  const el = m.target === "desc" ? descTextarea.value : commentTextarea.value;
+  if (el) {
+    el.focus();
+    el.setSelectionRange(newCaret, newCaret);
+  }
+}
+
+function onMentionKeydown(target: "desc" | "comment", e: KeyboardEvent) {
+  const m = mention.value;
+  if (!m || m.target !== target) return;
+  if (e.key === "Escape") {
+    e.preventDefault();
+    mention.value = null;
+    return;
+  }
+  const items = mentionItems.value;
+  if (!items.length) return;
+  if (e.key === "ArrowDown") {
+    e.preventDefault();
+    m.sel = (m.sel + 1) % items.length;
+  } else if (e.key === "ArrowUp") {
+    e.preventDefault();
+    m.sel = (m.sel - 1 + items.length) % items.length;
+  } else if (
+    (e.key === "Enter" && !e.ctrlKey && !e.metaKey) ||
+    e.key === "Tab"
+  ) {
+    // Plain Enter/Tab picks the highlighted item; Ctrl/Cmd+Enter is left for
+    // "post comment", so it falls through to that handler.
+    e.preventDefault();
+    void pickMention(items[Math.min(m.sel, items.length - 1)]);
+  }
+}
+
+// Close the menu on blur, deferred so a mousedown on an item still registers.
+function onMentionBlur() {
+  setTimeout(() => {
+    mention.value = null;
+  }, 120);
+}
 
 // --- Task linking ---
 // A relationship is stored one-way (the other task's id in `todo.links`) but
@@ -904,20 +1086,35 @@ onUnmounted(() => {
                 {{ descMode === "edit" ? t("todoPreview") : t("todoEditField") }}
               </button>
             </span>
-            <textarea
-              v-if="descMode === 'edit'"
-              v-model="draft.description"
-              class="tw-input tw-area"
-              rows="7"
-            ></textarea>
+            <div v-if="descMode === 'edit'" class="tw-mention-wrap">
+              <textarea
+                ref="descTextarea"
+                v-model="draft.description"
+                class="tw-input tw-area"
+                rows="7"
+                @input="onMentionInput('desc', $event)"
+                @keydown="onMentionKeydown('desc', $event)"
+                @blur="onMentionBlur"
+              ></textarea>
+              <ul v-if="mention && mention.target === 'desc' && mentionItems.length" class="tw-mention">
+                <li
+                  v-for="(it, i) in mentionItems"
+                  :key="it.value"
+                  class="tw-mention-item"
+                  :class="{ sel: i === mention.sel }"
+                  @mousedown.prevent="pickMention(it)"
+                >
+                  <span class="tw-mention-key">{{ it.label }}</span>
+                  <span v-if="it.sub" class="tw-mention-sub">{{ it.sub }}</span>
+                </li>
+              </ul>
+            </div>
             <div v-else class="tw-richtext">
               <template v-if="draft.description.trim()"
                 ><template v-for="(s, i) in descSegments" :key="i"
-                  ><a
-                    v-if="s.href"
-                    class="tw-link"
-                    @click.prevent="openLink(s.href)"
-                    >{{ s.text }}</a
+                  ><a v-if="s.kind === 'url'" class="tw-link" @click.prevent="openLink(s.href)">{{ s.text }}</a
+                  ><a v-else-if="s.kind === 'task'" class="tw-ref" :title="s.subject" @click.prevent="openTask(s.number)">{{ s.text }}<span class="tw-ref-title">{{ s.subject }}</span></a
+                  ><a v-else-if="s.kind === 'project'" class="tw-ref tw-ref-proj" @click.prevent="openProject(s.project)">{{ s.text }}</a
                   ><span v-else>{{ s.text }}</span></template
                 ></template
               >
@@ -987,26 +1184,42 @@ onUnmounted(() => {
                   </button>
                 </div>
                 <p class="tw-comment-body"
-                  ><template v-for="(s, i) in linkify(c.body)" :key="i"
-                    ><a
-                      v-if="s.href"
-                      class="tw-link"
-                      @click.prevent="openLink(s.href)"
-                      >{{ s.text }}</a
+                  ><template v-for="(s, i) in tokenize(c.body)" :key="i"
+                    ><a v-if="s.kind === 'url'" class="tw-link" @click.prevent="openLink(s.href)">{{ s.text }}</a
+                    ><a v-else-if="s.kind === 'task'" class="tw-ref" :title="s.subject" @click.prevent="openTask(s.number)">{{ s.text }}<span class="tw-ref-title">{{ s.subject }}</span></a
+                    ><a v-else-if="s.kind === 'project'" class="tw-ref tw-ref-proj" @click.prevent="openProject(s.project)">{{ s.text }}</a
                     ><span v-else>{{ s.text }}</span></template
                   ></p
                 >
               </li>
             </ul>
             <div class="tw-comment-compose">
-              <textarea
-                v-model="newComment"
-                class="tw-input tw-area"
-                :placeholder="t('todoCommentPlaceholder')"
-                rows="2"
-                @keydown.ctrl.enter="addComment"
-                @keydown.meta.enter="addComment"
-              ></textarea>
+              <div class="tw-mention-wrap">
+                <textarea
+                  ref="commentTextarea"
+                  v-model="newComment"
+                  class="tw-input tw-area"
+                  :placeholder="t('todoCommentPlaceholder')"
+                  rows="2"
+                  @input="onMentionInput('comment', $event)"
+                  @keydown="onMentionKeydown('comment', $event)"
+                  @keydown.ctrl.enter="addComment"
+                  @keydown.meta.enter="addComment"
+                  @blur="onMentionBlur"
+                ></textarea>
+                <ul v-if="mention && mention.target === 'comment' && mentionItems.length" class="tw-mention up">
+                  <li
+                    v-for="(it, i) in mentionItems"
+                    :key="it.value"
+                    class="tw-mention-item"
+                    :class="{ sel: i === mention.sel }"
+                    @mousedown.prevent="pickMention(it)"
+                  >
+                    <span class="tw-mention-key">{{ it.label }}</span>
+                    <span v-if="it.sub" class="tw-mention-sub">{{ it.sub }}</span>
+                  </li>
+                </ul>
+              </div>
               <button class="tw-btn" :disabled="!newComment.trim()" @click="addComment">{{ t("todoCommentAdd") }}</button>
             </div>
           </div>
@@ -1775,6 +1988,81 @@ onUnmounted(() => {
 .tw-richtext-empty {
   color: var(--text-4);
   font-style: italic;
+}
+
+/* Inline references (#N task, @name project) */
+.tw-ref {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-radius: 4px;
+  padding: 0 4px;
+  cursor: pointer;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.tw-ref:hover {
+  text-decoration: underline;
+}
+.tw-ref-title {
+  font-weight: 400;
+  opacity: 0.8;
+  margin-left: 4px;
+}
+.tw-ref-proj {
+  color: #c4a7ff;
+  background: rgba(179, 136, 255, 0.16);
+}
+
+/* Inline-reference autocomplete menu */
+.tw-mention-wrap {
+  position: relative;
+  width: 100%;
+}
+.tw-mention {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  z-index: 30;
+  margin: 3px 0 0;
+  padding: 4px;
+  list-style: none;
+  background: var(--card-bg);
+  border: 1px solid var(--stroke-strong);
+  border-radius: 6px;
+  max-height: 220px;
+  overflow-y: auto;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+}
+.tw-mention.up {
+  top: auto;
+  bottom: 100%;
+  margin: 0 0 3px;
+}
+.tw-mention-item {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.tw-mention-item:hover,
+.tw-mention-item.sel {
+  background: var(--accent-soft);
+}
+.tw-mention-key {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+  flex-shrink: 0;
+}
+.tw-mention-sub {
+  font-size: 12px;
+  color: var(--text-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* Linked tasks */
