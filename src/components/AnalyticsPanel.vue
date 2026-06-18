@@ -2,6 +2,9 @@
 import { ref, watch, onMounted, onUnmounted, computed, nextTick } from "vue";
 import { useI18n } from "vue-i18n";
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import ProjectLabel from "./ProjectLabel.vue";
+import { useProjectLinks } from "../projectLinks";
 import { fmtDateTime, fmtDay } from "../dateFormat";
 import {
   Chart,
@@ -309,9 +312,8 @@ const avgPerSession = computed(() => {
 });
 
 // --- per-project & anomalies ---
-function projectName(p: string | null): string {
-  return p && p.length ? p : t("projectUnknown");
-}
+// Merge-link badges (issue #13): aliases each canonical absorbed.
+const { aliasesOf } = useProjectLinks();
 
 // Largest project value (in the current metric) — scales the proportional bars.
 const projectMax = computed(() => {
@@ -523,12 +525,19 @@ watch(locale, () => {
   if (props.active) renderCharts();
 });
 
-onMounted(() => {
+// A merge done in the analytics window (a separate WebView) changes how usage
+// aggregates here too — re-read when it fires, if we're visible.
+let unlistenLinks: UnlistenFn | null = null;
+onMounted(async () => {
   if (props.active) load();
+  unlistenLinks = await listen("project-links-changed", () => {
+    if (props.active) void reload();
+  });
 });
 onUnmounted(() => {
   dailyChart?.destroy();
   modelChart?.destroy();
+  unlistenLinks?.();
 });
 </script>
 
@@ -589,7 +598,9 @@ onUnmounted(() => {
         <div class="anomaly-list">
           <div v-for="s in data.anomalies" :key="s.session_id" class="anomaly-row">
             <span class="anomaly-when">{{ fmtWhen(s.start) }}</span>
-            <span class="anomaly-proj">{{ projectName(s.project) }}</span>
+            <span class="anomaly-proj">
+              <ProjectLabel :name="s.project" :aliases="aliasesOf(s.project)" />
+            </span>
             <span class="anomaly-mult">×{{ anomalyRatio(s).toFixed(1) }}</span>
             <span class="anomaly-val">{{ fmtMetric(s.total_tokens, s.cost) }}</span>
           </div>
@@ -670,7 +681,9 @@ onUnmounted(() => {
         <div class="pbars">
           <div v-for="p in data.by_project" :key="p.project ?? '∅'" class="pbar-row">
             <div class="pbar-head">
-              <span class="pbar-name">{{ projectName(p.project) }}</span>
+              <span class="pbar-name">
+                <ProjectLabel :name="p.project" :aliases="aliasesOf(p.project)" />
+              </span>
               <span class="pbar-val">{{ fmtMetric(p.total_tokens, p.cost) }}</span>
             </div>
             <div class="pbar-track">

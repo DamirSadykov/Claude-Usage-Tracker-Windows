@@ -11,6 +11,9 @@
 import { ref, computed, onMounted, onUnmounted, nextTick } from "vue";
 import { useI18n, type Composer } from "vue-i18n";
 import { invoke } from "@tauri-apps/api/core";
+import ProjectAutocomplete from "./ProjectAutocomplete.vue";
+import ProjectLabel from "./ProjectLabel.vue";
+import { useProjectLinks } from "../projectLinks";
 import i18n from "../i18n";
 
 const { t, locale } = useI18n();
@@ -118,42 +121,10 @@ const projects = computed(() => {
   return [...set].sort();
 });
 
-// Project-field autocomplete: filtered dropdown of known projects as you type.
-const projectFocus = ref(false);
-const projectSel = ref(-1);
-const projectSuggestions = computed(() => {
-  const q = fProject.value.trim().toLowerCase();
-  // Show every project containing the query — including an exact match. An
-  // earlier version hid the exact match, which made "neo" vanish while "neo4j"
-  // stayed once you'd typed the shorter name in full.
-  const list = q
-    ? projects.value.filter((p) => p.toLowerCase().includes(q))
-    : projects.value;
-  return list.slice(0, 8);
-});
-function selectProject(p: string) {
-  fProject.value = p;
-  projectFocus.value = false;
-  projectSel.value = -1;
-}
-function onProjectBlur() {
-  // Delay so a mousedown on a suggestion registers before the list closes.
-  setTimeout(() => {
-    projectFocus.value = false;
-    projectSel.value = -1;
-  }, 120);
-}
-function moveProjectSel(step: number) {
-  const n = projectSuggestions.value.length;
-  if (!n) return;
-  projectFocus.value = true;
-  projectSel.value = (projectSel.value + step + n) % n;
-}
-function pickProjectSel() {
-  const s = projectSuggestions.value;
-  if (projectSel.value >= 0 && projectSel.value < s.length)
-    selectProject(s[projectSel.value]);
-}
+// Merge-link badges (issue #13). A task's `project` is stored raw, so it may be a
+// canonical (absorbed others) or an alias (folded into a canonical) — need both.
+const { aliasesOf, canonicalOf } = useProjectLinks();
+
 
 // Todos passing the active filters (project + search + show-done), the pool the
 // board draws from. Per-column ordering is applied in `itemsFor`.
@@ -883,10 +854,14 @@ onUnmounted(() => {
         </svg>
         <input v-model="search" class="tw-search-input" :placeholder="t('todoSearch')" />
       </div>
-      <select v-model="projectFilter" class="tw-select" :title="t('todoProject')">
-        <option value="">{{ t("todoFilterAll") }}</option>
-        <option v-for="p in projects" :key="p" :value="p">{{ p }}</option>
-      </select>
+      <ProjectAutocomplete
+        v-model="projectFilter"
+        :options="projects"
+        :placeholder="t('todoFilterAll')"
+        clearable
+        commit-on="select"
+        width="170px"
+      />
       <label class="tw-toggle">
         <input type="checkbox" v-model="showDone" />
         {{ t("todoShowDone") }}
@@ -940,7 +915,13 @@ onUnmounted(() => {
 
             <div class="tw-card-meta">
               <span v-if="todo.created_by === 'claude'" class="tw-ai sm" :title="t('todoAiHint')">{{ t("todoAi") }}</span>
-              <span v-if="todo.project" class="tw-tag">{{ todo.project }}</span>
+              <span v-if="todo.project" class="tw-tag">
+                <ProjectLabel
+                  :name="todo.project"
+                  :aliases="aliasesOf(todo.project)"
+                  :merged-into="canonicalOf(todo.project)"
+                />
+              </span>
               <span v-if="todo.estimate_minutes != null" class="tw-chip">⏱ {{ fmtEstimate(todo.estimate_minutes) }}</span>
               <span v-if="todo.scheduled_for" class="tw-chip">📅 {{ todo.scheduled_for }}</span>
               <span v-if="todo.plan" class="tw-chip" :title="todo.plan">📝</span>
@@ -1033,10 +1014,12 @@ onUnmounted(() => {
             </label>
             <label class="tw-field">
               <span>{{ t("todoProject") }}</span>
-              <select v-model="draft.project" class="tw-select">
-                <option value="">{{ t("todoNoProject") }}</option>
-                <option v-for="p in projects" :key="p" :value="p">{{ p }}</option>
-              </select>
+              <ProjectAutocomplete
+                v-model="draft.project"
+                :options="projects"
+                :placeholder="t('todoNoProject')"
+                clearable
+              />
             </label>
           </div>
           <div class="tw-row">
@@ -1195,35 +1178,13 @@ onUnmounted(() => {
           :placeholder="t('todoDescription')"
           rows="2"
         ></textarea>
-        <label class="tw-field tw-ac">
+        <label class="tw-field">
           <span>{{ t("todoProject") }}</span>
-          <input
+          <ProjectAutocomplete
             v-model="fProject"
-            class="tw-input"
+            :options="projects"
             :placeholder="t('todoProjectPlaceholder')"
-            autocomplete="off"
-            @focus="projectFocus = true"
-            @input="projectFocus = true; projectSel = -1"
-            @blur="onProjectBlur"
-            @keydown.down.prevent="moveProjectSel(1)"
-            @keydown.up.prevent="moveProjectSel(-1)"
-            @keydown.enter.prevent="pickProjectSel"
-            @keydown.escape="projectFocus = false"
           />
-          <ul
-            v-if="projectFocus && projectSuggestions.length"
-            class="tw-ac-list"
-          >
-            <li
-              v-for="(p, i) in projectSuggestions"
-              :key="p"
-              class="tw-ac-item"
-              :class="{ sel: i === projectSel }"
-              @mousedown.prevent="selectProject(p)"
-            >
-              {{ p }}
-            </li>
-          </ul>
         </label>
         <div class="tw-row">
           <label class="tw-field">
@@ -1600,37 +1561,6 @@ onUnmounted(() => {
   color: var(--text-4);
   font-style: italic;
   font-weight: 400;
-}
-.tw-ac {
-  position: relative;
-}
-.tw-ac-list {
-  position: absolute;
-  top: 100%;
-  left: 0;
-  right: 0;
-  z-index: 20;
-  margin: 2px 0 0;
-  padding: 4px;
-  list-style: none;
-  background: var(--card-bg);
-  border: 1px solid var(--stroke-strong);
-  border-radius: 6px;
-  max-height: 184px;
-  overflow-y: auto;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
-}
-.tw-ac-item {
-  padding: 6px 8px;
-  font-size: 12px;
-  color: var(--text-2);
-  border-radius: 4px;
-  cursor: pointer;
-}
-.tw-ac-item:hover,
-.tw-ac-item.sel {
-  background: var(--accent-soft);
-  color: var(--text);
 }
 .tw-form-actions {
   display: flex;

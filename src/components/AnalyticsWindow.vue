@@ -8,6 +8,10 @@
 import { ref, computed, onMounted, onUnmounted, watch, nextTick } from "vue";
 import { useI18n } from "vue-i18n";
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import ProjectAutocomplete from "./ProjectAutocomplete.vue";
+import ProjectLabel from "./ProjectLabel.vue";
+import { useProjectLinks } from "../projectLinks";
 import { getInsightHelpHtml, hasInsightHelp } from "../insightHelp";
 import { renderInsightHelp } from "../insightHelp/render";
 import { fmtDateTime, fmtDay } from "../dateFormat";
@@ -320,9 +324,10 @@ async function copyId(id: string) {
 function fmtWhen(iso: string): string {
   return fmtDateTime(iso, locale.value);
 }
-function projectName(p: string | null): string {
-  return p && p.length ? p : t("projectUnknown");
-}
+// Merge-link badges: which aliases each canonical absorbed (issue #13). Analytics
+// always shows resolved (canonical) names, so only the canonical→aliases side is
+// needed here.
+const { aliasesOf } = useProjectLinks();
 
 // --- trend badges (period over period) ---
 // Each KPI tile that supports a trend shows a small badge: arrow + delta%.
@@ -912,7 +917,7 @@ function onTilePopoverDismissScroll() {
 // The single-scroll dashboard is split into five tabs. Section order/visibility
 // (the old `dashboardSections` machinery) is dropped — the tab structure fixes
 // where each section lives.
-type TabId = "overview" | "trends" | "sessions" | "tools" | "insights";
+type TabId = "overview" | "trends" | "sessions" | "tools" | "insights" | "projects";
 const activeTab = ref<TabId>("overview");
 const tabs = computed<{ id: TabId; label: string; count?: number }[]>(() => [
   { id: "overview", label: t("awTabOverview") },
@@ -920,7 +925,68 @@ const tabs = computed<{ id: TabId; label: string; count?: number }[]>(() => [
   { id: "sessions", label: t("awTabSessions") },
   { id: "tools", label: t("awTabTools") },
   { id: "insights", label: t("awTabInsights"), count: activeInsights.value.length },
+  { id: "projects", label: t("awTabProjects") },
 ]);
+
+// --- projects tab: per-project breakdown + merge links (issue #13) ---
+// The merge maps a RAW project (alias) to a canonical name it's aggregated under,
+// so a renamed/absorbed project's history stops fragmenting. Resolution is
+// read-time in the backend, so unmerge restores the original split instantly.
+interface ProjectLink {
+  alias: string;
+  canonical: string;
+}
+const rawProjects = ref<string[]>([]); // un-merged names, for the merge picker
+const projectLinks = ref<ProjectLink[]>([]);
+const mergeAlias = ref("");
+const mergeCanonical = ref("");
+const mergeError = ref("");
+
+// Per-project breakdown: top-10 by default, "show more" reveals the long tail.
+const PROJ_COLLAPSED_N = 10;
+const projExpanded = ref(false);
+const visibleProjects = computed(() => {
+  const all = data.value?.by_project ?? [];
+  return projExpanded.value ? all : all.slice(0, PROJ_COLLAPSED_N);
+});
+
+async function loadProjectMgmt() {
+  try {
+    [rawProjects.value, projectLinks.value] = await Promise.all([
+      invoke<string[]>("get_raw_projects"),
+      invoke<ProjectLink[]>("get_project_links"),
+    ]);
+  } catch (e) {
+    mergeError.value = String(e);
+  }
+}
+
+async function doMerge() {
+  mergeError.value = "";
+  const alias = mergeAlias.value.trim();
+  const canonical = mergeCanonical.value.trim();
+  if (!alias || !canonical) return;
+  try {
+    await invoke("set_project_link", { alias, canonical });
+    mergeAlias.value = "";
+    mergeCanonical.value = "";
+    await loadProjectMgmt();
+    await reload(); // refresh by_project + the filter list with the new merge
+  } catch (e) {
+    mergeError.value = String(e);
+  }
+}
+
+async function doUnmerge(alias: string) {
+  mergeError.value = "";
+  try {
+    await invoke("remove_project_link", { alias });
+    await loadProjectMgmt();
+    await reload();
+  } catch (e) {
+    mergeError.value = String(e);
+  }
+}
 
 // --- session quality + productivity: hide sections with no data ---
 // Quality shows only when at least one of its two metrics is known (non-null),
@@ -959,9 +1025,11 @@ watch([dateFrom, dateTo, projectFilter], load);
 watch(locale, () => renderCharts());
 // Tabs are `v-if`-gated, so switching to a tab with charts remounts its
 // canvases — re-render once the new DOM is in place.
-watch(activeTab, () => {
+watch(activeTab, (tab) => {
   void nextTick().then(renderCharts);
+  if (tab === "projects") void loadProjectMgmt();
 });
+let unlistenLinks: UnlistenFn | null = null;
 onMounted(async () => {
   // Tile-help popover dismissal: Esc, outside click, and any scroll/resize
   // (capture phase catches scrolls inside `.aw-main`, the inner scroll area).
@@ -974,6 +1042,13 @@ onMounted(async () => {
   await loadIgnored();
   await loadGoals();
   await load();
+
+  // Refresh if a merge happens (here or in another window) — keeps the breakdown,
+  // filter list and merge table in sync without a manual reload.
+  unlistenLinks = await listen("project-links-changed", () => {
+    void reload();
+    if (activeTab.value === "projects") void loadProjectMgmt();
+  });
 });
 
 onUnmounted(() => {
@@ -981,6 +1056,7 @@ onUnmounted(() => {
   document.removeEventListener("mousedown", onTilePopoverPointerDown, true);
   window.removeEventListener("scroll", onTilePopoverDismissScroll, true);
   window.removeEventListener("resize", onTilePopoverDismissScroll);
+  unlistenLinks?.();
 });
 </script>
 
@@ -1004,10 +1080,14 @@ onUnmounted(() => {
         </label>
         <label>
           {{ t("analyticsByProject") }}
-          <select v-model="projectFilter">
-            <option value="">{{ t("allProjects") }}</option>
-            <option v-for="p in data?.projects ?? []" :key="p" :value="p">{{ p }}</option>
-          </select>
+          <ProjectAutocomplete
+            v-model="projectFilter"
+            :options="data?.projects ?? []"
+            :placeholder="t('allProjects')"
+            clearable
+            commit-on="select"
+            width="180px"
+          />
         </label>
         <button class="aw-export" @click="doExport" :title="t('exportJsonHint')">
           {{ t("exportJson") }}
@@ -1273,7 +1353,9 @@ onUnmounted(() => {
                 <div v-for="s in data.costly_by_cost" :key="'c' + s.session_id" class="aw-row">
                   <div class="aw-row-line">
                     <span class="aw-row-when">{{ fmtWhen(s.start) }}</span>
-                    <span v-if="!projectFilter" class="aw-row-proj">{{ projectName(s.project) }}</span>
+                    <span v-if="!projectFilter" class="aw-row-proj">
+                      <ProjectLabel :name="s.project" :aliases="aliasesOf(s.project)" />
+                    </span>
                     <button
                       class="aw-row-id"
                       @click="copyId(s.session_id)"
@@ -1296,7 +1378,9 @@ onUnmounted(() => {
                 <div v-for="s in data.costly_by_cache" :key="'k' + s.session_id" class="aw-row">
                   <div class="aw-row-line">
                     <span class="aw-row-when">{{ fmtWhen(s.start) }}</span>
-                    <span v-if="!projectFilter" class="aw-row-proj">{{ projectName(s.project) }}</span>
+                    <span v-if="!projectFilter" class="aw-row-proj">
+                      <ProjectLabel :name="s.project" :aliases="aliasesOf(s.project)" />
+                    </span>
                     <button
                       class="aw-row-id"
                       @click="copyId(s.session_id)"
@@ -1446,7 +1530,9 @@ onUnmounted(() => {
                         @click="copyId(a.session_id)"
                         :title="t('copySession') + ': ' + a.session_id"
                       >{{ shortId(a.session_id) }}</button>
-                      <span class="aw-row-proj">{{ projectName(a.project) }}</span>
+                      <span class="aw-row-proj">
+                        <ProjectLabel :name="a.project" :aliases="aliasesOf(a.project)" />
+                      </span>
                       <span class="aw-row-val">{{ fmtCost(a.cost) }}</span>
                     </li>
                   </ul>
@@ -1481,6 +1567,82 @@ onUnmounted(() => {
                 </div>
               </div>
             </details>
+          </section>
+        </div>
+
+        <!-- ===== Projects: merge management + per-project usage breakdown ===== -->
+        <div v-if="activeTab === 'projects'" class="aw-panel">
+          <section class="aw-proj-block">
+            <div class="aw-group-hd">{{ t("projectMergeTitle") }}</div>
+            <p class="aw-proj-desc">{{ t("projectMergeDesc") }}</p>
+
+            <div class="aw-merge-form">
+              <ProjectAutocomplete
+                v-model="mergeAlias"
+                :options="rawProjects"
+                :placeholder="t('projectMergeAliasLabel')"
+                width="180px"
+              />
+              <span class="aw-merge-arrow">→</span>
+              <ProjectAutocomplete
+                v-model="mergeCanonical"
+                :options="rawProjects"
+                :placeholder="t('projectMergeCanonicalPlaceholder')"
+                width="200px"
+              />
+              <button
+                class="aw-merge-btn"
+                :disabled="!mergeAlias || !mergeCanonical.trim()"
+                @click="doMerge"
+              >
+                {{ t("projectMergeBtn") }}
+              </button>
+            </div>
+            <div v-if="mergeError" class="aw-merge-err">{{ mergeError }}</div>
+
+            <ul v-if="projectLinks.length" class="aw-merge-list">
+              <li v-for="l in projectLinks" :key="l.alias" class="aw-merge-row">
+                <span class="aw-merge-alias">{{ l.alias }}</span>
+                <span class="aw-merge-arrow">→</span>
+                <span class="aw-merge-canon">{{ l.canonical }}</span>
+                <button class="aw-link-btn" @click="doUnmerge(l.alias)">
+                  {{ t("projectMergeUnmerge") }}
+                </button>
+              </li>
+            </ul>
+            <div v-else class="aw-proj-desc">{{ t("projectMergeEmpty") }}</div>
+          </section>
+
+          <section class="aw-proj-block">
+            <div class="aw-group-hd">{{ t("projectBreakdownTitle") }}</div>
+            <table v-if="data.by_project.length" class="aw-table">
+              <thead>
+                <tr>
+                  <th>{{ t("analyticsByProject") }}</th>
+                  <th>{{ t("metricTokens") }}</th>
+                  <th>{{ t("metricCost") }}</th>
+                  <th>{{ t("subagentSessions") }}</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="p in visibleProjects" :key="p.project ?? '∅'">
+                  <td class="aw-proj-name">
+                    <ProjectLabel :name="p.project" :aliases="aliasesOf(p.project)" />
+                  </td>
+                  <td>{{ fmtTokens(p.total_tokens) }}</td>
+                  <td>{{ fmtCost(p.cost) }}</td>
+                  <td>{{ p.sessions }}</td>
+                </tr>
+              </tbody>
+            </table>
+            <div v-else class="aw-proj-desc">{{ t("projectMergeNoProjects") }}</div>
+            <button
+              v-if="data.by_project.length > PROJ_COLLAPSED_N"
+              class="aw-link-btn"
+              @click="projExpanded = !projExpanded"
+            >
+              {{ projExpanded ? t("showLess") : t("showMore") + ' (' + (data.by_project.length - PROJ_COLLAPSED_N) + ')' }}
+            </button>
           </section>
         </div>
       </template>
@@ -1708,6 +1870,80 @@ onUnmounted(() => {
   font-style: italic;
   padding: 24px 4px;
   text-align: center;
+}
+
+/* --- Projects tab: per-project breakdown + merge management (issue #13) --- */
+.aw-proj-block {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.aw-proj-desc {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-4, rgba(255, 255, 255, 0.5));
+  max-width: 64ch;
+  line-height: 1.5;
+}
+.aw-proj-name {
+  color: var(--text-2, rgba(255, 255, 255, 0.85));
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.aw-merge-form {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.aw-merge-arrow {
+  color: var(--text-4, rgba(255, 255, 255, 0.5));
+}
+.aw-merge-btn {
+  border: 1px solid transparent;
+  background: var(--accent);
+  color: #fff;
+  border-radius: var(--card-radius);
+  padding: 5px 14px;
+  font-size: 12px;
+  font-family: var(--segoe);
+  cursor: pointer;
+  transition: filter 120ms;
+}
+.aw-merge-btn:hover:not(:disabled) {
+  filter: brightness(1.1);
+}
+.aw-merge-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.aw-merge-err {
+  font-size: 12px;
+  color: #e5736b;
+}
+.aw-merge-list {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.aw-merge-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}
+.aw-merge-alias {
+  color: var(--text-2, rgba(255, 255, 255, 0.85));
+}
+.aw-merge-canon {
+  color: var(--text, #e8e8e8);
+  font-weight: 500;
+  flex: 1;
 }
 
 .aw-kpis {
