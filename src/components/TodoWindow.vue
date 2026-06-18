@@ -359,6 +359,7 @@ function openDetail(todo: Todo) {
     scheduled_for: todo.scheduled_for ?? "",
     status: todo.status,
   };
+  descMode.value = "edit";
   view.value = "detail";
 }
 
@@ -450,6 +451,74 @@ function fmtTime(iso: string | undefined) {
     minute: "2-digit",
   });
 }
+
+// --- Mini editor: link highlighting ---
+// Split plain text into runs, marking http(s)/www URLs as links. Deliberately
+// NOT v-html: every run is rendered through Vue text interpolation (escaped),
+// links as <a> — so a crafted comment can't inject markup. The opened URL goes
+// through the backend `open_url` command, which only allows http/https.
+interface Segment {
+  text: string;
+  href: string | null;
+}
+
+const URL_RE = /(https?:\/\/[^\s<>]+|www\.[^\s<>]+)/gi;
+
+// Strip trailing prose punctuation that almost certainly isn't part of the URL
+// ("see https://x.com." → drop the period), while keeping a closing bracket that
+// actually balances one inside the URL (e.g. a /wiki/Foo_(bar) link).
+function trimUrlTail(url: string): string {
+  let u = url;
+  while (u.length) {
+    const ch = u[u.length - 1];
+    if (".,;:!?'\"«»".includes(ch)) {
+      u = u.slice(0, -1);
+      continue;
+    }
+    if (ch === ")" || ch === "]" || ch === "}") {
+      const open = ch === ")" ? "(" : ch === "]" ? "[" : "{";
+      const opens = u.split(open).length - 1;
+      const closes = u.split(ch).length - 1;
+      if (closes > opens) {
+        u = u.slice(0, -1);
+        continue;
+      }
+    }
+    break;
+  }
+  return u;
+}
+
+function linkify(text: string): Segment[] {
+  const out: Segment[] = [];
+  if (!text) return out;
+  let last = 0;
+  for (const m of text.matchAll(URL_RE)) {
+    const start = m.index ?? 0;
+    const url = trimUrlTail(m[0]);
+    if (!url) continue;
+    if (start > last) out.push({ text: text.slice(last, start), href: null });
+    const href = url.startsWith("www.") ? `https://${url}` : url;
+    out.push({ text: url, href });
+    last = start + url.length; // trimmed punctuation rejoins the next text run
+  }
+  if (last < text.length) out.push({ text: text.slice(last), href: null });
+  return out;
+}
+
+async function openLink(href: string | null) {
+  if (!href) return;
+  try {
+    await invoke("open_url", { url: href });
+  } catch (e) {
+    errorMsg.value = String(e);
+  }
+}
+
+// Description has an edit/preview toggle: edit = textarea, preview = the same
+// text with links rendered clickable. Reset to edit whenever a task opens.
+const descMode = ref<"edit" | "preview">("edit");
+const descSegments = computed(() => linkify(draft.value.description));
 
 // --- Drag and drop (native HTML5) ---
 function onDragStart(todo: Todo, e: DragEvent) {
@@ -736,8 +805,35 @@ onUnmounted(() => {
             </label>
           </div>
           <label class="tw-field">
-            <span>{{ t("todoDescription") }}</span>
-            <textarea v-model="draft.description" class="tw-input tw-area" rows="7"></textarea>
+            <span class="tw-field-row">
+              {{ t("todoDescription") }}
+              <button
+                type="button"
+                class="tw-mode"
+                @click="descMode = descMode === 'edit' ? 'preview' : 'edit'"
+              >
+                {{ descMode === "edit" ? t("todoPreview") : t("todoEditField") }}
+              </button>
+            </span>
+            <textarea
+              v-if="descMode === 'edit'"
+              v-model="draft.description"
+              class="tw-input tw-area"
+              rows="7"
+            ></textarea>
+            <div v-else class="tw-richtext">
+              <template v-if="draft.description.trim()"
+                ><template v-for="(s, i) in descSegments" :key="i"
+                  ><a
+                    v-if="s.href"
+                    class="tw-link"
+                    @click.prevent="openLink(s.href)"
+                    >{{ s.text }}</a
+                  ><span v-else>{{ s.text }}</span></template
+                ></template
+              >
+              <span v-else class="tw-richtext-empty">{{ t("todoNoDescription") }}</span>
+            </div>
           </label>
           <label class="tw-field">
             <span>{{ t("todoPlan") }} <em class="tw-hint">{{ t("todoPlanHint") }}</em></span>
@@ -769,7 +865,16 @@ onUnmounted(() => {
                     <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M4 4l8 8M12 4l-8 8" /></svg>
                   </button>
                 </div>
-                <p class="tw-comment-body">{{ c.body }}</p>
+                <p class="tw-comment-body"
+                  ><template v-for="(s, i) in linkify(c.body)" :key="i"
+                    ><a
+                      v-if="s.href"
+                      class="tw-link"
+                      @click.prevent="openLink(s.href)"
+                      >{{ s.text }}</a
+                    ><span v-else>{{ s.text }}</span></template
+                  ></p
+                >
               </li>
             </ul>
             <div class="tw-comment-compose">
@@ -1503,5 +1608,51 @@ onUnmounted(() => {
 }
 .tw-comment-compose .tw-area {
   width: 100%;
+}
+
+/* Mini editor: clickable links + edit/preview toggle */
+.tw-link {
+  color: var(--accent);
+  text-decoration: none;
+  cursor: pointer;
+  word-break: break-all;
+}
+.tw-link:hover {
+  text-decoration: underline;
+}
+.tw-field-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.tw-mode {
+  background: transparent;
+  border: none;
+  color: var(--accent);
+  font-family: var(--segoe);
+  font-size: 11px;
+  cursor: pointer;
+  padding: 1px 4px;
+  border-radius: 4px;
+}
+.tw-mode:hover {
+  background: var(--card-bg-hover);
+}
+.tw-richtext {
+  background: var(--card-bg);
+  border: 1px solid var(--stroke-strong);
+  border-radius: 5px;
+  padding: 9px 11px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+  min-height: 36px;
+}
+.tw-richtext-empty {
+  color: var(--text-4);
+  font-style: italic;
 }
 </style>
