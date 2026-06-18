@@ -50,6 +50,14 @@ function main() {
   const todos = Array.isArray(data && data.todos) ? data.todos : [];
 
   const project = path.basename(String(cwd).replace(/[\\/]+$/, ""));
+  // General cross-project note (issue #13): tasks aren't limited to the current
+  // project. The hook itself stays group-agnostic — Claude discovers associations
+  // on demand via `cc-todos related`.
+  const crossProjectNote =
+    `Tasks aren't limited to this project — to file one against a DIFFERENT project ` +
+    `(e.g. a related one you also work on), pass --project <name> to the add command; ` +
+    `the originating project ("${project}") is recorded automatically as the task's "from". ` +
+    `Run \`node "${CLI}" related ${project}\` to list projects associated with "${project}".`;
   // Kanban columns the tracker recognizes. Legacy `pending` (written before the
   // columns existed) is shown as `backlog`, matching the tracker's own load-time
   // migration, so Claude only ever sees a real column.
@@ -100,6 +108,7 @@ function main() {
       `where <status> is one kanban column: backlog | queue | in_progress | review | done, and <id> is the ⟨id⟩ shown above. The CLI validates the status and writes atomically. Run \`node "${CLI}" list\` to see current tasks. Editing other fields (subject / description / plan / estimate_minutes / scheduled_for / project) on an EXISTING task is not supported by the CLI and should be left to the user.`,
       `To record a NEW follow-up the user asked you to track, create it via the CLI (don't hand-edit): node "${CLI}" add "<subject>" [--project <name>] [--description <text>] — it lands in the backlog column. Only add tasks the user explicitly wants tracked; this is their list, not your scratchpad.`,
       `To leave a note on a task the user asked you to record (a finding, progress, a decision), post a comment — it shows in the task's thread attributed to you: node "${CLI}" comment add <id> --text "<body>". Comment only when the user wants it recorded on the task. In a comment or description you can reference another task by its number (e.g. "blocked by #${active[0] && active[0].number ? active[0].number : 12}") — the tracker renders it as a clickable link.`,
+      crossProjectNote,
       `Source of truth file (read-only for you): ${file}`,
     ].join("\n");
 
@@ -118,6 +127,7 @@ function main() {
     `    node "${CLI}" add "<subject>" [--project <name>] [--description <text>]`,
     `    node "${CLI}" list`,
     `Statuses are kanban columns: backlog | queue | in_progress | review | done. Only add tasks the user explicitly wants tracked; this is their list, not your scratchpad.`,
+    crossProjectNote,
     `Source of truth file (read-only for you): ${file}`,
   ].join("\n");
 

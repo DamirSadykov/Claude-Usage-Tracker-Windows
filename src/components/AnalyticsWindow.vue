@@ -12,6 +12,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import ProjectAutocomplete from "./ProjectAutocomplete.vue";
 import ProjectLabel from "./ProjectLabel.vue";
 import { useProjectLinks } from "../projectLinks";
+import { useProjectGroups, type ProjectGroup } from "../projectGroups";
 import { getInsightHelpHtml, hasInsightHelp } from "../insightHelp";
 import { renderInsightHelp } from "../insightHelp/render";
 import { fmtDateTime, fmtDay } from "../dateFormat";
@@ -325,9 +326,65 @@ function fmtWhen(iso: string): string {
   return fmtDateTime(iso, locale.value);
 }
 // Merge-link badges: which aliases each canonical absorbed (issue #13). Analytics
-// always shows resolved (canonical) names, so only the canonical→aliases side is
-// needed here.
-const { aliasesOf } = useProjectLinks();
+// shows resolved (canonical) names; canonicalOf is also used to total association
+// groups whose members are raw alias names.
+const { aliasesOf, canonicalOf } = useProjectLinks();
+
+// Association groups ("who works with whom"): peer links, not a stat merge.
+const { groups: projectGroups, save: saveGroups, relatedOf } = useProjectGroups();
+const newGroupName = ref("");
+// Per-group "add project" draft, keyed by group name.
+const groupAddDraft = ref<Record<string, string>>({});
+
+function createGroup() {
+  const name = newGroupName.value.trim();
+  if (!name || projectGroups.value.some((g) => g.name === name)) {
+    newGroupName.value = "";
+    return;
+  }
+  void saveGroups([...projectGroups.value, { name, projects: [] }]);
+  newGroupName.value = "";
+}
+function deleteGroup(name: string) {
+  void saveGroups(projectGroups.value.filter((g) => g.name !== name));
+}
+function addToGroup(name: string) {
+  const p = (groupAddDraft.value[name] ?? "").trim();
+  if (!p) return;
+  const next = projectGroups.value.map((g) =>
+    g.name === name && !g.projects.includes(p) ? { ...g, projects: [...g.projects, p] } : g,
+  );
+  groupAddDraft.value[name] = "";
+  void saveGroups(next);
+}
+function removeFromGroup(name: string, project: string) {
+  const next = projectGroups.value.map((g) =>
+    g.name === name ? { ...g, projects: g.projects.filter((p) => p !== project) } : g,
+  );
+  void saveGroups(next);
+}
+// Read-only combined total for a group: sum the by_project rows of its members,
+// mapping any member that's an alias to its canonical so merged usage is counted
+// once (and not missed). Returns null when no member has data in the window.
+function groupTotal(g: ProjectGroup): { tokens: number; cost: number } | null {
+  const canon = new Set(g.projects.map((p) => canonicalOf(p) ?? p));
+  let tokens = 0;
+  let cost = 0;
+  let any = false;
+  for (const row of data.value?.by_project ?? []) {
+    if (row.project && canon.has(row.project)) {
+      tokens += row.total_tokens;
+      cost += row.cost;
+      any = true;
+    }
+  }
+  return any ? { tokens, cost } : null;
+}
+// Formatted group total for the UI, or "" when no member has data in the window.
+function groupTotalText(g: ProjectGroup): string {
+  const tt = groupTotal(g);
+  return tt ? `${t("groupTotalLabel")}: ${fmtTokens(tt.tokens)} · ${fmtCost(tt.cost)}` : "";
+}
 
 // --- trend badges (period over period) ---
 // Each KPI tile that supports a trend shows a small badge: arrow + delta%.
@@ -1614,6 +1671,62 @@ onUnmounted(() => {
           </section>
 
           <section class="aw-proj-block">
+            <div class="aw-group-hd">{{ t("awGroupsTitle") }}</div>
+            <p class="aw-proj-desc">{{ t("groupsDesc") }}</p>
+
+            <div class="aw-merge-form">
+              <input
+                v-model="newGroupName"
+                class="aw-group-input"
+                :placeholder="t('groupCreatePlaceholder')"
+                @keydown.enter.prevent="createGroup"
+              />
+              <button class="aw-merge-btn" :disabled="!newGroupName.trim()" @click="createGroup">
+                {{ t("groupCreate") }}
+              </button>
+            </div>
+
+            <div v-if="projectGroups.length" class="aw-groups">
+              <div v-for="g in projectGroups" :key="g.name" class="aw-group">
+                <div class="aw-group-head">
+                  <span class="aw-group-name">{{ g.name }}</span>
+                  <span v-if="groupTotalText(g)" class="aw-group-total">{{ groupTotalText(g) }}</span>
+                  <button class="aw-link-btn" @click="deleteGroup(g.name)">
+                    {{ t("groupDelete") }}
+                  </button>
+                </div>
+                <div v-if="g.projects.length" class="aw-group-members">
+                  <span v-for="p in g.projects" :key="p" class="aw-chip">
+                    {{ p }}
+                    <button
+                      class="aw-chip-x"
+                      :aria-label="t('groupDelete')"
+                      @click="removeFromGroup(g.name, p)"
+                    >×</button>
+                  </span>
+                </div>
+                <div class="aw-merge-form">
+                  <ProjectAutocomplete
+                    :model-value="groupAddDraft[g.name] ?? ''"
+                    :options="rawProjects"
+                    :placeholder="t('groupAddPlaceholder')"
+                    width="180px"
+                    @update:model-value="(v: string) => (groupAddDraft[g.name] = v)"
+                  />
+                  <button
+                    class="aw-merge-btn"
+                    :disabled="!(groupAddDraft[g.name] ?? '').trim()"
+                    @click="addToGroup(g.name)"
+                  >
+                    {{ t("groupAdd") }}
+                  </button>
+                </div>
+              </div>
+            </div>
+            <div v-else class="aw-proj-desc">{{ t("groupsEmpty") }}</div>
+          </section>
+
+          <section class="aw-proj-block">
             <div class="aw-group-hd">{{ t("projectBreakdownTitle") }}</div>
             <table v-if="data.by_project.length" class="aw-table">
               <thead>
@@ -1627,7 +1740,11 @@ onUnmounted(() => {
               <tbody>
                 <tr v-for="p in visibleProjects" :key="p.project ?? '∅'">
                   <td class="aw-proj-name">
-                    <ProjectLabel :name="p.project" :aliases="aliasesOf(p.project)" />
+                    <ProjectLabel
+                      :name="p.project"
+                      :aliases="aliasesOf(p.project)"
+                      :related="relatedOf(p.project)"
+                    />
                   </td>
                   <td>{{ fmtTokens(p.total_tokens) }}</td>
                   <td>{{ fmtCost(p.cost) }}</td>
@@ -1944,6 +2061,83 @@ onUnmounted(() => {
   color: var(--text, #e8e8e8);
   font-weight: 500;
   flex: 1;
+}
+
+/* --- Association groups (issue #13) --- */
+.aw-group-input {
+  background: var(--card-bg, #232323);
+  border: 1px solid var(--stroke-strong, rgba(255, 255, 255, 0.12));
+  color: var(--text);
+  border-radius: var(--card-radius, 6px);
+  padding: 7px 10px;
+  font-size: 13px;
+  font-family: var(--segoe);
+  color-scheme: dark;
+  width: 220px;
+}
+.aw-group-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.aw-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.aw-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--stroke-strong, rgba(255, 255, 255, 0.08));
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.02);
+}
+.aw-group-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.aw-group-name {
+  font-weight: 600;
+  font-size: 13px;
+}
+.aw-group-total {
+  font-size: 12px;
+  color: var(--text-3, rgba(255, 255, 255, 0.7));
+  font-variant-numeric: tabular-nums;
+  margin-left: auto;
+}
+.aw-group-head .aw-link-btn {
+  flex-shrink: 0;
+}
+.aw-group-members {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.aw-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 4px 2px 8px;
+  font-size: 12px;
+  color: var(--text-2, rgba(255, 255, 255, 0.85));
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--stroke-strong, rgba(255, 255, 255, 0.1));
+  border-radius: 12px;
+}
+.aw-chip-x {
+  border: none;
+  background: transparent;
+  color: var(--text-4, rgba(255, 255, 255, 0.5));
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 2px;
+}
+.aw-chip-x:hover {
+  color: var(--text, #e8e8e8);
 }
 
 .aw-kpis {

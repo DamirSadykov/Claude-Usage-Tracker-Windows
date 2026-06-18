@@ -47,6 +47,12 @@ pub struct Todo {
     /// basename); None = not tied to a project.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
+    /// Project this task was filed FROM (issue #13). The cc-todos CLI sets it
+    /// automatically to the originating session's project when a task is filed
+    /// against a DIFFERENT project, so the board can show its provenance. None for
+    /// same-project or app-created tasks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
     /// Discussion thread on this todo (user + Claude). Empty → omitted from the
     /// file so hand-edits and the common no-comment case stay clean.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -184,6 +190,11 @@ pub fn upsert(file: &mut TodoFile, mut todo: Todo, now: &str) {
         if todo.number == 0 {
             todo.number = existing.number;
         }
+        // Provenance is set once (by the CLI) and has no UI field, so a UI edit
+        // that doesn't carry it must not erase it.
+        if todo.from.is_none() {
+            todo.from = existing.from.clone();
+        }
         *existing = todo;
     } else {
         if todo.created_at.is_empty() {
@@ -249,6 +260,7 @@ mod tests {
             scheduled_for: None,
             plan: String::new(),
             project: None,
+            from: None,
             comments: Vec::new(),
             links: Vec::new(),
             created_by: String::new(),
