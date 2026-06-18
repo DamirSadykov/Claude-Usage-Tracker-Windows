@@ -580,6 +580,18 @@ const descSegments = computed(() => tokenize(draft.value.description));
 // stored text stays `#12` / `@proj`, resolved at render time by tokenize().
 const descTextarea = ref<HTMLTextAreaElement | null>(null);
 const commentTextarea = ref<HTMLTextAreaElement | null>(null);
+const descMenuEl = ref<HTMLUListElement | null>(null);
+const commentMenuEl = ref<HTMLUListElement | null>(null);
+
+// Keep the keyboard-highlighted item visible as the menu scrolls.
+async function scrollSelIntoView() {
+  await nextTick();
+  const m = mention.value;
+  if (!m) return;
+  const ul = m.target === "desc" ? descMenuEl.value : commentMenuEl.value;
+  const li = ul?.children[m.sel] as HTMLElement | undefined;
+  li?.scrollIntoView({ block: "nearest" });
+}
 interface MentionState {
   target: "desc" | "comment";
   trigger: "#" | "@";
@@ -598,10 +610,14 @@ interface MentionItem {
 const mentionItems = computed<MentionItem[]>(() => {
   const m = mention.value;
   if (!m) return [];
-  const q = m.query.toLowerCase();
+  // Trim so a trailing space (still typing a multi-word title) doesn't break the
+  // number-prefix match; the list scrolls, so we keep a generous cap.
+  const q = m.query.trim().toLowerCase();
   if (m.trigger === "#") {
     let list = todos.value.filter((t) => t.number && t.id !== detailId.value);
     if (q) {
+      // GitHub-style: match by number prefix OR anywhere in the title text, so
+      // you can find a task by typing "#" then words from its subject.
       list = list.filter(
         (t) =>
           String(t.number).startsWith(q) ||
@@ -611,41 +627,51 @@ const mentionItems = computed<MentionItem[]>(() => {
     return list
       .slice()
       .sort((a, b) => (a.number ?? 0) - (b.number ?? 0))
-      .slice(0, 8)
+      .slice(0, 50)
       .map((t) => ({ label: `#${t.number}`, sub: t.subject, value: String(t.number) }));
   }
   let list = projects.value;
   if (q) list = list.filter((p) => p.toLowerCase().includes(q));
-  return list.slice(0, 8).map((p) => ({ label: `@${p}`, sub: "", value: p }));
+  return list.slice(0, 50).map((p) => ({ label: `@${p}`, sub: "", value: p }));
 });
 
-// On every keystroke, decide whether the caret sits inside a `#…`/`@…` token
-// (trigger at line start or after whitespace, valid chars up to the caret).
+// A mention is a SESSION: it opens the moment a `#`/`@` is typed (at line start
+// or after whitespace) and stays open as you keep typing, so a `#` query can hold
+// the words of a task title (spaces and all), GitHub-style. The session ends when
+// the trigger is deleted, the caret leaves it, a newline/oversized/`@`-with-space
+// query appears, or you pick/escape. Picking inserts the NUMBER, not the title.
+const MENTION_MAX_QUERY = 60;
 function onMentionInput(target: "desc" | "comment", e: Event) {
   const el = e.target as HTMLTextAreaElement;
   const text = el.value;
   const caret = el.selectionStart ?? text.length;
-  let triggerIdx = -1;
-  let trig: "#" | "@" | null = null;
-  for (let i = caret - 1; i >= 0; i--) {
-    const ch = text[i];
-    if (ch === "#" || ch === "@") {
-      if (i === 0 || /\s/.test(text[i - 1])) {
-        triggerIdx = i;
-        trig = ch as "#" | "@";
-      }
-      break;
+  const m = mention.value;
+  // Continue an open session while its trigger char is still in place.
+  if (m && m.target === target && caret > m.start && text[m.start] === m.trigger) {
+    const query = text.slice(m.start + 1, caret);
+    const ok =
+      !query.includes("\n") &&
+      query.length <= MENTION_MAX_QUERY &&
+      (m.trigger === "#"
+        ? !/\s{2,}/.test(query) // a double space ends a title search
+        : /^[A-Za-z0-9._\-]*$/.test(query)); // project names have no spaces
+    if (ok) {
+      m.query = query;
+      m.caret = caret;
+      m.sel = 0; // reset highlight to the top result as the query changes
+      return;
     }
-    if (/\s/.test(ch)) break;
+    mention.value = null;
   }
-  if (triggerIdx >= 0 && trig) {
-    const query = text.slice(triggerIdx + 1, caret);
-    const valid =
-      trig === "#" ? /^\d*$/.test(query) : /^[A-Za-z0-9._\-]*$/.test(query);
-    mention.value = valid
-      ? { target, trigger: trig, query, start: triggerIdx, caret, sel: 0 }
-      : null;
-  } else {
+  // Open a new session only when the trigger char was JUST typed (the char right
+  // before the caret), so a `#` from elsewhere in the text isn't hijacked.
+  const prev = text[caret - 1];
+  if (
+    (prev === "#" || prev === "@") &&
+    (caret - 1 === 0 || /\s/.test(text[caret - 2]))
+  ) {
+    mention.value = { target, trigger: prev, query: "", start: caret - 1, caret, sel: 0 };
+  } else if (mention.value && mention.value.target === target) {
     mention.value = null;
   }
 }
@@ -681,9 +707,11 @@ function onMentionKeydown(target: "desc" | "comment", e: KeyboardEvent) {
   if (e.key === "ArrowDown") {
     e.preventDefault();
     m.sel = (m.sel + 1) % items.length;
+    void scrollSelIntoView();
   } else if (e.key === "ArrowUp") {
     e.preventDefault();
     m.sel = (m.sel - 1 + items.length) % items.length;
+    void scrollSelIntoView();
   } else if (
     (e.key === "Enter" && !e.ctrlKey && !e.metaKey) ||
     e.key === "Tab"
@@ -1096,7 +1124,7 @@ onUnmounted(() => {
                 @keydown="onMentionKeydown('desc', $event)"
                 @blur="onMentionBlur"
               ></textarea>
-              <ul v-if="mention && mention.target === 'desc' && mentionItems.length" class="tw-mention">
+              <ul v-if="mention && mention.target === 'desc' && mentionItems.length" ref="descMenuEl" class="tw-mention">
                 <li
                   v-for="(it, i) in mentionItems"
                   :key="it.value"
@@ -1207,7 +1235,7 @@ onUnmounted(() => {
                   @keydown.meta.enter="addComment"
                   @blur="onMentionBlur"
                 ></textarea>
-                <ul v-if="mention && mention.target === 'comment' && mentionItems.length" class="tw-mention up">
+                <ul v-if="mention && mention.target === 'comment' && mentionItems.length" ref="commentMenuEl" class="tw-mention up">
                   <li
                     v-for="(it, i) in mentionItems"
                     :key="it.value"
