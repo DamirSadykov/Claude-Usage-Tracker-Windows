@@ -13,6 +13,8 @@
 //   add "<subject>" [--project <name>] [--status <status>] [--description <text>]
 //                   [--plan <text>] [--estimate <min>] [--scheduled <YYYY-MM-DD>]
 //   set-status <id> <status>        status ∈ backlog|queue|in_progress|review|done
+//   comment add <id> --text "<body>" [--by claude|user]
+//   comment list <id> [--json]
 //   list [--project <name>] [--json]
 //
 // Exit code is non-zero on any error (bad status, unknown id, usage), so a
@@ -102,7 +104,7 @@ function parseArgs(args) {
 
 const ADD_USAGE =
   'usage: cc-todos add "<subject>" [--project <name>] [--status <status>] ' +
-  "[--description <text>] [--plan <text>] [--estimate <min>] [--scheduled <YYYY-MM-DD>]";
+  "[--description <text>] [--plan <text>] [--estimate <min>] [--scheduled <YYYY-MM-DD>] [--by user|claude]";
 
 // Create a new todo. Mirrors the field set the tracker writes (todos.rs / the
 // TodoWindow form): id is a fresh UUID, created_at/updated_at stamped now,
@@ -120,8 +122,14 @@ function cmdAdd(args) {
     if (Number.isFinite(n)) estimate = Math.max(0, Math.round(n));
   }
   const now = new Date().toISOString();
+  const file = todosPath();
+  const data = load(file);
   const todo = {
     id: randomUUID(),
+    // Stable human-facing number for inline `#N` references, mirroring
+    // todos.rs::ensure_numbers (next after the current max). The app backfills
+    // any unnumbered rows on load, so a 0 here would still be fixed up later.
+    number: nextNumber(data),
     subject,
     description: typeof flags.description === "string" ? flags.description : "",
     status,
@@ -129,14 +137,78 @@ function cmdAdd(args) {
     scheduled_for: typeof flags.scheduled === "string" ? flags.scheduled : null,
     plan: typeof flags.plan === "string" ? flags.plan : "",
     project: typeof flags.project === "string" ? flags.project : null,
+    // This CLI is Claude's interface (the hook tells Claude to use it), so a
+    // task added here is AI-composed unless the caller overrides with --by user.
+    created_by: typeof flags.by === "string" ? flags.by : "claude",
     created_at: now,
     updated_at: now,
   };
-  const file = todosPath();
-  const data = load(file);
   data.todos.push(todo);
   save(file, data);
-  process.stdout.write(`ok: added ${todo.id} [${status}] ${subject}\n`);
+  process.stdout.write(
+    `ok: added #${todo.number} ${todo.id} [${status}] ${subject}\n`,
+  );
+}
+
+// Next task number = one past the current max (mirrors todos.rs::max_number+1).
+function nextNumber(data) {
+  let max = 0;
+  for (const t of data.todos) {
+    if (t && typeof t.number === "number" && t.number > max) max = t.number;
+  }
+  return max + 1;
+}
+
+const COMMENT_USAGE =
+  'usage: cc-todos comment add <id> --text "<body>" [--by claude|user]\n' +
+  "       cc-todos comment list <id> [--json]";
+
+// Append or list comments on a todo. Mirrors the Comment shape in todos.rs /
+// TodoWindow.vue: { id, author, body, created_at }. The thread is shared with
+// the tracker UI (the user posts there as "user"); this CLI is Claude's path, so
+// a comment added here defaults to author "claude" unless --by overrides it.
+function cmdComment(args) {
+  const [sub, ...rest] = args;
+  if (sub === "add") {
+    const { positional, flags } = parseArgs(rest);
+    const id = String(positional[0] ?? "").trim();
+    const body = typeof flags.text === "string" ? flags.text : "";
+    if (!id || !body.trim()) fail(COMMENT_USAGE);
+    const author = flags.by === "user" ? "user" : "claude";
+    const file = todosPath();
+    const data = load(file);
+    const todo = data.todos.find((t) => t && t.id === id);
+    if (!todo) fail(`no todo with id ${id}`);
+    if (!Array.isArray(todo.comments)) todo.comments = [];
+    const now = new Date().toISOString();
+    const comment = { id: randomUUID(), author, body, created_at: now };
+    todo.comments.push(comment);
+    todo.updated_at = now;
+    save(file, data);
+    process.stdout.write(`ok: comment ${comment.id} on ${id} by ${author}\n`);
+    return;
+  }
+  if (sub === "list") {
+    const id = String(rest.find((a) => !a.startsWith("--")) ?? "").trim();
+    if (!id) fail(COMMENT_USAGE);
+    const file = todosPath();
+    const todo = load(file).todos.find((t) => t && t.id === id);
+    if (!todo) fail(`no todo with id ${id}`);
+    const comments = Array.isArray(todo.comments) ? todo.comments : [];
+    if (rest.includes("--json")) {
+      process.stdout.write(JSON.stringify(comments, null, 2) + "\n");
+      return;
+    }
+    if (!comments.length) {
+      process.stdout.write("(no comments)\n");
+      return;
+    }
+    for (const c of comments) {
+      process.stdout.write(`[${c.author}] ${c.body}  ⟨${c.created_at}⟩\n`);
+    }
+    return;
+  }
+  fail(COMMENT_USAGE);
 }
 
 function cmdList(args) {
@@ -156,7 +228,8 @@ function cmdList(args) {
     return;
   }
   for (const t of todos) {
-    process.stdout.write(`[${t.status}] ${t.subject}  ⟨id:${t.id}⟩\n`);
+    const num = t.number ? `#${t.number} ` : "";
+    process.stdout.write(`${num}[${t.status}] ${t.subject}  ⟨id:${t.id}⟩\n`);
   }
 }
 
@@ -168,6 +241,8 @@ function usage(code) {
       "  set-status <id> <status>        status ∈ " +
       STATUSES.join(" | ") +
       "\n" +
+      '  comment add <id> --text "<body>" [--by claude|user]\n' +
+      "  comment list <id> [--json]\n" +
       "  list [--project <name>] [--json]\n",
   );
   process.exit(code);
@@ -180,6 +255,9 @@ switch (cmd) {
     break;
   case "set-status":
     cmdSetStatus(rest[0], rest[1]);
+    break;
+  case "comment":
+    cmdComment(rest);
     break;
   case "list":
     cmdList(rest);

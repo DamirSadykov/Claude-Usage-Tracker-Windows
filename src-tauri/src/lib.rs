@@ -771,12 +771,15 @@ async fn open_status_page() -> Result<(), String> {
     open::that(status::STATUS_PAGE_URL).map_err(|e| e.to_string())
 }
 
-/// Opens an external https URL in the default browser. Used by the About panel
-/// for the repo link and per-release pages. Restricted to https as a guard.
+/// Opens an external web URL in the default browser. Used by the About panel
+/// (repo link, per-release pages) and by linkified text in tasks/comments.
+/// Restricted to http/https so a malicious URL in a comment can't launch
+/// `file:`, `javascript:` or a custom-scheme handler; http is allowed too since
+/// this is a dev tool where `http://localhost:…` links are common.
 #[tauri::command]
 async fn open_url(url: String) -> Result<(), String> {
-    if !url.starts_with("https://") {
-        return Err("Только https-ссылки".into());
+    if !url.starts_with("https://") && !url.starts_with("http://") {
+        return Err("Только http/https-ссылки".into());
     }
     open::that(url).map_err(|e| e.to_string())
 }
@@ -1019,6 +1022,9 @@ fn write_todos_locked(
     let snap = app.state::<TodoSnapshot>();
     let mut guard = snap.0.lock().unwrap();
     let mut file = todos::load(&path);
+    // Backfill task numbers for any legacy/hand-edited rows before mutating, so
+    // every persisted file has stable `#N` references (upsert numbers new tasks).
+    todos::ensure_numbers(&mut file);
     mutate(&mut file);
     todos::save(&path, &file)?;
     *guard = todo_status_map(&file);
@@ -1085,11 +1091,17 @@ fn spawn_todos_watch(app: AppHandle) {
             Err(_) => return,
         };
         let modified = |p: &PathBuf| std::fs::metadata(p).and_then(|m| m.modified()).ok();
-        // Seed the snapshot so pre-existing review/done todos don't alert on the
-        // first observed change.
+        // One-time migration: give every existing task a stable number so inline
+        // `#N` references work even before the first edit this session. Done under
+        // the snapshot lock so the resulting write isn't seen as an external change.
         {
             let snap = app.state::<TodoSnapshot>();
-            *snap.0.lock().unwrap() = todo_status_map(&todos::load(&path));
+            let mut guard = snap.0.lock().unwrap();
+            let mut file = todos::load(&path);
+            if todos::ensure_numbers(&mut file) {
+                let _ = todos::save(&path, &file);
+            }
+            *guard = todo_status_map(&file);
         }
         let mut last: Option<SystemTime> = modified(&path);
         loop {
