@@ -41,10 +41,37 @@ pub struct Todo {
     /// basename); None = not tied to a project.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
+    /// Discussion thread on this todo (user + Claude). Empty → omitted from the
+    /// file so hand-edits and the common no-comment case stay clean.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub comments: Vec<Comment>,
+    /// Ids of related todos. Stored one-way per todo; the UI also surfaces the
+    /// reverse direction by scanning. Empty → omitted from the file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<String>,
+    /// Who composed this todo: `"user"` (hand-written in the UI) or `"claude"`
+    /// (the cc-todos CLI). Empty (legacy rows) renders as a user task — no AI
+    /// badge — so existing files need no migration.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub created_by: String,
     #[serde(default)]
     pub created_at: String,
     #[serde(default)]
     pub updated_at: String,
+}
+
+/// One comment in a todo's thread. `author` is `"user"` or `"claude"` (a plain
+/// string so another source can be added without a migration). `body` is plain
+/// text; the UI renders links in it. `id`/`created_at` are set by whoever appends
+/// (the frontend or the cc-todos CLI).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Comment {
+    pub id: String,
+    pub author: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub created_at: String,
 }
 
 fn default_version() -> u32 {
@@ -172,6 +199,9 @@ mod tests {
             scheduled_for: None,
             plan: String::new(),
             project: None,
+            comments: Vec::new(),
+            links: Vec::new(),
+            created_by: String::new(),
             created_at: String::new(),
             updated_at: String::new(),
         }

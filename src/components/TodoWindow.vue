@@ -37,6 +37,12 @@ async function loadLocaleFromStore() {
   }
 }
 
+export interface Comment {
+  id: string;
+  author: string; // "user" | "claude"
+  body: string;
+  created_at: string;
+}
 export interface Todo {
   id: string;
   subject: string;
@@ -46,6 +52,9 @@ export interface Todo {
   scheduled_for?: string | null;
   plan: string;
   project?: string | null;
+  comments?: Comment[];
+  links?: string[];
+  created_by?: string; // "user" | "claude" ("" / absent = user, no AI badge)
   created_at: string;
   updated_at: string;
 }
@@ -236,17 +245,6 @@ function startNew(colId = "backlog") {
   void refreshKnownProjects();
 }
 
-function startEdit(todo: Todo) {
-  editingId.value = todo.id;
-  fSubject.value = todo.subject;
-  fDescription.value = todo.description;
-  fEstimate.value = todo.estimate_minutes ?? null;
-  fScheduled.value = todo.scheduled_for ?? "";
-  fPlan.value = todo.plan;
-  fProject.value = todo.project ?? "";
-  formOpen.value = true;
-}
-
 async function submitForm() {
   const subject = fSubject.value.trim();
   if (!subject) return;
@@ -265,6 +263,9 @@ async function submitForm() {
     scheduled_for: fScheduled.value || null,
     plan: fPlan.value.trim(),
     project: fProject.value.trim() || null,
+    comments: existing?.comments,
+    links: existing?.links,
+    created_by: existing?.created_by ?? "user",
     created_at: existing?.created_at ?? "",
     updated_at: existing?.updated_at ?? "",
   };
@@ -298,6 +299,94 @@ async function removeTodo(todo: Todo) {
   try {
     todos.value = await invoke<Todo[]>("delete_todo", { id: todo.id });
     if (editingId.value === todo.id) resetForm();
+    if (detailId.value === todo.id) closeDetail();
+  } catch (e) {
+    errorMsg.value = String(e);
+  }
+}
+
+// --- Detail view (master-detail editor) ---
+// The board swaps to a full-screen detail editor: left rail lists the open
+// task's project siblings, right panel edits its fields. `draft` is an isolated
+// editable copy, so an external live-reload of `todos` never clobbers an in-
+// progress edit; `saveDetail` merges the draft back over the existing todo
+// (preserving id / comments / links / created_at) and persists via `upsert_todo`.
+const view = ref<"board" | "detail">("board");
+const detailId = ref<string | null>(null);
+const detail = computed(() => todos.value.find((t) => t.id === detailId.value) ?? null);
+
+interface Draft {
+  subject: string;
+  description: string;
+  plan: string;
+  project: string;
+  estimate_minutes: number | null;
+  scheduled_for: string;
+  status: string;
+}
+const draft = ref<Draft>({
+  subject: "",
+  description: "",
+  plan: "",
+  project: "",
+  estimate_minutes: null,
+  scheduled_for: "",
+  status: "backlog",
+});
+
+function rankStatus(s: string): number {
+  const i = COLUMNS.findIndex((c) => c.id === s);
+  return i < 0 ? COLUMNS.length : i;
+}
+// Left-rail tasks: same project as the open task (project-less tasks group
+// together), ordered by board column so the rail reads like a mini board.
+const detailSiblings = computed(() => {
+  const p = detail.value?.project ?? null;
+  return todos.value
+    .filter((t) => (t.project ?? null) === p)
+    .slice()
+    .sort((a, b) => rankStatus(a.status) - rankStatus(b.status));
+});
+
+function openDetail(todo: Todo) {
+  detailId.value = todo.id;
+  draft.value = {
+    subject: todo.subject,
+    description: todo.description ?? "",
+    plan: todo.plan ?? "",
+    project: todo.project ?? "",
+    estimate_minutes: todo.estimate_minutes ?? null,
+    scheduled_for: todo.scheduled_for ?? "",
+    status: todo.status,
+  };
+  view.value = "detail";
+}
+
+function closeDetail() {
+  view.value = "board";
+  detailId.value = null;
+}
+
+async function saveDetail() {
+  const cur = detail.value;
+  if (!cur) return;
+  const d = draft.value;
+  if (!d.subject.trim()) return;
+  const todo: Todo = {
+    ...cur, // keep id / comments / links / created_at / updated_at
+    subject: d.subject.trim(),
+    description: d.description.trim(),
+    plan: d.plan.trim(),
+    project: d.project.trim() || null,
+    estimate_minutes:
+      d.estimate_minutes === null || Number.isNaN(d.estimate_minutes)
+        ? null
+        : Math.max(0, Math.round(d.estimate_minutes)),
+    scheduled_for: d.scheduled_for || null,
+    status: d.status,
+  };
+  try {
+    todos.value = await invoke<Todo[]>("upsert_todo", { todo });
   } catch (e) {
     errorMsg.value = String(e);
   }
@@ -413,6 +502,8 @@ onUnmounted(() => {
 
 <template>
   <div class="tw-root">
+    <!-- BOARD VIEW -->
+    <template v-if="view === 'board'">
     <header class="tw-head">
       <div class="tw-title">
         <h1>{{ t("tasksTitle") }}</h1>
@@ -482,6 +573,7 @@ onUnmounted(() => {
             <p v-if="todo.description" class="tw-card-desc">{{ todo.description }}</p>
 
             <div class="tw-card-meta">
+              <span v-if="todo.created_by === 'claude'" class="tw-ai sm" :title="t('todoAiHint')">{{ t("todoAi") }}</span>
               <span v-if="todo.project" class="tw-tag">{{ todo.project }}</span>
               <span v-if="todo.estimate_minutes != null" class="tw-chip">⏱ {{ fmtEstimate(todo.estimate_minutes) }}</span>
               <span v-if="todo.scheduled_for" class="tw-chip">📅 {{ todo.scheduled_for }}</span>
@@ -499,7 +591,7 @@ onUnmounted(() => {
                 <option v-for="c in COLUMNS" :key="c.id" :value="c.id">{{ statusLabel(c.id) }}</option>
               </select>
               <div class="tw-card-actions">
-                <button class="tw-icon" :title="t('todoEdit')" @click.stop="startEdit(todo)" @mousedown.stop>
+                <button class="tw-icon" :title="t('todoEdit')" @click.stop="openDetail(todo)" @mousedown.stop>
                   <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
                     <path d="M11.5 2.5l2 2L6 12l-2.5.5L4 10z" />
                     <path d="M10.5 3.5l2 2" />
@@ -519,6 +611,87 @@ onUnmounted(() => {
         </div>
       </section>
     </main>
+    </template>
+
+    <!-- DETAIL VIEW: master-detail editor (left = project siblings, right = fields) -->
+    <template v-else>
+      <header class="tw-head">
+        <button class="tw-back" @click="closeDetail">
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 3.5 5 8l4.5 4.5" /></svg>
+          {{ t("todoBack") }}
+        </button>
+        <div class="tw-title">
+          <h1>{{ draft.subject || t("todoNew") }}</h1>
+          <span v-if="detail && detail.created_by === 'claude'" class="tw-ai" :title="t('todoAiHint')">{{ t("todoAi") }}</span>
+        </div>
+        <div class="tw-spacer"></div>
+        <button class="tw-btn" :disabled="!draft.subject.trim()" @click="saveDetail">{{ t("save") }}</button>
+      </header>
+
+      <div v-if="errorMsg" class="tw-error">{{ errorMsg }}</div>
+
+      <div class="tw-detail">
+        <aside class="tw-detail-list">
+          <div class="tw-detail-list-hd">{{ detail && detail.project ? detail.project : t("todoNoProject") }}</div>
+          <button
+            v-for="td in detailSiblings"
+            :key="td.id"
+            class="tw-detail-item"
+            :class="{ active: td.id === detailId }"
+            @click="openDetail(td)"
+          >
+            <span class="tw-detail-item-dot" :style="{ background: columnColor(td.status) }"></span>
+            <span class="tw-detail-item-subj" :class="{ done: td.status === 'done' }">{{ td.subject }}</span>
+            <span v-if="td.created_by === 'claude'" class="tw-ai sm" :title="t('todoAiHint')">{{ t("todoAi") }}</span>
+          </button>
+        </aside>
+
+        <section v-if="detail" class="tw-detail-main">
+          <label class="tw-field">
+            <span>{{ t("todoSubject") }}</span>
+            <input v-model="draft.subject" class="tw-input" maxlength="200" />
+          </label>
+          <div class="tw-row">
+            <label class="tw-field">
+              <span>{{ t("todoStatus") }}</span>
+              <select v-model="draft.status" class="tw-select">
+                <option v-for="c in COLUMNS" :key="c.id" :value="c.id">{{ t(c.labelKey) }}</option>
+              </select>
+            </label>
+            <label class="tw-field">
+              <span>{{ t("todoProject") }}</span>
+              <select v-model="draft.project" class="tw-select">
+                <option value="">{{ t("todoNoProject") }}</option>
+                <option v-for="p in projects" :key="p" :value="p">{{ p }}</option>
+              </select>
+            </label>
+          </div>
+          <div class="tw-row">
+            <label class="tw-field">
+              <span>{{ t("todoEstimate") }}</span>
+              <input v-model.number="draft.estimate_minutes" class="tw-input" type="number" min="0" step="5" />
+            </label>
+            <label class="tw-field">
+              <span>{{ t("todoScheduledFor") }}</span>
+              <input v-model="draft.scheduled_for" class="tw-input" type="date" />
+            </label>
+          </div>
+          <label class="tw-field">
+            <span>{{ t("todoDescription") }}</span>
+            <textarea v-model="draft.description" class="tw-input tw-area" rows="7"></textarea>
+          </label>
+          <label class="tw-field">
+            <span>{{ t("todoPlan") }} <em class="tw-hint">{{ t("todoPlanHint") }}</em></span>
+            <textarea v-model="draft.plan" class="tw-input tw-area" rows="5"></textarea>
+          </label>
+          <div class="tw-form-actions">
+            <button type="button" class="tw-btn ghost" @click="closeDetail">{{ t("todoBack") }}</button>
+            <button type="button" class="tw-btn" :disabled="!draft.subject.trim()" @click="saveDetail">{{ t("save") }}</button>
+          </div>
+        </section>
+        <section v-else class="tw-detail-main tw-detail-empty">{{ t("todoColEmpty") }}</section>
+      </div>
+    </template>
 
     <!-- Create / edit form (modal overlay) -->
     <div v-if="formOpen" class="tw-modal" @click.self="resetForm">
@@ -1000,5 +1173,134 @@ onUnmounted(() => {
   background: transparent;
   color: var(--text-3);
   border: 1px solid var(--stroke-strong);
+}
+
+/* AI-authored badge — violet so it can't be mistaken for a status colour. */
+.tw-ai {
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #c4a7ff;
+  background: rgba(179, 136, 255, 0.16);
+  border: 1px solid rgba(179, 136, 255, 0.5);
+  border-radius: 6px;
+  padding: 1px 6px;
+  line-height: 1.5;
+  flex-shrink: 0;
+}
+.tw-ai.sm {
+  font-size: 9px;
+  padding: 0 5px;
+}
+
+/* Detail view (master-detail editor) */
+.tw-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: transparent;
+  border: 1px solid var(--stroke-strong);
+  color: var(--text-2);
+  border-radius: 6px;
+  padding: 5px 11px 5px 8px;
+  font-size: 12px;
+  font-family: var(--segoe);
+  cursor: pointer;
+}
+.tw-back:hover {
+  background: var(--card-bg-hover);
+  color: var(--text);
+}
+.tw-detail {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  gap: 14px;
+  padding: 14px 16px;
+  overflow: hidden;
+}
+.tw-detail-list {
+  flex: 0 0 264px;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--stroke);
+  border-radius: 10px;
+  padding: 8px;
+}
+.tw-detail-list-hd {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-3);
+  padding: 4px 6px 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tw-detail-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  text-align: left;
+  width: 100%;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  padding: 8px;
+  color: var(--text-2);
+  cursor: pointer;
+  font-family: var(--segoe);
+  font-size: 12.5px;
+}
+.tw-detail-item:hover {
+  background: var(--card-bg-hover);
+}
+.tw-detail-item.active {
+  background: var(--accent-soft);
+  color: var(--text);
+}
+.tw-detail-item-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.tw-detail-item-subj {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tw-detail-item-subj.done {
+  text-decoration: line-through;
+  color: var(--text-3);
+}
+.tw-detail-main {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 13px;
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--stroke);
+  border-radius: 10px;
+  padding: 18px 20px;
+}
+.tw-detail-main .tw-select {
+  width: 100%;
+}
+.tw-detail-empty {
+  align-items: center;
+  justify-content: center;
+  color: var(--text-4);
+  font-size: 13px;
 }
 </style>

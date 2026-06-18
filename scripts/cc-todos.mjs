@@ -102,7 +102,7 @@ function parseArgs(args) {
 
 const ADD_USAGE =
   'usage: cc-todos add "<subject>" [--project <name>] [--status <status>] ' +
-  "[--description <text>] [--plan <text>] [--estimate <min>] [--scheduled <YYYY-MM-DD>]";
+  "[--description <text>] [--plan <text>] [--estimate <min>] [--scheduled <YYYY-MM-DD>] [--by user|claude]";
 
 // Create a new todo. Mirrors the field set the tracker writes (todos.rs / the
 // TodoWindow form): id is a fresh UUID, created_at/updated_at stamped now,
@@ -129,6 +129,9 @@ function cmdAdd(args) {
     scheduled_for: typeof flags.scheduled === "string" ? flags.scheduled : null,
     plan: typeof flags.plan === "string" ? flags.plan : "",
     project: typeof flags.project === "string" ? flags.project : null,
+    // This CLI is Claude's interface (the hook tells Claude to use it), so a
+    // task added here is AI-composed unless the caller overrides with --by user.
+    created_by: typeof flags.by === "string" ? flags.by : "claude",
     created_at: now,
     updated_at: now,
   };
