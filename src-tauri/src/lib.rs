@@ -1062,6 +1062,152 @@ fn save_project_groups(
     Ok(())
 }
 
+// --- CLI + SessionStart hook installer ---
+//
+// The cc-todos CLI + SessionStart hook ship as bundled Node scripts (resources).
+// "Install" = wire the hook into the user's ~/.claude/settings.json so Claude Code
+// runs it on every session start. The CLI needs no separate wiring — the hook
+// resolves cc-todos.mjs next to itself.
+
+/// Absolute path to `cc-todos-hook.mjs`, forward-slashed for a clean settings.json
+/// command on Windows. In a packaged build it's the bundled resource; in `tauri
+/// dev` it's the repo's `scripts/` (preferred there, since the resource copy under
+/// target/ is wiped on rebuild).
+fn cc_hook_script_path(app: &AppHandle) -> Result<String, String> {
+    let resource = app
+        .path()
+        .resolve("scripts/cc-todos-hook.mjs", tauri::path::BaseDirectory::Resource)
+        .ok()
+        .filter(|p| p.exists());
+    let dev = {
+        let d = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("scripts")
+            .join("cc-todos-hook.mjs");
+        std::fs::canonicalize(&d).ok().filter(|p| p.exists())
+    };
+    let chosen = if cfg!(debug_assertions) {
+        dev.or(resource)
+    } else {
+        resource.or(dev)
+    };
+    let p = chosen.ok_or_else(|| "cc-todos-hook.mjs not found (resource or dev path)".to_string())?;
+    // Drop the Windows \\?\ prefix canonicalize adds, use forward slashes.
+    let s = p.to_string_lossy().replace('\\', "/");
+    Ok(s.strip_prefix("//?/").map(str::to_string).unwrap_or(s))
+}
+
+/// `~/.claude/settings.json` — the global Claude Code config we wire the hook into.
+fn claude_settings_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let home = app.path().home_dir().map_err(|e| e.to_string())?;
+    Ok(home.join(".claude").join("settings.json"))
+}
+
+/// True if any SessionStart hook command references cc-todos-hook.mjs.
+fn settings_has_cc_hook(v: &serde_json::Value) -> bool {
+    v.get("hooks")
+        .and_then(|h| h.get("SessionStart"))
+        .and_then(|s| s.as_array())
+        .is_some_and(|groups| {
+            groups.iter().any(|g| {
+                g.get("hooks").and_then(|h| h.as_array()).is_some_and(|hs| {
+                    hs.iter().any(|hook| {
+                        hook.get("command")
+                            .and_then(|c| c.as_str())
+                            .is_some_and(|c| c.contains("cc-todos-hook.mjs"))
+                    })
+                })
+            })
+        })
+}
+
+#[derive(Serialize)]
+struct CcHookStatus {
+    installed: bool,
+    script_path: String,
+    settings_path: String,
+}
+
+/// Whether the SessionStart hook is already wired, plus the paths involved.
+#[tauri::command]
+fn cc_hook_status(app: AppHandle) -> Result<CcHookStatus, String> {
+    let settings = claude_settings_path(&app)?;
+    let installed = std::fs::read_to_string(&settings)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .map(|v| settings_has_cc_hook(&v))
+        .unwrap_or(false);
+    Ok(CcHookStatus {
+        installed,
+        script_path: cc_hook_script_path(&app).unwrap_or_default(),
+        settings_path: settings.to_string_lossy().replace('\\', "/"),
+    })
+}
+
+/// Wire the SessionStart hook into ~/.claude/settings.json. Idempotent: updates an
+/// existing cc-todos entry's path in place, or appends a new group; preserves all
+/// other hooks and keys. Atomic write (temp → rename). Returns the wired path.
+#[tauri::command]
+fn install_cc_hook(app: AppHandle) -> Result<String, String> {
+    let script = cc_hook_script_path(&app)?;
+    let command = format!("node \"{script}\"");
+    let settings_path = claude_settings_path(&app)?;
+
+    let mut root: serde_json::Value = std::fs::read_to_string(&settings_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !root.is_object() {
+        root = serde_json::json!({});
+    }
+
+    let obj = root.as_object_mut().unwrap();
+    let hooks = obj.entry("hooks").or_insert_with(|| serde_json::json!({}));
+    if !hooks.is_object() {
+        *hooks = serde_json::json!({});
+    }
+    let ss = hooks
+        .as_object_mut()
+        .unwrap()
+        .entry("SessionStart")
+        .or_insert_with(|| serde_json::json!([]));
+    if !ss.is_array() {
+        *ss = serde_json::json!([]);
+    }
+    let groups = ss.as_array_mut().unwrap();
+
+    // Update our command in place if already present (re-install / moved path).
+    let mut updated = false;
+    for g in groups.iter_mut() {
+        if let Some(hs) = g.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+            for hook in hs.iter_mut() {
+                let is_ours = hook
+                    .get("command")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|c| c.contains("cc-todos-hook.mjs"));
+                if is_ours {
+                    hook["command"] = serde_json::Value::String(command.clone());
+                    updated = true;
+                }
+            }
+        }
+    }
+    if !updated {
+        groups.push(serde_json::json!({
+            "hooks": [ { "type": "command", "command": command } ]
+        }));
+    }
+
+    if let Some(dir) = settings_path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let json = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
+    let tmp = settings_path.with_extension("json.tmp");
+    std::fs::write(&tmp, json.as_bytes()).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &settings_path).map_err(|e| e.to_string())?;
+    Ok(script)
+}
+
 /// Last-seen `id -> status` map, shared between the file watcher and the write
 /// commands. The watcher diffs the file against this to fire review/done alerts;
 /// the commands refresh it under the same lock right after they write, so the
@@ -1467,6 +1613,8 @@ pub fn run() {
             remove_project_link,
             get_project_groups,
             save_project_groups,
+            install_cc_hook,
+            cc_hook_status,
             upsert_todo,
             delete_todo,
             set_todo_status,

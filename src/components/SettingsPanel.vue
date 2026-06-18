@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, watch, onMounted } from "vue";
 import type { Ref } from "vue";
+import { invoke } from "@tauri-apps/api/core";
 import { useI18n } from "vue-i18n";
 import {
   ALERT_TIER_KEYS,
@@ -248,6 +249,38 @@ function toggleRuntime(kind: string) {
 }
 
 onMounted(loadIgnoredInsights);
+
+// --- cc-todos CLI + SessionStart hook installer ---
+interface CcHookStatus {
+  installed: boolean;
+  script_path: string;
+  settings_path: string;
+}
+const ccHookStatus = ref<CcHookStatus | null>(null);
+const installCcBusy = ref(false);
+const installCcMsg = ref("");
+
+async function loadCcHookStatus() {
+  try {
+    ccHookStatus.value = await invoke<CcHookStatus>("cc_hook_status");
+  } catch {
+    ccHookStatus.value = null;
+  }
+}
+async function doInstallCcHook() {
+  installCcBusy.value = true;
+  installCcMsg.value = "";
+  try {
+    const p = await invoke<string>("install_cc_hook");
+    installCcMsg.value = t("installCcHookDone", { path: p });
+    await loadCcHookStatus();
+  } catch (e) {
+    installCcMsg.value = String(e);
+  } finally {
+    installCcBusy.value = false;
+  }
+}
+onMounted(loadCcHookStatus);
 
 // Keep each threshold triple strictly ascending with a 1% gap so the colour
 // bands can't overlap. Fixed slider scale (5..99) + clamping — dynamic min/max
@@ -880,6 +913,21 @@ function handleSave() {
           step="1"
           @change="saveUpdaterSettings()"
         />
+      </div>
+
+      <!-- Install the cc-todos CLI + SessionStart hook into ~/.claude/settings.json -->
+      <div class="card" style="display: flex; align-items: center; gap: 12px">
+        <div style="flex: 1; min-width: 0">
+          <div class="card-title" style="font-size: 13px">{{ t('installCcHook') }}</div>
+          <div class="card-sub">{{ t('installCcHookDesc') }}</div>
+          <div v-if="ccHookStatus" class="card-sub" style="margin-top: 6px">
+            {{ ccHookStatus.installed ? t('installCcHookOn') : t('installCcHookOff') }}
+          </div>
+          <div v-if="installCcMsg" class="field-hint" style="margin-top: 4px">{{ installCcMsg }}</div>
+        </div>
+        <button type="button" class="suggest-btn" :disabled="installCcBusy" @click="doInstallCcHook">
+          {{ ccHookStatus && ccHookStatus.installed ? t('installCcHookReinstall') : t('installCcHookBtn') }}
+        </button>
       </div>
       </template>
     </div>
