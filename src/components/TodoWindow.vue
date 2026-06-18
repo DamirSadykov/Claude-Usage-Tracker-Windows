@@ -316,6 +316,15 @@ const view = ref<"board" | "detail">("board");
 const detailId = ref<string | null>(null);
 const detail = computed(() => todos.value.find((t) => t.id === detailId.value) ?? null);
 
+// Transient "Saved ✓" confirmation shown after a successful detail save.
+const saved = ref(false);
+let savedTimer: ReturnType<typeof setTimeout> | null = null;
+function flashSaved() {
+  saved.value = true;
+  if (savedTimer) clearTimeout(savedTimer);
+  savedTimer = setTimeout(() => (saved.value = false), 2000);
+}
+
 interface Draft {
   subject: string;
   description: string;
@@ -362,6 +371,7 @@ function openDetail(todo: Todo) {
   };
   descMode.value = "edit";
   mention.value = null;
+  saved.value = false;
   view.value = "detail";
 }
 
@@ -390,6 +400,7 @@ async function saveDetail() {
   };
   try {
     todos.value = await invoke<Todo[]>("upsert_todo", { todo });
+    flashSaved();
   } catch (e) {
     errorMsg.value = String(e);
   }
@@ -981,6 +992,12 @@ onUnmounted(() => {
           <span v-if="detail && detail.created_by === 'claude'" class="tw-ai" :title="t('todoAiHint')">{{ t("todoAi") }}</span>
         </div>
         <div class="tw-spacer"></div>
+        <transition name="tw-fade">
+          <span v-if="saved" class="tw-saved">
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 8.5l3 3 6-7" /></svg>
+            {{ t("todoSaved") }}
+          </span>
+        </transition>
         <button class="tw-btn" :disabled="!draft.subject.trim()" @click="saveDetail">{{ t("save") }}</button>
       </header>
 
@@ -1083,6 +1100,12 @@ onUnmounted(() => {
             <textarea v-model="draft.plan" class="tw-input tw-area" rows="5"></textarea>
           </label>
           <div class="tw-form-actions">
+            <transition name="tw-fade">
+              <span v-if="saved" class="tw-saved">
+                <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 8.5l3 3 6-7" /></svg>
+                {{ t("todoSaved") }}
+              </span>
+            </transition>
             <button type="button" class="tw-btn ghost" @click="closeDetail">{{ t("todoBack") }}</button>
             <button type="button" class="tw-btn" :disabled="!draft.subject.trim()" @click="saveDetail">{{ t("save") }}</button>
           </div>
@@ -1652,6 +1675,25 @@ onUnmounted(() => {
 .tw-ai.sm {
   font-size: 9px;
   padding: 0 5px;
+}
+
+/* "Saved ✓" confirmation */
+.tw-saved {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--success, #6ccb5f);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.tw-fade-enter-active,
+.tw-fade-leave-active {
+  transition: opacity 200ms ease;
+}
+.tw-fade-enter-from,
+.tw-fade-leave-to {
+  opacity: 0;
 }
 
 /* Detail view (master-detail editor) */
