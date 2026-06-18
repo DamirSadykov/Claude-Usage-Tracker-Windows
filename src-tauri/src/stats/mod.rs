@@ -13,6 +13,7 @@ use std::sync::Mutex;
 mod analytics;
 mod cc_store;
 mod forecast;
+mod project_links;
 mod snapshots;
 
 pub use analytics::{
@@ -21,6 +22,7 @@ pub use analytics::{
     ToolErrorStats, ToolUsage, Totals, TrendMetrics,
 };
 pub use cc_store::{CcActiveSession, CcUsageRow, ToolResultRow, TurnRow};
+pub use project_links::ProjectLink;
 pub use forecast::{ForecastData, TierForecast};
 pub use snapshots::{UsageDelta, UsageSnapshot};
 
@@ -156,6 +158,19 @@ const MIGRATIONS: &[&str] = &[
     // get DEFAULT 0 and are back-filled by the v8 re-ingest.
     "ALTER TABLE cc_usage ADD COLUMN git_commits INTEGER NOT NULL DEFAULT 0;
      ALTER TABLE cc_usage ADD COLUMN git_pushes  INTEGER NOT NULL DEFAULT 0;",
+    // v12 — project merge links (issue #13). Maps a raw project name (`alias`, the
+    // cwd basename stored in cc_usage/cc_turn) to the `canonical` name it should be
+    // aggregated under, so a renamed/absorbed project's history doesn't fragment
+    // across the rename. Resolution is READ-TIME only — analytics queries COALESCE
+    // the raw project through this table (see `resolved_project` in analytics.rs);
+    // raw rows are never rewritten, so removing a link restores the original split.
+    // Single-level by construction: writes normalize so a canonical is never itself
+    // an alias (see `set_project_link` in project_links.rs).
+    "CREATE TABLE IF NOT EXISTS project_links (
+        alias     TEXT PRIMARY KEY,
+        canonical TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_project_links_canonical ON project_links(canonical);",
 ];
 
 fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -443,19 +458,19 @@ mod tests {
     // --- migrations: v8–v11 ---
 
     #[test]
-    fn migration_count_advances_to_eleven() {
+    fn migration_count_advances_to_twelve() {
         let db = mem_db();
         let conn = db.conn.lock().unwrap();
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(v, MIGRATIONS.len() as i64);
-        assert_eq!(MIGRATIONS.len(), 11);
+        assert_eq!(MIGRATIONS.len(), 12);
     }
 
     #[test]
     fn cc_tool_result_and_turn_tables_exist_after_migrate() {
         let db = mem_db();
         let conn = db.conn.lock().unwrap();
-        for name in ["cc_tool_result", "cc_turn"] {
+        for name in ["cc_tool_result", "cc_turn", "project_links"] {
             let n: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
@@ -983,6 +998,47 @@ mod tests {
         let a = db.analytics("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z").unwrap();
         assert_eq!(a.by_project.len(), 1);
         assert_eq!(a.by_project[0].project.as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn analytics_merges_linked_projects() {
+        let db = mem_db();
+        db.cc_upsert(&[
+            CcUsageRow { project: Some("alpha".into()), ..cc_row("m1", "2026-01-01T10:00:00Z", "claude-opus-4-7", 100, 0, 1.0, "s1") },
+            CcUsageRow { project: Some("beta".into()), ..cc_row("m2", "2026-01-01T11:00:00Z", "claude-opus-4-7", 200, 0, 2.0, "s2") },
+        ])
+        .unwrap();
+        // Merge alpha into beta (rename/absorption).
+        db.set_project_link("alpha", "beta").unwrap();
+
+        // by_project collapses both raw names into one canonical line: tokens sum
+        // and the distinct-session count spans both projects.
+        let a = db.analytics("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z").unwrap();
+        assert_eq!(a.by_project.len(), 1);
+        assert_eq!(a.by_project[0].project.as_deref(), Some("beta"));
+        assert_eq!(a.by_project[0].total_tokens, 300);
+        assert_eq!(a.by_project[0].sessions, 2);
+
+        // Filtering by the canonical pulls in the alias's rows too; the filter list
+        // shows only the canonical name.
+        let ext = db
+            .analytics_ext("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z", Some("beta"), 10)
+            .unwrap();
+        assert_eq!(ext.totals.total_tokens, 300);
+        assert_eq!(ext.totals.sessions, 2);
+        assert_eq!(ext.projects, vec!["beta".to_string()]);
+
+        // cc_projects (task picker) collapses to the canonical; cc_raw_projects
+        // keeps both for the management UI.
+        assert_eq!(db.cc_projects().unwrap(), vec!["beta".to_string()]);
+        let mut raw = db.cc_raw_projects().unwrap();
+        raw.sort();
+        assert_eq!(raw, vec!["alpha".to_string(), "beta".to_string()]);
+
+        // Dropping the link restores the original split.
+        db.remove_project_link("alpha").unwrap();
+        let a2 = db.analytics("2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z").unwrap();
+        assert_eq!(a2.by_project.len(), 2);
     }
 
     #[test]

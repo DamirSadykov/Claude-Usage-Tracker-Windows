@@ -264,6 +264,18 @@ fn hit_ratio(input: i64, cache_read: i64) -> f64 {
     }
 }
 
+/// SQL expression mapping a raw project column to its canonical name via the
+/// `project_links` merge table (issue #13), falling back to the raw value when the
+/// project isn't an alias. `col` is the project column in scope — "project" for a
+/// single-table query over cc_usage/cc_turn, or a qualified form like "cu.project"
+/// when cc_usage is aliased. NULL (unattributed) stays NULL. The table is kept
+/// single-level (see project_links.rs), so this one COALESCE fully resolves any
+/// alias and can't loop. Read-time only — raw usage rows are never rewritten, so
+/// dropping a link instantly restores the original per-project split.
+pub(super) fn resolved_project(col: &str) -> String {
+    format!("COALESCE((SELECT canonical FROM project_links WHERE alias = {col}), {col})")
+}
+
 /// Σ over models of cache savings vs. a no-cache world, priced per family:
 /// savings = cache_read·pin·0.9 − cache_create·pin·0.25, scaled by 1e-6. Per-model
 /// because the input price `pin` differs by family. Unknown models contribute 0
@@ -274,7 +286,11 @@ fn cache_savings_for(
     to: &str,
     project: Option<&str>,
 ) -> Result<f64, rusqlite::Error> {
-    let proj = if project.is_some() { " AND project = ?3" } else { "" };
+    let proj = if project.is_some() {
+        format!(" AND {} = ?3", resolved_project("project"))
+    } else {
+        String::new()
+    };
     let sql = format!(
         "SELECT model, COALESCE(SUM(cache_read),0), COALESCE(SUM(cache_create),0)
          FROM cc_usage WHERE ts >= ?1 AND ts < ?2{proj}
@@ -389,7 +405,11 @@ fn productivity_for(
 ) -> Result<Productivity, rusqlite::Error> {
     // Active time + turn count (main-thread only). is_subagent IS NOT 1 also
     // catches NULLs from rows stored without the flag.
-    let proj = if project.is_some() { " AND project = ?4" } else { "" };
+    let proj = if project.is_some() {
+        format!(" AND {} = ?4", resolved_project("project"))
+    } else {
+        String::new()
+    };
     let active_sql = format!(
         "SELECT COALESCE(SUM(MIN(duration_ms, ?3)), 0), COUNT(*)
          FROM cc_turn
@@ -405,7 +425,11 @@ fn productivity_for(
     };
 
     // git commits / pushes from cc_usage.
-    let proj3 = if project.is_some() { " AND project = ?3" } else { "" };
+    let proj3 = if project.is_some() {
+        format!(" AND {} = ?3", resolved_project("project"))
+    } else {
+        String::new()
+    };
     let git_sql = format!(
         "SELECT COALESCE(SUM(git_commits), 0), COALESCE(SUM(git_pushes), 0)
          FROM cc_usage WHERE ts >= ?1 AND ts < ?2{proj3}"
@@ -416,7 +440,11 @@ fn productivity_for(
     };
 
     // Edits = Edit + Write + MultiEdit calls (project-aware via the cc_usage join).
-    let proj_cu = if project.is_some() { " AND cu.project = ?3" } else { "" };
+    let proj_cu = if project.is_some() {
+        format!(" AND {} = ?3", resolved_project("cu.project"))
+    } else {
+        String::new()
+    };
     let edits_sql = format!(
         "SELECT COALESCE(SUM(tu.n), 0)
          FROM cc_tool_use tu JOIN cc_usage cu USING (message_id)
@@ -477,8 +505,16 @@ fn session_roi_rates(
     to: &str,
     project: Option<&str>,
 ) -> Result<Vec<f64>, rusqlite::Error> {
-    let proj_t = if project.is_some() { " AND project = ?4" } else { "" };
-    let proj_c = if project.is_some() { " AND project = ?3" } else { "" };
+    let proj_t = if project.is_some() {
+        format!(" AND {} = ?4", resolved_project("project"))
+    } else {
+        String::new()
+    };
+    let proj_c = if project.is_some() {
+        format!(" AND {} = ?3", resolved_project("project"))
+    } else {
+        String::new()
+    };
     // Active time per session (capped per turn, main-thread), joined with the
     // session's main-thread cost.
     let sql = format!(
@@ -527,22 +563,21 @@ fn sessions_in(
     to: &str,
     project: Option<&str>,
 ) -> Result<Vec<SessionUsage>, rusqlite::Error> {
-    let sql = if project.is_some() {
-        "SELECT session_id, MAX(project), MIN(ts), MAX(ts),
-                SUM(input+output+cache_create+cache_read), SUM(cost), COUNT(*),
-                SUM(cache_create)
-         FROM cc_usage
-         WHERE ts >= ?1 AND ts < ?2 AND session_id IS NOT NULL AND project = ?3
-         GROUP BY session_id"
+    let rp = resolved_project("project");
+    let where_proj = if project.is_some() {
+        format!(" AND {rp} = ?3")
     } else {
-        "SELECT session_id, MAX(project), MIN(ts), MAX(ts),
+        String::new()
+    };
+    let sql = format!(
+        "SELECT session_id, MAX({rp}), MIN(ts), MAX(ts),
                 SUM(input+output+cache_create+cache_read), SUM(cost), COUNT(*),
                 SUM(cache_create)
          FROM cc_usage
-         WHERE ts >= ?1 AND ts < ?2 AND session_id IS NOT NULL
+         WHERE ts >= ?1 AND ts < ?2 AND session_id IS NOT NULL{where_proj}
          GROUP BY session_id"
-    };
-    let mut stmt = conn.prepare(sql)?;
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let map_row = |r: &rusqlite::Row| {
         Ok(SessionUsage {
             session_id: r.get(0)?,
@@ -667,11 +702,13 @@ impl StatsDb {
         };
 
         let by_project = {
-            let mut stmt = conn.prepare(
-                "SELECT project, SUM(input+output+cache_create+cache_read), SUM(cost),
+            let rp = resolved_project("project");
+            let sql = format!(
+                "SELECT {rp}, SUM(input+output+cache_create+cache_read), SUM(cost),
                         COUNT(*), COUNT(DISTINCT session_id)
-                 FROM cc_usage WHERE ts >= ?1 AND ts < ?2 GROUP BY project ORDER BY 2 DESC",
-            )?;
+                 FROM cc_usage WHERE ts >= ?1 AND ts < ?2 GROUP BY {rp} ORDER BY 2 DESC"
+            );
+            let mut stmt = conn.prepare(&sql)?;
             let rows = stmt
                 .query_map(params![from, to], |r| {
                     Ok(ProjectUsage {
@@ -727,9 +764,13 @@ impl StatsDb {
         top_n: usize,
     ) -> Result<AnalyticsExt, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
-        let proj_clause = if project.is_some() { " AND project = ?3" } else { "" };
+        let proj_clause = if project.is_some() {
+            format!(" AND {} = ?3", resolved_project("project"))
+        } else {
+            String::new()
+        };
         let prepare_proj = |sql_tmpl: String| -> Result<rusqlite::Statement<'_>, rusqlite::Error> {
-            conn.prepare(&sql_tmpl.replace("{proj}", proj_clause))
+            conn.prepare(&sql_tmpl.replace("{proj}", &proj_clause))
         };
 
         // --- totals (project-aware) ---
@@ -828,11 +869,13 @@ impl StatsDb {
         };
 
         let by_project = {
-            let mut stmt = conn.prepare(
-                "SELECT project, SUM(input+output+cache_create+cache_read), SUM(cost),
+            let rp = resolved_project("project");
+            let sql = format!(
+                "SELECT {rp}, SUM(input+output+cache_create+cache_read), SUM(cost),
                         COUNT(*), COUNT(DISTINCT session_id)
-                 FROM cc_usage WHERE ts >= ?1 AND ts < ?2 GROUP BY project ORDER BY 2 DESC",
-            )?;
+                 FROM cc_usage WHERE ts >= ?1 AND ts < ?2 GROUP BY {rp} ORDER BY 2 DESC"
+            );
+            let mut stmt = conn.prepare(&sql)?;
             let rows = stmt
                 .query_map(params![from, to], |r| {
                     Ok(ProjectUsage {
@@ -918,11 +961,13 @@ impl StatsDb {
 
         // --- distinct project list (for the UI filter) ---
         let projects = {
-            let mut stmt = conn.prepare(
-                "SELECT DISTINCT project FROM cc_usage
+            let rp = resolved_project("project");
+            let sql = format!(
+                "SELECT DISTINCT {rp} FROM cc_usage
                  WHERE ts >= ?1 AND ts < ?2 AND project IS NOT NULL
-                 ORDER BY project",
-            )?;
+                 ORDER BY 1"
+            );
+            let mut stmt = conn.prepare(&sql)?;
             let rows = stmt
                 .query_map(params![from, to], |r| r.get::<_, String>(0))?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -1129,7 +1174,11 @@ fn subagent_efficacy(
     to: &str,
     project: Option<&str>,
 ) -> Result<Option<SubagentEfficacy>, rusqlite::Error> {
-    let proj_clause = if project.is_some() { " AND project = ?3" } else { "" };
+    let proj_clause = if project.is_some() {
+        format!(" AND {} = ?3", resolved_project("project"))
+    } else {
+        String::new()
+    };
     let sql = format!(
         "WITH sess_class AS (
             SELECT session_id, MAX(is_subagent) AS has_sub

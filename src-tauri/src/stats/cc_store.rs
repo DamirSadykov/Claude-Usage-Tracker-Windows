@@ -64,10 +64,29 @@ pub struct TurnRow {
 }
 
 impl StatsDb {
-    /// Distinct non-empty project names ever seen in `cc_usage`, alphabetical.
-    /// Powers the task-manager's project picker so the user can pick a project
-    /// the tracker already knows about instead of retyping it.
+    /// Distinct project names ever seen in `cc_usage`, resolved through the merge
+    /// links (alias→canonical, issue #13) and de-duplicated, alphabetical. Powers
+    /// the task-manager's project picker and the analytics filter so the user
+    /// picks a canonical project the tracker already knows about — merged aliases
+    /// collapse into their canonical here.
     pub fn cc_projects(&self) -> Result<Vec<String>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let rp = super::analytics::resolved_project("project");
+        let sql = format!(
+            "SELECT DISTINCT {rp} FROM cc_usage \
+             WHERE project IS NOT NULL AND project <> '' ORDER BY 1"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Distinct RAW project names ever seen in `cc_usage` (NOT resolved through the
+    /// merge links), alphabetical. Drives the "Projects" management tab, which
+    /// needs the original names to let the user choose what to merge.
+    pub fn cc_raw_projects(&self) -> Result<Vec<String>, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT DISTINCT project FROM cc_usage \

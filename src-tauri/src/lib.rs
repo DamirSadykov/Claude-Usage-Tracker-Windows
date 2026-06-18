@@ -987,6 +987,48 @@ fn get_cc_projects(stats: tauri::State<'_, Arc<StatsDb>>) -> Result<Vec<String>,
     stats.cc_projects().map_err(|e| e.to_string())
 }
 
+/// RAW (un-merged) project names from cc_usage — the originals, for the "Projects"
+/// management tab where the user decides what to merge into what.
+#[tauri::command]
+fn get_raw_projects(stats: tauri::State<'_, Arc<StatsDb>>) -> Result<Vec<String>, String> {
+    stats.cc_raw_projects().map_err(|e| e.to_string())
+}
+
+/// All project merge links (alias→canonical, issue #13) for the management tab.
+#[tauri::command]
+fn get_project_links(stats: tauri::State<'_, Arc<StatsDb>>) -> Result<Vec<stats::ProjectLink>, String> {
+    stats.project_links_all().map_err(|e| e.to_string())
+}
+
+/// Merge `alias` into `canonical`. The store normalizes to stay single-level and
+/// returns a human-readable error (self-link, empty name, cycle) on rejection.
+/// On success, broadcasts `project-links-changed` so every window re-reads — a
+/// merge changes how usage aggregates everywhere, not just where it was triggered.
+#[tauri::command]
+fn set_project_link(
+    alias: String,
+    canonical: String,
+    app: tauri::AppHandle,
+    stats: tauri::State<'_, Arc<StatsDb>>,
+) -> Result<(), String> {
+    stats.set_project_link(&alias, &canonical)?;
+    let _ = app.emit("project-links-changed", ());
+    Ok(())
+}
+
+/// Drop the merge for `alias`, restoring its own per-project line. Broadcasts
+/// `project-links-changed` so all windows re-read (see `set_project_link`).
+#[tauri::command]
+fn remove_project_link(
+    alias: String,
+    app: tauri::AppHandle,
+    stats: tauri::State<'_, Arc<StatsDb>>,
+) -> Result<(), String> {
+    stats.remove_project_link(&alias).map_err(|e| e.to_string())?;
+    let _ = app.emit("project-links-changed", ());
+    Ok(())
+}
+
 /// Last-seen `id -> status` map, shared between the file watcher and the write
 /// commands. The watcher diffs the file against this to fire review/done alerts;
 /// the commands refresh it under the same lock right after they write, so the
@@ -1386,6 +1428,10 @@ pub fn run() {
             export_analytics_json,
             get_todos,
             get_cc_projects,
+            get_raw_projects,
+            get_project_links,
+            set_project_link,
+            remove_project_link,
             upsert_todo,
             delete_todo,
             set_todo_status,
