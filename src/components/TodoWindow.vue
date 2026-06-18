@@ -88,7 +88,7 @@ const errorMsg = ref("");
 
 // Filters
 const projectFilter = ref<string>(""); // "" = all
-const showDone = ref(true);
+const showDone = ref(false);
 const search = ref("");
 
 // Drag-and-drop state: id of the card being dragged + id of the column hovered.
@@ -1377,12 +1377,12 @@ onUnmounted(() => {
   flex-shrink: 0;
 }
 .tw-col-name {
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 600;
   color: var(--text-2);
 }
 .tw-col-count {
-  font-size: 11px;
+  font-size: 12px;
   color: var(--text-3);
   background: var(--track);
   border-radius: 9px;
@@ -1448,14 +1448,14 @@ onUnmounted(() => {
   color: var(--text-3);
 }
 .tw-card-title {
-  font-size: 13px;
+  font-size: 16px;
   font-weight: 500;
   line-height: 1.35;
   word-break: break-word;
 }
 .tw-card-desc {
   margin: 0;
-  font-size: 11.5px;
+  font-size: 13px;
   color: var(--text-3);
   line-height: 1.4;
   display: -webkit-box;
@@ -1471,15 +1471,30 @@ onUnmounted(() => {
   align-items: center;
 }
 .tw-tag {
-  font-size: 10.5px;
+  font-size: 12px;
   color: var(--text-2);
   background: var(--track);
   padding: 1px 7px;
   border-radius: 8px;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+/* In the card, a long project name should wrap inside the tag rather than be
+   ellipsised (ProjectLabel truncates by default for table cells). */
+.tw-tag :deep(.pl) {
+  max-width: 100%;
+}
+.tw-tag :deep(.pl-name) {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  overflow-wrap: anywhere;
 }
 .tw-chip {
-  font-size: 10.5px;
+  font-size: 12px;
   color: var(--text-3);
+  max-width: 100%;
+  overflow-wrap: anywhere;
 }
 /* Provenance chip — "↘ from <project>" for a cross-project task. */
 .tw-from {
@@ -1487,11 +1502,12 @@ onUnmounted(() => {
   background: var(--track);
   padding: 1px 7px;
   border-radius: 8px;
-  white-space: nowrap;
+  max-width: 100%;
+  overflow-wrap: anywhere;
 }
 /* Same provenance, shown read-only in the detail/edit view. */
 .tw-from-note {
-  font-size: 12px;
+  font-size: 13px;
   color: var(--text-3);
 }
 .tw-from-note strong {
@@ -1556,7 +1572,7 @@ onUnmounted(() => {
   box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
 }
 .tw-form-title {
-  font-size: 15px;
+  font-size: 16px;
   font-weight: 600;
   color: var(--text-2);
   margin-bottom: 2px;
@@ -1626,7 +1642,7 @@ onUnmounted(() => {
 
 /* AI-authored badge — violet so it can't be mistaken for a status colour. */
 .tw-ai {
-  font-size: 9.5px;
+  font-size: 11px;
   font-weight: 700;
   letter-spacing: 0.04em;
   text-transform: uppercase;
@@ -1639,7 +1655,7 @@ onUnmounted(() => {
   flex-shrink: 0;
 }
 .tw-ai.sm {
-  font-size: 9px;
+  font-size: 10.5px;
   padding: 0 5px;
 }
 
@@ -1701,7 +1717,7 @@ onUnmounted(() => {
   padding: 8px;
 }
 .tw-detail-list-hd {
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.04em;
@@ -1724,7 +1740,7 @@ onUnmounted(() => {
   color: var(--text-2);
   cursor: pointer;
   font-family: var(--segoe);
-  font-size: 12.5px;
+  font-size: 13px;
 }
 .tw-detail-item:hover {
   background: var(--card-bg-hover);
@@ -1782,7 +1798,7 @@ onUnmounted(() => {
   gap: 10px;
 }
 .tw-comments-hd {
-  font-size: 12px;
+  font-size: 13px;
   font-weight: 600;
   color: var(--text-2);
   display: flex;
@@ -1790,7 +1806,7 @@ onUnmounted(() => {
   gap: 7px;
 }
 .tw-comments-n {
-  font-size: 10.5px;
+  font-size: 11.5px;
   color: var(--text-3);
   background: var(--track);
   border-radius: 9px;
@@ -1799,7 +1815,7 @@ onUnmounted(() => {
   text-align: center;
 }
 .tw-comments-empty {
-  font-size: 12px;
+  font-size: 13px;
   color: var(--text-4);
 }
 .tw-comment-list {
@@ -1828,7 +1844,7 @@ onUnmounted(() => {
   margin-bottom: 4px;
 }
 .tw-comment-author {
-  font-size: 11.5px;
+  font-size: 13px;
   font-weight: 600;
   color: var(--text-2);
 }
@@ -1836,7 +1852,7 @@ onUnmounted(() => {
   color: #c4a7ff;
 }
 .tw-comment-time {
-  font-size: 10.5px;
+  font-size: 11.5px;
   color: var(--text-4);
 }
 .tw-comment-del {
@@ -1861,7 +1877,7 @@ onUnmounted(() => {
 }
 .tw-comment-body {
   margin: 0;
-  font-size: 12.5px;
+  font-size: 14px;
   line-height: 1.45;
   color: var(--text);
   white-space: pre-wrap;
