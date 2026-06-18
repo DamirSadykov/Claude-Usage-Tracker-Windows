@@ -730,94 +730,6 @@ function onMentionBlur() {
   }, 120);
 }
 
-// --- Task linking ---
-// A relationship is stored one-way (the other task's id in `todo.links`) but
-// shown both directions: the open task surfaces both the tasks it links to
-// (`out`) and the tasks that link to it (`inc`). Adding writes to the open task;
-// unlinking removes the edge from whichever side stores it. Like comments, links
-// persist immediately via upsert — independent of the field draft.
-interface Related {
-  todo: Todo;
-  out: boolean;
-  inc: boolean;
-}
-const relatedList = computed<Related[]>(() => {
-  const cur = detail.value;
-  if (!cur) return [];
-  const out = new Set(cur.links ?? []);
-  const res: Related[] = [];
-  for (const t of todos.value) {
-    if (t.id === cur.id) continue;
-    const isOut = out.has(t.id);
-    const isInc = (t.links ?? []).includes(cur.id);
-    if (isOut || isInc) res.push({ todo: t, out: isOut, inc: isInc });
-  }
-  return res.sort(
-    (a, b) => rankStatus(a.todo.status) - rankStatus(b.todo.status),
-  );
-});
-
-// Tasks not yet related to the open one (and not itself) — the link picker pool.
-const linkCandidates = computed(() => {
-  const cur = detail.value;
-  if (!cur) return [];
-  const related = new Set(relatedList.value.map((r) => r.todo.id));
-  return todos.value
-    .filter((t) => t.id !== cur.id && !related.has(t.id))
-    .slice()
-    .sort((a, b) => a.subject.localeCompare(b.subject));
-});
-const linkPick = ref("");
-
-async function persistTodo(todo: Todo) {
-  try {
-    todos.value = await invoke<Todo[]>("upsert_todo", { todo });
-  } catch (e) {
-    errorMsg.value = String(e);
-  }
-}
-
-async function addLink() {
-  const cur = detail.value;
-  const id = linkPick.value;
-  linkPick.value = "";
-  if (!cur || !id) return;
-  const links = [...(cur.links ?? [])];
-  if (!links.includes(id)) links.push(id);
-  await persistTodo({ ...cur, links });
-}
-
-async function unlink(r: Related) {
-  const cur = detail.value;
-  if (!cur) return;
-  // Drop the edge from whichever side(s) store it.
-  if (r.out) {
-    await persistTodo({
-      ...cur,
-      links: (cur.links ?? []).filter((x) => x !== r.todo.id),
-    });
-  }
-  if (r.inc) {
-    await persistTodo({
-      ...r.todo,
-      links: (r.todo.links ?? []).filter((x) => x !== cur.id),
-    });
-  }
-}
-
-// Count of related tasks (outgoing ∪ incoming) for a card badge. Dangling ids
-// (pointing at a deleted task) don't count, since we only match live todos.
-function relatedCount(todo: Todo): number {
-  const ids = new Set<string>();
-  for (const id of todo.links ?? []) {
-    if (todos.value.some((t) => t.id === id)) ids.add(id);
-  }
-  for (const t of todos.value) {
-    if (t.id !== todo.id && (t.links ?? []).includes(todo.id)) ids.add(t.id);
-  }
-  return ids.size;
-}
-
 // --- Drag and drop (native HTML5) ---
 function onDragStart(todo: Todo, e: DragEvent) {
   dragId.value = todo.id;
@@ -1004,7 +916,6 @@ onUnmounted(() => {
               <span v-if="todo.estimate_minutes != null" class="tw-chip">⏱ {{ fmtEstimate(todo.estimate_minutes) }}</span>
               <span v-if="todo.scheduled_for" class="tw-chip">📅 {{ todo.scheduled_for }}</span>
               <span v-if="todo.plan" class="tw-chip" :title="todo.plan">📝</span>
-              <span v-if="relatedCount(todo)" class="tw-chip" :title="t('todoLinks')">🔗 {{ relatedCount(todo) }}</span>
             </div>
 
             <div class="tw-card-foot">
@@ -1156,38 +1067,6 @@ onUnmounted(() => {
           <div class="tw-form-actions">
             <button type="button" class="tw-btn ghost" @click="closeDetail">{{ t("todoBack") }}</button>
             <button type="button" class="tw-btn" :disabled="!draft.subject.trim()" @click="saveDetail">{{ t("save") }}</button>
-          </div>
-
-          <!-- Linked tasks (stored one-way, shown both directions) -->
-          <div class="tw-links">
-            <div class="tw-comments-hd">
-              {{ t("todoLinks") }}
-              <span v-if="relatedList.length" class="tw-comments-n">{{ relatedList.length }}</span>
-            </div>
-            <ul v-if="relatedList.length" class="tw-link-list">
-              <li v-for="r in relatedList" :key="r.todo.id" class="tw-link-item">
-                <button class="tw-link-open" @click="openDetail(r.todo)">
-                  <span class="tw-detail-item-dot" :style="{ background: columnColor(r.todo.status) }"></span>
-                  <span class="tw-detail-item-subj" :class="{ done: r.todo.status === 'done' }">{{ r.todo.subject }}</span>
-                  <span v-if="r.todo.project && r.todo.project !== (detail && detail.project)" class="tw-tag">{{ r.todo.project }}</span>
-                </button>
-                <button class="tw-comment-del" :title="t('todoUnlink')" @click="unlink(r)">
-                  <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M4 4l8 8M12 4l-8 8" /></svg>
-                </button>
-              </li>
-            </ul>
-            <div v-else class="tw-comments-empty">{{ t("todoLinksEmpty") }}</div>
-            <select
-              v-if="linkCandidates.length"
-              v-model="linkPick"
-              class="tw-select tw-link-pick"
-              @change="addLink"
-            >
-              <option value="">{{ t("todoLinkAdd") }}</option>
-              <option v-for="c in linkCandidates" :key="c.id" :value="c.id">
-                {{ c.subject }}{{ c.project ? " — " + c.project : "" }}
-              </option>
-            </select>
           </div>
 
           <!-- Comments thread (posted independently of the field draft) -->
@@ -2093,49 +1972,4 @@ onUnmounted(() => {
   white-space: nowrap;
 }
 
-/* Linked tasks */
-.tw-links {
-  border-top: 1px solid var(--stroke-strong);
-  padding-top: 14px;
-  margin-top: 2px;
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-.tw-link-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-.tw-link-item {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-}
-.tw-link-open {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  text-align: left;
-  background: var(--card-bg);
-  border: 1px solid var(--stroke-strong);
-  border-radius: var(--card-radius);
-  padding: 7px 10px;
-  color: var(--text-2);
-  cursor: pointer;
-  font-family: var(--segoe);
-  font-size: 12.5px;
-}
-.tw-link-open:hover {
-  background: var(--card-bg-hover);
-  color: var(--text);
-}
-.tw-link-pick {
-  width: 100%;
-}
 </style>
