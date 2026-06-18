@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/nicegui/nicegui-tauri/v2/src-tauri/tauri.conf.json",
   "productName": "Claude Usage Tracker",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "identifier": "com.claude-usage-tracker.app",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -79,6 +79,10 @@
     "active": true,
     "targets": "all",
     "createUpdaterArtifacts": true,
+    "resources": {
+      "../scripts/cc-todos.mjs": "scripts/cc-todos.mjs",
+      "../scripts/cc-todos-hook.mjs": "scripts/cc-todos-hook.mjs"
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
