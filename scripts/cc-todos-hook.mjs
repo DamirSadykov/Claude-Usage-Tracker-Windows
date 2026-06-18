@@ -39,14 +39,15 @@ function main() {
     path.join(process.env.USERPROFILE || "", "AppData", "Roaming");
   const file = path.join(appData, "com.claude-usage-tracker.app", "todos.json");
 
-  let data;
+  let data = null;
   try {
     data = JSON.parse(readFileSync(file, "utf8"));
   } catch {
-    return; // tracker never run / file missing → nothing to surface
+    // Tracker never run / file missing → treat as an empty list. We still want
+    // to surface that the tracker + CLI exist (the CLI creates the file on its
+    // first write), so don't bail here — always tell the session it's available.
   }
   const todos = Array.isArray(data && data.todos) ? data.todos : [];
-  if (!todos.length) return;
 
   const project = path.basename(String(cwd).replace(/[\\/]+$/, ""));
   // Kanban columns the tracker recognizes. Legacy `pending` (written before the
@@ -62,48 +63,65 @@ function main() {
       col(t.status) !== "done" &&
       (!t.project || t.project === project),
   );
-  if (!active.length) return;
+  if (active.length) {
+    // Surface what the user is closest to finishing first: in_progress, then
+    // review, then queued, then backlog.
+    const order = { in_progress: 0, review: 1, queue: 2, backlog: 3 };
+    const rank = (s) => order[col(s)] ?? 3;
+    active.sort(
+      (a, b) =>
+        rank(a.status) - rank(b.status) ||
+        String(a.scheduled_for || "9999-99-99").localeCompare(
+          String(b.scheduled_for || "9999-99-99"),
+        ),
+    );
 
-  // Surface what the user is closest to finishing first: in_progress, then
-  // review, then queued, then backlog.
-  const order = { in_progress: 0, review: 1, queue: 2, backlog: 3 };
-  const rank = (s) => order[col(s)] ?? 3;
-  active.sort(
-    (a, b) =>
-      rank(a.status) - rank(b.status) ||
-      String(a.scheduled_for || "9999-99-99").localeCompare(
-        String(b.scheduled_for || "9999-99-99"),
-      ),
-  );
+    const lines = active.map((t) => {
+      const bits = [];
+      if (t.estimate_minutes != null) bits.push(`~${t.estimate_minutes}min`);
+      if (t.scheduled_for) bits.push(`by ${t.scheduled_for}`);
+      const meta = bits.length ? ` (${bits.join(", ")})` : "";
+      const desc = t.description
+        ? ` — ${String(t.description).split("\n")[0].slice(0, 140)}`
+        : "";
+      const num = t.number ? `#${t.number} ` : "";
+      return `- ${num}[${col(t.status)}] ${t.subject}${meta}${desc}  ⟨id:${t.id}⟩`;
+    });
 
-  const lines = active.map((t) => {
-    const bits = [];
-    if (t.estimate_minutes != null) bits.push(`~${t.estimate_minutes}min`);
-    if (t.scheduled_for) bits.push(`by ${t.scheduled_for}`);
-    const meta = bits.length ? ` (${bits.join(", ")})` : "";
-    const desc = t.description
-      ? ` — ${String(t.description).split("\n")[0].slice(0, 140)}`
-      : "";
-    const num = t.number ? `#${t.number} ` : "";
-    return `- ${num}[${col(t.status)}] ${t.subject}${meta}${desc}  ⟨id:${t.id}⟩`;
-  });
+    // Plain stdout on exit 0 is the most robust way to inject SessionStart
+    // context (no additionalContext-nesting ambiguity across CC versions).
+    const context = [
+      `User's active tasks from the Claude Usage Tracker (project "${project}"; the tracker is the source of truth):`,
+      lines.join("\n"),
+      "",
+      `These are the USER's todos, not your working task list.`,
+      `When the user says a task moved (e.g. done / in progress / in review), change its status with the tracker's CLI — do NOT hand-edit todos.json (the tracker may write it concurrently, and a malformed edit breaks the shared file):`,
+      `    node "${CLI}" set-status <id> <status>`,
+      `where <status> is one kanban column: backlog | queue | in_progress | review | done, and <id> is the ⟨id⟩ shown above. The CLI validates the status and writes atomically. Run \`node "${CLI}" list\` to see current tasks. Editing other fields (subject / description / plan / estimate_minutes / scheduled_for / project) on an EXISTING task is not supported by the CLI and should be left to the user.`,
+      `To record a NEW follow-up the user asked you to track, create it via the CLI (don't hand-edit): node "${CLI}" add "<subject>" [--project <name>] [--description <text>] — it lands in the backlog column. Only add tasks the user explicitly wants tracked; this is their list, not your scratchpad.`,
+      `To leave a note on a task the user asked you to record (a finding, progress, a decision), post a comment — it shows in the task's thread attributed to you: node "${CLI}" comment add <id> --text "<body>". Comment only when the user wants it recorded on the task. In a comment or description you can reference another task by its number (e.g. "blocked by #${active[0] && active[0].number ? active[0].number : 12}") — the tracker renders it as a clickable link.`,
+      `Source of truth file (read-only for you): ${file}`,
+    ].join("\n");
 
-  // Plain stdout on exit 0 is the most robust way to inject SessionStart
-  // context (no additionalContext-nesting ambiguity across CC versions).
-  const context = [
-    `User's active tasks from the Claude Usage Tracker (project "${project}"; the tracker is the source of truth):`,
-    lines.join("\n"),
-    "",
-    `These are the USER's todos, not your working task list.`,
-    `When the user says a task moved (e.g. done / in progress / in review), change its status with the tracker's CLI — do NOT hand-edit todos.json (the tracker may write it concurrently, and a malformed edit breaks the shared file):`,
-    `    node "${CLI}" set-status <id> <status>`,
-    `where <status> is one kanban column: backlog | queue | in_progress | review | done, and <id> is the ⟨id⟩ shown above. The CLI validates the status and writes atomically. Run \`node "${CLI}" list\` to see current tasks. Editing other fields (subject / description / plan / estimate_minutes / scheduled_for / project) on an EXISTING task is not supported by the CLI and should be left to the user.`,
-    `To record a NEW follow-up the user asked you to track, create it via the CLI (don't hand-edit): node "${CLI}" add "<subject>" [--project <name>] [--description <text>] — it lands in the backlog column. Only add tasks the user explicitly wants tracked; this is their list, not your scratchpad.`,
-    `To leave a note on a task the user asked you to record (a finding, progress, a decision), post a comment — it shows in the task's thread attributed to you: node "${CLI}" comment add <id> --text "<body>". Comment only when the user wants it recorded on the task. In a comment or description you can reference another task by its number (e.g. "blocked by #${active[0] && active[0].number ? active[0].number : 12}") — the tracker renders it as a clickable link.`,
+    process.stdout.write(context + "\n");
+    return;
+  }
+
+  // No active tasks for THIS project (empty board, or all done, or tracker not
+  // yet run). Still surface that the tracker and its CLI exist, so a session in a
+  // project with no todos knows it can add/list them — otherwise it never learns
+  // about the CLI or todos.json. The status/comment parts of the contract need
+  // task ids, so they're omitted here.
+  const note = [
+    `The Claude Usage Tracker is available in this environment — its todo list is the USER's task tracker (the source of truth). No active tasks for project "${project}" right now.`,
+    `To record a NEW task the user asks you to track, or to see existing ones, use its CLI — don't hand-edit the JSON (the tracker may write it concurrently):`,
+    `    node "${CLI}" add "<subject>" [--project <name>] [--description <text>]`,
+    `    node "${CLI}" list`,
+    `Statuses are kanban columns: backlog | queue | in_progress | review | done. Only add tasks the user explicitly wants tracked; this is their list, not your scratchpad.`,
     `Source of truth file (read-only for you): ${file}`,
   ].join("\n");
 
-  process.stdout.write(context + "\n");
+  process.stdout.write(note + "\n");
 }
 
 try {
