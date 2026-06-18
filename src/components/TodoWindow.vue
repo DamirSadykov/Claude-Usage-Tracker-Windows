@@ -569,6 +569,23 @@ function openProject(name: string) {
   closeDetail();
 }
 
+// Distinct other tasks this one references inline (#N) across its description and
+// comments — drives the card's link chip. Uses tokenize so it counts exactly
+// what renders as a reference (a #frag inside a URL isn't one) and only resolved
+// numbers.
+function refCount(todo: Todo): number {
+  const nums = new Set<number>();
+  const scan = (text: string | undefined) => {
+    if (!text) return;
+    for (const s of tokenize(text)) {
+      if (s.kind === "task" && s.number !== todo.number) nums.add(s.number);
+    }
+  };
+  scan(todo.description);
+  for (const c of todo.comments ?? []) scan(c.body);
+  return nums.size;
+}
+
 // Description has an edit/preview toggle: edit = textarea, preview = the same
 // text with links/references rendered. Reset to edit whenever a task opens.
 const descMode = ref<"edit" | "preview">("edit");
@@ -916,6 +933,7 @@ onUnmounted(() => {
               <span v-if="todo.estimate_minutes != null" class="tw-chip">⏱ {{ fmtEstimate(todo.estimate_minutes) }}</span>
               <span v-if="todo.scheduled_for" class="tw-chip">📅 {{ todo.scheduled_for }}</span>
               <span v-if="todo.plan" class="tw-chip" :title="todo.plan">📝</span>
+              <span v-if="refCount(todo)" class="tw-chip" :title="t('todoRefs')">🔗 {{ refCount(todo) }}</span>
             </div>
 
             <div class="tw-card-foot">
