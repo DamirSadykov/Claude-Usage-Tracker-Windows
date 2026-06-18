@@ -122,8 +122,14 @@ function cmdAdd(args) {
     if (Number.isFinite(n)) estimate = Math.max(0, Math.round(n));
   }
   const now = new Date().toISOString();
+  const file = todosPath();
+  const data = load(file);
   const todo = {
     id: randomUUID(),
+    // Stable human-facing number for inline `#N` references, mirroring
+    // todos.rs::ensure_numbers (next after the current max). The app backfills
+    // any unnumbered rows on load, so a 0 here would still be fixed up later.
+    number: nextNumber(data),
     subject,
     description: typeof flags.description === "string" ? flags.description : "",
     status,
@@ -137,11 +143,20 @@ function cmdAdd(args) {
     created_at: now,
     updated_at: now,
   };
-  const file = todosPath();
-  const data = load(file);
   data.todos.push(todo);
   save(file, data);
-  process.stdout.write(`ok: added ${todo.id} [${status}] ${subject}\n`);
+  process.stdout.write(
+    `ok: added #${todo.number} ${todo.id} [${status}] ${subject}\n`,
+  );
+}
+
+// Next task number = one past the current max (mirrors todos.rs::max_number+1).
+function nextNumber(data) {
+  let max = 0;
+  for (const t of data.todos) {
+    if (t && typeof t.number === "number" && t.number > max) max = t.number;
+  }
+  return max + 1;
 }
 
 const COMMENT_USAGE =
@@ -213,7 +228,8 @@ function cmdList(args) {
     return;
   }
   for (const t of todos) {
-    process.stdout.write(`[${t.status}] ${t.subject}  ⟨id:${t.id}⟩\n`);
+    const num = t.number ? `#${t.number} ` : "";
+    process.stdout.write(`${num}[${t.status}] ${t.subject}  ⟨id:${t.id}⟩\n`);
   }
 }
 

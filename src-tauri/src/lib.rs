@@ -1022,6 +1022,9 @@ fn write_todos_locked(
     let snap = app.state::<TodoSnapshot>();
     let mut guard = snap.0.lock().unwrap();
     let mut file = todos::load(&path);
+    // Backfill task numbers for any legacy/hand-edited rows before mutating, so
+    // every persisted file has stable `#N` references (upsert numbers new tasks).
+    todos::ensure_numbers(&mut file);
     mutate(&mut file);
     todos::save(&path, &file)?;
     *guard = todo_status_map(&file);
@@ -1088,11 +1091,17 @@ fn spawn_todos_watch(app: AppHandle) {
             Err(_) => return,
         };
         let modified = |p: &PathBuf| std::fs::metadata(p).and_then(|m| m.modified()).ok();
-        // Seed the snapshot so pre-existing review/done todos don't alert on the
-        // first observed change.
+        // One-time migration: give every existing task a stable number so inline
+        // `#N` references work even before the first edit this session. Done under
+        // the snapshot lock so the resulting write isn't seen as an external change.
         {
             let snap = app.state::<TodoSnapshot>();
-            *snap.0.lock().unwrap() = todo_status_map(&todos::load(&path));
+            let mut guard = snap.0.lock().unwrap();
+            let mut file = todos::load(&path);
+            if todos::ensure_numbers(&mut file) {
+                let _ = todos::save(&path, &file);
+            }
+            *guard = todo_status_map(&file);
         }
         let mut last: Option<SystemTime> = modified(&path);
         loop {

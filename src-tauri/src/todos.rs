@@ -24,6 +24,12 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Todo {
     pub id: String,
+    /// Stable, human-facing task number (like a GitHub issue number) for inline
+    /// `#N` references. Assigned once (see [`ensure_numbers`]) and never reused,
+    /// so a reference stays valid even after other tasks are deleted. 0 = not yet
+    /// assigned (legacy/hand-edited rows; backfilled on the next load/write).
+    #[serde(default)]
+    pub number: u32,
     pub subject: String,
     #[serde(default)]
     pub description: String,
@@ -127,9 +133,46 @@ pub fn save(path: &Path, file: &TodoFile) -> Result<(), String> {
     Ok(())
 }
 
+/// The largest task number currently assigned (0 if none).
+pub fn max_number(file: &TodoFile) -> u32 {
+    file.todos.iter().map(|t| t.number).max().unwrap_or(0)
+}
+
+/// Assign a stable sequential number to every task that lacks one (`number == 0`),
+/// in creation order, continuing after the current max. Returns true if anything
+/// changed, so the caller can persist. Numbers are never reused, so an inline
+/// `#N` reference stays valid even after other tasks are deleted.
+pub fn ensure_numbers(file: &mut TodoFile) -> bool {
+    let mut idx: Vec<usize> = file
+        .todos
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.number == 0)
+        .map(|(i, _)| i)
+        .collect();
+    if idx.is_empty() {
+        return false;
+    }
+    // Deterministic order regardless of vec order: oldest first, id as tiebreak.
+    idx.sort_by(|&a, &b| {
+        file.todos[a]
+            .created_at
+            .cmp(&file.todos[b].created_at)
+            .then_with(|| file.todos[a].id.cmp(&file.todos[b].id))
+    });
+    let mut next = max_number(file) + 1;
+    for i in idx {
+        file.todos[i].number = next;
+        next += 1;
+    }
+    true
+}
+
 /// Insert a new todo or replace an existing one (matched by `id`). `created_at`
 /// is preserved from the existing row (or stamped `now` for a new one);
-/// `updated_at` is always set to `now`.
+/// `updated_at` is always set to `now`. A new task with no `number` (0) gets the
+/// next one; replacing a task keeps its existing number if the caller didn't
+/// carry it through.
 pub fn upsert(file: &mut TodoFile, mut todo: Todo, now: &str) {
     todo.updated_at = now.to_string();
     if let Some(existing) = file.todos.iter_mut().find(|t| t.id == todo.id) {
@@ -138,10 +181,16 @@ pub fn upsert(file: &mut TodoFile, mut todo: Todo, now: &str) {
         } else {
             existing.created_at.clone()
         };
+        if todo.number == 0 {
+            todo.number = existing.number;
+        }
         *existing = todo;
     } else {
         if todo.created_at.is_empty() {
             todo.created_at = now.to_string();
+        }
+        if todo.number == 0 {
+            todo.number = max_number(file) + 1;
         }
         file.todos.push(todo);
     }
@@ -192,6 +241,7 @@ mod tests {
     fn todo(id: &str, status: &str) -> Todo {
         Todo {
             id: id.to_string(),
+            number: 0,
             subject: format!("subject {id}"),
             description: String::new(),
             status: status.to_string(),
@@ -224,6 +274,49 @@ mod tests {
         assert_eq!(f.todos[0].subject, "changed");
         assert_eq!(f.todos[0].created_at, "T1"); // preserved
         assert_eq!(f.todos[0].updated_at, "T2"); // bumped
+    }
+
+    #[test]
+    fn upsert_assigns_number_to_new_tasks() {
+        let mut f = TodoFile::default();
+        upsert(&mut f, todo("a", "backlog"), "T1");
+        upsert(&mut f, todo("b", "backlog"), "T2");
+        assert_eq!(f.todos[0].number, 1);
+        assert_eq!(f.todos[1].number, 2);
+
+        // Replacing a task keeps its number even if the caller passes 0.
+        let mut updated = todo("a", "done");
+        updated.number = 0;
+        upsert(&mut f, updated, "T3");
+        assert_eq!(f.todos.iter().find(|t| t.id == "a").unwrap().number, 1);
+
+        // A caller that carries a non-zero number is respected.
+        let mut c = todo("c", "backlog");
+        c.number = 0;
+        upsert(&mut f, c, "T4");
+        assert_eq!(f.todos.iter().find(|t| t.id == "c").unwrap().number, 3);
+    }
+
+    #[test]
+    fn ensure_numbers_backfills_in_creation_order_and_continues_after_max() {
+        let mut f = TodoFile::default();
+        // Pre-existing numbered task + two legacy tasks (number 0).
+        let mut numbered = todo("x", "backlog");
+        numbered.number = 5;
+        numbered.created_at = "2026-01-01".into();
+        let mut older = todo("a", "backlog");
+        older.created_at = "2026-02-01".into();
+        let mut newer = todo("b", "backlog");
+        newer.created_at = "2026-03-01".into();
+        f.todos = vec![newer, numbered, older];
+
+        assert!(ensure_numbers(&mut f));
+        // Continues after the max (5); oldest legacy gets the lower number.
+        assert_eq!(f.todos.iter().find(|t| t.id == "a").unwrap().number, 6);
+        assert_eq!(f.todos.iter().find(|t| t.id == "b").unwrap().number, 7);
+        assert_eq!(f.todos.iter().find(|t| t.id == "x").unwrap().number, 5);
+        // Idempotent once everything is numbered.
+        assert!(!ensure_numbers(&mut f));
     }
 
     #[test]
