@@ -13,6 +13,8 @@
 //   add "<subject>" [--project <name>] [--status <status>] [--description <text>]
 //                   [--plan <text>] [--estimate <min>] [--scheduled <YYYY-MM-DD>]
 //   set-status <id> <status>        status ∈ backlog|queue|in_progress|review|done
+//   comment add <id> --text "<body>" [--by claude|user]
+//   comment list <id> [--json]
 //   list [--project <name>] [--json]
 //
 // Exit code is non-zero on any error (bad status, unknown id, usage), so a
@@ -142,6 +144,58 @@ function cmdAdd(args) {
   process.stdout.write(`ok: added ${todo.id} [${status}] ${subject}\n`);
 }
 
+const COMMENT_USAGE =
+  'usage: cc-todos comment add <id> --text "<body>" [--by claude|user]\n' +
+  "       cc-todos comment list <id> [--json]";
+
+// Append or list comments on a todo. Mirrors the Comment shape in todos.rs /
+// TodoWindow.vue: { id, author, body, created_at }. The thread is shared with
+// the tracker UI (the user posts there as "user"); this CLI is Claude's path, so
+// a comment added here defaults to author "claude" unless --by overrides it.
+function cmdComment(args) {
+  const [sub, ...rest] = args;
+  if (sub === "add") {
+    const { positional, flags } = parseArgs(rest);
+    const id = String(positional[0] ?? "").trim();
+    const body = typeof flags.text === "string" ? flags.text : "";
+    if (!id || !body.trim()) fail(COMMENT_USAGE);
+    const author = flags.by === "user" ? "user" : "claude";
+    const file = todosPath();
+    const data = load(file);
+    const todo = data.todos.find((t) => t && t.id === id);
+    if (!todo) fail(`no todo with id ${id}`);
+    if (!Array.isArray(todo.comments)) todo.comments = [];
+    const now = new Date().toISOString();
+    const comment = { id: randomUUID(), author, body, created_at: now };
+    todo.comments.push(comment);
+    todo.updated_at = now;
+    save(file, data);
+    process.stdout.write(`ok: comment ${comment.id} on ${id} by ${author}\n`);
+    return;
+  }
+  if (sub === "list") {
+    const id = String(rest.find((a) => !a.startsWith("--")) ?? "").trim();
+    if (!id) fail(COMMENT_USAGE);
+    const file = todosPath();
+    const todo = load(file).todos.find((t) => t && t.id === id);
+    if (!todo) fail(`no todo with id ${id}`);
+    const comments = Array.isArray(todo.comments) ? todo.comments : [];
+    if (rest.includes("--json")) {
+      process.stdout.write(JSON.stringify(comments, null, 2) + "\n");
+      return;
+    }
+    if (!comments.length) {
+      process.stdout.write("(no comments)\n");
+      return;
+    }
+    for (const c of comments) {
+      process.stdout.write(`[${c.author}] ${c.body}  ⟨${c.created_at}⟩\n`);
+    }
+    return;
+  }
+  fail(COMMENT_USAGE);
+}
+
 function cmdList(args) {
   const file = todosPath();
   let todos = load(file).todos.filter(Boolean);
@@ -171,6 +225,8 @@ function usage(code) {
       "  set-status <id> <status>        status ∈ " +
       STATUSES.join(" | ") +
       "\n" +
+      '  comment add <id> --text "<body>" [--by claude|user]\n' +
+      "  comment list <id> [--json]\n" +
       "  list [--project <name>] [--json]\n",
   );
   process.exit(code);
@@ -183,6 +239,9 @@ switch (cmd) {
     break;
   case "set-status":
     cmdSetStatus(rest[0], rest[1]);
+    break;
+  case "comment":
+    cmdComment(rest);
     break;
   case "list":
     cmdList(rest);

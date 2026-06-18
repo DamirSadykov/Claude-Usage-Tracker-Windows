@@ -98,6 +98,7 @@ function main() {
     `    node "${CLI}" set-status <id> <status>`,
     `where <status> is one kanban column: backlog | queue | in_progress | review | done, and <id> is the ⟨id⟩ shown above. The CLI validates the status and writes atomically. Run \`node "${CLI}" list\` to see current tasks. Editing other fields (subject / description / plan / estimate_minutes / scheduled_for / project) on an EXISTING task is not supported by the CLI and should be left to the user.`,
     `To record a NEW follow-up the user asked you to track, create it via the CLI (don't hand-edit): node "${CLI}" add "<subject>" [--project <name>] [--description <text>] — it lands in the backlog column. Only add tasks the user explicitly wants tracked; this is their list, not your scratchpad.`,
+    `To leave a note on a task the user asked you to record (a finding, progress, a decision), post a comment — it shows in the task's thread attributed to you: node "${CLI}" comment add <id> --text "<body>". Comment only when the user wants it recorded on the task.`,
     `Source of truth file (read-only for you): ${file}`,
   ].join("\n");
 

@@ -392,6 +392,65 @@ async function saveDetail() {
   }
 }
 
+// --- Comments (discussion thread on the open task) ---
+// A comment is posted independently of the field draft: appending one persists
+// immediately (it's a discrete action, not part of the "Save" of edited fields),
+// so a pending draft edit is left untouched. `detail.value` is the persisted
+// todo, so we merge onto that — never onto the draft.
+const newComment = ref("");
+
+const detailComments = computed(() => detail.value?.comments ?? []);
+
+async function persistComments(comments: Comment[]) {
+  const cur = detail.value;
+  if (!cur) return;
+  try {
+    todos.value = await invoke<Todo[]>("upsert_todo", {
+      todo: { ...cur, comments },
+    });
+  } catch (e) {
+    errorMsg.value = String(e);
+  }
+}
+
+async function addComment() {
+  const body = newComment.value.trim();
+  if (!body || !detail.value) return;
+  const comment: Comment = {
+    id: crypto.randomUUID(),
+    author: "user",
+    body,
+    created_at: new Date().toISOString(),
+  };
+  await persistComments([...(detail.value.comments ?? []), comment]);
+  newComment.value = "";
+}
+
+async function removeComment(id: string) {
+  if (!detail.value) return;
+  await persistComments(
+    (detail.value.comments ?? []).filter((c) => c.id !== id),
+  );
+}
+
+function commentAuthorLabel(author: string) {
+  return author === "claude" ? t("todoAuthorClaude") : t("todoAuthorYou");
+}
+
+// Format an ISO timestamp for a comment line. Empty/garbage → "" so a hand-
+// edited comment without a date just shows no time rather than "Invalid Date".
+function fmtTime(iso: string | undefined) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleString(locale.value === "ru" ? "ru-RU" : "en-US", {
+    day: "2-digit",
+    month: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
 // --- Drag and drop (native HTML5) ---
 function onDragStart(todo: Todo, e: DragEvent) {
   dragId.value = todo.id;
@@ -687,6 +746,43 @@ onUnmounted(() => {
           <div class="tw-form-actions">
             <button type="button" class="tw-btn ghost" @click="closeDetail">{{ t("todoBack") }}</button>
             <button type="button" class="tw-btn" :disabled="!draft.subject.trim()" @click="saveDetail">{{ t("save") }}</button>
+          </div>
+
+          <!-- Comments thread (posted independently of the field draft) -->
+          <div class="tw-comments">
+            <div class="tw-comments-hd">
+              {{ t("todoComments") }}
+              <span v-if="detailComments.length" class="tw-comments-n">{{ detailComments.length }}</span>
+            </div>
+            <div v-if="!detailComments.length" class="tw-comments-empty">{{ t("todoCommentsEmpty") }}</div>
+            <ul v-else class="tw-comment-list">
+              <li
+                v-for="c in detailComments"
+                :key="c.id"
+                class="tw-comment"
+                :class="{ ai: c.author === 'claude' }"
+              >
+                <div class="tw-comment-head">
+                  <span class="tw-comment-author" :class="{ ai: c.author === 'claude' }">{{ commentAuthorLabel(c.author) }}</span>
+                  <span v-if="fmtTime(c.created_at)" class="tw-comment-time">{{ fmtTime(c.created_at) }}</span>
+                  <button class="tw-comment-del" :title="t('todoDelete')" @click="removeComment(c.id)">
+                    <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M4 4l8 8M12 4l-8 8" /></svg>
+                  </button>
+                </div>
+                <p class="tw-comment-body">{{ c.body }}</p>
+              </li>
+            </ul>
+            <div class="tw-comment-compose">
+              <textarea
+                v-model="newComment"
+                class="tw-input tw-area"
+                :placeholder="t('todoCommentPlaceholder')"
+                rows="2"
+                @keydown.ctrl.enter="addComment"
+                @keydown.meta.enter="addComment"
+              ></textarea>
+              <button class="tw-btn" :disabled="!newComment.trim()" @click="addComment">{{ t("todoCommentAdd") }}</button>
+            </div>
           </div>
         </section>
         <section v-else class="tw-detail-main tw-detail-empty">{{ t("todoColEmpty") }}</section>
@@ -1302,5 +1398,110 @@ onUnmounted(() => {
   justify-content: center;
   color: var(--text-4);
   font-size: 13px;
+}
+
+/* Comments thread */
+.tw-comments {
+  border-top: 1px solid var(--stroke-strong);
+  padding-top: 14px;
+  margin-top: 2px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.tw-comments-hd {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-2);
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.tw-comments-n {
+  font-size: 10.5px;
+  color: var(--text-3);
+  background: var(--track);
+  border-radius: 9px;
+  padding: 1px 7px;
+  min-width: 18px;
+  text-align: center;
+}
+.tw-comments-empty {
+  font-size: 12px;
+  color: var(--text-4);
+}
+.tw-comment-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.tw-comment {
+  background: var(--card-bg);
+  border: 1px solid var(--stroke-strong);
+  border-left: 3px solid var(--text-4);
+  border-radius: var(--card-radius);
+  padding: 8px 11px;
+}
+/* Claude comments get the same violet accent as the AI badge. */
+.tw-comment.ai {
+  border-left-color: #b388ff;
+}
+.tw-comment-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.tw-comment-author {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+.tw-comment-author.ai {
+  color: #c4a7ff;
+}
+.tw-comment-time {
+  font-size: 10.5px;
+  color: var(--text-4);
+}
+.tw-comment-del {
+  margin-left: auto;
+  background: transparent;
+  border: none;
+  color: var(--text-4);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  padding: 2px;
+  border-radius: 4px;
+  opacity: 0;
+  transition: opacity 120ms;
+}
+.tw-comment:hover .tw-comment-del {
+  opacity: 1;
+}
+.tw-comment-del:hover {
+  color: #f87171;
+  background: var(--card-bg-hover);
+}
+.tw-comment-body {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.45;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.tw-comment-compose {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: flex-end;
+}
+.tw-comment-compose .tw-area {
+  width: 100%;
 }
 </style>
