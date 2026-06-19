@@ -11,6 +11,7 @@ import TodoWindow from "./components/TodoWindow.vue";
 import FocusControls from "./components/FocusControls.vue";
 import ServiceStatusBar from "./components/ServiceStatusBar.vue";
 import AboutPanel from "./components/AboutPanel.vue";
+import { applyFont, writeCachedFontId, DEFAULT_FONT_ID } from "./fontSwitch";
 import {
     DEFAULT_THRESHOLDS,
     normalize,
@@ -120,6 +121,7 @@ const todoNotificationsEnabled = ref(true);
 const runtimeInsightsEnabled = ref(false);
 const runtimeInsightKinds = ref<string[]>(["long_session", "cold_rewrites"]);
 const systemInfoEnabled = ref(true);
+const uiFont = ref(DEFAULT_FONT_ID);
 const todaySpent = ref<number | null>(null);
 const suggestedBudget = ref<number | null>(null);
 const budgetUnit = computed<"usd" | "pct">(() =>
@@ -253,6 +255,10 @@ async function loadSettings() {
             (await store.get<boolean>("systemInfoEnabled")) ?? true;
         const savedLocale = await store.get<string>("locale");
         if (savedLocale) locale.value = savedLocale;
+        uiFont.value = (await store.get<string>("uiFont")) ?? DEFAULT_FONT_ID;
+        // Apply the persisted font and refresh the fast cache main.ts reads.
+        applyFont(uiFont.value);
+        writeCachedFontId(uiFont.value);
     } catch {
         // First run
     }
@@ -296,6 +302,7 @@ async function saveSettings() {
     await store.set("runtimeInsightKinds", [...runtimeInsightKinds.value]);
     await store.set("systemInfoEnabled", systemInfoEnabled.value);
     await store.set("locale", locale.value);
+    await store.set("uiFont", uiFont.value);
     await store.save();
 }
 
@@ -595,6 +602,7 @@ async function handleSave(settings: {
     todoNotificationsEnabled: boolean;
     systemInfoEnabled: boolean;
     locale: string;
+    uiFont: string;
 }) {
     sessionKey.value = settings.sessionKey;
     orgId.value = settings.orgId;
@@ -621,6 +629,9 @@ async function handleSave(settings: {
     todoNotificationsEnabled.value = settings.todoNotificationsEnabled;
     systemInfoEnabled.value = settings.systemInfoEnabled;
     locale.value = settings.locale;
+    uiFont.value = settings.uiFont;
+    applyFont(uiFont.value);
+    writeCachedFontId(uiFont.value);
     // The backend re-arms its alert engine on disable (see `configure`).
     await saveSettings();
 
@@ -1030,6 +1041,7 @@ onUnmounted(() => {
             :runtime-insights-enabled="runtimeInsightsEnabled"
             :runtime-insight-kinds="runtimeInsightKinds"
             :locale="locale"
+            :ui-font="uiFont"
             @save="handleSave"
             @runtime-change="handleRuntimeChange"
         />

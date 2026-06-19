@@ -1,0 +1,11 @@
+/* Montserrat — per-font size tuning.
+ *
+ * Applies when fontSwitch.ts sets data-font="montserrat" on :root. Montserrat
+ * is a geometric sans that runs a touch larger/wider than the Segoe default,
+ * so a few spots are trimmed. Add `:root[data-font="montserrat"] .x { … }`
+ * rules here to tune this font in isolation. */
+
+/* Tasks board — short card title (TodoWindow). */
+:root[data-font="montserrat"] .tw-card-title {
+  font-size: 15px;
+}

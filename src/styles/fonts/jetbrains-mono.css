@@ -1,0 +1,40 @@
+/* JetBrains Mono — per-font size tuning.
+ *
+ * Loaded globally (main.ts); applies when fontSwitch.ts sets
+ * data-font="jetbrains-mono" on :root. Monospace glyphs are wider/taller than
+ * the sans default, so dense numeric UI overflows at the base sizes — trim it
+ * here. These global `:root[data-font=…] .x` rules outrank component scoped
+ * styles by specificity, so per-component overrides aren't needed.
+ *
+ * Edit values here to tune this font in isolation (one font = one file). */
+
+/* Tray popup — usage metrics (global classes in style.css). */
+:root[data-font="jetbrains-mono"] .pct {
+  font-size: 16px;
+  letter-spacing: -0.03em;
+}
+:root[data-font="jetbrains-mono"] .card-title {
+  font-size: 13px;
+}
+:root[data-font="jetbrains-mono"] .card-sub {
+  font-size: 12px;
+}
+:root[data-font="jetbrains-mono"] .pace-row,
+:root[data-font="jetbrains-mono"] .meta-row {
+  font-size: 11px;
+}
+
+/* Tasks board — short card title (TodoWindow). */
+:root[data-font="jetbrains-mono"] .tw-card-title {
+  font-size: 14px;
+}
+
+/* Analytics — summary figures (AnalyticsPanel). */
+:root[data-font="jetbrains-mono"] .stat-val {
+  font-size: 17px;
+  letter-spacing: -0.02em;
+}
+:root[data-font="jetbrains-mono"] .stat-lbl {
+  font-size: 11px;
+  letter-spacing: 0;
+}
