@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch, onMounted } from "vue";
+import { ref, watch, onMounted, onUnmounted } from "vue";
 import type { Ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { useI18n } from "vue-i18n";
@@ -12,6 +12,7 @@ import {
 import type { AlertTiers, AlertTierKey, AlertTypes, AlertTypeKey } from "../thresholds";
 import { useUpdater } from "../updater";
 import { INSIGHT_KINDS } from "../insightKinds";
+import { FONT_OPTIONS, applyFont } from "../fontSwitch";
 
 const TIER_LABELS: Record<AlertTierKey, string> = {
   five_hour: "session5h",
@@ -75,6 +76,7 @@ const props = defineProps<{
   runtimeInsightsEnabled: boolean;
   runtimeInsightKinds: string[];
   locale: string;
+  uiFont: string;
 }>();
 
 const emit = defineEmits<{
@@ -104,6 +106,7 @@ const emit = defineEmits<{
     todoNotificationsEnabled: boolean;
     systemInfoEnabled: boolean;
     locale: string;
+    uiFont: string;
   }];
   // Runtime-insight settings save immediately (not via the Save button).
   runtimeChange: [settings: { enabled: boolean; kinds: string[] }];
@@ -143,6 +146,20 @@ const localSvcNotify = ref(props.serviceStatusNotify);
 const localTodoNotify = ref(props.todoNotificationsEnabled);
 const localSystemInfo = ref(props.systemInfoEnabled);
 const localLocale = ref(props.locale);
+const localFont = ref(props.uiFont);
+
+// Live preview: applying on change lets the user compare fonts before saving.
+// The choice only persists when the Save button calls handleSave → emit("save").
+function onFontChange() {
+  applyFont(localFont.value);
+}
+
+// If the panel closes without saving, revert any preview to the persisted font.
+// After a successful save props.uiFont already equals the choice, so this is a
+// no-op in that case.
+onUnmounted(() => {
+  applyFont(props.uiFont);
+});
 
 watch(() => props.sessionKey, (v) => (localSessionKey.value = v));
 watch(() => props.orgId, (v) => (localOrgId.value = v));
@@ -176,6 +193,7 @@ watch(() => props.serviceStatusNotify, (v) => (localSvcNotify.value = v));
 watch(() => props.todoNotificationsEnabled, (v) => (localTodoNotify.value = v));
 watch(() => props.systemInfoEnabled, (v) => (localSystemInfo.value = v));
 watch(() => props.locale, (v) => (localLocale.value = v));
+watch(() => props.uiFont, (v) => (localFont.value = v));
 
 // --- Insights toggles ---
 // We mirror AnalyticsWindow.vue's pattern: read/write `ignoredInsights` in
@@ -343,6 +361,7 @@ function handleSave() {
     todoNotificationsEnabled: localTodoNotify.value,
     systemInfoEnabled: localSystemInfo.value,
     locale: localLocale.value,
+    uiFont: localFont.value,
   });
 }
 </script>
@@ -494,6 +513,22 @@ function handleSave() {
             >RU</button>
           </div>
         </div>
+      </div>
+
+      <!-- UI font -->
+      <div class="card">
+        <div class="field-label">{{ t('uiFont') }}</div>
+        <select
+          v-model="localFont"
+          class="field-input"
+          :style="{ fontFamily: 'var(--segoe)' }"
+          @change="onFontChange"
+        >
+          <option v-for="f in FONT_OPTIONS" :key="f.id" :value="f.id">
+            {{ f.system ? `${f.name} (${t('uiFontSystem')})` : f.name }}{{ f.mono ? ' · mono' : '' }}
+          </option>
+        </select>
+        <div class="field-hint">{{ t('uiFontHint') }}</div>
       </div>
 
       <!-- Auto-start toggle -->
@@ -1159,7 +1194,16 @@ function handleSave() {
   font-size: 13px;
   font-family: var(--segoe);
   outline: none;
+  /* Render native controls (e.g. the <select> dropdown list) in dark theme so
+     options aren't white-on-white on Windows/WebView2. */
+  color-scheme: dark;
   transition: border-color 120ms, background 120ms;
+}
+/* Solid background fallback for the native <option> popup (the translucent
+   field background would show through as white). */
+.field-input option {
+  background: var(--card-bg);
+  color: var(--text);
 }
 
 .field-input:focus {
