@@ -932,7 +932,7 @@ onUnmounted(() => {
             @dragstart="onDragStart(todo, $event)"
             @dragend="onDragEnd"
           >
-            <div class="tw-card-title">{{ todo.subject }}</div>
+            <div class="tw-card-title"><span v-if="todo.number" class="tw-card-num">#{{ todo.number }}</span>{{ todo.subject }}</div>
             <p v-if="todo.description" class="tw-card-desc">{{ todo.description }}</p>
 
             <div class="tw-card-meta">
@@ -996,7 +996,7 @@ onUnmounted(() => {
           {{ t("todoBack") }}
         </button>
         <div class="tw-title">
-          <h1>{{ draft.subject || t("todoNew") }}</h1>
+          <h1><span v-if="detail?.number" class="tw-detail-num">#{{ detail.number }}</span>{{ draft.subject || t("todoNew") }}</h1>
           <span v-if="detail && detail.created_by === 'claude'" class="tw-ai" :title="t('todoAiHint')">{{ t("todoAi") }}</span>
         </div>
         <div class="tw-spacer"></div>
@@ -1022,7 +1022,7 @@ onUnmounted(() => {
             @click="openDetail(td)"
           >
             <span class="tw-detail-item-dot" :style="{ background: columnColor(td.status) }"></span>
-            <span class="tw-detail-item-subj" :class="{ done: td.status === 'done' }">{{ td.subject }}</span>
+            <span class="tw-detail-item-subj" :class="{ done: td.status === 'done' }"><span v-if="td.number" class="tw-detail-item-num">#{{ td.number }}</span>{{ td.subject }}</span>
             <span v-if="td.created_by === 'claude'" class="tw-ai sm" :title="t('todoAiHint')">{{ t("todoAi") }}</span>
           </button>
         </aside>
@@ -1272,6 +1272,12 @@ onUnmounted(() => {
   font-size: 18px;
   font-weight: 600;
 }
+.tw-detail-num {
+  margin-right: 7px;
+  color: var(--text-3);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
 .tw-open {
   font-size: 12px;
   color: var(--text-3);
@@ -1489,6 +1495,12 @@ onUnmounted(() => {
   line-height: 1.35;
   word-break: break-word;
 }
+.tw-card-num {
+  margin-right: 6px;
+  color: var(--text-3);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
 .tw-card-desc {
   margin: 0;
   font-size: 13px;
@@ -1630,6 +1642,7 @@ onUnmounted(() => {
 .tw-area {
   resize: vertical;
   min-height: 36px;
+  line-height: 1.6;
 }
 .tw-row {
   display: flex;
@@ -1802,6 +1815,12 @@ onUnmounted(() => {
   text-decoration: line-through;
   color: var(--text-3);
 }
+.tw-detail-item-num {
+  margin-right: 5px;
+  color: var(--text-3);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
 .tw-detail-main {
   flex: 1;
   min-height: 0;
@@ -1914,7 +1933,7 @@ onUnmounted(() => {
 .tw-comment-body {
   margin: 0;
   font-size: 14px;
-  line-height: 1.45;
+  line-height: 1.65;
   color: var(--text);
   white-space: pre-wrap;
   word-break: break-word;
@@ -1964,7 +1983,7 @@ onUnmounted(() => {
   border-radius: 5px;
   padding: 9px 11px;
   font-size: 13px;
-  line-height: 1.5;
+  line-height: 1.7;
   color: var(--text);
   white-space: pre-wrap;
   word-break: break-word;
