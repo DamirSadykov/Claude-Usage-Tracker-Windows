@@ -547,6 +547,14 @@ async function openLink(href: string) {
   }
 }
 
+// User-facing guide (how tasks & analytics work). Published as the repo wiki's
+// Home page, so the short `/wiki` URL is stable regardless of page naming.
+const GUIDE_URL =
+  "https://github.com/DamirSadykov/Claude-Usage-Tracker-Windows/wiki";
+function openGuide() {
+  openLink(GUIDE_URL);
+}
+
 // Navigate a #N reference to that task's detail; a @name reference back to the
 // board filtered to that project.
 function openTask(number: number) {
@@ -873,6 +881,13 @@ onUnmounted(() => {
         <input type="checkbox" v-model="showDone" />
         {{ t("todoShowDone") }}
       </label>
+      <button class="tw-guide" :title="t('todoGuideHint')" @click="openGuide">
+        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M2.5 3.2c1.8-.6 3.7-.6 5.5.3 1.8-.9 3.7-.9 5.5-.3v8.6c-1.8-.6-3.7-.6-5.5.3-1.8-.9-3.7-.9-5.5-.3z" />
+          <path d="M8 3.5v8.6" />
+        </svg>
+        {{ t("todoGuide") }}
+      </button>
       <button class="tw-add" @click="startNew('backlog')">+ {{ t("todoAdd") }}</button>
     </header>
 
@@ -1308,6 +1323,27 @@ onUnmounted(() => {
   align-items: center;
   gap: 5px;
   cursor: pointer;
+}
+.tw-guide {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid var(--stroke-strong);
+  background: var(--card-bg);
+  color: var(--text-3);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  font-family: var(--segoe);
+  transition: color 120ms, border-color 120ms;
+}
+.tw-guide:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+.tw-guide svg {
+  opacity: 0.85;
 }
 .tw-add {
   border: 1px solid var(--accent);
