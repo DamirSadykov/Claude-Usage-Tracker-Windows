@@ -38,3 +38,31 @@
   font-size: 11px;
   letter-spacing: 0;
 }
+
+/* Analytics flyout — controls + dense rows. Monospace is the widest face here,
+ * so at base sizes the controls row wraps the "Подробнее" button to a second
+ * line and the anomaly/legend rows overflow. Scoped to .analytics (the tray
+ * flyout) so the detail window keeps its own sizing. */
+:root[data-font="fira-code"] .analytics .seg button {
+  font-size: 11px;
+  padding: 6px 10px;
+  letter-spacing: -0.01em;
+}
+:root[data-font="fira-code"] .analytics .more-btn {
+  font-size: 11px;
+  padding: 5px 8px;
+}
+:root[data-font="fira-code"] .analytics .seg-sm button {
+  font-size: 10px;
+}
+:root[data-font="fira-code"] .analytics .block-title {
+  font-size: 11px;
+}
+:root[data-font="fira-code"] .analytics .alert-head,
+:root[data-font="fira-code"] .analytics .anomaly-row {
+  font-size: 11px;
+}
+:root[data-font="fira-code"] .analytics .legend-item,
+:root[data-font="fira-code"] .analytics .pbar-head {
+  font-size: 12px;
+}

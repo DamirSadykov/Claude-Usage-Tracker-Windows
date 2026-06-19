@@ -9,3 +9,37 @@
 :root[data-font="montserrat"] .tw-card-title {
   font-size: 15px;
 }
+
+/* Analytics flyout (AnalyticsPanel, root .analytics) — Montserrat runs a touch
+ * wider than Segoe, so the controls row wraps the "Подробнее" button onto a
+ * second line and the dense rows below crowd. Trim the popup's text a notch.
+ * Scoped to .analytics so only the tray flyout is affected, not the detail
+ * window. */
+:root[data-font="montserrat"] .analytics .seg button {
+  font-size: 12px;
+  padding: 6px 12px;
+}
+:root[data-font="montserrat"] .analytics .more-btn {
+  font-size: 12px;
+  padding: 5px 9px;
+}
+:root[data-font="montserrat"] .analytics .seg-sm button {
+  font-size: 11px;
+}
+:root[data-font="montserrat"] .analytics .stat-val {
+  font-size: 18px;
+}
+:root[data-font="montserrat"] .analytics .stat-lbl {
+  font-size: 11px;
+}
+:root[data-font="montserrat"] .analytics .block-title {
+  font-size: 12px;
+}
+:root[data-font="montserrat"] .analytics .alert-head,
+:root[data-font="montserrat"] .analytics .anomaly-row {
+  font-size: 12px;
+}
+:root[data-font="montserrat"] .analytics .legend-item,
+:root[data-font="montserrat"] .analytics .pbar-head {
+  font-size: 13px;
+}
