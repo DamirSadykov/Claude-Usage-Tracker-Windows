@@ -1065,26 +1065,27 @@ fn save_project_groups(
 
 // --- CLI + SessionStart hook installer ---
 //
-// The cc-todos CLI + SessionStart hook ship as bundled Node scripts (resources).
-// "Install" = wire the hook into the user's ~/.claude/settings.json so Claude Code
-// runs it on every session start. The CLI needs no separate wiring — the hook
-// resolves cc-todos.mjs next to itself.
+// The unified `cli.mjs` (todos / phases / hook areas) ships as bundled Node
+// scripts (resources). "Install" = wire the hook into the user's
+// ~/.claude/settings.json so Claude Code runs `cli.mjs hook` on every session
+// start. The CLI areas need no separate wiring — the hook hands Claude the
+// cli.mjs path and Claude calls `cli.mjs todos …` itself.
 
-/// Absolute path to `cc-todos-hook.mjs`, forward-slashed for a clean settings.json
-/// command on Windows. In a packaged build it's the bundled resource; in `tauri
-/// dev` it's the repo's `scripts/` (preferred there, since the resource copy under
-/// target/ is wiped on rebuild).
+/// Absolute path to the unified `cli.mjs`, forward-slashed for a clean
+/// settings.json command on Windows. In a packaged build it's the bundled
+/// resource; in `tauri dev` it's the repo's `scripts/` (preferred there, since
+/// the resource copy under target/ is wiped on rebuild).
 fn cc_hook_script_path(app: &AppHandle) -> Result<String, String> {
     let resource = app
         .path()
-        .resolve("scripts/cc-todos-hook.mjs", tauri::path::BaseDirectory::Resource)
+        .resolve("scripts/cli.mjs", tauri::path::BaseDirectory::Resource)
         .ok()
         .filter(|p| p.exists());
     let dev = {
         let d = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("scripts")
-            .join("cc-todos-hook.mjs");
+            .join("cli.mjs");
         std::fs::canonicalize(&d).ok().filter(|p| p.exists())
     };
     let chosen = if cfg!(debug_assertions) {
@@ -1092,10 +1093,17 @@ fn cc_hook_script_path(app: &AppHandle) -> Result<String, String> {
     } else {
         resource.or(dev)
     };
-    let p = chosen.ok_or_else(|| "cc-todos-hook.mjs not found (resource or dev path)".to_string())?;
+    let p = chosen.ok_or_else(|| "cli.mjs not found (resource or dev path)".to_string())?;
     // Drop the Windows \\?\ prefix canonicalize adds, use forward slashes.
     let s = p.to_string_lossy().replace('\\', "/");
     Ok(s.strip_prefix("//?/").map(str::to_string).unwrap_or(s))
+}
+
+/// A SessionStart hook command that belongs to the tracker — either the unified
+/// `cli.mjs … hook` or a legacy standalone `cc-todos-hook.mjs` from before the
+/// CLI was unified. Used to detect our entry and re-wire it idempotently.
+fn is_our_hook_command(cmd: &str) -> bool {
+    cmd.contains("cli.mjs") || cmd.contains("cc-todos-hook.mjs")
 }
 
 /// `~/.claude/settings.json` — the global Claude Code config we wire the hook into.
@@ -1115,7 +1123,7 @@ fn settings_has_cc_hook(v: &serde_json::Value) -> bool {
                     hs.iter().any(|hook| {
                         hook.get("command")
                             .and_then(|c| c.as_str())
-                            .is_some_and(|c| c.contains("cc-todos-hook.mjs"))
+                            .is_some_and(is_our_hook_command)
                     })
                 })
             })
@@ -1151,7 +1159,7 @@ fn cc_hook_status(app: AppHandle) -> Result<CcHookStatus, String> {
 #[tauri::command]
 fn install_cc_hook(app: AppHandle) -> Result<String, String> {
     let script = cc_hook_script_path(&app)?;
-    let command = format!("node \"{script}\"");
+    let command = format!("node \"{script}\" hook");
     let settings_path = claude_settings_path(&app)?;
 
     let mut root: serde_json::Value = std::fs::read_to_string(&settings_path)
@@ -1185,7 +1193,7 @@ fn install_cc_hook(app: AppHandle) -> Result<String, String> {
                 let is_ours = hook
                     .get("command")
                     .and_then(|c| c.as_str())
-                    .is_some_and(|c| c.contains("cc-todos-hook.mjs"));
+                    .is_some_and(is_our_hook_command);
                 if is_ours {
                     hook["command"] = serde_json::Value::String(command.clone());
                     updated = true;

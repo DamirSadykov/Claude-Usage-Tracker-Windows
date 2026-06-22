@@ -1,7 +1,7 @@
-# Phase 4: Полировка и follow-ups
+# Phase 4: Дисциплина фаза=сессия (PR3)
 
-опциональное
+хук подмешивает текущую фазу + handoff + SKILL.md
 
-- [ ] 4.1 интерактивный toggle из UI (write-back)
-- [ ] 4.2 watcher на .claude/phases для live-reload
-- [ ] 4.3 edge: merge-проекты при матчинге
+- [ ] 4.1 хук подмешивает текущую фазу проекта
+- [ ] 4.2 cli.mjs phases handoff - батон между сессиями
+- [ ] 4.3 закоммитить SKILL.md (инвокация cli.mjs phases)

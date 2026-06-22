@@ -1,7 +1,7 @@
-#!/usr/bin/env node
-// CLI for Claude Code to mutate the tracker's todo list WITHOUT hand-editing
-// todos.json. Ships next to cc-todos-hook.mjs; the SessionStart hook tells Claude
-// to call this instead of rewriting the file directly.
+// `cli.mjs todos` — mutate the tracker's todo list WITHOUT hand-editing
+// todos.json. Lazily loaded by ../cli.mjs; also reachable via the back-compat
+// `cc-todos.mjs` shim. The SessionStart hook tells Claude to call this instead
+// of rewriting the file directly.
 //
 // Why a CLI: hand-edited JSON is fragile — Claude can break formatting, set an
 // invalid status, clobber a field, or race the tracker's own atomic write. This
@@ -9,7 +9,7 @@
 // mirroring src-tauri/src/todos.rs. The status set MUST stay in sync with
 // `todos.rs::STATUSES` and the kanban columns in TodoWindow.vue.
 //
-// Commands:
+// Commands (run as `cli.mjs todos <cmd>`):
 //   add "<subject>" [--project <name>] [--status <status>] [--description <text>]
 //                   [--plan <text>] [--estimate <min>] [--scheduled <YYYY-MM-DD>]
 //   set-status <id> <status>        status ∈ backlog|queue|in_progress|review|done
@@ -94,7 +94,7 @@ function fail(msg) {
 }
 
 function cmdSetStatus(id, status) {
-  if (!id || !status) fail("usage: cc-todos set-status <id> <status>");
+  if (!id || !status) fail("usage: cli todos set-status <id> <status>");
   if (!STATUSES.includes(status))
     fail(`invalid status "${status}". valid: ${STATUSES.join(" | ")}`);
   const file = todosPath();
@@ -134,7 +134,7 @@ function parseArgs(args) {
 }
 
 const ADD_USAGE =
-  'usage: cc-todos add "<subject>" [--project <name>] [--from <project>] [--status <status>] ' +
+  'usage: cli todos add "<subject>" [--project <name>] [--from <project>] [--status <status>] ' +
   "[--description <text>] [--plan <text>] [--estimate <min>] [--scheduled <YYYY-MM-DD>] [--by user|claude]";
 
 // Create a new todo. Mirrors the field set the tracker writes (todos.rs / the
@@ -202,8 +202,8 @@ function nextNumber(data) {
 }
 
 const COMMENT_USAGE =
-  'usage: cc-todos comment add <id> --text "<body>" [--by claude|user]\n' +
-  "       cc-todos comment list <id> [--json]";
+  'usage: cli todos comment add <id> --text "<body>" [--by claude|user]\n' +
+  "       cli todos comment list <id> [--json]";
 
 // Append or list comments on a todo. Mirrors the Comment shape in todos.rs /
 // TodoWindow.vue: { id, author, body, created_at }. The thread is shared with
@@ -282,7 +282,7 @@ function cmdList(args) {
 function cmdRelated(args) {
   const { positional, flags } = parseArgs(args);
   const project = String(positional[0] ?? flags.project ?? "").trim();
-  if (!project) fail("usage: cc-todos related <project> [--json]");
+  if (!project) fail("usage: cli todos related <project> [--json]");
   const related = relatedProjects(project);
   if (flags.json) {
     process.stdout.write(JSON.stringify({ project, related }, null, 2) + "\n");
@@ -314,7 +314,7 @@ function cmdGroups(args) {
 
 function usage(code) {
   process.stdout.write(
-    "cc-todos - Claude Usage Tracker todo CLI\n\n" +
+    "cli todos - Claude Usage Tracker todo CLI\n\n" +
       '  add "<subject>" [--project <name>] [--from <project>] [--status <status>]\n' +
       "                  [--description <text>] [--plan <text>] [--estimate <min>] [--scheduled <YYYY-MM-DD>]\n" +
       "  set-status <id> <status>        status ∈ " +
@@ -329,33 +329,36 @@ function usage(code) {
   process.exit(code);
 }
 
-const [cmd, ...rest] = process.argv.slice(2);
-switch (cmd) {
-  case "add":
-    cmdAdd(rest);
-    break;
-  case "set-status":
-    cmdSetStatus(rest[0], rest[1]);
-    break;
-  case "comment":
-    cmdComment(rest);
-    break;
-  case "list":
-    cmdList(rest);
-    break;
-  case "related":
-    cmdRelated(rest);
-    break;
-  case "groups":
-    cmdGroups(rest);
-    break;
-  case undefined:
-  case "-h":
-  case "--help":
-  case "help":
-    usage(0);
-    break;
-  default:
-    process.stderr.write(`unknown command: ${cmd}\n`);
-    usage(1);
+// Entry for the unified dispatcher: `cli.mjs todos <cmd> …` → run([...]).
+export function run(args) {
+  const [cmd, ...rest] = args;
+  switch (cmd) {
+    case "add":
+      cmdAdd(rest);
+      break;
+    case "set-status":
+      cmdSetStatus(rest[0], rest[1]);
+      break;
+    case "comment":
+      cmdComment(rest);
+      break;
+    case "list":
+      cmdList(rest);
+      break;
+    case "related":
+      cmdRelated(rest);
+      break;
+    case "groups":
+      cmdGroups(rest);
+      break;
+    case undefined:
+    case "-h":
+    case "--help":
+    case "help":
+      usage(0);
+      break;
+    default:
+      process.stderr.write(`unknown command: ${cmd}\n`);
+      usage(1);
+  }
 }
