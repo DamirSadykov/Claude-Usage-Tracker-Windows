@@ -81,7 +81,8 @@
     "createUpdaterArtifacts": true,
     "resources": {
       "../scripts/cc-todos.mjs": "scripts/cc-todos.mjs",
-      "../scripts/cc-todos-hook.mjs": "scripts/cc-todos-hook.mjs"
+      "../scripts/cc-todos-hook.mjs": "scripts/cc-todos-hook.mjs",
+      "../scripts/cc-phases.mjs": "scripts/cc-phases.mjs"
     },
     "icon": [
       "icons/32x32.png",

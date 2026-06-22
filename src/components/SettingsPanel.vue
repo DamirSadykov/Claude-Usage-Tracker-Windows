@@ -300,6 +300,33 @@ async function doInstallCcHook() {
 }
 onMounted(loadCcHookStatus);
 
+// --- Phases in tasks (issue #16) ---
+// Parked in the Updates tab FOR NOW; later it moves into the tasks settings.
+// A UI-only flag stored straight in settings.json (like ignoredInsights above) —
+// no backend config — so relocating it won't touch the Save flow. Default ON.
+const phasesEnabled = ref(true);
+
+async function loadPhasesEnabled() {
+  try {
+    const { load: loadStore } = await import("@tauri-apps/plugin-store");
+    const store = await loadStore("settings.json");
+    const v = await store.get<boolean>("phasesEnabled");
+    if (typeof v === "boolean") phasesEnabled.value = v;
+  } catch {}
+}
+
+async function togglePhasesEnabled() {
+  phasesEnabled.value = !phasesEnabled.value;
+  try {
+    const { load: loadStore } = await import("@tauri-apps/plugin-store");
+    const store = await loadStore("settings.json");
+    await store.set("phasesEnabled", phasesEnabled.value);
+    await store.save();
+  } catch {}
+}
+
+onMounted(loadPhasesEnabled);
+
 // Keep each threshold triple strictly ascending with a 1% gap so the colour
 // bands can't overlap. Fixed slider scale (5..99) + clamping — dynamic min/max
 // would make neighbouring thumbs visually drift when their range changes.
@@ -963,6 +990,18 @@ function handleSave() {
         <button type="button" class="suggest-btn" :disabled="installCcBusy" @click="doInstallCcHook">
           {{ ccHookStatus && ccHookStatus.installed ? t('installCcHookReinstall') : t('installCcHookBtn') }}
         </button>
+      </div>
+
+      <!-- Phases in tasks (issue #16) — parked here for now; moves to the tasks
+           settings later. UI-only flag in settings.json. -->
+      <div class="card toggle-card" @click="togglePhasesEnabled">
+        <div style="flex: 1; min-width: 0">
+          <div class="card-title" style="font-size: 13px">{{ t('phasesSetting') }}</div>
+          <div class="card-sub">{{ t('phasesSettingDesc') }}</div>
+        </div>
+        <div class="toggle" :class="{ on: phasesEnabled }">
+          <div class="toggle-knob"></div>
+        </div>
       </div>
       </template>
     </div>

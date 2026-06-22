@@ -300,8 +300,9 @@ fn extract_tool_uses(msg: &Value) -> Vec<(String, i64)> {
 }
 
 /// Project label from a working directory: the last path component of a `cwd`
-/// like `D:\projects\app` or `/home/u/app` → `app`. None if empty.
-fn project_name(cwd: &str) -> Option<String> {
+/// like `D:\projects\app` or `/home/u/app` → `app`. None if empty. `pub(crate)`
+/// so the phases reader derives the SAME basename the board keys todos by.
+pub(crate) fn project_name(cwd: &str) -> Option<String> {
     let name = cwd
         .trim_end_matches(['/', '\\'])
         .rsplit(['/', '\\'])
