@@ -64,6 +64,28 @@ export interface Todo {
   updated_at: string;
 }
 
+// Phase plans (issue #16) authored by the cc-phases CLI and read from each
+// project's `.claude/phases/<N>.md`. Read-only here: the board shows a task's
+// phases as checkboxes (done → struck through); the CLI is the only writer.
+export interface Subphase {
+  num: number;
+  title: string;
+  text: string;
+  done: boolean;
+}
+export interface Phase {
+  num: number;
+  title: string;
+  desc: string;
+  done: boolean;
+  subs: Subphase[];
+}
+export interface PhasePlan {
+  task_number: number;
+  project: string;
+  phases: Phase[];
+}
+
 // Kanban columns, left to right — must match `todos.rs::STATUSES`. `dot` is the
 // column's accent colour, also used for each card's left stripe.
 interface Column {
@@ -115,6 +137,14 @@ const formOpen = ref(false);
 // Projects the tracker has seen (from cc_usage), so the picker offers real
 // projects even before any todo uses them.
 const knownProjects = ref<string[]>([]);
+
+// Phase plans keyed by `${project}::${task_number}` for O(1) lookup per card.
+// Read-only: authored by the cc-phases CLI in each project's .claude/phases/.
+const phasePlans = ref<Map<string, PhasePlan>>(new Map());
+
+// UI toggle (Settings → Updates, issue #16): when off, hide all phase UI. Stored
+// straight in settings.json by the settings panel; read here on mount/focus.
+const phasesEnabled = ref(true);
 
 // Merge-link badges (issue #13). A task's `project` is stored raw, so it may be a
 // canonical (absorbed others) or an alias (folded into a canonical) — need both.
@@ -805,6 +835,45 @@ let unlistenFocus: (() => void) | null = null;
 // reaches the picker. We also kick a background ingest (like the Analytics
 // window) so a brand-new project lands in cc_usage even if Analytics was never
 // opened this session.
+// Read the phases UI toggle from the shared settings store (Settings → Updates).
+async function loadPhasesEnabled() {
+  try {
+    const { load: loadStore } = await import("@tauri-apps/plugin-store");
+    const store = await loadStore("settings.json");
+    const v = await store.get<boolean>("phasesEnabled");
+    if (typeof v === "boolean") phasesEnabled.value = v;
+  } catch {
+    // store missing / unreadable → keep default (on)
+  }
+}
+
+// Pull the phase plans the tracker can find (across projects) and key them for
+// per-card lookup. Best-effort: a missing command / no plans leaves cards bare.
+async function refreshPhasePlans() {
+  try {
+    const plans = await invoke<PhasePlan[]>("get_phase_plans");
+    const m = new Map<string, PhasePlan>();
+    for (const p of plans) m.set(`${p.project}::${p.task_number}`, p);
+    phasePlans.value = m;
+  } catch {
+    // command unavailable / nothing to read → keep what we have
+  }
+}
+
+// The phase plan for a task, if one exists (matched by project basename + number).
+// Accepts the nullable `detail` ref as well as a concrete card todo.
+function phasesFor(todo: Todo | null | undefined): PhasePlan | null {
+  if (!todo || !todo.project || !todo.number) return null;
+  return phasePlans.value.get(`${todo.project}::${todo.number}`) ?? null;
+}
+
+// "done/total" phase count; "" when the task has no plan.
+function phaseProgress(todo: Todo | null | undefined): string {
+  const plan = phasesFor(todo);
+  if (!plan) return "";
+  return `${plan.phases.filter((p) => p.done).length}/${plan.phases.length}`;
+}
+
 async function refreshKnownProjects() {
   try {
     knownProjects.value = await invoke<string[]>("get_cc_projects");
@@ -834,14 +903,25 @@ onMounted(async () => {
   // Live reload: the backend watcher fires this whenever todos.json changes on
   // disk (CLI / Claude / hand-edit), so the board stays in sync without a manual
   // refresh.
-  unlistenTodos = await listen("todos-file-changed", () => requestReload());
+  unlistenTodos = await listen("todos-file-changed", () => {
+    requestReload();
+    // A todos.json change often coincides with phase edits (same session);
+    // re-read plans too. There's no separate phase-file watcher yet (PR2).
+    void refreshPhasePlans();
+  });
   await loadTodos();
   await refreshKnownProjects();
+  void loadPhasesEnabled();
+  void refreshPhasePlans();
   // Persisted webview: refresh the picker each time the window is brought to
   // front, so a project used since the last view (now in cc_usage) shows up.
   const { getCurrentWindow } = await import("@tauri-apps/api/window");
   unlistenFocus = await getCurrentWindow().onFocusChanged(({ payload: focused }) => {
-    if (focused) void refreshKnownProjects();
+    if (focused) {
+      void refreshKnownProjects();
+      void loadPhasesEnabled();
+      void refreshPhasePlans();
+    }
   });
 });
 
@@ -952,6 +1032,7 @@ onUnmounted(() => {
               <span v-if="todo.estimate_minutes != null" class="tw-chip">⏱ {{ fmtEstimate(todo.estimate_minutes) }}</span>
               <span v-if="todo.scheduled_for" class="tw-chip">📅 {{ todo.scheduled_for }}</span>
               <span v-if="todo.plan" class="tw-chip" :title="todo.plan">📝</span>
+              <span v-if="phasesEnabled && phasesFor(todo)" class="tw-chip" :title="t('phasesLabel')">☑ {{ phaseProgress(todo) }}</span>
               <span v-if="refCount(todo)" class="tw-chip" :title="t('todoRefs')">🔗 {{ refCount(todo) }}</span>
             </div>
 
@@ -1116,6 +1197,35 @@ onUnmounted(() => {
             <span>{{ t("todoPlan") }} <em class="tw-hint">{{ t("todoPlanHint") }}</em></span>
             <textarea v-model="draft.plan" class="tw-input tw-area" rows="5"></textarea>
           </label>
+
+          <!-- Phase plan (issue #16): read-only checkboxes; done → struck through.
+               The cc-phases CLI is the only writer; here it's display-only. -->
+          <div v-if="phasesEnabled && phasesFor(detail)" class="tw-field tw-phases">
+            <div class="tw-phases-hd">
+              <span>{{ t("phasesLabel") }}</span>
+              <span class="tw-phases-prog">{{ phaseProgress(detail) }}</span>
+            </div>
+            <ul class="tw-phase-list">
+              <li v-for="ph in phasesFor(detail)?.phases ?? []" :key="ph.num" class="tw-phase">
+                <div class="tw-phase-row" :class="{ done: ph.done }">
+                  <span class="tw-cbx" :class="{ on: ph.done }"></span>
+                  <span class="tw-phase-t">{{ ph.num }}. {{ ph.title }}<span v-if="ph.desc" class="tw-phase-d"> — {{ ph.desc }}</span></span>
+                </div>
+                <ul v-if="ph.subs.length" class="tw-sub-list">
+                  <li
+                    v-for="s in ph.subs"
+                    :key="s.num"
+                    class="tw-sub-row"
+                    :class="{ done: s.done }"
+                  >
+                    <span class="tw-cbx sm" :class="{ on: s.done }"></span>
+                    <span class="tw-sub-t">{{ ph.num }}.{{ s.num }} {{ s.title }}<span v-if="s.text" class="tw-phase-d"> — {{ s.text }}</span></span>
+                  </li>
+                </ul>
+              </li>
+            </ul>
+          </div>
+
           <div class="tw-form-actions">
             <transition name="tw-fade">
               <span v-if="saved" class="tw-saved">
@@ -1511,6 +1621,122 @@ onUnmounted(() => {
   -webkit-box-orient: vertical;
   overflow: hidden;
   word-break: break-word;
+}
+
+/* Phase plan checklist on a card (issue #16). Read-only: the cc-phases CLI
+   writes the markdown; here a filled box + strike-through just reflects state. */
+.tw-phases {
+  border-top: 1px solid var(--stroke-strong);
+  margin-top: 6px;
+  padding-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.tw-phases-hd {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-3);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.tw-phases-prog {
+  font-variant-numeric: tabular-nums;
+  color: var(--text-4);
+  background: var(--track);
+  border-radius: 8px;
+  padding: 0 6px;
+}
+.tw-phase-list,
+.tw-sub-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.tw-sub-list {
+  margin: 3px 0 2px 18px;
+}
+.tw-phase-row,
+.tw-sub-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+}
+.tw-phase-row {
+  font-size: 12.5px;
+  color: var(--text);
+}
+.tw-sub-row {
+  font-size: 12px;
+  color: var(--text-2);
+}
+.tw-phase-t,
+.tw-sub-t {
+  line-height: 1.35;
+  word-break: break-word;
+}
+.tw-phase-d {
+  color: var(--text-3);
+  font-weight: 400;
+}
+/* Done item: bright text with a SEPARATE strike line drawn as a pseudo-element,
+   so the line stays subtle (its own colour) while the text reads at full
+   brightness — decoupled, unlike text-decoration which ties the line to the
+   text colour. Done text keeps the base row colour (--text / --text-2). */
+.tw-phase-row.done .tw-phase-t,
+.tw-sub-row.done .tw-sub-t {
+  position: relative;
+}
+.tw-phase-row.done .tw-phase-t::after,
+.tw-sub-row.done .tw-sub-t::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 1px;
+  background: var(--text-4);
+  pointer-events: none;
+}
+/* Hover a done item to drop the strike line and read it cleanly. */
+.tw-phase-row.done:hover .tw-phase-t::after,
+.tw-sub-row.done:hover .tw-sub-t::after {
+  display: none;
+}
+.tw-cbx {
+  flex-shrink: 0;
+  width: 13px;
+  height: 13px;
+  margin-top: 1px;
+  border: 1.4px solid var(--stroke-strong);
+  border-radius: 3px;
+  box-sizing: border-box;
+  position: relative;
+}
+.tw-cbx.sm {
+  width: 12px;
+  height: 12px;
+}
+.tw-cbx.on {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.tw-cbx.on::after {
+  content: "";
+  position: absolute;
+  left: 3.5px;
+  top: 1px;
+  width: 3.5px;
+  height: 6.5px;
+  border: solid #06283b;
+  border-width: 0 1.6px 1.6px 0;
+  transform: rotate(45deg);
 }
 .tw-card-meta {
   display: flex;

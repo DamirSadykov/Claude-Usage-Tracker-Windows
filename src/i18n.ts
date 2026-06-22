@@ -151,6 +151,10 @@ const messages = {
     todoDescription: "Description",
     todoPlan: "Plan",
     todoPlanHint: "you write it — not generated",
+    phasesLabel: "Phases",
+    phasesSetting: "Phases in tasks",
+    phasesSettingDesc:
+      "Show phase checkboxes on task cards (parked here for now; moves to the tasks settings later).",
     todoEstimate: "Estimate (min)",
     todoScheduledFor: "When",
     todoProject: "Project",
@@ -599,6 +603,10 @@ const messages = {
     todoDescription: "Описание",
     todoPlan: "План",
     todoPlanHint: "пишешь ты — не генерируется",
+    phasesLabel: "Фазы",
+    phasesSetting: "Фазы в задачах",
+    phasesSettingDesc:
+      "Показывать чекбоксы фаз на карточках задач (пока здесь; позже переедет в настройки задач).",
     todoEstimate: "Оценка (мин)",
     todoScheduledFor: "Когда",
     todoProject: "Проект",

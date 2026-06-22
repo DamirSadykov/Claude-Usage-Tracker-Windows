@@ -1,6 +1,7 @@
 pub mod alerts;
 pub mod cc;
 pub mod domain;
+pub mod phases;
 pub mod project_groups;
 pub mod report;
 pub mod stats;
@@ -1281,6 +1282,25 @@ fn set_todo_status(
     })
 }
 
+/// All phase plans the tracker can find, across every project that has a
+/// `.claude/phases/` dir. Read-only: the plans are authored by the `cc-phases`
+/// CLI and live in each project. The frontend matches a plan to a task card by
+/// (project basename, task_number). The disk walk (resolve project paths, read
+/// each plan) runs off the async runtime so it can't stall the UI.
+#[tauri::command]
+async fn get_phase_plans() -> Result<Vec<phases::Plan>, String> {
+    let claude = cc::claude_dir().ok_or("Cannot resolve Claude config directory")?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut out = Vec::new();
+        for (base, path) in phases::project_paths(&claude) {
+            out.extend(phases::read_plans(&base, &path));
+        }
+        out
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
 /// Show the standalone Todo window (declared hidden in tauri.conf.json).
 #[tauri::command]
 fn open_todo_window(app: AppHandle) {
@@ -1618,6 +1638,7 @@ pub fn run() {
             upsert_todo,
             delete_todo,
             set_todo_status,
+            get_phase_plans,
             open_todo_window,
         ])
         .run(tauri::generate_context!())
