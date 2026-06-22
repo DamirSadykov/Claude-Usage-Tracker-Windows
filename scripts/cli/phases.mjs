@@ -69,6 +69,11 @@ function phaseFile(slug, n) {
 function planReadme(slug) {
   return path.join(planDir(slug), "README.md");
 }
+// One-line baton handed to the NEXT session, surfaced by the SessionStart hook.
+// CLI-managed (separate from the freeform README) so it can be set/cleared cleanly.
+function handoffFile(slug) {
+  return path.join(planDir(slug), "HANDOFF.md");
+}
 
 function fail(msg) {
   process.stderr.write(msg + "\n");
@@ -485,6 +490,35 @@ function cmdList(args) {
   process.stdout.write(out.join("\n") + "\n");
 }
 
+// Set / show / clear the plan's handoff baton — a one-line note for whoever
+// picks up the next phase. The SessionStart hook surfaces it automatically.
+//   handoff "<text>"   set it     |   handoff   show it   |   handoff --clear
+function cmdHandoff(args) {
+  const { positional, flags } = parseArgs(args);
+  const slug = resolvePlan(flags);
+  if (flags.clear) {
+    try {
+      rmSync(handoffFile(slug));
+      process.stdout.write(`ok: handoff cleared ("${slug}")\n`);
+    } catch {
+      process.stdout.write(`(no handoff for "${slug}")\n`);
+    }
+    return;
+  }
+  const text = sanitize(positional[0]);
+  if (!text) {
+    try {
+      process.stdout.write(readFileSync(handoffFile(slug), "utf8"));
+    } catch {
+      process.stdout.write(`(no handoff for "${slug}")\n`);
+    }
+    return;
+  }
+  const stamp = new Date().toISOString().slice(0, 10);
+  writeAtomic(handoffFile(slug), `# Handoff (${stamp})\n\n${text}\n`);
+  process.stdout.write(`ok: handoff saved for "${slug}"\n`);
+}
+
 function usage(code) {
   process.stdout.write(
     "cli phases - break a task into ordered phases (folder per plan in <project>/.claude/phases/)\n\n" +
@@ -496,7 +530,8 @@ function usage(code) {
       '  edit <loc> [--title "…"] [--desc "…"] [--plan <slug>]\n' +
       "  delete <loc> [--force] [--plan <slug>]\n" +
       "  verify [--plan <slug>]          integrity self-check\n" +
-      "  list [--plan <slug>] [--json]\n\n" +
+      "  list [--plan <slug>] [--json]\n" +
+      '  handoff ["<text>"] [--clear] [--plan <slug>]   baton for the next session\n\n' +
       "--plan is the plan folder name; optional when only one plan exists.\n",
   );
   process.exit(code);
@@ -536,6 +571,9 @@ export function run(args) {
     case "list":
       cmdList(rest);
       break;
+    case "handoff":
+      cmdHandoff(rest);
+      break;
     case undefined:
     case "-h":
     case "--help":
@@ -546,4 +584,83 @@ export function run(args) {
       process.stderr.write(`unknown command: ${cmd}\n`);
       usage(1);
   }
+}
+
+// Read-only digest of a project's plans for the SessionStart hook (cli/hook.mjs):
+// per plan, the tracker link, the CURRENT (first unfinished) phase and its next
+// unfinished subphase, progress, and the handoff baton. `root` is the session's
+// cwd (NOT process.cwd()). Pure read; swallows every error → [] (the hook must
+// never break a session). Reuses parsePhase so the grammar has one source.
+export function readPlansForHook(root) {
+  const phasesDir = path.join(root, ".claude", "phases");
+  let dirents;
+  try {
+    dirents = readdirSync(phasesDir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const out = [];
+  for (const ent of dirents) {
+    if (!ent.isDirectory()) continue;
+    const slug = ent.name;
+    const dir = path.join(phasesDir, slug);
+
+    let task = null;
+    let title = slug;
+    try {
+      const meta = readFileSync(path.join(dir, "README.md"), "utf8");
+      const t = meta.match(/CC-task:\s*#?(\d+)/i);
+      if (t) task = Number(t[1]);
+      const h = meta.match(/^#\s+(.+)$/m);
+      if (h) title = h[1].trim();
+    } catch {
+      // no README → still report the plan by its folder name
+    }
+
+    let files = [];
+    try {
+      files = readdirSync(dir);
+    } catch {
+      // unreadable plan dir → no phases
+    }
+    const phases = files
+      .map((f) => f.match(/^Phase-(\d+)\.md$/))
+      .filter(Boolean)
+      .map((m) => Number(m[1]))
+      .sort((a, b) => a - b)
+      .map((n) => {
+        try {
+          return parsePhase(readFileSync(path.join(dir, `Phase-${n}.md`), "utf8"), n);
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
+
+    const current = phases.find((p) => !p.done) || null;
+    const nextSub = current ? current.subs.find((s) => !s.done) || null : null;
+    let handoff = null;
+    try {
+      // Stored as "# Handoff (date)\n\n<baton>"; surface just the baton line.
+      const body = readFileSync(handoffFile(slug), "utf8")
+        .replace(/^#.*$/m, "")
+        .replace(/\s+/g, " ")
+        .trim();
+      if (body) handoff = body;
+    } catch {
+      // no handoff → null
+    }
+
+    out.push({
+      slug,
+      title,
+      task,
+      total: phases.length,
+      done: phases.filter((p) => p.done).length,
+      current,
+      nextSub,
+      handoff,
+    });
+  }
+  return out;
 }

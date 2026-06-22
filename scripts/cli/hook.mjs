@@ -1,10 +1,14 @@
 // `cli.mjs hook` — Claude Code SessionStart hook for the Claude Usage Tracker.
 //
-// The tracker owns `todos.json` (the user's task list); this hook surfaces the
-// ACTIVE todos for the current project into the session context, plus a short
-// contract telling Claude how it may edit them. It is strictly read-only and
-// MUST never disrupt a session: a missing/unreadable file, no matching todos,
-// or any error is a silent no-op (exit 0, no output).
+// Two modes, by whether the current project is mid-PLAN (issue #16):
+//   • PHASE MODE — the project has a plan with an unfinished phase: surface the
+//     CURRENT phase + handoff baton + the discipline, and DON'T dump the task
+//     board (the session is aimed at the phase; the full list would just bloat
+//     context). A thin pointer keeps the plan's own task and `todos list` reachable.
+//   • TODO MODE — no active phase: surface the ACTIVE todos for the project plus
+//     the short contract for editing them.
+// It is strictly read-only and MUST never disrupt a session: a missing/unreadable
+// file, no matching todos, or any error is a silent no-op (exit 0, no output).
 //
 // Wired as a global SessionStart hook in ~/.claude/settings.json (the tracker's
 // installer writes `node "<cli.mjs>" hook`) so it fires in every project; it
@@ -14,6 +18,7 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { readPlansForHook } from "./phases.mjs";
 
 // The unified CLI is this module's grandparent-relative entry (scripts/cli.mjs);
 // resolve its absolute path so the contract below can hand Claude exact,
@@ -23,6 +28,11 @@ const CLI = path.join(
   "..",
   "cli.mjs",
 );
+// The absolute `node "<…>/cli.mjs"` invocation is long; spell it ONCE per block
+// as `<cli>` and reference that short alias in every command, like the other
+// `<id>` / `<N.k>` placeholders — keeps the injected context from drowning in the
+// repeated path.
+const CLI_NOTE = `<cli> = node "${CLI}"`;
 
 function main() {
   // SessionStart hooks receive a JSON payload on stdin (session_id, cwd,
@@ -59,7 +69,7 @@ function main() {
     `Tasks aren't limited to this project — to file one against a DIFFERENT project ` +
     `(e.g. a related one you also work on), pass --project <name> to the add command; ` +
     `the originating project ("${project}") is recorded automatically as the task's "from". ` +
-    `Run \`node "${CLI}" todos related ${project}\` to list projects associated with "${project}".`;
+    `Run \`<cli> todos related ${project}\` to list projects associated with "${project}".`;
   // Kanban columns the tracker recognizes. Legacy `pending` (written before the
   // columns existed) is shown as `backlog`, matching the tracker's own load-time
   // migration, so Claude only ever sees a real column.
@@ -73,6 +83,23 @@ function main() {
       col(t.status) !== "done" &&
       (!t.project || t.project === project),
   );
+
+  // If this project is mid-PLAN, the session is aimed at the CURRENT phase, not
+  // the task board — surface the phase (focused) and do NOT dump the task list.
+  // Read-only and guarded: any failure falls through to plain todo mode.
+  let phasePlans = [];
+  try {
+    phasePlans = readPlansForHook(cwd).filter((p) => p.current);
+  } catch {
+    phasePlans = [];
+  }
+  if (phasePlans.length) {
+    process.stdout.write(
+      phaseModeContext(project, todos, active, file, phasePlans) + "\n",
+    );
+    return;
+  }
+
   if (active.length) {
     // Surface what the user is closest to finishing first: in_progress, then
     // review, then queued, then backlog.
@@ -104,12 +131,11 @@ function main() {
       `User's active tasks from the Claude Usage Tracker (project "${project}"; the tracker is the source of truth):`,
       lines.join("\n"),
       "",
-      `These are the USER's todos, not your working task list.`,
-      `When the user says a task moved (e.g. done / in progress / in review), change its status with the tracker's CLI — do NOT hand-edit todos.json (the tracker may write it concurrently, and a malformed edit breaks the shared file):`,
-      `    node "${CLI}" todos set-status <id> <status>`,
-      `where <status> is one kanban column: backlog | queue | in_progress | review | done, and <id> is the ⟨id⟩ shown above. The CLI validates the status and writes atomically. Run \`node "${CLI}" todos list\` to see current tasks. Editing other fields (subject / description / plan / estimate_minutes / scheduled_for / project) on an EXISTING task is not supported by the CLI and should be left to the user.`,
-      `To record a NEW follow-up the user asked you to track, create it via the CLI (don't hand-edit): node "${CLI}" todos add "<subject>" [--project <name>] [--description <text>] — it lands in the backlog column. Only add tasks the user explicitly wants tracked; this is their list, not your scratchpad.`,
-      `To leave a note on a task the user asked you to record (a finding, progress, a decision), post a comment — it shows in the task's thread attributed to you: node "${CLI}" todos comment add <id> --text "<body>". Comment only when the user wants it recorded on the task. In a comment or description you can reference another task by its number (e.g. "blocked by #${active[0] && active[0].number ? active[0].number : 12}") — the tracker renders it as a clickable link.`,
+      `These are the USER's todos, not your working task list. Mutate ONLY via the CLI (${CLI_NOTE}), never by hand-editing todos.json (the tracker may write it concurrently, and a malformed edit breaks the shared file):`,
+      `· move a task: <cli> todos set-status <id> <status> — <id> is the ⟨id⟩ above; <status> ∈ backlog | queue | in_progress | review | done. Other fields (subject / description / plan / estimate / scheduled / project) on an EXISTING task: leave to the user.`,
+      `· new follow-up: <cli> todos add "<subject>" [--project <name>] [--description <text>] — lands in backlog. Only add what the user explicitly asked to track; this is their list, not your scratchpad.`,
+      `· note a finding: <cli> todos comment add <id> --text "<body>" — shows in the task thread as you; only when the user wants it recorded. Reference another task as #N (e.g. "blocked by #${active[0] && active[0].number ? active[0].number : 12}").`,
+      `· see current tasks: <cli> todos list`,
       crossProjectNote,
       `Source of truth file (read-only for you): ${file}`,
     ].join("\n");
@@ -125,15 +151,64 @@ function main() {
   // task ids, so they're omitted here.
   const note = [
     `The Claude Usage Tracker is available in this environment — its todo list is the USER's task tracker (the source of truth). No active tasks for project "${project}" right now.`,
-    `To record a NEW task the user asks you to track, or to see existing ones, use its CLI — don't hand-edit the JSON (the tracker may write it concurrently):`,
-    `    node "${CLI}" todos add "<subject>" [--project <name>] [--description <text>]`,
-    `    node "${CLI}" todos list`,
-    `Statuses are kanban columns: backlog | queue | in_progress | review | done. Only add tasks the user explicitly wants tracked; this is their list, not your scratchpad.`,
+    `Use the CLI (${CLI_NOTE}), don't hand-edit the JSON (the tracker may write it concurrently):`,
+    `· add a task: <cli> todos add "<subject>" [--project <name>] [--description <text>] — lands in backlog; only what the user explicitly wants tracked.`,
+    `· see tasks: <cli> todos list — statuses: backlog | queue | in_progress | review | done.`,
     crossProjectNote,
     `Source of truth file (read-only for you): ${file}`,
   ].join("\n");
 
   process.stdout.write(note + "\n");
+}
+
+// PHASE MODE (issue #16): when the current project has a plan with an unfinished
+// phase, the session is aimed at that phase — so we surface the phase INSTEAD of
+// the task board (the full todo list is noise here, and bloats context). We still
+// hand Claude exactly enough to drive the plan's own task: its id + the status/
+// comment commands, plus a count of the other open tasks behind a `todos list`.
+// `plans` are the project's plans with a current phase; `active` is the open todos.
+function phaseModeContext(project, todos, active, file, plans) {
+  const byNumber = new Map(
+    todos.filter((t) => t && t.number != null).map((t) => [t.number, t]),
+  );
+  const linked = [];
+  const lines = [];
+  for (const p of plans) {
+    const todo = p.task != null ? byNumber.get(p.task) : null;
+    if (todo) linked.push(todo);
+    const idPart = todo ? `, id:${todo.id}` : "";
+    const link =
+      p.task != null
+        ? `task #${p.task}${todo ? ` "${todo.subject}"` : ""}${idPart}`
+        : "(not linked to a task)";
+    const next = p.nextSub
+      ? ` — next: ${p.current.num}.${p.nextSub.num} ${p.nextSub.title}`
+      : "";
+    lines.push(
+      `- plan "${p.slug}" (${link}): phase ${p.current.num}/${p.total} "${p.current.title}"${next}`,
+    );
+    if (p.handoff) lines.push(`  ↪ handoff from last session: ${p.handoff}`);
+  }
+
+  const linkedIds = new Set(linked.map((t) => t.id));
+  const otherOpen = active.filter((t) => !linkedIds.has(t.id));
+
+  const out = [
+    `This project is mid-PLAN (skill: phases) — work the CURRENT phase only, one phase per session. The task board is NOT loaded here, to keep the session phase-focused. (${CLI_NOTE})`,
+    lines.join("\n"),
+    "Phase ops — `<cli> phases <cmd>`: done <N.k> (tick a subphase) · done <N> then verify then STOP (next phase = next session) · handoff \"<what's done; the concrete next step>\" · list.",
+  ];
+  if (linked.length) {
+    const ids = linked.map((t) => `#${t.number} (id:${t.id})`).join(", ");
+    out.push(
+      `The plan's own tracker task ${ids} — \`<cli> todos <cmd>\`: set-status <id> <status> (backlog|queue|in_progress|review|done) · comment add <id> --text "<body>". Don't hand-edit todos.json.`,
+    );
+  }
+  out.push(
+    `Other open tasks for "${project}": ${otherOpen.length} — not loaded, to keep focus; run \`<cli> todos list\`.`,
+  );
+  out.push(`Source of truth (read-only): ${file}`);
+  return out.join("\n");
 }
 
 // Entry for the unified dispatcher: `cli.mjs hook`. A todo hook must NEVER break
