@@ -1,6 +1,6 @@
-#!/usr/bin/env node
-// CLI for Claude Code to break a large task into ordered PHASES (and subphases)
-// and tick them off one at a time. Plans live IN THE PROJECT, not the user
+// `cli.mjs phases` — break a large task into ordered PHASES (and subphases) and
+// tick them off one at a time. Lazily loaded by ../cli.mjs; also reachable via
+// the back-compat `cc-phases.mjs` shim. Plans live IN THE PROJECT, not the user
 // layer, as a FOLDER per plan with a human-meaningful (English) name:
 //
 //   .claude/phases/
@@ -29,7 +29,7 @@
 // `[x]` = done. ` — ` splits an item's title from its optional text. A phase
 // locator is its number `N`; a subphase locator is `N.k`.
 //
-// Commands:
+// Commands (run as `cli.mjs phases <cmd>`):
 //   create "<English title>" [--task <N>]     make a new plan folder (title → folder
 //                                             name, so it's validated English-only)
 //   add "<title>" ["<desc>"] [--plan <slug>]              new phase
@@ -182,7 +182,7 @@ function resolvePlan(flags) {
   const plans = listPlans();
   if (plans.length === 1) return plans[0];
   if (plans.length === 0)
-    fail("no plans yet — create one: cc-phases create \"<title>\" --task <N>");
+    fail("no plans yet — create one: cli phases create \"<title>\" --task <N>");
   fail(`multiple plans (${plans.join(", ")}) — pass --plan <slug>`);
 }
 
@@ -240,13 +240,13 @@ function ensureRootReadme() {
       "**file per phase** (`Phase-N.md`). Each plan's `README.md` holds notes plus",
       "its tracker link (`CC-task: #N`).",
       "",
-      "Managed by the cc-phases CLI — mutate through it, not by hand:",
+      "Managed by the cli phases CLI — mutate through it, not by hand:",
       "",
-      '    node <scripts>/cc-phases.mjs create "Plan title" --task <N>',
-      '    node <scripts>/cc-phases.mjs add "Phase title" "what done looks like"',
-      '    node <scripts>/cc-phases.mjs add-sub "Subphase title" --phase 1',
-      "    node <scripts>/cc-phases.mjs done 1.1",
-      "    node <scripts>/cc-phases.mjs list",
+      '    node <cli.mjs> phases create "Plan title" --task <N>',
+      '    node <cli.mjs> phases add "Phase title" "what done looks like"',
+      '    node <cli.mjs> phases add-sub "Subphase title" --phase 1',
+      "    node <cli.mjs> phases done 1.1",
+      "    node <cli.mjs> phases list",
       "",
     ].join("\n"),
   );
@@ -290,7 +290,7 @@ function locate(plan, loc) {
 function cmdCreate(args) {
   const { positional, flags } = parseArgs(args);
   const title = String(positional[0] ?? "").trim();
-  if (!title) fail('usage: cc-phases create "<English title>" [--task <N>]');
+  if (!title) fail('usage: cli phases create "<English title>" [--task <N>]');
   if (!TITLE_RE.test(title))
     fail(
       `title must be English letters/digits/space/_/- only (it becomes a folder name): "${title}"`,
@@ -311,10 +311,10 @@ function cmdCreate(args) {
     `CC-task: #${task ?? "(none)"}`,
     "",
     "> Notes on this plan — context, decisions, how to run the phases, gotchas.",
-    "> Add freely; the cc-phases CLI does NOT overwrite this file after creation.",
+    "> Add freely; the cli phases CLI does NOT overwrite this file after creation.",
     "",
     "Phases live in the sibling `Phase-N.md` files (one per phase). Manage them",
-    "with the cc-phases CLI, not by hand.",
+    "with the cli phases CLI, not by hand.",
     "",
   ].join("\n");
   writeAtomic(planReadme(slug), readme);
@@ -330,7 +330,7 @@ function cmdAdd(args) {
   if (args[0] === "subphase" || args[0] === "sub") return cmdAddSub(args.slice(1));
   const { positional, flags } = parseArgs(args);
   const title = sanitize(positional[0]);
-  if (!title) fail('usage: cc-phases add "<title>" ["<desc>"] [--plan <slug>]');
+  if (!title) fail('usage: cli phases add "<title>" ["<desc>"] [--plan <slug>]');
   const desc = sanitize(positional[1]);
   const slug = resolvePlan(flags);
   const nums = phaseNums(slug);
@@ -343,7 +343,7 @@ function cmdAddSub(args) {
   const { positional, flags } = parseArgs(args);
   const title = sanitize(positional[0]);
   if (!title)
-    fail('usage: cc-phases add-sub "<title>" ["<text>"] [--phase <N>] [--plan <slug>]');
+    fail('usage: cli phases add-sub "<title>" ["<text>"] [--phase <N>] [--plan <slug>]');
   const text = sanitize(positional[1]);
   const slug = resolvePlan(flags);
   const nums = phaseNums(slug);
@@ -365,7 +365,7 @@ function cmdAddSub(args) {
 function setDone(args, done) {
   const { positional, flags } = parseArgs(args);
   const loc = positional[0];
-  if (!loc) fail(`usage: cc-phases ${done ? "done" : "reopen"} <loc> [--plan <slug>]`);
+  if (!loc) fail(`usage: cli phases ${done ? "done" : "reopen"} <loc> [--plan <slug>]`);
   const slug = resolvePlan(flags);
   const plan = loadPlan(slug);
   const { phase, sub } = locate(plan, loc);
@@ -382,7 +382,7 @@ function setDone(args, done) {
 function cmdEdit(args) {
   const { positional, flags } = parseArgs(args);
   const loc = positional[0];
-  if (!loc) fail('usage: cc-phases edit <loc> [--title "…"] [--desc "…"] [--plan <slug>]');
+  if (!loc) fail('usage: cli phases edit <loc> [--title "…"] [--desc "…"] [--plan <slug>]');
   const slug = resolvePlan(flags);
   const plan = loadPlan(slug);
   const { phase, sub } = locate(plan, loc);
@@ -409,7 +409,7 @@ function cmdEdit(args) {
 function cmdDelete(args) {
   const { positional, flags } = parseArgs(args);
   const loc = positional[0];
-  if (!loc) fail("usage: cc-phases delete <loc> [--force] [--plan <slug>]");
+  if (!loc) fail("usage: cli phases delete <loc> [--force] [--plan <slug>]");
   const slug = resolvePlan(flags);
   const plan = loadPlan(slug);
   const { phase, sub } = locate(plan, loc);
@@ -487,7 +487,7 @@ function cmdList(args) {
 
 function usage(code) {
   process.stdout.write(
-    "cc-phases - break a task into ordered phases (folder per plan in <project>/.claude/phases/)\n\n" +
+    "cli phases - break a task into ordered phases (folder per plan in <project>/.claude/phases/)\n\n" +
       '  create "<English title>" [--task <N>]   new plan folder (title → folder name)\n' +
       '  add "<title>" ["<desc>"] [--plan <slug>]               new phase\n' +
       '  add-sub "<title>" ["<text>"] [--phase <N>] [--plan <slug>]\n' +
@@ -502,45 +502,48 @@ function usage(code) {
   process.exit(code);
 }
 
-const [cmd, ...rest] = process.argv.slice(2);
-switch (cmd) {
-  case "create":
-    cmdCreate(rest);
-    break;
-  case "add":
-    cmdAdd(rest);
-    break;
-  case "add-sub":
-  case "addsub":
-    cmdAddSub(rest);
-    break;
-  case "done":
-    setDone(rest, true);
-    break;
-  case "reopen":
-  case "undone":
-    setDone(rest, false);
-    break;
-  case "edit":
-    cmdEdit(rest);
-    break;
-  case "delete":
-  case "rm":
-    cmdDelete(rest);
-    break;
-  case "verify":
-    cmdVerify(rest);
-    break;
-  case "list":
-    cmdList(rest);
-    break;
-  case undefined:
-  case "-h":
-  case "--help":
-  case "help":
-    usage(0);
-    break;
-  default:
-    process.stderr.write(`unknown command: ${cmd}\n`);
-    usage(1);
+// Entry for the unified dispatcher: `cli.mjs phases <cmd> …` → run([...]).
+export function run(args) {
+  const [cmd, ...rest] = args;
+  switch (cmd) {
+    case "create":
+      cmdCreate(rest);
+      break;
+    case "add":
+      cmdAdd(rest);
+      break;
+    case "add-sub":
+    case "addsub":
+      cmdAddSub(rest);
+      break;
+    case "done":
+      setDone(rest, true);
+      break;
+    case "reopen":
+    case "undone":
+      setDone(rest, false);
+      break;
+    case "edit":
+      cmdEdit(rest);
+      break;
+    case "delete":
+    case "rm":
+      cmdDelete(rest);
+      break;
+    case "verify":
+      cmdVerify(rest);
+      break;
+    case "list":
+      cmdList(rest);
+      break;
+    case undefined:
+    case "-h":
+    case "--help":
+    case "help":
+      usage(0);
+      break;
+    default:
+      process.stderr.write(`unknown command: ${cmd}\n`);
+      usage(1);
+  }
 }

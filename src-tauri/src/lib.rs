@@ -11,7 +11,7 @@ pub mod todos;
 pub mod usage;
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1065,26 +1065,27 @@ fn save_project_groups(
 
 // --- CLI + SessionStart hook installer ---
 //
-// The cc-todos CLI + SessionStart hook ship as bundled Node scripts (resources).
-// "Install" = wire the hook into the user's ~/.claude/settings.json so Claude Code
-// runs it on every session start. The CLI needs no separate wiring — the hook
-// resolves cc-todos.mjs next to itself.
+// The unified `cli.mjs` (todos / phases / hook areas) ships as bundled Node
+// scripts (resources). "Install" = wire the hook into the user's
+// ~/.claude/settings.json so Claude Code runs `cli.mjs hook` on every session
+// start. The CLI areas need no separate wiring — the hook hands Claude the
+// cli.mjs path and Claude calls `cli.mjs todos …` itself.
 
-/// Absolute path to `cc-todos-hook.mjs`, forward-slashed for a clean settings.json
-/// command on Windows. In a packaged build it's the bundled resource; in `tauri
-/// dev` it's the repo's `scripts/` (preferred there, since the resource copy under
-/// target/ is wiped on rebuild).
+/// Absolute path to the unified `cli.mjs`, forward-slashed for a clean
+/// settings.json command on Windows. In a packaged build it's the bundled
+/// resource; in `tauri dev` it's the repo's `scripts/` (preferred there, since
+/// the resource copy under target/ is wiped on rebuild).
 fn cc_hook_script_path(app: &AppHandle) -> Result<String, String> {
     let resource = app
         .path()
-        .resolve("scripts/cc-todos-hook.mjs", tauri::path::BaseDirectory::Resource)
+        .resolve("scripts/cli.mjs", tauri::path::BaseDirectory::Resource)
         .ok()
         .filter(|p| p.exists());
     let dev = {
         let d = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("scripts")
-            .join("cc-todos-hook.mjs");
+            .join("cli.mjs");
         std::fs::canonicalize(&d).ok().filter(|p| p.exists())
     };
     let chosen = if cfg!(debug_assertions) {
@@ -1092,10 +1093,38 @@ fn cc_hook_script_path(app: &AppHandle) -> Result<String, String> {
     } else {
         resource.or(dev)
     };
-    let p = chosen.ok_or_else(|| "cc-todos-hook.mjs not found (resource or dev path)".to_string())?;
+    let p = chosen.ok_or_else(|| "cli.mjs not found (resource or dev path)".to_string())?;
     // Drop the Windows \\?\ prefix canonicalize adds, use forward slashes.
     let s = p.to_string_lossy().replace('\\', "/");
     Ok(s.strip_prefix("//?/").map(str::to_string).unwrap_or(s))
+}
+
+/// A SessionStart hook command that belongs to the tracker — either the unified
+/// `cli.mjs … hook` or a legacy standalone `cc-todos-hook.mjs` from before the
+/// CLI was unified. Used to detect our entry and re-wire it idempotently.
+fn is_our_hook_command(cmd: &str) -> bool {
+    cmd.contains("cli.mjs") || cmd.contains("cc-todos-hook.mjs")
+}
+
+/// The directory of the script in a `node "<path>"` hook command (the path is
+/// the first double-quoted span). Used to locate, and then delete, the now-orphan
+/// legacy `cc-*.mjs` scripts when migrating a pre-unification install to cli.mjs.
+fn hook_command_script_dir(command: &str) -> Option<PathBuf> {
+    let start = command.find('"')?;
+    let rest = &command[start + 1..];
+    let end = rest.find('"')?;
+    PathBuf::from(&rest[..end]).parent().map(Path::to_path_buf)
+}
+
+/// Best-effort removal of the legacy standalone scripts left next to an old
+/// `cc-todos-hook.mjs` after switching to the unified `cli.mjs`. Only ever
+/// touches files with these exact names, and ignores every error (a missing
+/// file, a read-only resource dir the updater already cleaned, etc.) — cleanup
+/// must never make a re-install fail.
+fn remove_legacy_scripts(dir: &Path) {
+    for name in ["cc-todos-hook.mjs", "cc-todos.mjs", "cc-phases.mjs"] {
+        let _ = std::fs::remove_file(dir.join(name));
+    }
 }
 
 /// `~/.claude/settings.json` — the global Claude Code config we wire the hook into.
@@ -1115,7 +1144,7 @@ fn settings_has_cc_hook(v: &serde_json::Value) -> bool {
                     hs.iter().any(|hook| {
                         hook.get("command")
                             .and_then(|c| c.as_str())
-                            .is_some_and(|c| c.contains("cc-todos-hook.mjs"))
+                            .is_some_and(is_our_hook_command)
                     })
                 })
             })
@@ -1151,7 +1180,7 @@ fn cc_hook_status(app: AppHandle) -> Result<CcHookStatus, String> {
 #[tauri::command]
 fn install_cc_hook(app: AppHandle) -> Result<String, String> {
     let script = cc_hook_script_path(&app)?;
-    let command = format!("node \"{script}\"");
+    let command = format!("node \"{script}\" hook");
     let settings_path = claude_settings_path(&app)?;
 
     let mut root: serde_json::Value = std::fs::read_to_string(&settings_path)
@@ -1178,15 +1207,26 @@ fn install_cc_hook(app: AppHandle) -> Result<String, String> {
     let groups = ss.as_array_mut().unwrap();
 
     // Update our command in place if already present (re-install / moved path).
+    // While doing so, note the dir of any LEGACY (cc-todos-hook.mjs) entry so its
+    // now-orphan cc-*.mjs scripts can be deleted after the write — migrating to
+    // cli.mjs shouldn't leave the old standalone scripts piling up on disk.
     let mut updated = false;
+    let mut legacy_dirs: Vec<PathBuf> = Vec::new();
     for g in groups.iter_mut() {
         if let Some(hs) = g.get_mut("hooks").and_then(|h| h.as_array_mut()) {
             for hook in hs.iter_mut() {
-                let is_ours = hook
+                let old = hook
                     .get("command")
                     .and_then(|c| c.as_str())
-                    .is_some_and(|c| c.contains("cc-todos-hook.mjs"));
-                if is_ours {
+                    .map(str::to_string);
+                if old.as_deref().is_some_and(is_our_hook_command) {
+                    if let Some(old_cmd) = &old {
+                        if old_cmd.contains("cc-todos-hook.mjs") {
+                            if let Some(dir) = hook_command_script_dir(old_cmd) {
+                                legacy_dirs.push(dir);
+                            }
+                        }
+                    }
                     hook["command"] = serde_json::Value::String(command.clone());
                     updated = true;
                 }
@@ -1206,6 +1246,12 @@ fn install_cc_hook(app: AppHandle) -> Result<String, String> {
     let tmp = settings_path.with_extension("json.tmp");
     std::fs::write(&tmp, json.as_bytes()).map_err(|e| e.to_string())?;
     std::fs::rename(&tmp, &settings_path).map_err(|e| e.to_string())?;
+
+    // Settings now point at cli.mjs — clean up the orphaned legacy scripts next
+    // to any old cc-todos-hook.mjs entry we just rewired (best-effort, never fatal).
+    for dir in legacy_dirs {
+        remove_legacy_scripts(&dir);
+    }
     Ok(script)
 }
 
@@ -1643,4 +1689,42 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod hook_install_tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_legacy_and_unified_hook_commands() {
+        assert!(is_our_hook_command(r#"node "C:/app/scripts/cc-todos-hook.mjs""#));
+        assert!(is_our_hook_command(r#"node "C:/app/scripts/cli.mjs" hook"#));
+        assert!(!is_our_hook_command("node some-other-tool.mjs"));
+    }
+
+    #[test]
+    fn extracts_script_dir_from_quoted_command() {
+        let dir = hook_command_script_dir(r#"node "D:/x/scripts/cc-todos-hook.mjs""#);
+        assert_eq!(dir, Some(PathBuf::from("D:/x/scripts")));
+        // No quoted path → None (nothing to clean up).
+        assert_eq!(hook_command_script_dir("node cli.mjs hook"), None);
+    }
+
+    #[test]
+    fn removes_only_legacy_scripts_best_effort() {
+        let dir = std::env::temp_dir().join("cut_hook_cleanup_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["cc-todos-hook.mjs", "cc-todos.mjs", "cc-phases.mjs", "keep.mjs"] {
+            std::fs::write(dir.join(name), "x").unwrap();
+        }
+        remove_legacy_scripts(&dir);
+        assert!(!dir.join("cc-todos-hook.mjs").exists());
+        assert!(!dir.join("cc-todos.mjs").exists());
+        assert!(!dir.join("cc-phases.mjs").exists());
+        assert!(dir.join("keep.mjs").exists()); // untouched
+        // A second run over the now-clean dir must not error.
+        remove_legacy_scripts(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -1,5 +1,4 @@
-#!/usr/bin/env node
-// Claude Code SessionStart hook for the Claude Usage Tracker.
+// `cli.mjs hook` — Claude Code SessionStart hook for the Claude Usage Tracker.
 //
 // The tracker owns `todos.json` (the user's task list); this hook surfaces the
 // ACTIVE todos for the current project into the session context, plus a short
@@ -7,19 +6,22 @@
 // MUST never disrupt a session: a missing/unreadable file, no matching todos,
 // or any error is a silent no-op (exit 0, no output).
 //
-// Wired as a global SessionStart hook in ~/.claude/settings.json so it fires in
-// every project; it filters todos by the current cwd's project basename (plus
-// any project-less todos). See todos.rs / TodoWindow.vue for the schema.
+// Wired as a global SessionStart hook in ~/.claude/settings.json (the tracker's
+// installer writes `node "<cli.mjs>" hook`) so it fires in every project; it
+// filters todos by the current cwd's project basename (plus any project-less
+// todos). See todos.rs / TodoWindow.vue for the schema.
 
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-// The mutation CLI ships next to this hook; resolve its absolute path so the
-// contract below can hand Claude an exact, copy-pasteable command.
+// The unified CLI is this module's grandparent-relative entry (scripts/cli.mjs);
+// resolve its absolute path so the contract below can hand Claude exact,
+// copy-pasteable commands (`cli.mjs todos <cmd> …`).
 const CLI = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
-  "cc-todos.mjs",
+  "..",
+  "cli.mjs",
 );
 
 function main() {
@@ -52,12 +54,12 @@ function main() {
   const project = path.basename(String(cwd).replace(/[\\/]+$/, ""));
   // General cross-project note (issue #13): tasks aren't limited to the current
   // project. The hook itself stays group-agnostic — Claude discovers associations
-  // on demand via `cc-todos related`.
+  // on demand via `cli.mjs todos related`.
   const crossProjectNote =
     `Tasks aren't limited to this project — to file one against a DIFFERENT project ` +
     `(e.g. a related one you also work on), pass --project <name> to the add command; ` +
     `the originating project ("${project}") is recorded automatically as the task's "from". ` +
-    `Run \`node "${CLI}" related ${project}\` to list projects associated with "${project}".`;
+    `Run \`node "${CLI}" todos related ${project}\` to list projects associated with "${project}".`;
   // Kanban columns the tracker recognizes. Legacy `pending` (written before the
   // columns existed) is shown as `backlog`, matching the tracker's own load-time
   // migration, so Claude only ever sees a real column.
@@ -104,10 +106,10 @@ function main() {
       "",
       `These are the USER's todos, not your working task list.`,
       `When the user says a task moved (e.g. done / in progress / in review), change its status with the tracker's CLI — do NOT hand-edit todos.json (the tracker may write it concurrently, and a malformed edit breaks the shared file):`,
-      `    node "${CLI}" set-status <id> <status>`,
-      `where <status> is one kanban column: backlog | queue | in_progress | review | done, and <id> is the ⟨id⟩ shown above. The CLI validates the status and writes atomically. Run \`node "${CLI}" list\` to see current tasks. Editing other fields (subject / description / plan / estimate_minutes / scheduled_for / project) on an EXISTING task is not supported by the CLI and should be left to the user.`,
-      `To record a NEW follow-up the user asked you to track, create it via the CLI (don't hand-edit): node "${CLI}" add "<subject>" [--project <name>] [--description <text>] — it lands in the backlog column. Only add tasks the user explicitly wants tracked; this is their list, not your scratchpad.`,
-      `To leave a note on a task the user asked you to record (a finding, progress, a decision), post a comment — it shows in the task's thread attributed to you: node "${CLI}" comment add <id> --text "<body>". Comment only when the user wants it recorded on the task. In a comment or description you can reference another task by its number (e.g. "blocked by #${active[0] && active[0].number ? active[0].number : 12}") — the tracker renders it as a clickable link.`,
+      `    node "${CLI}" todos set-status <id> <status>`,
+      `where <status> is one kanban column: backlog | queue | in_progress | review | done, and <id> is the ⟨id⟩ shown above. The CLI validates the status and writes atomically. Run \`node "${CLI}" todos list\` to see current tasks. Editing other fields (subject / description / plan / estimate_minutes / scheduled_for / project) on an EXISTING task is not supported by the CLI and should be left to the user.`,
+      `To record a NEW follow-up the user asked you to track, create it via the CLI (don't hand-edit): node "${CLI}" todos add "<subject>" [--project <name>] [--description <text>] — it lands in the backlog column. Only add tasks the user explicitly wants tracked; this is their list, not your scratchpad.`,
+      `To leave a note on a task the user asked you to record (a finding, progress, a decision), post a comment — it shows in the task's thread attributed to you: node "${CLI}" todos comment add <id> --text "<body>". Comment only when the user wants it recorded on the task. In a comment or description you can reference another task by its number (e.g. "blocked by #${active[0] && active[0].number ? active[0].number : 12}") — the tracker renders it as a clickable link.`,
       crossProjectNote,
       `Source of truth file (read-only for you): ${file}`,
     ].join("\n");
@@ -124,8 +126,8 @@ function main() {
   const note = [
     `The Claude Usage Tracker is available in this environment — its todo list is the USER's task tracker (the source of truth). No active tasks for project "${project}" right now.`,
     `To record a NEW task the user asks you to track, or to see existing ones, use its CLI — don't hand-edit the JSON (the tracker may write it concurrently):`,
-    `    node "${CLI}" add "<subject>" [--project <name>] [--description <text>]`,
-    `    node "${CLI}" list`,
+    `    node "${CLI}" todos add "<subject>" [--project <name>] [--description <text>]`,
+    `    node "${CLI}" todos list`,
     `Statuses are kanban columns: backlog | queue | in_progress | review | done. Only add tasks the user explicitly wants tracked; this is their list, not your scratchpad.`,
     crossProjectNote,
     `Source of truth file (read-only for you): ${file}`,
@@ -134,9 +136,12 @@ function main() {
   process.stdout.write(note + "\n");
 }
 
-try {
-  main();
-} catch {
-  // A todo hook must never break a session.
-  process.exit(0);
+// Entry for the unified dispatcher: `cli.mjs hook`. A todo hook must NEVER break
+// a session, so any error is swallowed (exit 0, no output).
+export function run() {
+  try {
+    main();
+  } catch {
+    process.exit(0);
+  }
 }
