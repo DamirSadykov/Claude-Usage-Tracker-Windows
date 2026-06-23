@@ -6,9 +6,13 @@
 //     board (the session is aimed at the phase; the full list would just bloat
 //     context). A thin pointer keeps the plan's own task and `todos list` reachable.
 //   • TODO MODE — no active phase: surface the ACTIVE todos for the project plus
-//     the short contract for editing them. Tasks are gated by the "task priority
-//     in context" setting (settings.json): only those at/above the threshold show
-//     (default `medium`), high-priority ones in full and the rest as one-liners.
+//     the short contract for editing them. Two sub-modes:
+//       – DUE MODE (#36): if anything is scheduled for today or earlier, show ONLY
+//         those (today's focus, flagged ⏰, most overdue first) and hold the rest
+//         of the board back.
+//       – PRIORITY MODE (#32): with nothing due, fall back to the project's open
+//         tasks gated by the "task priority in context" setting (settings.json,
+//         default `medium`) — high-priority in full, the rest as one-liners.
 // It is strictly read-only and MUST never disrupt a session: a missing/unreadable
 // file, no matching todos, or any error is a silent no-op (exit 0, no output).
 //
@@ -60,6 +64,14 @@ function contextMinRank(appData) {
   return MIN.medium;
 }
 
+// Local calendar date as YYYY-MM-DD — "today" is the USER's day, not UTC (a
+// scheduled_for date is a plain local date). Used to surface due/overdue tasks.
+function localToday() {
+  const d = new Date();
+  const z = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())}`;
+}
+
 function main() {
   // SessionStart hooks receive a JSON payload on stdin (session_id, cwd,
   // source, …). Fall back to process.cwd() if it's absent or unparseable.
@@ -92,10 +104,8 @@ function main() {
   // project. The hook itself stays group-agnostic — Claude discovers associations
   // on demand via `cli.mjs todos related`.
   const crossProjectNote =
-    `Tasks aren't limited to this project — to file one against a DIFFERENT project ` +
-    `(e.g. a related one you also work on), pass --project <name> to the add command; ` +
-    `the originating project ("${project}") is recorded automatically as the task's "from". ` +
-    `Run \`<cli> todos related ${project}\` to list projects associated with "${project}".`;
+    `Cross-project: \`--project <name>\` on add files a task against another project ` +
+    `("${project}" is saved as its "from"). \`<cli> todos related ${project}\` lists associated projects.`;
   // Kanban columns the tracker recognizes. Legacy `pending` (written before the
   // columns existed) is shown as `backlog`, matching the tracker's own load-time
   // migration, so Claude only ever sees a real column.
@@ -127,33 +137,48 @@ function main() {
   }
 
   if (active.length) {
-    // The "task priority in context" setting gates what's injected: only tasks at
-    // or above the threshold are shown (default `medium`, so low/unset stay out).
     const minRank = contextMinRank(appData);
-    const shown = active.filter((t) => prank(t) >= minRank);
+    const today = localToday();
+    const isDue = (t) =>
+      !!t.scheduled_for && String(t.scheduled_for).slice(0, 10) <= today;
+    // Two modes for the todo context:
+    //  • DUE MODE (issue #36): if anything is scheduled for today or earlier, the
+    //    session focuses on THOSE — today's plan, not the whole board.
+    //  • PRIORITY MODE (issue #32): with nothing due, fall back to the project's
+    //    open tasks gated by the "task priority in context" threshold (default
+    //    medium). This is the original behaviour.
+    const dueMode = active.some(isDue);
+    const shown = dueMode
+      ? active.filter(isDue)
+      : active.filter((t) => prank(t) >= minRank);
     const hidden = active.length - shown.length;
 
     if (!shown.length) {
-      // Every open task is below the threshold: don't dump them, but say so (and
-      // how to surface them) rather than going silently empty.
+      // Not in due mode (nothing scheduled) and nothing clears the priority
+      // threshold: don't dump the rest, but say so rather than going silently empty.
       const note = [
-        `The Claude Usage Tracker has ${active.length} open task(s) for project "${project}", but all are below the current "task priority in context" threshold — none are shown here.`,
+        `The Claude Usage Tracker has ${active.length} open task(s) for project "${project}", but none are due today and all are below the "task priority in context" threshold — none are shown here.`,
         `See them or re-prioritize via the CLI (${CLI_NOTE}); lower the threshold in the tracker's settings to surface more:`,
         `· list every task: <cli> todos list`,
         `· set a priority: <cli> todos set-priority <id> <high|medium|low|none>`,
         crossProjectNote,
-        `Source of truth file (read-only for you): ${file}`,
+        `File (don't edit): ${file}`,
       ].join("\n");
       process.stdout.write(note + "\n");
       return;
     }
 
-    // Surface what matters most first: priority desc, then closest-to-finishing
-    // status (in_progress → review → queue → backlog), then soonest scheduled.
+    // Order: the due group first and, within it, the most overdue (earliest
+    // date) first; then everything by priority desc, closest-to-finishing status,
+    // and soonest scheduled.
     const order = { in_progress: 0, review: 1, queue: 2, backlog: 3 };
     const rank = (s) => order[col(s)] ?? 3;
     shown.sort(
       (a, b) =>
+        (isDue(a) ? 0 : 1) - (isDue(b) ? 0 : 1) ||
+        (isDue(a) && isDue(b)
+          ? String(a.scheduled_for).localeCompare(String(b.scheduled_for))
+          : 0) ||
         prank(b) - prank(a) ||
         rank(a.status) - rank(b.status) ||
         String(a.scheduled_for || "9999-99-99").localeCompare(
@@ -164,13 +189,16 @@ function main() {
     const lines = shown.map((t) => {
       const num = t.number ? `#${t.number} ` : "";
       const prio = t.priority ? ` ‹${t.priority}›` : "";
-      const head = `- ${num}[${col(t.status)}]${prio} ${t.subject}`;
-      // High priority → LONG form (meta + first description line); medium/low/
-      // unset that cleared the threshold stay a compact one-liner.
-      if (t.priority === "high") {
+      const date = t.scheduled_for ? String(t.scheduled_for).slice(0, 10) : "";
+      const due = isDue(t) ? (date < today ? ` ⏰ overdue (${date})` : ` ⏰ today`) : "";
+      const head = `- ${num}[${col(t.status)}]${prio}${due} ${t.subject}`;
+      // Due or high-priority tasks → LONG form (meta + first description line);
+      // everything else that cleared the threshold stays a compact one-liner.
+      if (isDue(t) || t.priority === "high") {
         const bits = [];
         if (t.estimate_minutes != null) bits.push(`~${t.estimate_minutes}min`);
-        if (t.scheduled_for) bits.push(`by ${t.scheduled_for}`);
+        // The ⏰ marker already carries a due task's date; only show a future date.
+        if (t.scheduled_for && !isDue(t)) bits.push(`by ${date}`);
         const meta = bits.length ? ` (${bits.join(", ")})` : "";
         const desc = t.description
           ? ` — ${String(t.description).split("\n")[0].slice(0, 140)}`
@@ -181,25 +209,30 @@ function main() {
     });
     if (hidden) {
       lines.push(
-        `  …plus ${hidden} lower-priority task(s) hidden by the "task priority in context" threshold — \`<cli> todos list\` shows all.`,
+        dueMode
+          ? `  …plus ${hidden} other open task(s) not due today — held back to keep the focus on today; \`<cli> todos list\` shows all.`
+          : `  …plus ${hidden} lower-priority task(s) below the "task priority in context" threshold — \`<cli> todos list\` shows all.`,
       );
     }
 
     const refExample = shown[0] && shown[0].number ? shown[0].number : 12;
+    const headerLine = dueMode
+      ? `User's tasks DUE TODAY / overdue (⏰) (Claude Usage Tracker, project "${project}") — today's focus, shown in full. The rest of the board is held back this session:`
+      : `User's active tasks (Claude Usage Tracker, project "${project}"). High-priority shown in full, the rest as one-liners:`;
     // Plain stdout on exit 0 is the most robust way to inject SessionStart
     // context (no additionalContext-nesting ambiguity across CC versions).
     const context = [
-      `User's active tasks from the Claude Usage Tracker (project "${project}"; the tracker is the source of truth). High-priority tasks are shown in full, lower ones as one-liners:`,
+      headerLine,
       lines.join("\n"),
       "",
       `These are the USER's todos, not your working task list. Mutate ONLY via the CLI (${CLI_NOTE}), never by hand-editing todos.json (the tracker may write it concurrently, and a malformed edit breaks the shared file):`,
-      `· move a task: <cli> todos set-status <id> <status> — <id> is the ⟨id⟩ above; <status> ∈ backlog | queue | in_progress | review | done. Other fields (subject / description / plan / estimate / scheduled / project) on an EXISTING task: leave to the user.`,
+      `· move a task: <cli> todos set-status <id> <status> — <id> is the ⟨id⟩ above; <status> ∈ backlog | queue | in_progress | review | done. Don't edit other fields of existing tasks — leave them to the user.`,
       `· set priority: <cli> todos set-priority <id> <high|medium|low|none> — priority decides which tasks reach this context (the threshold lives in the tracker's settings).`,
-      `· new follow-up: <cli> todos add "<subject>" [--project <name>] [--priority high|medium|low] [--description <text>] — lands in backlog. Only add what the user explicitly asked to track; this is their list, not your scratchpad.`,
+      `· new follow-up: <cli> todos add "<subject>" [--project <name>] [--priority high|medium|low] [--scheduled YYYY-MM-DD] [--description <text>] — lands in backlog. Only add what the user asked to track — their list, not your scratchpad.`,
       `· note a finding: <cli> todos comment add <id> --text "<body>" — shows in the task thread as you; only when the user wants it recorded. Reference another task as #N (e.g. "blocked by #${refExample}").`,
       `· see current tasks: <cli> todos list`,
       crossProjectNote,
-      `Source of truth file (read-only for you): ${file}`,
+      `File (don't edit): ${file}`,
     ].join("\n");
 
     process.stdout.write(context + "\n");
@@ -217,7 +250,7 @@ function main() {
     `· add a task: <cli> todos add "<subject>" [--project <name>] [--description <text>] — lands in backlog; only what the user explicitly wants tracked.`,
     `· see tasks: <cli> todos list — statuses: backlog | queue | in_progress | review | done.`,
     crossProjectNote,
-    `Source of truth file (read-only for you): ${file}`,
+    `File (don't edit): ${file}`,
   ].join("\n");
 
   process.stdout.write(note + "\n");
@@ -267,9 +300,9 @@ function phaseModeContext(project, todos, active, file, plans) {
     );
   }
   out.push(
-    `Other open tasks for "${project}": ${otherOpen.length} — not loaded, to keep focus; run \`<cli> todos list\`.`,
+    `Other open tasks for "${project}": ${otherOpen.length} (\`<cli> todos list\`).`,
   );
-  out.push(`Source of truth (read-only): ${file}`);
+  out.push(`File (don't edit): ${file}`);
   return out.join("\n");
 }
 
