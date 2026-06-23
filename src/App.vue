@@ -114,6 +114,9 @@ const notificationsMutedUntil = ref<string | null>(null);
 const serviceStatusEnabled = ref(true);
 const serviceStatusInterval = ref(90);
 const serviceStatusNotify = ref(true);
+// Memory-bloat watch (#33): desktop notification when a project's Claude memory
+// grows suddenly or its index is already oversized. On by default.
+const memoryBloatEnabled = ref(true);
 // Independent of `notificationsEnabled` (usage alerts): toasts when a todo is
 // moved into review/done by an external writer (cc-todos CLI / Claude). On by
 // default. Gated entirely in the backend watcher; here we just persist it.
@@ -237,6 +240,8 @@ async function loadSettings() {
             (await store.get<number>("serviceStatusInterval")) ?? 90;
         serviceStatusNotify.value =
             (await store.get<boolean>("serviceStatusNotify")) ?? true;
+        memoryBloatEnabled.value =
+            (await store.get<boolean>("memoryBloatEnabled")) ?? true;
         todoNotificationsEnabled.value =
             (await store.get<boolean>("todoNotificationsEnabled")) ?? true;
         runtimeInsightsEnabled.value =
@@ -297,6 +302,7 @@ async function saveSettings() {
     await store.set("serviceStatusEnabled", serviceStatusEnabled.value);
     await store.set("serviceStatusInterval", serviceStatusInterval.value);
     await store.set("serviceStatusNotify", serviceStatusNotify.value);
+    await store.set("memoryBloatEnabled", memoryBloatEnabled.value);
     await store.set("todoNotificationsEnabled", todoNotificationsEnabled.value);
     await store.set("runtimeInsightsEnabled", runtimeInsightsEnabled.value);
     await store.set("runtimeInsightKinds", [...runtimeInsightKinds.value]);
@@ -334,6 +340,7 @@ function buildConfig() {
         service_status_enabled: serviceStatusEnabled.value,
         service_status_interval: serviceStatusInterval.value,
         service_status_notify: serviceStatusNotify.value,
+        memory_bloat_enabled: memoryBloatEnabled.value,
         todo_notifications_enabled: todoNotificationsEnabled.value,
         runtime_insights_enabled: runtimeInsightsEnabled.value,
         runtime_insight_kinds: [...runtimeInsightKinds.value],
@@ -379,6 +386,18 @@ async function serviceToast(a: { kind: string; text: string }) {
               ? t("statusToastIncident")
               : t("statusToastDegraded");
     await notify(title, a.text);
+}
+
+// Memory-bloat notifications (#33) come pre-decided by the backend (a sudden
+// jump or an already-oversized index/entry); we localize the wrapper and honour
+// the toggle. `detail` is e.g. "+7 KB" or "MEMORY.md 40 KB".
+async function memoryToast(a: { kind: string; project: string; detail: string }) {
+    if (!memoryBloatEnabled.value) return;
+    const body =
+        a.kind === "large"
+            ? t("memAlertLarge", { project: a.project, detail: a.detail })
+            : t("memAlertGrew", { project: a.project, detail: a.detail });
+    await notify(t("memAlertTitle"), body);
 }
 
 // A todo moved into review/done by an external writer (the cc-todos CLI or a
@@ -599,6 +618,7 @@ async function handleSave(settings: {
     serviceStatusEnabled: boolean;
     serviceStatusInterval: number;
     serviceStatusNotify: boolean;
+    memoryBloatEnabled: boolean;
     todoNotificationsEnabled: boolean;
     systemInfoEnabled: boolean;
     locale: string;
@@ -626,6 +646,7 @@ async function handleSave(settings: {
     serviceStatusEnabled.value = settings.serviceStatusEnabled;
     serviceStatusInterval.value = settings.serviceStatusInterval;
     serviceStatusNotify.value = settings.serviceStatusNotify;
+    memoryBloatEnabled.value = settings.memoryBloatEnabled;
     todoNotificationsEnabled.value = settings.todoNotificationsEnabled;
     systemInfoEnabled.value = settings.systemInfoEnabled;
     locale.value = settings.locale;
@@ -729,6 +750,12 @@ onMounted(async () => {
             "service-alert",
             (e) => {
                 void serviceToast(e.payload);
+            },
+        ),
+        await listen<{ kind: string; project: string; detail: string }>(
+            "memory-alert",
+            (e) => {
+                void memoryToast(e.payload);
             },
         ),
         await listen<{ subject: string; status: string; project: string | null }>(
@@ -1036,6 +1063,7 @@ onUnmounted(() => {
             :service-status-enabled="serviceStatusEnabled"
             :service-status-interval="serviceStatusInterval"
             :service-status-notify="serviceStatusNotify"
+            :memory-bloat-enabled="memoryBloatEnabled"
             :todo-notifications-enabled="todoNotificationsEnabled"
             :system-info-enabled="systemInfoEnabled"
             :runtime-insights-enabled="runtimeInsightsEnabled"

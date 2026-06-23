@@ -1,6 +1,7 @@
 pub mod alerts;
 pub mod cc;
 pub mod domain;
+pub mod memory;
 pub mod phases;
 pub mod project_groups;
 pub mod report;
@@ -666,6 +667,87 @@ fn spawn_status_loop(app: AppHandle) {
             }
 
             tokio::time::sleep(Duration::from_secs(sleep)).await;
+        }
+    });
+}
+
+// --- Memory-bloat watch (#33): notify on sudden growth or a bloated index ---
+
+/// Emitted when a project's Claude memory grows suddenly (a pasted log/blob) or
+/// its index is already oversized, so the frontend can raise a desktop
+/// notification. Mirrors the `service-alert` flow.
+#[derive(Serialize, Clone)]
+struct MemoryAlert {
+    /// `grew` (sudden delta this run) | `large` (already oversized at startup).
+    kind: String,
+    /// Human-friendly project label.
+    project: String,
+    /// Localizable detail, e.g. "+7 KB" or "MEMORY.md 40 KB".
+    detail: String,
+}
+
+/// Memory changes rarely and the scan only stats files, so a relaxed cadence
+/// keeps this from ever being a load on disk.
+const MEMORY_CHECK_INTERVAL: Duration = Duration::from_secs(120);
+
+/// Round bytes to the nearest KB for display.
+fn kb(bytes: u64) -> u64 {
+    (bytes + 512) / 1024
+}
+
+fn spawn_memory_loop(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        // Per-project total bytes from the previous scan; absent = not yet seen,
+        // so a project's first sighting only sets a baseline (no delta alert).
+        let mut prev: HashMap<String, u64> = HashMap::new();
+        // First enabled pass also runs the one-time absolute (already-bloated) check.
+        let mut first = true;
+
+        loop {
+            let enabled =
+                { app.state::<Mutex<AppConfig>>().lock().unwrap().memory_bloat_enabled };
+            if enabled {
+                for s in memory::scan() {
+                    let label = memory::label(&s.project);
+                    if first {
+                        // Already-bloated index or a blob-sized entry from before this run.
+                        if s.memory_md > memory::MEMORY_MD_LIMIT {
+                            let _ = app.emit(
+                                "memory-alert",
+                                MemoryAlert {
+                                    kind: "large".into(),
+                                    project: label,
+                                    detail: format!("MEMORY.md {} KB", kb(s.memory_md)),
+                                },
+                            );
+                        } else if s.max_entry > memory::ENTRY_LIMIT {
+                            let _ = app.emit(
+                                "memory-alert",
+                                MemoryAlert {
+                                    kind: "large".into(),
+                                    project: label,
+                                    detail: format!("{} {} KB", s.max_entry_name, kb(s.max_entry)),
+                                },
+                            );
+                        }
+                    } else if let Some(&old) = prev.get(&s.project) {
+                        // Ongoing: a sudden jump = something big was pasted in.
+                        if s.total >= old.saturating_add(memory::DELTA_LIMIT) {
+                            let _ = app.emit(
+                                "memory-alert",
+                                MemoryAlert {
+                                    kind: "grew".into(),
+                                    project: label,
+                                    detail: format!("+{} KB", kb(s.total - old)),
+                                },
+                            );
+                        }
+                    }
+                    prev.insert(s.project, s.total);
+                }
+                first = false;
+            }
+            tokio::time::sleep(MEMORY_CHECK_INTERVAL).await;
         }
     });
 }
@@ -1646,6 +1728,7 @@ pub fn run() {
             spawn_status_loop(app.handle().clone());
             spawn_sysmon_loop(app.handle().clone());
             spawn_todos_watch(app.handle().clone());
+            spawn_memory_loop(app.handle().clone());
 
             Ok(())
         })

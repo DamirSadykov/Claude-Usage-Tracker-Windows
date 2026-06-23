@@ -444,6 +444,11 @@ const messages = {
     serviceStatusNotifyDesc: "Alert when an incident starts or is resolved",
     todoNotifications: "Task notifications",
     todoNotificationsDesc: "Notify when a task is moved to review/done outside the app (e.g. by Claude)",
+    memBloatSetting: "Memory-bloat alert",
+    memBloatSettingDesc: "Notify when a project's Claude memory grows suddenly or its index is oversized (risks a silent partial load)",
+    memAlertTitle: "Claude memory",
+    memAlertGrew: "{project}: memory grew {detail} — possible log/blob dump, review it",
+    memAlertLarge: "{project}: {detail} is oversized — risks a partial load, trim it",
     installCcHook: "Claude Code CLI + hook",
     installCcHookDesc:
       "Wire the SessionStart hook into ~/.claude/settings.json so every Claude Code session sees this project's tasks and edits them via the cc-todos CLI.",
@@ -910,6 +915,11 @@ const messages = {
     serviceStatusNotifyDesc: "Оповещать о начале и разрешении инцидента",
     todoNotifications: "Уведомления о задачах",
     todoNotificationsDesc: "Уведомлять, когда задачу двигают в ревью/готово вне приложения (например, Claude)",
+    memBloatSetting: "Сигнал о раздувании памяти",
+    memBloatSettingDesc: "Уведомлять, когда память проекта резко растёт или индекс раздут (риск тихой частичной загрузки)",
+    memAlertTitle: "Память Claude",
+    memAlertGrew: "{project}: память выросла на {detail} — возможно, влит лог/блоб, проверь",
+    memAlertLarge: "{project}: {detail} — слишком крупно, риск частичной загрузки, почисти",
     installCcHook: "CLI + хук Claude Code",
     installCcHookDesc:
       "Прописать SessionStart-хук в ~/.claude/settings.json, чтобы каждая сессия Claude Code видела задачи этого проекта и меняла их через CLI cc-todos.",

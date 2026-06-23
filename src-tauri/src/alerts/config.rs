@@ -121,6 +121,12 @@ pub struct AppConfig {
     pub service_status_interval: u64,
     #[serde(default = "default_true")]
     pub service_status_notify: bool,
+    // Memory-bloat watch (#33): notify when a project's Claude memory grows
+    // suddenly (a pasted log/blob) or its MEMORY.md index is already oversized
+    // (risks a silent partial load). Independent of `notifications_enabled`.
+    // On by default.
+    #[serde(default = "default_true")]
+    pub memory_bloat_enabled: bool,
     // Runtime optimization tips (issue #46). Master opt-in, off by default — when
     // on, the engine evaluates the active Claude Code session each poll and toasts
     // the per-kind tips selected in `runtime_insight_kinds`.
@@ -185,6 +191,7 @@ impl Default for AppConfig {
             service_status_enabled: true,
             service_status_interval: 90,
             service_status_notify: true,
+            memory_bloat_enabled: true,
             runtime_insights_enabled: false,
             runtime_insight_kinds: default_runtime_insight_kinds(),
             system_info_enabled: true,
