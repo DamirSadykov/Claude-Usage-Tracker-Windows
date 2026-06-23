@@ -32,12 +32,15 @@
 // Commands (run as `cli.mjs phases <cmd>`):
 //   create "<English title>" [--task <N>]     make a new plan folder (title → folder
 //                                             name, so it's validated English-only)
-//   add "<title>" ["<desc>"] [--plan <slug>]              new phase
+//   add "<title>" ["<desc>"] [--at <N>] [--plan <slug>]   new phase; --at inserts
+//                                             at position N (shifting later down)
 //   add-sub "<title>" ["<text>"] [--phase <N>] [--plan <slug>]   new subphase
 //   done <loc> [--plan <slug>]      loc = N (phase) or N.k (subphase) → done
 //   reopen <loc> [--plan <slug>]    → not done
 //   edit <loc> [--title "…"] [--desc "…"] [--plan <slug>]
 //   delete <loc> [--force] [--plan <slug>]    phase with subphases needs --force
+//   move <from> <to> [--plan <slug>]    reorder: 1-based positions, rest shift to fill
+//   renumber [--plan <slug>]        compact phase numbers to a gapless 1..n
 //   verify [--plan <slug>]          integrity self-check
 //   list [--plan <slug>] [--json]   one plan, or (no plan, many) the plan index
 //
@@ -215,6 +218,22 @@ function loadPlan(slug) {
   return { slug, ...readPlanMeta(slug), phases };
 }
 
+// Reorder primitive shared by move/renumber/insert: take the phases in their
+// DESIRED order, renumber them 1..n, and rewrite the plan folder to match.
+// Phase numbers live in the filename (Phase-<n>.md) AND drive every subphase
+// prefix (serializePhase writes `<num>.<k>` from phase.num), so renumbering is
+// purely a reassign-then-rewrite. We delete every existing phase file first so
+// a shrink (e.g. compacting 1,2,4,5 → 1,2,3,4) can't leave a stale Phase-5.md
+// behind; all content is already in memory (loadPlan), so the wipe is safe.
+function rewriteAllPhases(slug, ordered) {
+  const old = phaseNums(slug);
+  ordered.forEach((p, i) => {
+    p.num = i + 1;
+  });
+  for (const n of old) rmSync(phaseFile(slug, n));
+  for (const p of ordered) writeAtomic(phaseFile(slug, p.num), serializePhase(p));
+}
+
 // The plan's title (first H1) and tracker link (`CC-task: #N`) from its README.
 function readPlanMeta(slug) {
   let text = "";
@@ -335,9 +354,21 @@ function cmdAdd(args) {
   if (args[0] === "subphase" || args[0] === "sub") return cmdAddSub(args.slice(1));
   const { positional, flags } = parseArgs(args);
   const title = sanitize(positional[0]);
-  if (!title) fail('usage: cli phases add "<title>" ["<desc>"] [--plan <slug>]');
+  if (!title) fail('usage: cli phases add "<title>" ["<desc>"] [--at <N>] [--plan <slug>]');
   const desc = sanitize(positional[1]);
   const slug = resolvePlan(flags);
+  // --at <N>: INSERT at position N, shifting that phase and later ones down.
+  // Without it, append after the last phase (the common case).
+  if (flags.at != null && flags.at !== true) {
+    const at = Number(flags.at);
+    if (!Number.isInteger(at) || at < 1) fail("--at must be a positive integer");
+    const plan = loadPlan(slug);
+    const idx = Math.min(at - 1, plan.phases.length); // clamp past-the-end → append
+    plan.phases.splice(idx, 0, { num: 0, title, desc, done: false, subs: [] });
+    rewriteAllPhases(slug, plan.phases);
+    process.stdout.write(`ok: inserted Phase ${idx + 1} into "${slug}": ${title}\n`);
+    return;
+  }
   const nums = phaseNums(slug);
   const num = (nums.length ? Math.max(...nums) : 0) + 1;
   writeAtomic(phaseFile(slug, num), serializePhase({ num, title, desc, done: false, subs: [] }));
@@ -427,6 +458,43 @@ function cmdDelete(args) {
     rmSync(phaseFile(slug, phase.num));
   }
   process.stdout.write(`ok: deleted ${loc} ("${slug}")\n`);
+}
+
+// Move an existing phase to a new 1-based position, shifting the rest to fill
+// the gap. `to` is the position the phase should END UP at (clamped to [1, n]);
+// move 5 2 makes the old phase 5 the new phase 2. Subphases ride along — their
+// `N.k` prefix is rewritten from the new phase number.
+function cmdMove(args) {
+  const { positional, flags } = parseArgs(args);
+  const from = Number(positional[0]);
+  const to = Number(positional[1]);
+  if (!Number.isInteger(from) || !Number.isInteger(to) || from < 1 || to < 1)
+    fail("usage: cli phases move <from> <to>   (both 1-based phase positions)");
+  const slug = resolvePlan(flags);
+  const plan = loadPlan(slug);
+  const idxFrom = plan.phases.findIndex((p) => p.num === from);
+  if (idxFrom < 0) fail(`no phase ${from} in plan "${slug}"`);
+  const [moved] = plan.phases.splice(idxFrom, 1);
+  const idxTo = Math.min(to - 1, plan.phases.length); // post-removal index → final position
+  plan.phases.splice(idxTo, 0, moved);
+  rewriteAllPhases(slug, plan.phases);
+  process.stdout.write(`ok: moved phase ${from} → position ${idxTo + 1} ("${slug}")\n`);
+}
+
+// Compact phase numbers to a gapless 1..n in their current order — useful after
+// a `delete` leaves a hole (1,2,4,5 → 1,2,3,4). Pure renumber, no reorder.
+function cmdRenumber(args) {
+  const { flags } = parseArgs(args);
+  const slug = resolvePlan(flags);
+  const plan = loadPlan(slug);
+  const before = plan.phases.map((p) => p.num);
+  rewriteAllPhases(slug, plan.phases); // phases are already in ascending order
+  const after = plan.phases.map((p) => p.num);
+  process.stdout.write(
+    JSON.stringify(before) === JSON.stringify(after)
+      ? `ok: "${slug}" already 1..${after.length} — nothing to renumber\n`
+      : `ok: renumbered "${slug}": ${before.join(",")} → ${after.join(",")}\n`,
+  );
 }
 
 // Read-only integrity check: every phase file parses, subphase numbers are unique
@@ -523,12 +591,14 @@ function usage(code) {
   process.stdout.write(
     "cli phases - break a task into ordered phases (folder per plan in <project>/.claude/phases/)\n\n" +
       '  create "<English title>" [--task <N>]   new plan folder (title → folder name)\n' +
-      '  add "<title>" ["<desc>"] [--plan <slug>]               new phase\n' +
+      '  add "<title>" ["<desc>"] [--at <N>] [--plan <slug>]   new phase (--at = insert at pos N)\n' +
       '  add-sub "<title>" ["<text>"] [--phase <N>] [--plan <slug>]\n' +
       "  done <loc> [--plan <slug>]      loc = N (phase) or N.k (subphase)\n" +
       "  reopen <loc> [--plan <slug>]\n" +
       '  edit <loc> [--title "…"] [--desc "…"] [--plan <slug>]\n' +
       "  delete <loc> [--force] [--plan <slug>]\n" +
+      "  move <from> <to> [--plan <slug>]   reorder phases (1-based positions)\n" +
+      "  renumber [--plan <slug>]        compact phase numbers to 1..n (fix gaps)\n" +
       "  verify [--plan <slug>]          integrity self-check\n" +
       "  list [--plan <slug>] [--json]\n" +
       '  handoff ["<text>"] [--clear] [--plan <slug>]   baton for the next session\n\n' +
@@ -564,6 +634,13 @@ export function run(args) {
     case "delete":
     case "rm":
       cmdDelete(rest);
+      break;
+    case "move":
+    case "mv":
+      cmdMove(rest);
+      break;
+    case "renumber":
+      cmdRenumber(rest);
       break;
     case "verify":
       cmdVerify(rest);
