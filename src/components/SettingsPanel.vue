@@ -327,6 +327,43 @@ async function togglePhasesEnabled() {
 
 onMounted(loadPhasesEnabled);
 
+// --- Task priority in context (issue #32) ---
+// The LOWEST task priority the SessionStart hook injects into a Claude Code
+// session: all | low | medium | high. A UI-only flag in settings.json read
+// directly by the hook (like phasesEnabled above) — no backend config. Default
+// `medium`, so low/unset tasks stay out of context unless the user lowers the bar.
+const TASK_CTX_LEVELS = ["all", "low", "medium", "high"] as const;
+const taskCtxPrio = ref<string>("medium");
+
+function taskCtxPrioLabel(lv: string): string {
+  if (lv === "all") return t("taskCtxPrioAll");
+  if (lv === "low") return t("taskCtxPrioLow");
+  if (lv === "medium") return t("taskCtxPrioMedium");
+  return t("taskCtxPrioHigh");
+}
+
+async function loadTaskCtxPrio() {
+  try {
+    const { load: loadStore } = await import("@tauri-apps/plugin-store");
+    const store = await loadStore("settings.json");
+    const v = await store.get<string>("taskContextPriority");
+    if (typeof v === "string" && (TASK_CTX_LEVELS as readonly string[]).includes(v))
+      taskCtxPrio.value = v;
+  } catch {}
+}
+
+async function setTaskCtxPrio(v: string) {
+  taskCtxPrio.value = v;
+  try {
+    const { load: loadStore } = await import("@tauri-apps/plugin-store");
+    const store = await loadStore("settings.json");
+    await store.set("taskContextPriority", v);
+    await store.save();
+  } catch {}
+}
+
+onMounted(loadTaskCtxPrio);
+
 // Keep each threshold triple strictly ascending with a 1% gap so the colour
 // bands can't overlap. Fixed slider scale (5..99) + clamping — dynamic min/max
 // would make neighbouring thumbs visually drift when their range changes.
@@ -1002,6 +1039,20 @@ function handleSave() {
         <div class="toggle" :class="{ on: phasesEnabled }">
           <div class="toggle-knob"></div>
         </div>
+      </div>
+
+      <!-- Task priority in context (issue #32) — UI-only flag in settings.json,
+           read by the SessionStart hook to gate which tasks reach a session. -->
+      <div class="card">
+        <div class="field-label">{{ t('taskCtxPrioSetting') }}</div>
+        <select
+          class="field-input"
+          :value="taskCtxPrio"
+          @change="setTaskCtxPrio(($event.target as HTMLSelectElement).value)"
+        >
+          <option v-for="lv in TASK_CTX_LEVELS" :key="lv" :value="lv">{{ taskCtxPrioLabel(lv) }}</option>
+        </select>
+        <div class="field-hint">{{ t('taskCtxPrioDesc') }}</div>
       </div>
       </template>
     </div>

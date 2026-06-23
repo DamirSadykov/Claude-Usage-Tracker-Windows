@@ -6,7 +6,9 @@
 //     board (the session is aimed at the phase; the full list would just bloat
 //     context). A thin pointer keeps the plan's own task and `todos list` reachable.
 //   • TODO MODE — no active phase: surface the ACTIVE todos for the project plus
-//     the short contract for editing them.
+//     the short contract for editing them. Tasks are gated by the "task priority
+//     in context" setting (settings.json): only those at/above the threshold show
+//     (default `medium`), high-priority ones in full and the rest as one-liners.
 // It is strictly read-only and MUST never disrupt a session: a missing/unreadable
 // file, no matching todos, or any error is a silent no-op (exit 0, no output).
 //
@@ -33,6 +35,30 @@ const CLI = path.join(
 // `<id>` / `<N.k>` placeholders — keeps the injected context from drowning in the
 // repeated path.
 const CLI_NOTE = `<cli> = node "${CLI}"`;
+
+// Priority ranks, shared with todos.rs::PRIORITIES / the cc-todos CLI. Unset = 0.
+const PRANK = { high: 3, medium: 2, low: 1 };
+const prank = (t) => (t && PRANK[t.priority]) || 0;
+
+// The "task priority in context" setting (settings.json, written by the tracker's
+// SettingsPanel) names the LOWEST priority a task must have to reach a session:
+// all | low | medium | high → a min rank. Default is `medium`, so low/unset tasks
+// stay out of context unless the user opts them in. Read-only and forgiving: a
+// missing file, bad JSON, or unknown value falls back to the default.
+function contextMinRank(appData) {
+  const MIN = { all: 0, low: 1, medium: 2, high: 3 };
+  try {
+    const raw = readFileSync(
+      path.join(appData, "com.claude-usage-tracker.app", "settings.json"),
+      "utf8",
+    );
+    const v = JSON.parse(raw).taskContextPriority;
+    if (typeof v === "string" && v in MIN) return MIN[v];
+  } catch {
+    // no settings file / bad JSON / missing key → default
+  }
+  return MIN.medium;
+}
 
 function main() {
   // SessionStart hooks receive a JSON payload on stdin (session_id, cwd,
@@ -101,40 +127,76 @@ function main() {
   }
 
   if (active.length) {
-    // Surface what the user is closest to finishing first: in_progress, then
-    // review, then queued, then backlog.
+    // The "task priority in context" setting gates what's injected: only tasks at
+    // or above the threshold are shown (default `medium`, so low/unset stay out).
+    const minRank = contextMinRank(appData);
+    const shown = active.filter((t) => prank(t) >= minRank);
+    const hidden = active.length - shown.length;
+
+    if (!shown.length) {
+      // Every open task is below the threshold: don't dump them, but say so (and
+      // how to surface them) rather than going silently empty.
+      const note = [
+        `The Claude Usage Tracker has ${active.length} open task(s) for project "${project}", but all are below the current "task priority in context" threshold — none are shown here.`,
+        `See them or re-prioritize via the CLI (${CLI_NOTE}); lower the threshold in the tracker's settings to surface more:`,
+        `· list every task: <cli> todos list`,
+        `· set a priority: <cli> todos set-priority <id> <high|medium|low|none>`,
+        crossProjectNote,
+        `Source of truth file (read-only for you): ${file}`,
+      ].join("\n");
+      process.stdout.write(note + "\n");
+      return;
+    }
+
+    // Surface what matters most first: priority desc, then closest-to-finishing
+    // status (in_progress → review → queue → backlog), then soonest scheduled.
     const order = { in_progress: 0, review: 1, queue: 2, backlog: 3 };
     const rank = (s) => order[col(s)] ?? 3;
-    active.sort(
+    shown.sort(
       (a, b) =>
+        prank(b) - prank(a) ||
         rank(a.status) - rank(b.status) ||
         String(a.scheduled_for || "9999-99-99").localeCompare(
           String(b.scheduled_for || "9999-99-99"),
         ),
     );
 
-    const lines = active.map((t) => {
-      const bits = [];
-      if (t.estimate_minutes != null) bits.push(`~${t.estimate_minutes}min`);
-      if (t.scheduled_for) bits.push(`by ${t.scheduled_for}`);
-      const meta = bits.length ? ` (${bits.join(", ")})` : "";
-      const desc = t.description
-        ? ` — ${String(t.description).split("\n")[0].slice(0, 140)}`
-        : "";
+    const lines = shown.map((t) => {
       const num = t.number ? `#${t.number} ` : "";
-      return `- ${num}[${col(t.status)}] ${t.subject}${meta}${desc}  ⟨id:${t.id}⟩`;
+      const prio = t.priority ? ` ‹${t.priority}›` : "";
+      const head = `- ${num}[${col(t.status)}]${prio} ${t.subject}`;
+      // High priority → LONG form (meta + first description line); medium/low/
+      // unset that cleared the threshold stay a compact one-liner.
+      if (t.priority === "high") {
+        const bits = [];
+        if (t.estimate_minutes != null) bits.push(`~${t.estimate_minutes}min`);
+        if (t.scheduled_for) bits.push(`by ${t.scheduled_for}`);
+        const meta = bits.length ? ` (${bits.join(", ")})` : "";
+        const desc = t.description
+          ? ` — ${String(t.description).split("\n")[0].slice(0, 140)}`
+          : "";
+        return `${head}${meta}${desc}  ⟨id:${t.id}⟩`;
+      }
+      return `${head}  ⟨id:${t.id}⟩`;
     });
+    if (hidden) {
+      lines.push(
+        `  …plus ${hidden} lower-priority task(s) hidden by the "task priority in context" threshold — \`<cli> todos list\` shows all.`,
+      );
+    }
 
+    const refExample = shown[0] && shown[0].number ? shown[0].number : 12;
     // Plain stdout on exit 0 is the most robust way to inject SessionStart
     // context (no additionalContext-nesting ambiguity across CC versions).
     const context = [
-      `User's active tasks from the Claude Usage Tracker (project "${project}"; the tracker is the source of truth):`,
+      `User's active tasks from the Claude Usage Tracker (project "${project}"; the tracker is the source of truth). High-priority tasks are shown in full, lower ones as one-liners:`,
       lines.join("\n"),
       "",
       `These are the USER's todos, not your working task list. Mutate ONLY via the CLI (${CLI_NOTE}), never by hand-editing todos.json (the tracker may write it concurrently, and a malformed edit breaks the shared file):`,
       `· move a task: <cli> todos set-status <id> <status> — <id> is the ⟨id⟩ above; <status> ∈ backlog | queue | in_progress | review | done. Other fields (subject / description / plan / estimate / scheduled / project) on an EXISTING task: leave to the user.`,
-      `· new follow-up: <cli> todos add "<subject>" [--project <name>] [--description <text>] — lands in backlog. Only add what the user explicitly asked to track; this is their list, not your scratchpad.`,
-      `· note a finding: <cli> todos comment add <id> --text "<body>" — shows in the task thread as you; only when the user wants it recorded. Reference another task as #N (e.g. "blocked by #${active[0] && active[0].number ? active[0].number : 12}").`,
+      `· set priority: <cli> todos set-priority <id> <high|medium|low|none> — priority decides which tasks reach this context (the threshold lives in the tracker's settings).`,
+      `· new follow-up: <cli> todos add "<subject>" [--project <name>] [--priority high|medium|low] [--description <text>] — lands in backlog. Only add what the user explicitly asked to track; this is their list, not your scratchpad.`,
+      `· note a finding: <cli> todos comment add <id> --text "<body>" — shows in the task thread as you; only when the user wants it recorded. Reference another task as #N (e.g. "blocked by #${refExample}").`,
       `· see current tasks: <cli> todos list`,
       crossProjectNote,
       `Source of truth file (read-only for you): ${file}`,

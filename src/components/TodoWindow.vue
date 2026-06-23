@@ -52,6 +52,7 @@ export interface Todo {
   subject: string;
   description: string;
   status: string;
+  priority?: string; // "high" | "medium" | "low" | "" (unset) — drives hook context
   estimate_minutes?: number | null;
   scheduled_for?: string | null;
   plan: string;
@@ -132,7 +133,13 @@ const fPlan = ref("");
 const fProject = ref("");
 // Column a freshly created task lands in (set by the column's "+" button).
 const formStatus = ref("backlog");
+// Priority bucket for the new-task form; "" = unset. Mirrors todos.rs::PRIORITIES.
+const fPriority = ref("");
 const formOpen = ref(false);
+
+// Priority buckets, most→least important; "" = unset. The <select>s offer these
+// plus an empty option. Kept in lockstep with todos.rs / the cc-todos CLI.
+const PRIORITY_LEVELS = ["high", "medium", "low"] as const;
 
 // Projects the tracker has seen (from cc_usage), so the picker offers real
 // projects even before any todo uses them.
@@ -241,6 +248,7 @@ function resetForm() {
   fPlan.value = "";
   fProject.value = "";
   formStatus.value = "backlog";
+  fPriority.value = "";
   formOpen.value = false;
   flushPendingReload();
 }
@@ -265,6 +273,7 @@ async function submitForm() {
     subject,
     description: fDescription.value.trim(),
     status: existing?.status ?? formStatus.value,
+    priority: fPriority.value || "",
     estimate_minutes:
       fEstimate.value === null || Number.isNaN(fEstimate.value)
         ? null
@@ -341,6 +350,7 @@ interface Draft {
   estimate_minutes: number | null;
   scheduled_for: string;
   status: string;
+  priority: string;
 }
 const draft = ref<Draft>({
   subject: "",
@@ -350,6 +360,7 @@ const draft = ref<Draft>({
   estimate_minutes: null,
   scheduled_for: "",
   status: "backlog",
+  priority: "",
 });
 
 function rankStatus(s: string): number {
@@ -376,6 +387,7 @@ function openDetail(todo: Todo) {
     estimate_minutes: todo.estimate_minutes ?? null,
     scheduled_for: todo.scheduled_for ?? "",
     status: todo.status,
+    priority: todo.priority ?? "",
   };
   descMode.value = "edit";
   mention.value = null;
@@ -405,6 +417,7 @@ async function saveDetail() {
         : Math.max(0, Math.round(d.estimate_minutes)),
     scheduled_for: d.scheduled_for || null,
     status: d.status,
+    priority: d.priority || "",
   };
   try {
     todos.value = await invoke<Todo[]>("upsert_todo", { todo });
@@ -817,6 +830,14 @@ function columnColor(s: string) {
   return COL_BY_ID[s]?.dot ?? "var(--text-4)";
 }
 
+// Localized label for a priority bucket ("" → the "no priority" option).
+function priorityLabel(p: string | null | undefined): string {
+  if (p === "high") return t("todoPriorityHigh");
+  if (p === "medium") return t("todoPriorityMedium");
+  if (p === "low") return t("todoPriorityLow");
+  return t("todoPriorityNone");
+}
+
 function fmtEstimate(min: number | null | undefined) {
   if (min === null || min === undefined) return "";
   if (min < 60) return `${min} ${t("minShort")}`;
@@ -1016,6 +1037,13 @@ onUnmounted(() => {
             <p v-if="todo.description" class="tw-card-desc">{{ todo.description }}</p>
 
             <div class="tw-card-meta">
+              <span
+                v-if="todo.priority"
+                class="tw-chip tw-prio"
+                :class="'tw-prio-' + todo.priority"
+                :title="t('todoPriority')"
+                >{{ priorityLabel(todo.priority) }}</span
+              >
               <span v-if="todo.created_by === 'claude'" class="tw-ai sm" :title="t('todoAiHint')">{{ t("todoAi") }}</span>
               <span v-if="todo.project" class="tw-tag">
                 <ProjectLabel
@@ -1121,15 +1149,22 @@ onUnmounted(() => {
               </select>
             </label>
             <label class="tw-field">
-              <span>{{ t("todoProject") }}</span>
-              <ProjectAutocomplete
-                v-model="draft.project"
-                :options="projects"
-                :placeholder="t('todoNoProject')"
-                clearable
-              />
+              <span>{{ t("todoPriority") }}</span>
+              <select v-model="draft.priority" class="tw-select">
+                <option value="">{{ t("todoPriorityNone") }}</option>
+                <option v-for="p in PRIORITY_LEVELS" :key="p" :value="p">{{ priorityLabel(p) }}</option>
+              </select>
             </label>
           </div>
+          <label class="tw-field">
+            <span>{{ t("todoProject") }}</span>
+            <ProjectAutocomplete
+              v-model="draft.project"
+              :options="projects"
+              :placeholder="t('todoNoProject')"
+              clearable
+            />
+          </label>
           <div
             v-if="detail?.from && detail.from !== draft.project"
             class="tw-from-note"
@@ -1329,6 +1364,13 @@ onUnmounted(() => {
             :options="projects"
             :placeholder="t('todoProjectPlaceholder')"
           />
+        </label>
+        <label class="tw-field">
+          <span>{{ t("todoPriority") }}</span>
+          <select v-model="fPriority" class="tw-select">
+            <option value="">{{ t("todoPriorityNone") }}</option>
+            <option v-for="p in PRIORITY_LEVELS" :key="p" :value="p">{{ priorityLabel(p) }}</option>
+          </select>
         </label>
         <div class="tw-row">
           <label class="tw-field">
@@ -1769,6 +1811,25 @@ onUnmounted(() => {
   color: var(--text-3);
   max-width: 100%;
   overflow-wrap: anywhere;
+}
+/* Priority chip — colour-coded by bucket (high red, medium amber, low muted). */
+.tw-prio {
+  font-weight: 600;
+  padding: 1px 7px;
+  border-radius: 999px;
+  text-transform: capitalize;
+}
+.tw-prio-high {
+  color: #d4453a;
+  background: rgba(212, 69, 58, 0.13);
+}
+.tw-prio-medium {
+  color: #c07c19;
+  background: rgba(192, 124, 25, 0.14);
+}
+.tw-prio-low {
+  color: var(--text-3);
+  background: var(--track);
 }
 /* Provenance chip — "↘ from <project>" for a cross-project task. */
 .tw-from {
