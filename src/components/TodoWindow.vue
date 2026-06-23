@@ -1921,6 +1921,10 @@ onUnmounted(() => {
   font-size: 13px;
   font-family: var(--segoe);
   width: 100%;
+  /* Render native controls in dark theme so the <input type="date"> calendar
+     picker icon (and its popup) isn't a dark-on-dark, near-invisible glyph on
+     Windows/WebView2 — same fix the settings selects already use. */
+  color-scheme: dark;
 }
 .tw-input:focus {
   outline: none;
