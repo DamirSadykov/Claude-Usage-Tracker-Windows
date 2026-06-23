@@ -71,6 +71,7 @@ const props = defineProps<{
   serviceStatusEnabled: boolean;
   serviceStatusInterval: number;
   serviceStatusNotify: boolean;
+  memoryBloatEnabled: boolean;
   todoNotificationsEnabled: boolean;
   systemInfoEnabled: boolean;
   runtimeInsightsEnabled: boolean;
@@ -103,6 +104,7 @@ const emit = defineEmits<{
     serviceStatusEnabled: boolean;
     serviceStatusInterval: number;
     serviceStatusNotify: boolean;
+    memoryBloatEnabled: boolean;
     todoNotificationsEnabled: boolean;
     systemInfoEnabled: boolean;
     locale: string;
@@ -143,6 +145,7 @@ const localGoalErrorRatePct = ref<number | "">(
 const localSvcEnabled = ref(props.serviceStatusEnabled);
 const localSvcInterval = ref(props.serviceStatusInterval);
 const localSvcNotify = ref(props.serviceStatusNotify);
+const localMemBloat = ref(props.memoryBloatEnabled);
 const localTodoNotify = ref(props.todoNotificationsEnabled);
 const localSystemInfo = ref(props.systemInfoEnabled);
 const localLocale = ref(props.locale);
@@ -190,6 +193,7 @@ watch(() => props.goalErrorRateMax, (v) => (localGoalErrorRatePct.value = v === 
 watch(() => props.serviceStatusEnabled, (v) => (localSvcEnabled.value = v));
 watch(() => props.serviceStatusInterval, (v) => (localSvcInterval.value = v));
 watch(() => props.serviceStatusNotify, (v) => (localSvcNotify.value = v));
+watch(() => props.memoryBloatEnabled, (v) => (localMemBloat.value = v));
 watch(() => props.todoNotificationsEnabled, (v) => (localTodoNotify.value = v));
 watch(() => props.systemInfoEnabled, (v) => (localSystemInfo.value = v));
 watch(() => props.locale, (v) => (localLocale.value = v));
@@ -422,6 +426,7 @@ function handleSave() {
     serviceStatusEnabled: localSvcEnabled.value,
     serviceStatusInterval: localSvcInterval.value,
     serviceStatusNotify: localSvcNotify.value,
+    memoryBloatEnabled: localMemBloat.value,
     todoNotificationsEnabled: localTodoNotify.value,
     systemInfoEnabled: localSystemInfo.value,
     locale: localLocale.value,
@@ -818,6 +823,17 @@ function handleSave() {
           <div class="card-sub">{{ t('todoNotificationsDesc') }}</div>
         </div>
         <div class="toggle" :class="{ on: localTodoNotify }">
+          <div class="toggle-knob"></div>
+        </div>
+      </div>
+
+      <!-- Memory-bloat watch (#33) — sudden growth / oversized index notification -->
+      <div class="card toggle-card" @click="localMemBloat = !localMemBloat">
+        <div style="flex: 1; min-width: 0">
+          <div class="card-title" style="font-size: 13px">{{ t('memBloatSetting') }}</div>
+          <div class="card-sub">{{ t('memBloatSettingDesc') }}</div>
+        </div>
+        <div class="toggle" :class="{ on: localMemBloat }">
           <div class="toggle-knob"></div>
         </div>
       </div>
