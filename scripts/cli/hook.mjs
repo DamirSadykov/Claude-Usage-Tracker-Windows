@@ -104,10 +104,8 @@ function main() {
   // project. The hook itself stays group-agnostic — Claude discovers associations
   // on demand via `cli.mjs todos related`.
   const crossProjectNote =
-    `Tasks aren't limited to this project — to file one against a DIFFERENT project ` +
-    `(e.g. a related one you also work on), pass --project <name> to the add command; ` +
-    `the originating project ("${project}") is recorded automatically as the task's "from". ` +
-    `Run \`<cli> todos related ${project}\` to list projects associated with "${project}".`;
+    `Cross-project: \`--project <name>\` on add files a task against another project ` +
+    `("${project}" is saved as its "from"). \`<cli> todos related ${project}\` lists associated projects.`;
   // Kanban columns the tracker recognizes. Legacy `pending` (written before the
   // columns existed) is shown as `backlog`, matching the tracker's own load-time
   // migration, so Claude only ever sees a real column.
@@ -164,7 +162,7 @@ function main() {
         `· list every task: <cli> todos list`,
         `· set a priority: <cli> todos set-priority <id> <high|medium|low|none>`,
         crossProjectNote,
-        `Source of truth file (read-only for you): ${file}`,
+        `File (don't edit): ${file}`,
       ].join("\n");
       process.stdout.write(note + "\n");
       return;
@@ -219,8 +217,8 @@ function main() {
 
     const refExample = shown[0] && shown[0].number ? shown[0].number : 12;
     const headerLine = dueMode
-      ? `User's tasks DUE TODAY / overdue (⏰) from the Claude Usage Tracker (project "${project}"; the tracker is the source of truth) — today's focus, shown in full. The rest of the board is held back this session:`
-      : `User's active tasks from the Claude Usage Tracker (project "${project}"; the tracker is the source of truth). High-priority tasks are shown in full, the rest as one-liners:`;
+      ? `User's tasks DUE TODAY / overdue (⏰) (Claude Usage Tracker, project "${project}") — today's focus, shown in full. The rest of the board is held back this session:`
+      : `User's active tasks (Claude Usage Tracker, project "${project}"). High-priority shown in full, the rest as one-liners:`;
     // Plain stdout on exit 0 is the most robust way to inject SessionStart
     // context (no additionalContext-nesting ambiguity across CC versions).
     const context = [
@@ -228,13 +226,13 @@ function main() {
       lines.join("\n"),
       "",
       `These are the USER's todos, not your working task list. Mutate ONLY via the CLI (${CLI_NOTE}), never by hand-editing todos.json (the tracker may write it concurrently, and a malformed edit breaks the shared file):`,
-      `· move a task: <cli> todos set-status <id> <status> — <id> is the ⟨id⟩ above; <status> ∈ backlog | queue | in_progress | review | done. Other fields (subject / description / plan / estimate / scheduled / project) on an EXISTING task: leave to the user.`,
+      `· move a task: <cli> todos set-status <id> <status> — <id> is the ⟨id⟩ above; <status> ∈ backlog | queue | in_progress | review | done. Don't edit other fields of existing tasks — leave them to the user.`,
       `· set priority: <cli> todos set-priority <id> <high|medium|low|none> — priority decides which tasks reach this context (the threshold lives in the tracker's settings).`,
-      `· new follow-up: <cli> todos add "<subject>" [--project <name>] [--priority high|medium|low] [--scheduled YYYY-MM-DD] [--description <text>] — lands in backlog (a task scheduled for today/earlier is surfaced regardless of priority). Only add what the user explicitly asked to track; this is their list, not your scratchpad.`,
+      `· new follow-up: <cli> todos add "<subject>" [--project <name>] [--priority high|medium|low] [--scheduled YYYY-MM-DD] [--description <text>] — lands in backlog. Only add what the user asked to track — their list, not your scratchpad.`,
       `· note a finding: <cli> todos comment add <id> --text "<body>" — shows in the task thread as you; only when the user wants it recorded. Reference another task as #N (e.g. "blocked by #${refExample}").`,
       `· see current tasks: <cli> todos list`,
       crossProjectNote,
-      `Source of truth file (read-only for you): ${file}`,
+      `File (don't edit): ${file}`,
     ].join("\n");
 
     process.stdout.write(context + "\n");
@@ -252,7 +250,7 @@ function main() {
     `· add a task: <cli> todos add "<subject>" [--project <name>] [--description <text>] — lands in backlog; only what the user explicitly wants tracked.`,
     `· see tasks: <cli> todos list — statuses: backlog | queue | in_progress | review | done.`,
     crossProjectNote,
-    `Source of truth file (read-only for you): ${file}`,
+    `File (don't edit): ${file}`,
   ].join("\n");
 
   process.stdout.write(note + "\n");
@@ -302,9 +300,9 @@ function phaseModeContext(project, todos, active, file, plans) {
     );
   }
   out.push(
-    `Other open tasks for "${project}": ${otherOpen.length} — not loaded, to keep focus; run \`<cli> todos list\`.`,
+    `Other open tasks for "${project}": ${otherOpen.length} (\`<cli> todos list\`).`,
   );
-  out.push(`Source of truth (read-only): ${file}`);
+  out.push(`File (don't edit): ${file}`);
   return out.join("\n");
 }
 
