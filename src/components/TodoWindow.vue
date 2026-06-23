@@ -313,7 +313,20 @@ async function moveStatus(todo: Todo, status: string) {
   }
 }
 
-async function removeTodo(todo: Todo) {
+// Deleting a task asks first (issue #21): the card's trash opens a confirm
+// dialog; the actual removal happens in confirmDelete. `pendingDelete` holds the
+// task awaiting confirmation (null = no dialog open).
+const pendingDelete = ref<Todo | null>(null);
+function removeTodo(todo: Todo) {
+  pendingDelete.value = todo;
+}
+function cancelDelete() {
+  pendingDelete.value = null;
+}
+async function confirmDelete() {
+  const todo = pendingDelete.value;
+  if (!todo) return;
+  pendingDelete.value = null;
   try {
     todos.value = await invoke<Todo[]>("delete_todo", { id: todo.id });
     if (editingId.value === todo.id) resetForm();
@@ -1338,6 +1351,20 @@ onUnmounted(() => {
       </div>
     </template>
 
+    <!-- Delete confirmation (issue #21) -->
+    <div v-if="pendingDelete" class="tw-modal" @click.self="cancelDelete">
+      <div class="tw-form tw-confirm">
+        <div class="tw-form-title">{{ t("todoDeleteConfirmTitle") }}</div>
+        <p class="tw-confirm-body">
+          {{ t("todoDeleteConfirmBody") }} <strong>{{ pendingDelete.subject }}</strong>
+        </p>
+        <div class="tw-form-actions">
+          <button type="button" class="tw-btn ghost" @click="cancelDelete">{{ t("todoCancel") }}</button>
+          <button type="button" class="tw-btn danger" @click="confirmDelete">{{ t("todoDelete") }}</button>
+        </div>
+      </div>
+    </div>
+
     <!-- Create / edit form (modal overlay) -->
     <div v-if="formOpen" class="tw-modal" @click.self="resetForm">
       <form class="tw-form" @submit.prevent="submitForm">
@@ -1978,6 +2005,24 @@ onUnmounted(() => {
   background: transparent;
   color: var(--text-3);
   border: 1px solid var(--stroke-strong);
+}
+.tw-btn.danger {
+  background: #e0524a;
+  color: #fff;
+}
+.tw-btn.danger:hover {
+  background: #d4453a;
+}
+/* Delete-confirmation dialog: a narrow .tw-form panel with a short question. */
+.tw-confirm {
+  max-width: 360px;
+}
+.tw-confirm-body {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-2);
+  word-break: break-word;
 }
 
 /* AI-authored badge — violet so it can't be mistaken for a status colour. */
