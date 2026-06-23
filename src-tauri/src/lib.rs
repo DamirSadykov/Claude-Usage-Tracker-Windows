@@ -1304,6 +1304,9 @@ fn upsert_todo(app: AppHandle, todo: todos::Todo) -> Result<Vec<todos::Todo>, St
     if !todos::is_valid_status(&todo.status) {
         return Err(format!("invalid status: {}", todo.status));
     }
+    if !todos::is_valid_priority(&todo.priority) {
+        return Err(format!("invalid priority: {}", todo.priority));
+    }
     let now = chrono::Utc::now().to_rfc3339();
     write_todos_locked(&app, move |file| todos::upsert(file, todo, &now))
 }

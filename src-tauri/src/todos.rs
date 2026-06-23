@@ -34,6 +34,13 @@ pub struct Todo {
     #[serde(default)]
     pub description: String,
     pub status: String,
+    /// Priority bucket: `high` | `medium` | `low`, or empty = unset. Drives which
+    /// tasks the SessionStart hook injects (a min-level threshold) and how verbose
+    /// each one is. Empty is omitted from the file so existing todos need no
+    /// migration and unprioritized rows stay clean. Keep the value set in lockstep
+    /// with [`PRIORITIES`], the cc-todos CLI, and TodoWindow.vue.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub priority: String,
     /// LLM/user time estimate in minutes; None = unestimated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimate_minutes: Option<i64>,
@@ -233,6 +240,17 @@ pub fn is_valid_status(status: &str) -> bool {
     STATUSES.contains(&status)
 }
 
+/// Priority buckets, most to least important. The hook ranks by this order and
+/// the settings threshold names one of these (plus "all"). Mirrored in the
+/// cc-todos CLI and TodoWindow.vue.
+pub const PRIORITIES: [&str; 3] = ["high", "medium", "low"];
+
+/// Valid priority values: one of [`PRIORITIES`] or empty (unset). The command
+/// layer rejects anything else before it reaches the shared file.
+pub fn is_valid_priority(priority: &str) -> bool {
+    priority.is_empty() || PRIORITIES.contains(&priority)
+}
+
 /// Map a raw status onto a real kanban column. The pre-kanban `pending` status
 /// becomes `backlog`; any unrecognized value (a typo, a hand-edit, or a status
 /// from a future version) also falls back to `backlog` so the todo still shows
@@ -256,6 +274,7 @@ mod tests {
             subject: format!("subject {id}"),
             description: String::new(),
             status: status.to_string(),
+            priority: String::new(),
             estimate_minutes: None,
             scheduled_for: None,
             plan: String::new(),
@@ -364,6 +383,41 @@ mod tests {
         assert!(!is_valid_status("pending"));
         assert!(!is_valid_status("Done"));
         assert!(!is_valid_status("archived"));
+    }
+
+    #[test]
+    fn priority_validation_allows_buckets_and_unset() {
+        assert!(is_valid_priority("high"));
+        assert!(is_valid_priority("medium"));
+        assert!(is_valid_priority("low"));
+        assert!(is_valid_priority("")); // unset is valid
+        assert!(!is_valid_priority("urgent"));
+        assert!(!is_valid_priority("High"));
+    }
+
+    #[test]
+    fn priority_empty_is_omitted_from_file() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("cut_todos_priority_test.json");
+        let _ = std::fs::remove_file(&path);
+
+        let mut f = TodoFile::default();
+        let mut a = todo("a", "backlog");
+        a.priority = "high".into();
+        let b = todo("b", "backlog"); // priority unset
+        upsert(&mut f, a, "T1");
+        upsert(&mut f, b, "T1");
+        save(&path, &f).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("\"priority\": \"high\""));
+        // Exactly one priority field — the unset one is omitted.
+        assert_eq!(raw.matches("\"priority\"").count(), 1);
+
+        let back = load(&path);
+        assert_eq!(back.todos.iter().find(|t| t.id == "a").unwrap().priority, "high");
+        assert_eq!(back.todos.iter().find(|t| t.id == "b").unwrap().priority, "");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -10,9 +10,10 @@
 // `todos.rs::STATUSES` and the kanban columns in TodoWindow.vue.
 //
 // Commands (run as `cli.mjs todos <cmd>`):
-//   add "<subject>" [--project <name>] [--status <status>] [--description <text>]
-//                   [--plan <text>] [--estimate <min>] [--scheduled <YYYY-MM-DD>]
+//   add "<subject>" [--project <name>] [--status <status>] [--priority <level>]
+//                   [--description <text>] [--plan <text>] [--estimate <min>] [--scheduled <YYYY-MM-DD>]
 //   set-status <id> <status>        status ∈ backlog|queue|in_progress|review|done
+//   set-priority <id> <level>       level ∈ high|medium|low|none
 //   comment add <id> --text "<body>" [--by claude|user]
 //   comment list <id> [--json]
 //   list [--project <name>] [--json]
@@ -26,6 +27,21 @@ import path from "node:path";
 
 // Kanban columns, in board order. Keep in lockstep with todos.rs::STATUSES.
 const STATUSES = ["backlog", "queue", "in_progress", "review", "done"];
+
+// Priority buckets, most to least important; "" = unset. Keep in lockstep with
+// todos.rs::PRIORITIES and TodoWindow.vue. The SessionStart hook ranks by this
+// order and a settings threshold picks the minimum level that enters context.
+const PRIORITIES = ["high", "medium", "low"];
+
+// Normalize a --priority / set-priority value to a real bucket or "" (unset).
+// "none"/"clear"/"" explicitly clear it. Returns undefined for anything invalid,
+// so the caller can fail with a helpful message instead of writing garbage.
+function normalizePriority(v) {
+  if (v == null || v === true) return undefined;
+  const s = String(v).toLowerCase().trim();
+  if (s === "none" || s === "clear" || s === "") return "";
+  return PRIORITIES.includes(s) ? s : undefined;
+}
 
 // Same location the tracker and the hook use: the app data dir on Windows.
 function todosPath() {
@@ -111,6 +127,31 @@ function cmdSetStatus(id, status) {
   process.stdout.write(`ok: ${id} -> ${status}\n`);
 }
 
+// Set (or clear) a todo's priority bucket. `level` is high|medium|low, or
+// none|clear|"" to unset. Mirrors cmdSetStatus: validate, locate by id, write
+// atomically. Clearing removes the field so the file stays clean (matches the
+// Rust skip_serializing_if and how the app omits an unset priority).
+function cmdSetPriority(id, level) {
+  if (!id || level == null)
+    fail(`usage: cli todos set-priority <id> <${PRIORITIES.join("|")}|none>`);
+  const priority = normalizePriority(level);
+  if (priority === undefined)
+    fail(`invalid priority "${level}". valid: ${PRIORITIES.join(" | ")} | none`);
+  const file = todosPath();
+  const data = load(file);
+  const todo = data.todos.find((t) => t && t.id === id);
+  if (!todo) fail(`no todo with id ${id}`);
+  if ((todo.priority || "") === priority) {
+    process.stdout.write(`ok: ${id} already ${priority || "unset"}\n`);
+    return;
+  }
+  if (priority) todo.priority = priority;
+  else delete todo.priority;
+  todo.updated_at = new Date().toISOString();
+  save(file, data);
+  process.stdout.write(`ok: ${id} priority -> ${priority || "unset"}\n`);
+}
+
 // Minimal `--flag value` parser: collects positional args and flag pairs.
 // A flag with no following value (or followed by another --flag) becomes `true`.
 function parseArgs(args) {
@@ -135,7 +176,7 @@ function parseArgs(args) {
 
 const ADD_USAGE =
   'usage: cli todos add "<subject>" [--project <name>] [--from <project>] [--status <status>] ' +
-  "[--description <text>] [--plan <text>] [--estimate <min>] [--scheduled <YYYY-MM-DD>] [--by user|claude]";
+  "[--priority high|medium|low] [--description <text>] [--plan <text>] [--estimate <min>] [--scheduled <YYYY-MM-DD>] [--by user|claude]";
 
 // Create a new todo. Mirrors the field set the tracker writes (todos.rs / the
 // TodoWindow form): id is a fresh UUID, created_at/updated_at stamped now,
@@ -151,6 +192,13 @@ function cmdAdd(args) {
   if (flags.estimate != null && flags.estimate !== true) {
     const n = Number(flags.estimate);
     if (Number.isFinite(n)) estimate = Math.max(0, Math.round(n));
+  }
+  let priority = "";
+  if (flags.priority != null && flags.priority !== true) {
+    const p = normalizePriority(flags.priority);
+    if (p === undefined)
+      fail(`invalid --priority "${flags.priority}". valid: ${PRIORITIES.join(" | ")} | none`);
+    priority = p;
   }
   const now = new Date().toISOString();
   const file = todosPath();
@@ -174,6 +222,8 @@ function cmdAdd(args) {
     subject,
     description: typeof flags.description === "string" ? flags.description : "",
     status,
+    // Omit the field entirely when unset, mirroring todos.rs (skip_serializing_if).
+    ...(priority ? { priority } : {}),
     estimate_minutes: estimate,
     scheduled_for: typeof flags.scheduled === "string" ? flags.scheduled : null,
     plan: typeof flags.plan === "string" ? flags.plan : "",
@@ -261,6 +311,13 @@ function cmdList(args) {
     const p = args[pi + 1];
     todos = todos.filter((t) => (t.project || "") === p);
   }
+  const pri = args.indexOf("--priority");
+  if (pri !== -1 && args[pri + 1]) {
+    const want = normalizePriority(args[pri + 1]);
+    if (want === undefined)
+      fail(`invalid --priority "${args[pri + 1]}". valid: ${PRIORITIES.join(" | ")} | none`);
+    todos = todos.filter((t) => (t.priority || "") === want);
+  }
   if (args.includes("--json")) {
     process.stdout.write(JSON.stringify(todos, null, 2) + "\n");
     return;
@@ -271,7 +328,8 @@ function cmdList(args) {
   }
   for (const t of todos) {
     const num = t.number ? `#${t.number} ` : "";
-    process.stdout.write(`${num}[${t.status}] ${t.subject}  ⟨id:${t.id}⟩\n`);
+    const prio = t.priority ? ` ‹${t.priority}›` : "";
+    process.stdout.write(`${num}[${t.status}]${prio} ${t.subject}  ⟨id:${t.id}⟩\n`);
   }
 }
 
@@ -320,6 +378,9 @@ function usage(code) {
       "  set-status <id> <status>        status ∈ " +
       STATUSES.join(" | ") +
       "\n" +
+      "  set-priority <id> <level>       level ∈ " +
+      PRIORITIES.join(" | ") +
+      " | none\n" +
       '  comment add <id> --text "<body>" [--by claude|user]\n' +
       "  comment list <id> [--json]\n" +
       "  list [--project <name>] [--json]\n" +
@@ -338,6 +399,9 @@ export function run(args) {
       break;
     case "set-status":
       cmdSetStatus(rest[0], rest[1]);
+      break;
+    case "set-priority":
+      cmdSetPriority(rest[0], rest[1]);
       break;
     case "comment":
       cmdComment(rest);
