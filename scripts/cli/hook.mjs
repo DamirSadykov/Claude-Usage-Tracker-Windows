@@ -9,6 +9,8 @@
 //     the short contract for editing them. Tasks are gated by the "task priority
 //     in context" setting (settings.json): only those at/above the threshold show
 //     (default `medium`), high-priority ones in full and the rest as one-liners.
+//     Tasks scheduled for today or earlier (due/overdue) are pulled in regardless
+//     of the threshold, flagged ⏰, shown in full, and sorted to the top (#36).
 // It is strictly read-only and MUST never disrupt a session: a missing/unreadable
 // file, no matching todos, or any error is a silent no-op (exit 0, no output).
 //
@@ -58,6 +60,14 @@ function contextMinRank(appData) {
     // no settings file / bad JSON / missing key → default
   }
   return MIN.medium;
+}
+
+// Local calendar date as YYYY-MM-DD — "today" is the USER's day, not UTC (a
+// scheduled_for date is a plain local date). Used to surface due/overdue tasks.
+function localToday() {
+  const d = new Date();
+  const z = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())}`;
 }
 
 function main() {
@@ -127,17 +137,23 @@ function main() {
   }
 
   if (active.length) {
-    // The "task priority in context" setting gates what's injected: only tasks at
-    // or above the threshold are shown (default `medium`, so low/unset stay out).
+    // Two gates decide what reaches the session:
+    //  • priority threshold (taskContextPriority, default medium) — importance;
+    //  • "due" — scheduled_for today or earlier — time-relevance (issue #36).
+    // A task is surfaced if it clears the threshold OR is due; due tasks come in
+    // regardless of priority, because the user planned them for today.
     const minRank = contextMinRank(appData);
-    const shown = active.filter((t) => prank(t) >= minRank);
+    const today = localToday();
+    const isDue = (t) =>
+      !!t.scheduled_for && String(t.scheduled_for).slice(0, 10) <= today;
+    const shown = active.filter((t) => prank(t) >= minRank || isDue(t));
     const hidden = active.length - shown.length;
 
     if (!shown.length) {
-      // Every open task is below the threshold: don't dump them, but say so (and
-      // how to surface them) rather than going silently empty.
+      // Nothing clears the threshold and nothing is due: don't dump the rest, but
+      // say so (and how to surface them) rather than going silently empty.
       const note = [
-        `The Claude Usage Tracker has ${active.length} open task(s) for project "${project}", but all are below the current "task priority in context" threshold — none are shown here.`,
+        `The Claude Usage Tracker has ${active.length} open task(s) for project "${project}", but all are below the "task priority in context" threshold and none are due today — none are shown here.`,
         `See them or re-prioritize via the CLI (${CLI_NOTE}); lower the threshold in the tracker's settings to surface more:`,
         `· list every task: <cli> todos list`,
         `· set a priority: <cli> todos set-priority <id> <high|medium|low|none>`,
@@ -148,12 +164,17 @@ function main() {
       return;
     }
 
-    // Surface what matters most first: priority desc, then closest-to-finishing
-    // status (in_progress → review → queue → backlog), then soonest scheduled.
+    // Order: the due group first and, within it, the most overdue (earliest
+    // date) first; then everything by priority desc, closest-to-finishing status,
+    // and soonest scheduled.
     const order = { in_progress: 0, review: 1, queue: 2, backlog: 3 };
     const rank = (s) => order[col(s)] ?? 3;
     shown.sort(
       (a, b) =>
+        (isDue(a) ? 0 : 1) - (isDue(b) ? 0 : 1) ||
+        (isDue(a) && isDue(b)
+          ? String(a.scheduled_for).localeCompare(String(b.scheduled_for))
+          : 0) ||
         prank(b) - prank(a) ||
         rank(a.status) - rank(b.status) ||
         String(a.scheduled_for || "9999-99-99").localeCompare(
@@ -164,13 +185,16 @@ function main() {
     const lines = shown.map((t) => {
       const num = t.number ? `#${t.number} ` : "";
       const prio = t.priority ? ` ‹${t.priority}›` : "";
-      const head = `- ${num}[${col(t.status)}]${prio} ${t.subject}`;
-      // High priority → LONG form (meta + first description line); medium/low/
-      // unset that cleared the threshold stay a compact one-liner.
-      if (t.priority === "high") {
+      const date = t.scheduled_for ? String(t.scheduled_for).slice(0, 10) : "";
+      const due = isDue(t) ? (date < today ? ` ⏰ overdue (${date})` : ` ⏰ today`) : "";
+      const head = `- ${num}[${col(t.status)}]${prio}${due} ${t.subject}`;
+      // Due or high-priority tasks → LONG form (meta + first description line);
+      // everything else that cleared the threshold stays a compact one-liner.
+      if (isDue(t) || t.priority === "high") {
         const bits = [];
         if (t.estimate_minutes != null) bits.push(`~${t.estimate_minutes}min`);
-        if (t.scheduled_for) bits.push(`by ${t.scheduled_for}`);
+        // The ⏰ marker already carries a due task's date; only show a future date.
+        if (t.scheduled_for && !isDue(t)) bits.push(`by ${date}`);
         const meta = bits.length ? ` (${bits.join(", ")})` : "";
         const desc = t.description
           ? ` — ${String(t.description).split("\n")[0].slice(0, 140)}`
@@ -189,13 +213,13 @@ function main() {
     // Plain stdout on exit 0 is the most robust way to inject SessionStart
     // context (no additionalContext-nesting ambiguity across CC versions).
     const context = [
-      `User's active tasks from the Claude Usage Tracker (project "${project}"; the tracker is the source of truth). High-priority tasks are shown in full, lower ones as one-liners:`,
+      `User's active tasks from the Claude Usage Tracker (project "${project}"; the tracker is the source of truth). Tasks due today / overdue (⏰) and high-priority ones are shown in full — due tasks are surfaced even below the priority threshold; the rest are one-liners:`,
       lines.join("\n"),
       "",
       `These are the USER's todos, not your working task list. Mutate ONLY via the CLI (${CLI_NOTE}), never by hand-editing todos.json (the tracker may write it concurrently, and a malformed edit breaks the shared file):`,
       `· move a task: <cli> todos set-status <id> <status> — <id> is the ⟨id⟩ above; <status> ∈ backlog | queue | in_progress | review | done. Other fields (subject / description / plan / estimate / scheduled / project) on an EXISTING task: leave to the user.`,
       `· set priority: <cli> todos set-priority <id> <high|medium|low|none> — priority decides which tasks reach this context (the threshold lives in the tracker's settings).`,
-      `· new follow-up: <cli> todos add "<subject>" [--project <name>] [--priority high|medium|low] [--description <text>] — lands in backlog. Only add what the user explicitly asked to track; this is their list, not your scratchpad.`,
+      `· new follow-up: <cli> todos add "<subject>" [--project <name>] [--priority high|medium|low] [--scheduled YYYY-MM-DD] [--description <text>] — lands in backlog (a task scheduled for today/earlier is surfaced regardless of priority). Only add what the user explicitly asked to track; this is their list, not your scratchpad.`,
       `· note a finding: <cli> todos comment add <id> --text "<body>" — shows in the task thread as you; only when the user wants it recorded. Reference another task as #N (e.g. "blocked by #${refExample}").`,
       `· see current tasks: <cli> todos list`,
       crossProjectNote,
