@@ -6,11 +6,13 @@
 //     board (the session is aimed at the phase; the full list would just bloat
 //     context). A thin pointer keeps the plan's own task and `todos list` reachable.
 //   • TODO MODE — no active phase: surface the ACTIVE todos for the project plus
-//     the short contract for editing them. Tasks are gated by the "task priority
-//     in context" setting (settings.json): only those at/above the threshold show
-//     (default `medium`), high-priority ones in full and the rest as one-liners.
-//     Tasks scheduled for today or earlier (due/overdue) are pulled in regardless
-//     of the threshold, flagged ⏰, shown in full, and sorted to the top (#36).
+//     the short contract for editing them. Two sub-modes:
+//       – DUE MODE (#36): if anything is scheduled for today or earlier, show ONLY
+//         those (today's focus, flagged ⏰, most overdue first) and hold the rest
+//         of the board back.
+//       – PRIORITY MODE (#32): with nothing due, fall back to the project's open
+//         tasks gated by the "task priority in context" setting (settings.json,
+//         default `medium`) — high-priority in full, the rest as one-liners.
 // It is strictly read-only and MUST never disrupt a session: a missing/unreadable
 // file, no matching todos, or any error is a silent no-op (exit 0, no output).
 //
@@ -137,23 +139,27 @@ function main() {
   }
 
   if (active.length) {
-    // Two gates decide what reaches the session:
-    //  • priority threshold (taskContextPriority, default medium) — importance;
-    //  • "due" — scheduled_for today or earlier — time-relevance (issue #36).
-    // A task is surfaced if it clears the threshold OR is due; due tasks come in
-    // regardless of priority, because the user planned them for today.
     const minRank = contextMinRank(appData);
     const today = localToday();
     const isDue = (t) =>
       !!t.scheduled_for && String(t.scheduled_for).slice(0, 10) <= today;
-    const shown = active.filter((t) => prank(t) >= minRank || isDue(t));
+    // Two modes for the todo context:
+    //  • DUE MODE (issue #36): if anything is scheduled for today or earlier, the
+    //    session focuses on THOSE — today's plan, not the whole board.
+    //  • PRIORITY MODE (issue #32): with nothing due, fall back to the project's
+    //    open tasks gated by the "task priority in context" threshold (default
+    //    medium). This is the original behaviour.
+    const dueMode = active.some(isDue);
+    const shown = dueMode
+      ? active.filter(isDue)
+      : active.filter((t) => prank(t) >= minRank);
     const hidden = active.length - shown.length;
 
     if (!shown.length) {
-      // Nothing clears the threshold and nothing is due: don't dump the rest, but
-      // say so (and how to surface them) rather than going silently empty.
+      // Not in due mode (nothing scheduled) and nothing clears the priority
+      // threshold: don't dump the rest, but say so rather than going silently empty.
       const note = [
-        `The Claude Usage Tracker has ${active.length} open task(s) for project "${project}", but all are below the "task priority in context" threshold and none are due today — none are shown here.`,
+        `The Claude Usage Tracker has ${active.length} open task(s) for project "${project}", but none are due today and all are below the "task priority in context" threshold — none are shown here.`,
         `See them or re-prioritize via the CLI (${CLI_NOTE}); lower the threshold in the tracker's settings to surface more:`,
         `· list every task: <cli> todos list`,
         `· set a priority: <cli> todos set-priority <id> <high|medium|low|none>`,
@@ -205,15 +211,20 @@ function main() {
     });
     if (hidden) {
       lines.push(
-        `  …plus ${hidden} lower-priority task(s) hidden by the "task priority in context" threshold — \`<cli> todos list\` shows all.`,
+        dueMode
+          ? `  …plus ${hidden} other open task(s) not due today — held back to keep the focus on today; \`<cli> todos list\` shows all.`
+          : `  …plus ${hidden} lower-priority task(s) below the "task priority in context" threshold — \`<cli> todos list\` shows all.`,
       );
     }
 
     const refExample = shown[0] && shown[0].number ? shown[0].number : 12;
+    const headerLine = dueMode
+      ? `User's tasks DUE TODAY / overdue (⏰) from the Claude Usage Tracker (project "${project}"; the tracker is the source of truth) — today's focus, shown in full. The rest of the board is held back this session:`
+      : `User's active tasks from the Claude Usage Tracker (project "${project}"; the tracker is the source of truth). High-priority tasks are shown in full, the rest as one-liners:`;
     // Plain stdout on exit 0 is the most robust way to inject SessionStart
     // context (no additionalContext-nesting ambiguity across CC versions).
     const context = [
-      `User's active tasks from the Claude Usage Tracker (project "${project}"; the tracker is the source of truth). Tasks due today / overdue (⏰) and high-priority ones are shown in full — due tasks are surfaced even below the priority threshold; the rest are one-liners:`,
+      headerLine,
       lines.join("\n"),
       "",
       `These are the USER's todos, not your working task list. Mutate ONLY via the CLI (${CLI_NOTE}), never by hand-editing todos.json (the tracker may write it concurrently, and a malformed edit breaks the shared file):`,
