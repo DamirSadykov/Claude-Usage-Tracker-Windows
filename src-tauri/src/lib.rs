@@ -9,6 +9,7 @@ pub mod stats;
 pub mod status;
 pub mod sysmon;
 pub mod todos;
+pub mod triage;
 pub mod usage;
 
 use std::collections::{HashMap, HashSet};
@@ -1064,6 +1065,22 @@ fn get_todos(app: AppHandle) -> Result<Vec<todos::Todo>, String> {
     Ok(todos::load(&todos_path(&app)?).todos)
 }
 
+/// Path to the nightly-triage digest, a sibling of todos.json in the app data
+/// dir (see triage.rs / the cc-triage CLI). Read-only from the tracker's side.
+fn triage_digest_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).ok();
+    Ok(dir.join("triage-digest.json"))
+}
+
+/// The latest nightly-triage digest, or None if no run has produced one yet (or
+/// the file is unreadable). The triage agent writes it via the cc-triage CLI;
+/// the tracker only reads it.
+#[tauri::command]
+fn get_triage_digest(app: AppHandle) -> Result<Option<triage::TriageDigest>, String> {
+    Ok(triage::load(&triage_digest_path(&app)?))
+}
+
 /// Distinct project names the tracker has seen (from cc_usage), for the
 /// task-manager's project picker. Empty if analytics has never ingested.
 #[tauri::command]
@@ -1758,6 +1775,7 @@ pub fn run() {
             get_analytics_ext,
             export_analytics_json,
             get_todos,
+            get_triage_digest,
             get_cc_projects,
             get_raw_projects,
             get_project_links,

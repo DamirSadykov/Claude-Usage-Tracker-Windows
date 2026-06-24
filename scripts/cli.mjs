@@ -4,6 +4,7 @@
 //
 //   node cli.mjs todos  <…>    → ./cli/todos.mjs   (mutate the todo list)
 //   node cli.mjs phases <…>    → ./cli/phases.mjs  (break a task into phases)
+//   node cli.mjs triage <…>    → ./cli/triage.mjs  (publish the nightly digest)
 //   node cli.mjs hook          → ./cli/hook.mjs    (SessionStart hook)
 //
 // Each area module exports `run(args)`. Back-compat shims (cc-todos.mjs,
@@ -14,6 +15,7 @@
 const AREAS = {
   todos: "./cli/todos.mjs",
   phases: "./cli/phases.mjs",
+  triage: "./cli/triage.mjs",
   hook: "./cli/hook.mjs",
 };
 
@@ -22,6 +24,7 @@ function usage(code) {
     "cli - Claude Usage Tracker\n\n" +
       "  todos   <…>   mutate the todo list (add / set-status / comment / list / …)\n" +
       "  phases  <…>   break a task into ordered phases (create / add / done / list / …)\n" +
+      "  triage  <…>   publish/read the nightly-triage digest (publish / show / clear)\n" +
       "  hook          SessionStart hook (wired into ~/.claude/settings.json)\n\n" +
       "Run `cli <area> --help` for an area's commands.\n",
   );

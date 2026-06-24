@@ -1,0 +1,3 @@
+# Handoff (2026-06-24)
+
+Фаза 1 готова и проверена (CLI smoke + cargo test triage = 4 passed). Сделано: контракт triage-digest.json; scripts/cli/triage.mjs (publish строгий/show forgiving/clear); area triage в scripts/cli.mjs; src-tauri/src/triage.rs (TriageDigest+DigestItem, forgiving load, 4 теста); lib.rs: pub mod triage + triage_digest_path + #[command] get_triage_digest + регистрация в generate_handler. СЛЕДУЮЩИЙ ШАГ (Фаза 2): spawn_triage_loop в lib.rs по образцу spawn_memory_loop (~строки 698-752) - следить за triage-digest.json, дебаунс по полю generated_at (last-seen), при свежем дайджесте emit('triage-alert') c headline; фронт ловит как memory-alert/service-alert и поднимает desktop-нотификацию.
