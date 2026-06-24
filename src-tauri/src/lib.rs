@@ -753,6 +753,71 @@ fn spawn_memory_loop(app: AppHandle) {
     });
 }
 
+// --- Nightly-triage watch (#35): notify when a fresh digest lands ---
+
+/// Emitted when a fresh nightly-triage digest is written, so the frontend can
+/// raise a desktop notification. Mirrors the `memory-alert` / `service-alert`
+/// flow. The body is the digest's own `headline`; `project` is the board it
+/// covered (may be empty for a board-wide note).
+#[derive(Serialize, Clone)]
+struct TriageAlert {
+    headline: String,
+    project: String,
+}
+
+/// The digest is rewritten at most once a night, so a relaxed cadence is plenty —
+/// like the memory watch, this only reads one small file per tick.
+const TRIAGE_CHECK_INTERVAL: Duration = Duration::from_secs(120);
+
+fn spawn_triage_loop(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let path = match triage_digest_path(&app) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        // The `generated_at` of the digest we last saw. A fresh run carries a new
+        // timestamp, so the same digest never fires twice. `None` = nothing seen
+        // yet.
+        let mut last_seen: Option<String> = None;
+        // The first pass only records a baseline. A digest already on disk at
+        // startup is shown by the in-app card (Phase 3); firing a desktop
+        // notification on every app launch for an already-written digest would be
+        // noise. The notification's value is "a fresh triage landed while you were
+        // working".
+        let mut first = true;
+
+        loop {
+            if let Some(d) = triage::load(&path) {
+                if !d.generated_at.is_empty() && last_seen.as_deref() != Some(d.generated_at.as_str())
+                {
+                    // Gate the toast, but advance `last_seen` regardless — so
+                    // toggling notifications off then on never replays a stale
+                    // digest (unlike the memory loop, which skips its baseline
+                    // update while disabled). Reuses the task-board toggle: a
+                    // triage digest is the same family as a todo status change.
+                    let enabled = app
+                        .state::<Mutex<AppConfig>>()
+                        .lock()
+                        .unwrap()
+                        .todo_notifications_enabled;
+                    if !first && enabled {
+                        let _ = app.emit(
+                            "triage-alert",
+                            TriageAlert {
+                                headline: d.headline.clone(),
+                                project: d.project.clone().unwrap_or_default(),
+                            },
+                        );
+                    }
+                    last_seen = Some(d.generated_at);
+                }
+            }
+            first = false;
+            tokio::time::sleep(TRIAGE_CHECK_INTERVAL).await;
+        }
+    });
+}
+
 // --- System resource monitor (whole-machine CPU + RAM for the mini panel) ---
 
 // How often the mini panel gets a fresh CPU/RAM reading.
@@ -1746,6 +1811,7 @@ pub fn run() {
             spawn_sysmon_loop(app.handle().clone());
             spawn_todos_watch(app.handle().clone());
             spawn_memory_loop(app.handle().clone());
+            spawn_triage_loop(app.handle().clone());
 
             Ok(())
         })

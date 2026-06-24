@@ -15,6 +15,7 @@ import ProjectAutocomplete from "./ProjectAutocomplete.vue";
 import ProjectLabel from "./ProjectLabel.vue";
 import { useProjectLinks } from "../projectLinks";
 import i18n from "../i18n";
+import type { TriageDigest, DigestItem } from "../App.vue";
 
 const { t, locale } = useI18n();
 
@@ -622,6 +623,87 @@ function openProject(name: string) {
   closeDetail();
 }
 
+// --- Nightly-triage digest (#35) ---
+// The latest digest the triage agent published (read-only; null until a run has
+// happened, or if the file is unreadable). Shown as a chip beside the open-task
+// count, expanding to a popover whose #N references jump to the task card. The
+// triage agent owns writes via the cc-triage CLI; we only ever read.
+const triageDigest = ref<TriageDigest | null>(null);
+const triageOpen = ref(false);
+
+async function loadTriageDigest() {
+  try {
+    triageDigest.value =
+      (await invoke<TriageDigest | null>("get_triage_digest")) ?? null;
+  } catch {
+    // not under Tauri, or no digest yet
+  }
+}
+
+// Display order: most urgent finding first, advisory suggestions last. The kinds
+// mirror triage.rs::KINDS; the order here is a UI choice.
+const TRIAGE_KIND_ORDER = ["overdue", "stale", "no_priority", "suggestion"] as const;
+const TRIAGE_KIND_LABEL: Record<string, string> = {
+  overdue: "triageKindOverdue",
+  stale: "triageKindStale",
+  no_priority: "triageKindNoPriority",
+  suggestion: "triageKindSuggestion",
+  other: "triageKindOther",
+};
+
+// Items bucketed by kind in display order, empty buckets dropped. A kind the
+// tracker doesn't know (a newer writer) falls into a trailing "other" bucket so
+// nothing silently disappears.
+const triageGroups = computed<{ kind: string; items: DigestItem[] }[]>(() => {
+  const d = triageDigest.value;
+  if (!d) return [];
+  const out: { kind: string; items: DigestItem[] }[] = [];
+  const known = new Set<string>(TRIAGE_KIND_ORDER);
+  for (const kind of TRIAGE_KIND_ORDER) {
+    const items = d.items.filter((i) => i.kind === kind);
+    if (items.length) out.push({ kind, items });
+  }
+  const rest = d.items.filter((i) => !known.has(i.kind));
+  if (rest.length) out.push({ kind: "other", items: rest });
+  return out;
+});
+
+const triageHeadline = computed(
+  () => triageDigest.value?.headline?.trim() || t("triageAlertEmpty"),
+);
+
+function triageKindLabel(kind: string): string {
+  const key = TRIAGE_KIND_LABEL[kind];
+  return key ? t(key) : kind;
+}
+
+// Empty/garbage timestamp → "" (mirrors fmtTime) so a hand-edited digest shows
+// no time rather than "Invalid Date".
+const triageGeneratedLabel = computed(() => {
+  const iso = triageDigest.value?.generated_at;
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleString(locale.value === "ru" ? "ru-RU" : "en-US", {
+    day: "2-digit",
+    month: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+});
+
+// A digest #N is a live link only if it maps to a real task on the board.
+function triageHasTask(num?: number): boolean {
+  return num != null && byNumber.value.has(num);
+}
+
+// Jump from a digest reference to that task's card, closing the popover.
+function triageGoToTask(num?: number) {
+  if (!triageHasTask(num)) return;
+  triageOpen.value = false;
+  openTask(num as number);
+}
+
 // Distinct other tasks this one references inline (#N) across its description and
 // comments — drives the card's link chip. Uses tokenize so it counts exactly
 // what renders as a reference (a #frag inside a URL isn't one) and only resolved
@@ -862,6 +944,7 @@ function fmtEstimate(min: number | null | undefined) {
 let unlistenLocale: (() => void) | null = null;
 let unlistenTodos: (() => void) | null = null;
 let unlistenFocus: (() => void) | null = null;
+let unlistenTriage: (() => void) | null = null;
 
 // Refresh the project picker from cc_usage. The todos window is a persisted
 // webview (created once at startup, then shown/hidden), so `onMounted` runs a
@@ -943,10 +1026,16 @@ onMounted(async () => {
     // re-read plans too. There's no separate phase-file watcher yet (PR2).
     void refreshPhasePlans();
   });
+  // A fresh nightly-triage digest landed (the backend broadcasts to all
+  // windows); refresh the chip so it reflects the latest run.
+  unlistenTriage = await listen("triage-alert", () => {
+    void loadTriageDigest();
+  });
   await loadTodos();
   await refreshKnownProjects();
   void loadPhasesEnabled();
   void refreshPhasePlans();
+  void loadTriageDigest();
   // Persisted webview: refresh the picker each time the window is brought to
   // front, so a project used since the last view (now in cc_usage) shows up.
   const { getCurrentWindow } = await import("@tauri-apps/api/window");
@@ -955,6 +1044,7 @@ onMounted(async () => {
       void refreshKnownProjects();
       void loadPhasesEnabled();
       void refreshPhasePlans();
+      void loadTriageDigest();
     }
   });
 });
@@ -963,6 +1053,7 @@ onUnmounted(() => {
   if (unlistenLocale) unlistenLocale();
   if (unlistenTodos) unlistenTodos();
   if (unlistenFocus) unlistenFocus();
+  if (unlistenTriage) unlistenTriage();
 });
 </script>
 
@@ -974,6 +1065,60 @@ onUnmounted(() => {
       <div class="tw-title">
         <h1>{{ t("tasksTitle") }}</h1>
         <span class="tw-open">{{ openCount }} {{ t("todoOpenItems") }}</span>
+        <div v-if="triageDigest" class="tw-triage">
+          <button
+            class="tw-triage-chip"
+            :class="{ open: triageOpen }"
+            :title="t('triageAlertTitle')"
+            @click="triageOpen = !triageOpen"
+          >
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M5.5 2.5h5l2 2v9h-9v-11z" />
+              <path d="M6 7.5h4M6 10h2.5" />
+            </svg>
+            <span class="tw-triage-headline">{{ triageHeadline }}</span>
+            <span class="tw-triage-caret">›</span>
+          </button>
+
+          <template v-if="triageOpen">
+            <div class="tw-triage-backdrop" @click="triageOpen = false"></div>
+            <div class="tw-triage-pop">
+              <div class="tw-triage-pop-head">
+                <span class="tw-triage-pop-title">{{ t("triageAlertTitle") }}</span>
+                <span class="tw-triage-meta">
+                  <span v-if="triageDigest.project">{{ triageDigest.project }}</span>
+                  <span v-if="triageGeneratedLabel">{{ triageGeneratedLabel }}</span>
+                </span>
+              </div>
+              <p v-if="triageDigest.summary" class="tw-triage-summary">
+                {{ triageDigest.summary }}
+              </p>
+              <div v-if="!triageGroups.length" class="tw-triage-clean">
+                {{ t("triageCardClean") }}
+              </div>
+              <div v-for="g in triageGroups" :key="g.kind" class="tw-triage-group">
+                <div class="tw-triage-group-head" :class="`k-${g.kind}`">
+                  <span class="tw-triage-dot"></span>
+                  <span>{{ triageKindLabel(g.kind) }}</span>
+                  <span class="tw-triage-count">{{ g.items.length }}</span>
+                </div>
+                <ul class="tw-triage-list">
+                  <li v-for="(it, i) in g.items" :key="i" class="tw-triage-item">
+                    <a
+                      v-if="triageHasTask(it.number)"
+                      class="tw-ref tw-triage-ref"
+                      @click.prevent="triageGoToTask(it.number)"
+                      >#{{ it.number }}</a
+                    ><span v-else-if="it.number != null" class="tw-triage-num"
+                      >#{{ it.number }}</span
+                    ><span class="tw-triage-subject">{{ it.subject }}</span
+                    ><span v-if="it.note" class="tw-triage-note">{{ it.note }}</span>
+                  </li>
+                </ul>
+              </div>
+            </div>
+          </template>
+        </div>
       </div>
       <div class="tw-spacer"></div>
       <div class="tw-search">
@@ -2351,6 +2496,166 @@ onUnmounted(() => {
 .tw-ref-proj {
   color: #c4a7ff;
   background: rgba(179, 136, 255, 0.16);
+}
+
+/* Nightly-triage digest (#35): a chip beside the open-task count that expands
+   to a read-only popover; #N references inside jump to the task card. */
+.tw-triage {
+  position: relative;
+  display: inline-flex;
+}
+.tw-triage-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 280px;
+  padding: 3px 9px;
+  border: 1px solid var(--stroke-strong);
+  border-radius: 999px;
+  background: var(--card-bg);
+  color: var(--text-2);
+  font-family: var(--segoe);
+  font-size: 12px;
+  cursor: pointer;
+  transition:
+    background 120ms,
+    border-color 120ms;
+}
+.tw-triage-chip:hover,
+.tw-triage-chip.open {
+  background: var(--card-bg-hover);
+  border-color: var(--accent);
+}
+.tw-triage-chip svg {
+  flex: none;
+  color: var(--text-3);
+}
+.tw-triage-headline {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tw-triage-caret {
+  flex: none;
+  color: var(--text-3);
+  font-size: 14px;
+  line-height: 1;
+  transition: transform 120ms;
+}
+.tw-triage-chip.open .tw-triage-caret {
+  transform: rotate(90deg);
+}
+.tw-triage-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+}
+.tw-triage-pop {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 41;
+  width: 340px;
+  max-height: 60vh;
+  overflow-y: auto;
+  padding: 12px;
+  background: var(--card-bg);
+  border: 1px solid var(--stroke-strong);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.tw-triage-pop-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+.tw-triage-pop-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+.tw-triage-meta {
+  display: inline-flex;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-4);
+  white-space: nowrap;
+}
+.tw-triage-summary {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-2);
+}
+.tw-triage-clean {
+  font-size: 12px;
+  color: var(--text-3);
+}
+.tw-triage-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.tw-triage-group-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--text-2);
+}
+.tw-triage-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-3);
+  flex: none;
+}
+.tw-triage-group-head.k-overdue .tw-triage-dot {
+  background: #f87171;
+}
+.tw-triage-group-head.k-stale .tw-triage-dot {
+  background: var(--warning);
+}
+.tw-triage-group-head.k-no_priority .tw-triage-dot {
+  background: var(--text-3);
+}
+.tw-triage-group-head.k-suggestion .tw-triage-dot {
+  background: var(--accent);
+}
+.tw-triage-count {
+  color: var(--text-4);
+  font-weight: 400;
+}
+.tw-triage-list {
+  margin: 0;
+  padding: 0 0 0 13px;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.tw-triage-item {
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--text-2);
+}
+.tw-triage-num {
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+  margin-right: 5px;
+}
+.tw-triage-ref {
+  margin-right: 5px;
+}
+.tw-triage-note {
+  color: var(--text-3);
+  margin-left: 5px;
 }
 
 /* Inline-reference autocomplete menu */
