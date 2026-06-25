@@ -2,7 +2,7 @@
 import { ref, onMounted, onUnmounted, computed } from "vue";
 import { useI18n } from "vue-i18n";
 import { invoke } from "@tauri-apps/api/core";
-import SettingsPanel from "./components/SettingsPanel.vue";
+import SettingsWindow from "./components/SettingsWindow.vue";
 import UsagePanel from "./components/UsagePanel.vue";
 import MiniPanel from "./components/MiniPanel.vue";
 import AnalyticsPanel from "./components/AnalyticsPanel.vue";
@@ -28,6 +28,7 @@ import { useUpdater, initUpdater } from "./updater";
 const isMini = window.location.hash === "#mini";
 const isAnalytics = window.location.hash === "#analytics";
 const isTodos = window.location.hash === "#todos";
+const isSettings = window.location.hash === "#settings";
 
 export interface UsageTier {
     percent_used: number;
@@ -149,7 +150,6 @@ const runtimeInsightKinds = ref<string[]>(["long_session", "cold_rewrites"]);
 const systemInfoEnabled = ref(true);
 const uiFont = ref(DEFAULT_FONT_ID);
 const todaySpent = ref<number | null>(null);
-const suggestedBudget = ref<number | null>(null);
 const budgetUnit = computed<"usd" | "pct">(() =>
     ccAnalyticsEnabled.value ? "usd" : "pct",
 );
@@ -164,7 +164,6 @@ const sessionActive = computed(() => {
 const error = ref("");
 const errorReportable = ref(false);
 const loading = ref(false);
-const showSettings = ref(false);
 const showAbout = ref(false);
 
 interface DiagReport {
@@ -512,50 +511,6 @@ async function setMute(until: string | null) {
     await applyConfig();
 }
 
-// Daily budget that would spread the remaining weekly limit evenly until reset
-// (instead of burning it in one day). In % mode it's the leftover weekly % over
-// the days left; in $ mode we extrapolate the weekly $ ceiling from this week's
-// spend vs the weekly %, then spread the remainder.
-async function loadSuggestion() {
-    const wk = usage.value?.seven_day;
-    if (!configured.value || !wk?.reset_at) {
-        suggestedBudget.value = null;
-        return;
-    }
-    const end = new Date(wk.reset_at).getTime();
-    const daysLeft = (end - Date.now()) / 86400000;
-    if (daysLeft <= 0) {
-        suggestedBudget.value = null;
-        return;
-    }
-    if (budgetUnit.value === "pct") {
-        suggestedBudget.value = Math.max(100 - wk.percent_used, 0) / daysLeft;
-        return;
-    }
-    // $ mode: need enough weekly usage to extrapolate a ceiling reliably.
-    if (wk.percent_used < 1) {
-        suggestedBudget.value = null;
-        return;
-    }
-    try {
-        const from = new Date(end - 7 * 86400000).toISOString();
-        const to = new Date().toISOString();
-        const a = await invoke<{ totals: { cost: number } }>("get_analytics", {
-            from,
-            to,
-        });
-        const weekCost = a.totals.cost;
-        if (weekCost <= 0) {
-            suggestedBudget.value = null;
-            return;
-        }
-        const ceiling = weekCost / (wk.percent_used / 100);
-        suggestedBudget.value = Math.max(ceiling - weekCost, 0) / daysLeft;
-    } catch {
-        suggestedBudget.value = null;
-    }
-}
-
 async function refresh() {
     if (!configured.value) return;
     loading.value = true;
@@ -695,12 +650,15 @@ async function handleSave(settings: {
     // The backend re-arms its alert engine on disable (see `configure`).
     await saveSettings();
 
-    showSettings.value = false;
     // Analytics is unavailable once the opt-in is turned off.
     if (!ccAnalyticsEnabled.value) showAnalytics.value = false;
     await applyConfig();
     await loadTodaySpent();
     await loadForecast();
+    // Tell the settings window (and any other listener) to refresh its form from
+    // the canonical on-disk state we just wrote.
+    const { emit } = await import("@tauri-apps/api/event");
+    await emit("settings-changed");
 }
 
 // Runtime-insight settings save immediately (table checkboxes), so reconfigure
@@ -710,14 +668,21 @@ async function handleRuntimeChange(payload: { enabled: boolean; kinds: string[] 
     runtimeInsightKinds.value = [...payload.kinds];
     await saveSettings();
     if (configured.value) await applyConfig();
+    const { emit } = await import("@tauri-apps/api/event");
+    await emit("settings-changed");
 }
 
 function toggleAnalytics() {
     showAnalytics.value = !showAnalytics.value;
     if (showAnalytics.value) {
-        showSettings.value = false;
         showAbout.value = false;
     }
+}
+
+// Settings now live in their own window (issue #45). The gear opens it on the
+// tab that matches this screen; the window forwards saves back here.
+async function openSettings(tab: string) {
+    await invoke("open_settings_window", { tab });
 }
 
 async function openTodos() {
@@ -731,7 +696,6 @@ async function openTodos() {
 function toggleAbout() {
     showAbout.value = !showAbout.value;
     if (showAbout.value) {
-        showSettings.value = false;
         showAnalytics.value = false;
     }
 }
@@ -756,6 +720,7 @@ onMounted(async () => {
     if (isMini) return; // the mini window self-initializes via MiniPanel
     if (isAnalytics) return; // the analytics window has its own init flow
     if (isTodos) return; // the todos window self-initializes via TodoWindow
+    if (isSettings) return; // the settings window self-initializes via SettingsWindow
 
     await loadSettings();
 
@@ -770,7 +735,6 @@ onMounted(async () => {
                 errorReportable.value = false;
                 loading.value = false;
                 void loadTodaySpent();
-                void loadSuggestion();
                 void loadForecast();
             },
         ),
@@ -842,15 +806,21 @@ onMounted(async () => {
                 autoStartStatus.value = "";
             }
         }),
-        await listen("open-settings", () => {
-            showSettings.value = true;
+        // Saves come from the standalone settings window (issue #45). This window
+        // stays the single writer of settings.json + caller of `configure`.
+        await listen<Parameters<typeof handleSave>[0]>("settings-save", (e) => {
+            void handleSave(e.payload);
         }),
+        await listen<{ enabled: boolean; kinds: string[] }>(
+            "settings-runtime-change",
+            (e) => {
+                void handleRuntimeChange(e.payload);
+            },
+        ),
     );
 
     if (configured.value) {
         await applyConfig();
-    } else {
-        showSettings.value = true;
     }
 
     // Surface a diagnostic report left by a crash on the previous run (or a
@@ -873,6 +843,7 @@ onUnmounted(() => {
     <MiniPanel v-if="isMini" />
     <AnalyticsWindow v-else-if="isAnalytics" />
     <TodoWindow v-else-if="isTodos" />
+    <SettingsWindow v-else-if="isSettings" />
     <div v-else class="flyout accent-claude">
         <!-- Header -->
         <div class="fly-hd">
@@ -894,7 +865,7 @@ onUnmounted(() => {
                     class="icon-btn"
                     @click="toggleMini"
                     title="Mini widget"
-                    v-if="!showSettings && !showAbout && configured"
+                    v-if="!showAbout && configured"
                 >
                     <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
                         <rect x="1" y="5" width="14" height="8" rx="2" stroke-linecap="round"/>
@@ -906,7 +877,7 @@ onUnmounted(() => {
                     :class="{ spin: loading }"
                     @click="refresh"
                     :title="t('refresh')"
-                    v-if="!showSettings && !showAbout && configured"
+                    v-if="!showAbout && configured"
                 >
                     <svg
                         width="14"
@@ -929,7 +900,7 @@ onUnmounted(() => {
                     :class="{ active: showAnalytics }"
                     @click="toggleAnalytics"
                     :title="t('analytics')"
-                    v-if="!showSettings && !showAbout && configured && ccAnalyticsEnabled"
+                    v-if="!showAbout && configured && ccAnalyticsEnabled"
                 >
                     <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
                         <path d="M2 14V2" stroke-linecap="round"/>
@@ -943,7 +914,7 @@ onUnmounted(() => {
                     class="icon-btn"
                     @click="openTodos"
                     :title="t('tasks')"
-                    v-if="!showSettings && !showAbout"
+                    v-if="!showAbout"
                 >
                     <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
                         <path d="M2 4l1.3 1.3L6 2.5" stroke-linecap="round" stroke-linejoin="round"/>
@@ -968,7 +939,6 @@ onUnmounted(() => {
                     :class="{ active: showAbout }"
                     @click="toggleAbout"
                     :title="t('about')"
-                    v-if="!showSettings"
                 >
                     <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5">
                         <circle cx="8" cy="8" r="6.5" />
@@ -978,11 +948,10 @@ onUnmounted(() => {
                 </button>
                 <button
                     class="icon-btn"
-                    @click="showSettings = !showSettings; showAnalytics = false; showAbout = false"
-                    :title="showSettings ? t('back') : t('settings')"
+                    @click="openSettings('account')"
+                    :title="t('settings')"
                 >
                     <svg
-                        v-if="!showSettings"
                         width="14"
                         height="14"
                         viewBox="0 0 24 24"
@@ -993,21 +962,6 @@ onUnmounted(() => {
                             d="M19.43 12.98c.04-.32.07-.64.07-.98s-.03-.66-.07-.98l2.11-1.65c.19-.15.24-.42.12-.64l-2-3.46c-.12-.22-.39-.3-.61-.22l-2.49 1c-.52-.4-1.08-.73-1.69-.98l-.38-2.65C14.46 2.18 14.25 2 14 2h-4c-.25 0-.46.18-.49.42l-.38 2.65c-.61.25-1.17.59-1.69.98l-2.49-1c-.23-.09-.49 0-.61.22l-2 3.46c-.13.22-.07.49.12.64l2.11 1.65c-.04.32-.07.65-.07.98s.03.66.07.98l-2.11 1.65c-.19.15-.24.42-.12.64l2 3.46c.12.22.39.3.61.22l2.49-1c.52.4 1.08.73 1.69.98l-.38 2.65c-.03.24.18.42.43.42h4c.25 0 .46-.18.49-.42l.38-2.65c.61-.25 1.17-.59 1.69-.98l2.49 1c.23.09.49 0 .61-.22l2-3.46c.12-.22.07-.49-.12-.64l-2.11-1.65zM12 15.5c-1.93 0-3-1.07-3-3.5s1.07-3.5 3-3.5 3 1.07 3 3.5-1.07 3.5-3 3.5z"
                         />
                     </svg>
-                    <svg
-                        v-else
-                        width="14"
-                        height="14"
-                        viewBox="0 0 16 16"
-                        fill="none"
-                        stroke="currentColor"
-                        stroke-width="1.5"
-                    >
-                        <path
-                            d="M10 3L5 8l5 5"
-                            stroke-linecap="round"
-                            stroke-linejoin="round"
-                        />
-                    </svg>
                 </button>
             </div>
         </div>
@@ -1016,7 +970,7 @@ onUnmounted(() => {
 
         <!-- Status tray: Claude service health + 5h session activity -->
         <ServiceStatusBar
-            v-if="usage && !showSettings && !showAbout && (serviceStatusEnabled || sessionActive)"
+            v-if="usage && !showAbout && (serviceStatusEnabled || sessionActive)"
             :service-enabled="serviceStatusEnabled"
             :session-active="sessionActive"
         />
@@ -1082,45 +1036,8 @@ onUnmounted(() => {
             </div>
         </div>
 
-        <!-- Settings -->
-        <SettingsPanel
-            v-if="showSettings"
-            :session-key="sessionKey"
-            :org-id="orgId"
-            :refresh-interval="refreshInterval"
-            :auto-start-session="autoStartSession"
-            :session-thresholds="sessionThresholds"
-            :weekly-thresholds="weeklyThresholds"
-            :notifications-enabled="notificationsEnabled"
-            :notify-forecast-minutes="notifyForecastMinutes"
-            :forecast-window-minutes="forecastWindowMinutes"
-            :alert-tiers="alertTiers"
-            :alert-types="alertTypes"
-            :quiet-hours-enabled="quietHoursEnabled"
-            :quiet-hours-start="quietHoursStart"
-            :quiet-hours-end="quietHoursEnd"
-            :cc-analytics-enabled="ccAnalyticsEnabled"
-            :daily-budget-enabled="dailyBudgetEnabled"
-            :daily-budget="dailyBudget"
-            :suggested-budget="suggestedBudget"
-            :goal-cost-per-hour-max="goalCostPerHourMax"
-            :goal-error-rate-max="goalErrorRateMax"
-            :service-status-enabled="serviceStatusEnabled"
-            :service-status-interval="serviceStatusInterval"
-            :service-status-notify="serviceStatusNotify"
-            :memory-bloat-enabled="memoryBloatEnabled"
-            :todo-notifications-enabled="todoNotificationsEnabled"
-            :system-info-enabled="systemInfoEnabled"
-            :runtime-insights-enabled="runtimeInsightsEnabled"
-            :runtime-insight-kinds="runtimeInsightKinds"
-            :locale="locale"
-            :ui-font="uiFont"
-            @save="handleSave"
-            @runtime-change="handleRuntimeChange"
-        />
-
         <!-- Analytics -->
-        <AnalyticsPanel v-else-if="showAnalytics" :active="showAnalytics" />
+        <AnalyticsPanel v-if="showAnalytics" :active="showAnalytics" />
 
         <!-- About / What's new -->
         <AboutPanel v-else-if="showAbout" />
@@ -1137,7 +1054,7 @@ onUnmounted(() => {
                 </p>
                 <button
                     class="btn-primary"
-                    @click="showSettings = true"
+                    @click="openSettings('account')"
                     style="margin-top: 12px"
                 >
                     {{ t("configure") }}
