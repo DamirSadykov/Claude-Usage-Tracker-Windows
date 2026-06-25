@@ -85,6 +85,9 @@ export interface Phase {
 export interface PhasePlan {
   task_number: number;
   project: string;
+  // The plan's north star (README `## Vision`), surfaced read-only above the
+  // phase checklist. null when the section is empty / still the placeholder.
+  vision: string | null;
   phases: Phase[];
 }
 
@@ -1508,7 +1511,10 @@ onUnmounted(() => {
               <span v-else class="tw-richtext-empty">{{ t("todoNoDescription") }}</span>
             </div>
           </label>
-          <label class="tw-field">
+          <!-- The free-form plan note. Hidden once the task has a structured phase
+               plan (Vision + phases below ARE the plan) — kept only if it still holds
+               legacy text, so nothing is silently dropped. -->
+          <label v-if="!(phasesEnabled && phasesFor(detail)) || !!detail?.plan" class="tw-field">
             <span>{{ t("todoPlan") }} <em class="tw-hint">{{ t("todoPlanHint") }}</em></span>
             <textarea v-model="draft.plan" class="tw-input tw-area" rows="5"></textarea>
           </label>
@@ -1517,8 +1523,14 @@ onUnmounted(() => {
                The cc-phases CLI is the only writer; here it's display-only. -->
           <div v-if="phasesEnabled && phasesFor(detail)" class="tw-field tw-phases">
             <div class="tw-phases-hd">
-              <span>{{ t("phasesLabel") }}</span>
+              <span>{{ t("todoPlan") }}</span>
               <span class="tw-phases-prog">{{ phaseProgress(detail) }}</span>
+            </div>
+            <!-- The plan's north star (README ## Vision), read-only here; the
+                 cc-phases CLI / hook is the writer. Holds every phase to intent. -->
+            <div v-if="phasesFor(detail)?.vision" class="tw-vision">
+              <span class="tw-vision-label">★ {{ t("visionLabel") }}</span>
+              <p class="tw-vision-text">{{ phasesFor(detail)?.vision }}</p>
             </div>
             <ul class="tw-phase-list">
               <li v-for="ph in phasesFor(detail)?.phases ?? []" :key="ph.num" class="tw-phase">
@@ -1985,6 +1997,30 @@ onUnmounted(() => {
   background: var(--track);
   border-radius: 8px;
   padding: 0 6px;
+}
+.tw-vision {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  border-left: 2px solid var(--accent);
+  background: var(--card-bg);
+  border-radius: 4px;
+  padding: 6px 9px;
+  margin: 2px 0 4px;
+}
+.tw-vision-label {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--accent);
+}
+.tw-vision-text {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-2);
+  white-space: pre-wrap;
 }
 .tw-phase-list,
 .tw-sub-list {

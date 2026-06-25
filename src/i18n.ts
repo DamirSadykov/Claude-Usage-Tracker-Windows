@@ -154,6 +154,7 @@ const messages = {
     todoPlan: "Plan",
     todoPlanHint: "you write it — not generated",
     phasesLabel: "Phases",
+    visionLabel: "Vision",
     phasesSetting: "Phases in tasks",
     phasesSettingDesc:
       "Show phase checkboxes on task cards (parked here for now; moves to the tasks settings later).",
@@ -171,6 +172,11 @@ const messages = {
     taskCtxPrioLow: "Low and above",
     taskCtxPrioMedium: "Medium and above",
     taskCtxPrioHigh: "High only",
+    sessionCtxSetting: "Session context",
+    sessionCtxDesc:
+      "What a session leads with when the project has an active phase plan: the current phase (focused) or always the task board.",
+    sessionCtxPhase: "Active phase",
+    sessionCtxTasks: "Always tasks",
     todoProject: "Project",
     todoProjectPlaceholder: "e.g. my-app (optional)",
     todoShowDone: "Show done",
@@ -640,6 +646,7 @@ const messages = {
     todoPlan: "План",
     todoPlanHint: "пишешь ты — не генерируется",
     phasesLabel: "Фазы",
+    visionLabel: "Видение",
     phasesSetting: "Фазы в задачах",
     phasesSettingDesc:
       "Показывать чекбоксы фаз на карточках задач (пока здесь; позже переедет в настройки задач).",
@@ -657,6 +664,11 @@ const messages = {
     taskCtxPrioLow: "Низкий и выше",
     taskCtxPrioMedium: "Средний и выше",
     taskCtxPrioHigh: "Только высокий",
+    sessionCtxSetting: "Контекст сессии",
+    sessionCtxDesc:
+      "С чего начинать сессию, когда у проекта есть активный план фаз: с текущей фазы (фокус) или всегда с доски задач.",
+    sessionCtxPhase: "Активная фаза",
+    sessionCtxTasks: "Всегда задачи",
     todoProject: "Проект",
     todoProjectPlaceholder: "напр. my-app (необязательно)",
     todoShowDone: "Показать готовые",

@@ -234,19 +234,103 @@ function rewriteAllPhases(slug, ordered) {
   for (const p of ordered) writeAtomic(phaseFile(slug, p.num), serializePhase(p));
 }
 
-// The plan's title (first H1) and tracker link (`CC-task: #N`) from its README.
+// Scaffold placeholder for the README's `## Vision` section. Treated as "empty"
+// so the hook won't surface it and `verify` nudges you to fill it.
+const VISION_PLACEHOLDER =
+  "_(the goal and the intended flow — fill this before decomposing into phases)_";
+
+// The plan's Vision: the north-star prose the SessionStart hook surfaces into
+// EVERY session, so the overall intent/flow survives the one-phase-per-session
+// split (without it, a phase quietly redefines the task). Read from the README's
+// `## Vision` section (heading text "Vision" or "Видение"). Returns the trimmed
+// body, or null when the section is missing or still the scaffold placeholder.
+function extractVision(readmeText) {
+  if (!readmeText) return null;
+  const lines = readmeText.split(/\r?\n/);
+  // Heading whose text is "Vision"/"Видение", not just a prefix ("Visionary").
+  // A negative letter-lookahead — NOT \b, whose ASCII word-boundary fails after
+  // a Cyrillic heading ("Видение") and would silently drop the section.
+  let i = lines.findIndex((l) =>
+    /^#{1,6}\s+(vision|видение)(?![a-zа-яё])/i.test(l),
+  );
+  if (i < 0) return null;
+  const body = [];
+  for (i += 1; i < lines.length; i++) {
+    if (/^#{1,6}\s+/.test(lines[i])) break; // next heading ends the section
+    body.push(lines[i]);
+  }
+  const text = body
+    .join("\n")
+    .replace(/<!--[\s\S]*?-->/g, "") // drop the scaffold's guidance comment
+    .trim();
+  return !text || text === VISION_PLACEHOLDER ? null : text;
+}
+
+// Locate the README's `## Vision` section: the heading line index and the body
+// range [bodyStart, bodyEnd) up to the next heading or EOF. Null when absent.
+function locateVisionSection(lines) {
+  const head = lines.findIndex((l) =>
+    /^#{1,6}\s+(vision|видение)(?![a-zа-яё])/i.test(l),
+  );
+  if (head < 0) return null;
+  let end = head + 1;
+  while (end < lines.length && !/^#{1,6}\s+/.test(lines[end])) end++;
+  return { head, bodyStart: head + 1, bodyEnd: end };
+}
+
+// Write the README's `## Vision` section body (the only part of the otherwise
+// freeform README the CLI manages). Replaces the section body in place when the
+// heading exists; otherwise inserts a `## Vision` section after the CC-task line
+// (or the H1). Preserves the file's EOL style and everything outside the section.
+function writeVision(slug, body) {
+  let text;
+  try {
+    text = readFileSync(planReadme(slug), "utf8");
+  } catch {
+    fail(`plan "${slug}" has no README to hold a vision`);
+  }
+  const eol = text.includes("\r\n") ? "\r\n" : "\n";
+  const lines = text.split(/\r?\n/);
+  const bodyLines = String(body).split(/\r?\n/);
+  const loc = locateVisionSection(lines);
+  let next;
+  if (loc) {
+    next = [
+      ...lines.slice(0, loc.bodyStart),
+      ...bodyLines,
+      "",
+      ...lines.slice(loc.bodyEnd),
+    ];
+  } else {
+    let at = lines.findIndex((l) => /CC-task:/i.test(l));
+    if (at < 0) at = lines.findIndex((l) => /^#\s+/.test(l));
+    at = at < 0 ? 0 : at + 1;
+    next = [
+      ...lines.slice(0, at),
+      "",
+      "## Vision",
+      ...bodyLines,
+      "",
+      ...lines.slice(at),
+    ];
+  }
+  writeAtomic(planReadme(slug), next.join(eol));
+}
+
+// The plan's title (first H1), tracker link (`CC-task: #N`) and Vision from README.
 function readPlanMeta(slug) {
   let text = "";
   try {
     text = readFileSync(planReadme(slug), "utf8");
   } catch {
-    return { title: slug, task: null };
+    return { title: slug, task: null, vision: null };
   }
   const title = text.match(/^#\s+(.+)$/m);
   const task = text.match(/CC-task:\s*#?(\d+)/i);
   return {
     title: title ? title[1].trim() : slug,
     task: task ? Number(task[1]) : null,
+    vision: extractVision(text),
   };
 }
 
@@ -334,18 +418,35 @@ function cmdCreate(args) {
     "",
     `CC-task: #${task ?? "(none)"}`,
     "",
-    "> Notes on this plan — context, decisions, how to run the phases, gotchas.",
-    "> Add freely; the cli phases CLI does NOT overwrite this file after creation.",
+    "## Vision",
+    "<!-- The north star. The goal and the FLOW exactly as the task/spec describes",
+    "     it — the faithful intent, not a paraphrase. The SessionStart hook surfaces",
+    "     THIS into every session, so each phase is checked against the whole and a",
+    "     phase that drifts from the flow gets caught. Fill it BEFORE decomposing",
+    "     into phases. Keep it short — a few lines. -->",
+    VISION_PLACEHOLDER,
     "",
-    "Phases live in the sibling `Phase-N.md` files (one per phase). Manage them",
-    "with the cli phases CLI, not by hand.",
+    "## Phase index",
+    "<!-- Optional map of the phases against the vision — # · phase · what it",
+    "     unblocks · risk. Keeping it next to the Vision makes a drifting phase",
+    "     visible at a glance. -->",
+    "",
+    "## Notes",
+    "> Context, decisions, how to run the phases, gotchas. The cli phases CLI does",
+    "> NOT overwrite this file after creation — add freely. Phases live in the",
+    "> sibling `Phase-N.md` files (one per phase); manage them with the CLI, not",
+    "> by hand.",
     "",
   ].join("\n");
   writeAtomic(planReadme(slug), readme);
   ensureRootReadme();
+  const vision =
+    flags.vision != null && flags.vision !== true ? sanitize(flags.vision) : "";
+  if (vision) writeVision(slug, vision);
   process.stdout.write(
     `ok: created plan "${slug}"` +
       (task ? ` (CC-task #${task})` : " (no --task: it won't show on a task card)") +
+      (vision ? " — vision set" : "") +
       `\n`,
   );
 }
@@ -357,6 +458,12 @@ function cmdAdd(args) {
   if (!title) fail('usage: cli phases add "<title>" ["<desc>"] [--at <N>] [--plan <slug>]');
   const desc = sanitize(positional[1]);
   const slug = resolvePlan(flags);
+  // Decomposing before the Vision is written is how phases quietly redefine the
+  // task — nudge (don't block) when the FIRST phase lands with no north star set.
+  const visionNote =
+    phaseNums(slug).length === 0 && !readPlanMeta(slug).vision
+      ? '\n  ! Vision not set — you\'re decomposing before the north star is written. Set it: cli phases vision "<the goal and the intended flow>"'
+      : "";
   // --at <N>: INSERT at position N, shifting that phase and later ones down.
   // Without it, append after the last phase (the common case).
   if (flags.at != null && flags.at !== true) {
@@ -366,13 +473,13 @@ function cmdAdd(args) {
     const idx = Math.min(at - 1, plan.phases.length); // clamp past-the-end → append
     plan.phases.splice(idx, 0, { num: 0, title, desc, done: false, subs: [] });
     rewriteAllPhases(slug, plan.phases);
-    process.stdout.write(`ok: inserted Phase ${idx + 1} into "${slug}": ${title}\n`);
+    process.stdout.write(`ok: inserted Phase ${idx + 1} into "${slug}": ${title}${visionNote}\n`);
     return;
   }
   const nums = phaseNums(slug);
   const num = (nums.length ? Math.max(...nums) : 0) + 1;
   writeAtomic(phaseFile(slug, num), serializePhase({ num, title, desc, done: false, subs: [] }));
-  process.stdout.write(`ok: added Phase ${num} to "${slug}": ${title}\n`);
+  process.stdout.write(`ok: added Phase ${num} to "${slug}": ${title}${visionNote}\n`);
 }
 
 function cmdAddSub(args) {
@@ -504,8 +611,13 @@ function cmdVerify(args) {
   const slug = resolvePlan(flags);
   const plan = loadPlan(slug);
   const problems = [];
+  const warnings = [];
   if (plan.task == null)
     problems.push('README has no "CC-task: #N" link — it won\'t show on a task card');
+  if (!plan.vision)
+    warnings.push(
+      'README "## Vision" section is empty — the SessionStart hook has no north star to surface; fill it so the phases stay true to the plan\'s intent',
+    );
   for (const p of plan.phases) {
     const seen = new Set();
     for (const s of p.subs) {
@@ -519,9 +631,9 @@ function cmdVerify(args) {
   if (problems.length)
     fail(`verify FAILED for "${slug}":\n  - ` + problems.join("\n  - "));
   const subs = plan.phases.reduce((n, p) => n + p.subs.length, 0);
-  process.stdout.write(
-    `ok: "${slug}" valid — CC-task #${plan.task}, ${plan.phases.length} phase(s), ${subs} subphase(s)\n`,
-  );
+  let msg = `ok: "${slug}" valid — CC-task #${plan.task}, ${plan.phases.length} phase(s), ${subs} subphase(s)`;
+  if (warnings.length) msg += "\n  ! " + warnings.join("\n  ! ");
+  process.stdout.write(msg + "\n");
 }
 
 function cmdList(args) {
@@ -549,6 +661,7 @@ function cmdList(args) {
   }
   const mark = (d) => (d ? "[x]" : "[ ]");
   const out = [`${plan.slug} (CC-task #${plan.task ?? "?"}):`];
+  if (plan.vision) out.push(`  ★ vision: ${plan.vision.replace(/\s+/g, " ")}`);
   for (const p of plan.phases) {
     out.push(`  ${mark(p.done)} ${p.num}. ${p.title}${p.desc ? ` — ${p.desc}` : ""}`);
     for (const s of p.subs) {
@@ -556,6 +669,33 @@ function cmdList(args) {
     }
   }
   process.stdout.write(out.join("\n") + "\n");
+}
+
+// Set / show / clear the plan's Vision — the north star the SessionStart hook
+// surfaces into every session, stored as the README's `## Vision` section. The
+// counterpart to handoff: handoff is the per-session baton, vision is the whole
+// plan's fixed intent.
+//   vision "<text>"   set it   |   vision   show it   |   vision --clear   reset
+function cmdVision(args) {
+  const { positional, flags } = parseArgs(args);
+  const slug = resolvePlan(flags);
+  if (flags.clear) {
+    writeVision(slug, VISION_PLACEHOLDER);
+    process.stdout.write(`ok: vision cleared for "${slug}"\n`);
+    return;
+  }
+  const text = sanitize(positional[0]);
+  if (!text) {
+    const v = readPlanMeta(slug).vision;
+    process.stdout.write(
+      v
+        ? v + "\n"
+        : `(no vision set for "${slug}" — set it with: cli phases vision "<the goal and the intended flow>")\n`,
+    );
+    return;
+  }
+  writeVision(slug, text);
+  process.stdout.write(`ok: vision saved for "${slug}"\n`);
 }
 
 // Set / show / clear the plan's handoff baton — a one-line note for whoever
@@ -590,7 +730,7 @@ function cmdHandoff(args) {
 function usage(code) {
   process.stdout.write(
     "cli phases - break a task into ordered phases (folder per plan in <project>/.claude/phases/)\n\n" +
-      '  create "<English title>" [--task <N>]   new plan folder (title → folder name)\n' +
+      '  create "<English title>" [--task <N>] [--vision "<text>"]   new plan folder\n' +
       '  add "<title>" ["<desc>"] [--at <N>] [--plan <slug>]   new phase (--at = insert at pos N)\n' +
       '  add-sub "<title>" ["<text>"] [--phase <N>] [--plan <slug>]\n' +
       "  done <loc> [--plan <slug>]      loc = N (phase) or N.k (subphase)\n" +
@@ -601,6 +741,7 @@ function usage(code) {
       "  renumber [--plan <slug>]        compact phase numbers to 1..n (fix gaps)\n" +
       "  verify [--plan <slug>]          integrity self-check\n" +
       "  list [--plan <slug>] [--json]\n" +
+      '  vision ["<text>"] [--clear] [--plan <slug>]    north star (README ## Vision; hook surfaces it)\n' +
       '  handoff ["<text>"] [--clear] [--plan <slug>]   baton for the next session\n\n' +
       "--plan is the plan folder name; optional when only one plan exists.\n",
   );
@@ -651,6 +792,9 @@ export function run(args) {
     case "handoff":
       cmdHandoff(rest);
       break;
+    case "vision":
+      cmdVision(rest);
+      break;
     case undefined:
     case "-h":
     case "--help":
@@ -684,12 +828,14 @@ export function readPlansForHook(root) {
 
     let task = null;
     let title = slug;
+    let vision = null;
     try {
       const meta = readFileSync(path.join(dir, "README.md"), "utf8");
       const t = meta.match(/CC-task:\s*#?(\d+)/i);
       if (t) task = Number(t[1]);
       const h = meta.match(/^#\s+(.+)$/m);
       if (h) title = h[1].trim();
+      vision = extractVision(meta);
     } catch {
       // no README → still report the plan by its folder name
     }
@@ -732,6 +878,7 @@ export function readPlansForHook(root) {
       slug,
       title,
       task,
+      vision,
       total: phases.length,
       done: phases.filter((p) => p.done).length,
       current,
