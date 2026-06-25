@@ -1628,6 +1628,28 @@ fn open_todo_window(app: AppHandle) {
     }
 }
 
+/// Show the shared Settings window (declared hidden in tauri.conf.json) and tell
+/// it which tab to open. Every screen's gear routes here, so settings live in one
+/// canonical window instead of inline in each. `tab` falls back to "account".
+fn show_settings_window(app: &AppHandle, tab: Option<String>) {
+    if let Some(win) = app.get_webview_window("settings") {
+        let _ = win.unminimize();
+        let _ = win.show();
+        let _ = win.set_focus();
+        // The window is created hidden at startup, so its `settings-open` listener
+        // is already registered by the time any gear is clicked (same pattern as
+        // the todos-locale push). Emit after show so it switches tab immediately.
+        let _ = win.emit("settings-open", tab.unwrap_or_else(|| "account".into()));
+    } else {
+        warn!("settings window not found");
+    }
+}
+
+#[tauri::command]
+fn open_settings_window(app: AppHandle, tab: Option<String>) {
+    show_settings_window(&app, tab);
+}
+
 /// Background watcher: poll `todos.json`'s mtime and, on change, (1) emit
 /// `todos-file-changed` so an open Todo window can live-reload, and (2) diff the
 /// file against [`TodoSnapshot`] to fire a `todo-status-alert` when a todo moves
@@ -1817,10 +1839,7 @@ pub fn run() {
                         }
                     }
                     "settings" => {
-                        if let Some(window) = app.get_webview_window("main") {
-                            show_flyout(&window, None);
-                            let _ = window.emit("open-settings", ());
-                        }
+                        show_settings_window(app, None);
                     }
                     "mini" => {
                         if let Some(window) = app.get_webview_window("mini") {
@@ -1908,6 +1927,18 @@ pub fn run() {
                 });
             }
 
+            // Settings window: same hide-on-[X] so `open_settings_window` always
+            // re-shows the one live webview (preserves its loaded state + listener).
+            if let Some(window) = app.get_webview_window("settings") {
+                let w = window.clone();
+                window.on_window_event(move |event| {
+                    if let WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = w.hide();
+                    }
+                });
+            }
+
             spawn_poll_loop(app.handle().clone(), notify);
             spawn_status_loop(app.handle().clone());
             spawn_sysmon_loop(app.handle().clone());
@@ -1962,6 +1993,7 @@ pub fn run() {
             set_todo_status,
             get_phase_plans,
             open_todo_window,
+            open_settings_window,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

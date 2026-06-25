@@ -30,9 +30,10 @@ const TYPE_LABELS: Record<AlertTypeKey, string> = {
 
 const { t } = useI18n();
 
-// Settings are grouped into topic tabs. A future iteration may promote this to
-// a dedicated settings window with the same sections (see issue discussion).
-type SettingsTab = "account" | "limits" | "notifications" | "budget" | "insights" | "updates";
+// Settings are grouped into topic tabs. The panel now lives in a dedicated
+// settings window (issue #45); each screen's gear opens it on a matching tab via
+// the `openTab` prop (the window forwards the backend's `settings-open` event).
+type SettingsTab = "account" | "limits" | "notifications" | "budget" | "insights" | "tasks" | "updates";
 const tab = ref<SettingsTab>("account");
 
 const {
@@ -46,6 +47,9 @@ const {
 
 
 const props = defineProps<{
+  // Which tab to show. Driven by the gear that opened the window; user clicks
+  // still switch tabs freely afterwards (this only forces it on (re)open).
+  openTab?: SettingsTab;
   sessionKey: string;
   orgId: string;
   refreshInterval: number;
@@ -198,6 +202,12 @@ watch(() => props.todoNotificationsEnabled, (v) => (localTodoNotify.value = v));
 watch(() => props.systemInfoEnabled, (v) => (localSystemInfo.value = v));
 watch(() => props.locale, (v) => (localLocale.value = v));
 watch(() => props.uiFont, (v) => (localFont.value = v));
+
+// Honour the requested tab on mount and whenever the host re-opens with a new
+// one (clicking a different screen's gear). Same value won't re-fire — harmless,
+// the panel is already on it.
+if (props.openTab) tab.value = props.openTab;
+watch(() => props.openTab, (v) => { if (v) tab.value = v; });
 
 // --- Insights toggles ---
 // We mirror AnalyticsWindow.vue's pattern: read/write `ignoredInsights` in
@@ -539,6 +549,20 @@ function handleSave() {
       <button
         type="button"
         class="settings-tab"
+        :class="{ active: tab === 'tasks' }"
+        @click="tab = 'tasks'"
+      >
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4">
+          <path d="M2 4l1.3 1.3L6 2.5" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M2 11l1.3 1.3L6 9.5" stroke-linecap="round" stroke-linejoin="round"/>
+          <line x1="8.5" y1="4" x2="14" y2="4" stroke-linecap="round"/>
+          <line x1="8.5" y1="11" x2="14" y2="11" stroke-linecap="round"/>
+        </svg>
+        <span>{{ t('tabTasks') }}</span>
+      </button>
+      <button
+        type="button"
+        class="settings-tab"
         :class="{ active: tab === 'updates' }"
         @click="tab = 'updates'"
       >
@@ -550,6 +574,7 @@ function handleSave() {
       </button>
     </div>
 
+    <div class="settings-content">
     <div class="cards">
       <!-- ===== Account ===== -->
       <template v-if="tab === 'account'">
@@ -1061,7 +1086,10 @@ function handleSave() {
           @change="saveUpdaterSettings()"
         />
       </div>
+      </template>
 
+      <!-- ===== Tasks ===== -->
+      <template v-if="tab === 'tasks'">
       <!-- Install the cc-todos CLI + SessionStart hook into ~/.claude/settings.json -->
       <div class="card" style="display: flex; align-items: center; gap: 12px">
         <div style="flex: 1; min-width: 0">
@@ -1077,8 +1105,7 @@ function handleSave() {
         </button>
       </div>
 
-      <!-- Phases in tasks (issue #16) — parked here for now; moves to the tasks
-           settings later. UI-only flag in settings.json. -->
+      <!-- Phases in tasks (issue #16) — UI-only flag in settings.json. -->
       <div class="card toggle-card" @click="togglePhasesEnabled">
         <div style="flex: 1; min-width: 0">
           <div class="card-title" style="font-size: 13px">{{ t('phasesSetting') }}</div>
@@ -1119,10 +1146,11 @@ function handleSave() {
       </template>
     </div>
 
-    <div style="padding: 8px 10px 12px">
+    <div class="settings-save-bar">
       <button type="submit" class="save-btn" :disabled="!localSessionKey || !localOrgId">
         {{ t('save') }}
       </button>
+    </div>
     </div>
   </form>
 </template>
@@ -1130,33 +1158,48 @@ function handleSave() {
 <style scoped>
 .settings-form {
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
   flex: 1;
   min-height: 0;
 }
 
+/* Right side: scrollable cards + the save bar pinned under them. */
+.settings-content {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* Left side: a vertical tab rail. */
 .settings-tabs {
   display: flex;
+  flex-direction: column;
   gap: 2px;
-  padding: 8px 10px 2px;
+  padding: 10px 8px;
   flex-shrink: 0;
+  width: 150px;
+  overflow-y: auto;
+  border-right: 1px solid var(--stroke-strong);
 }
 
 .settings-tab {
-  flex: 1;
-  min-width: 0;
+  width: 100%;
   display: flex;
-  flex-direction: column;
+  flex-direction: row;
   align-items: center;
-  gap: 4px;
-  padding: 7px 2px;
+  justify-content: flex-start;
+  gap: 10px;
+  padding: 9px 10px;
   border: none;
   border-radius: 6px;
   background: transparent;
   color: var(--text-3);
-  font-size: 10.5px;
+  font-size: 12.5px;
   font-family: var(--segoe);
   white-space: nowrap;
+  text-align: left;
   cursor: pointer;
   transition: background 120ms, color 120ms;
 }
@@ -1467,6 +1510,11 @@ function handleSave() {
 .lang-btn.active {
   background: var(--accent);
   color: white;
+}
+
+.settings-save-bar {
+  padding: 8px 10px 12px;
+  flex-shrink: 0;
 }
 
 .save-btn {

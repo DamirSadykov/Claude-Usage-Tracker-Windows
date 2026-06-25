@@ -693,6 +693,11 @@ async function copyExport() {
   } catch {}
 }
 
+// Open the shared settings window on the Budget tab (issue #45).
+async function openSettings() {
+  await invoke("open_settings_window", { tab: "budget" });
+}
+
 // Largest per-row metric (cost) — scales the costly-session bars.
 function maxCost(rows: SessionUsage[]): number {
   return rows.reduce((m, r) => (r.cost > m ? r.cost : m), 0);
@@ -1148,6 +1153,12 @@ onUnmounted(() => {
         </label>
         <button class="aw-export" @click="doExport" :title="t('exportJsonHint')">
           {{ t("exportJson") }}
+        </button>
+        <button class="aw-settings" @click="openSettings" :title="t('settings')">
+          <svg width="15" height="15" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4">
+            <circle cx="8" cy="8" r="2.2" />
+            <path d="M8 1.5v1.8M8 12.7v1.8M14.5 8h-1.8M3.3 8H1.5M12.6 3.4l-1.3 1.3M4.7 11.3l-1.3 1.3M12.6 12.6l-1.3-1.3M4.7 4.7L3.4 3.4" stroke-linecap="round" />
+          </svg>
         </button>
       </div>
     </header>
@@ -1904,6 +1915,25 @@ onUnmounted(() => {
 }
 .aw-export:hover {
   filter: brightness(1.1);
+}
+
+/* Settings gear — secondary icon button next to Export. */
+.aw-settings {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--stroke-strong);
+  background: transparent;
+  color: var(--text-2);
+  border-radius: var(--card-radius);
+  padding: 5px 8px;
+  cursor: pointer;
+  transition: background 120ms, border-color 120ms, color 120ms;
+}
+.aw-settings:hover {
+  border-color: var(--accent);
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.05);
 }
 
 /* Tab bar under the header — one row of buttons, the active one gets an accent

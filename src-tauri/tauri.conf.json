@@ -63,6 +63,19 @@
         "center": true,
         "visible": false,
         "dragDropEnabled": false
+      },
+      {
+        "label": "settings",
+        "url": "index.html#settings",
+        "title": "Claude Usage — Settings",
+        "width": 680,
+        "height": 780,
+        "minWidth": 560,
+        "minHeight": 540,
+        "resizable": true,
+        "decorations": true,
+        "center": true,
+        "visible": false
       }
     ],
     "trayIcon": {
