@@ -64,6 +64,24 @@ function contextMinRank(appData) {
   return MIN.medium;
 }
 
+// The "session context" setting (settings.json, written by SettingsPanel) chooses
+// what a session LEADS WITH when the project is mid-plan: "phase" (default) — the
+// current phase, focused, board held back; or "tasks" — always the task board,
+// even mid-plan. Read-only and forgiving: missing/bad/unknown falls back to "phase".
+function sessionContextMode(appData) {
+  try {
+    const raw = readFileSync(
+      path.join(appData, "com.claude-usage-tracker.app", "settings.json"),
+      "utf8",
+    );
+    const v = JSON.parse(raw).sessionContext;
+    if (v === "tasks" || v === "phase") return v;
+  } catch {
+    // no settings file / bad JSON / missing key → default
+  }
+  return "phase";
+}
+
 // Local calendar date as YYYY-MM-DD — "today" is the USER's day, not UTC (a
 // scheduled_for date is a plain local date). Used to surface due/overdue tasks.
 function localToday() {
@@ -129,7 +147,9 @@ function main() {
   } catch {
     phasePlans = [];
   }
-  if (phasePlans.length) {
+  // Phase mode is the default lead when the project is mid-plan, but the user can
+  // force the task board instead via the "session context" setting.
+  if (phasePlans.length && sessionContextMode(appData) === "phase") {
     process.stdout.write(
       phaseModeContext(project, todos, active, file, phasePlans) + "\n",
     );

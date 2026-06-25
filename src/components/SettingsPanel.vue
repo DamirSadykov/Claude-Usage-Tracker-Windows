@@ -368,6 +368,38 @@ async function setTaskCtxPrio(v: string) {
 
 onMounted(loadTaskCtxPrio);
 
+// What a session LEADS WITH when the project is mid-plan: "phase" (the current
+// phase, focused) or "tasks" (always the task board). UI-only flag in settings.json
+// read by the SessionStart hook (like taskContextPriority). Default "phase".
+const SESSION_CTX_MODES = ["phase", "tasks"] as const;
+const sessionCtx = ref<string>("phase");
+
+function sessionCtxLabel(m: string): string {
+  return m === "tasks" ? t("sessionCtxTasks") : t("sessionCtxPhase");
+}
+
+async function loadSessionCtx() {
+  try {
+    const { load: loadStore } = await import("@tauri-apps/plugin-store");
+    const store = await loadStore("settings.json");
+    const v = await store.get<string>("sessionContext");
+    if (typeof v === "string" && (SESSION_CTX_MODES as readonly string[]).includes(v))
+      sessionCtx.value = v;
+  } catch {}
+}
+
+async function setSessionCtx(v: string) {
+  sessionCtx.value = v;
+  try {
+    const { load: loadStore } = await import("@tauri-apps/plugin-store");
+    const store = await loadStore("settings.json");
+    await store.set("sessionContext", v);
+    await store.save();
+  } catch {}
+}
+
+onMounted(loadSessionCtx);
+
 // Keep each threshold triple strictly ascending with a 1% gap so the colour
 // bands can't overlap. Fixed slider scale (5..99) + clamping — dynamic min/max
 // would make neighbouring thumbs visually drift when their range changes.
@@ -1069,6 +1101,20 @@ function handleSave() {
           <option v-for="lv in TASK_CTX_LEVELS" :key="lv" :value="lv">{{ taskCtxPrioLabel(lv) }}</option>
         </select>
         <div class="field-hint">{{ t('taskCtxPrioDesc') }}</div>
+      </div>
+
+      <!-- Session context (phase vs tasks) — UI-only flag in settings.json, read by
+           the SessionStart hook to choose what a mid-plan session leads with. -->
+      <div class="card">
+        <div class="field-label">{{ t('sessionCtxSetting') }}</div>
+        <select
+          class="field-input"
+          :value="sessionCtx"
+          @change="setSessionCtx(($event.target as HTMLSelectElement).value)"
+        >
+          <option v-for="m in SESSION_CTX_MODES" :key="m" :value="m">{{ sessionCtxLabel(m) }}</option>
+        </select>
+        <div class="field-hint">{{ t('sessionCtxDesc') }}</div>
       </div>
       </template>
     </div>
