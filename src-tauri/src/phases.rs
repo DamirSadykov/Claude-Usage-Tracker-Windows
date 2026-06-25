@@ -58,6 +58,9 @@ pub struct Phase {
 pub struct Plan {
     pub task_number: u32,
     pub project: String,
+    /// The plan's north star, from the README's `## Vision` section. None when the
+    /// section is absent or still the scaffold placeholder.
+    pub vision: Option<String>,
     pub phases: Vec<Phase>,
 }
 
@@ -142,9 +145,8 @@ pub fn parse_phase(text: &str, num: u32) -> Phase {
 
 /// The tracker task number from a plan README's `CC-task: #N` line. None when
 /// absent (e.g. `CC-task: #(none)`), which means the plan isn't shown on a card.
-fn read_plan_task(plan_dir: &Path) -> Option<u32> {
-    let text = std::fs::read_to_string(plan_dir.join("README.md")).ok()?;
-    for line in text.lines() {
+fn read_task(readme: &str) -> Option<u32> {
+    for line in readme.lines() {
         if let Some(idx) = line.find("CC-task:") {
             let digits: String = line[idx + "CC-task:".len()..]
                 .chars()
@@ -157,6 +159,79 @@ fn read_plan_task(plan_dir: &Path) -> Option<u32> {
         }
     }
     None
+}
+
+/// Scaffold placeholder for the README's `## Vision` section — treated as "no
+/// vision". Must match `VISION_PLACEHOLDER` in scripts/cli/phases.mjs.
+const VISION_PLACEHOLDER: &str =
+    "_(the goal and the intended flow — fill this before decomposing into phases)_";
+
+/// A line that opens a Markdown section: 1–6 leading `#` then whitespace.
+fn is_heading(line: &str) -> bool {
+    let hashes = line.bytes().take_while(|&b| b == b'#').count();
+    (1..=6).contains(&hashes) && line[hashes..].starts_with(char::is_whitespace)
+}
+
+/// A `## Vision` / `## Видение` heading: the section text is exactly the word
+/// (not a prefix like "Visionary"), case-insensitive. Mirrors the negative
+/// letter-lookahead in the CLI's `extractVision`.
+fn is_vision_heading(line: &str) -> bool {
+    if !is_heading(line) {
+        return false;
+    }
+    let hashes = line.bytes().take_while(|&b| b == b'#').count();
+    let rest = line[hashes..].trim_start().to_lowercase();
+    for kw in ["vision", "видение"] {
+        if let Some(after) = rest.strip_prefix(kw) {
+            if !after.chars().next().is_some_and(char::is_alphabetic) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Remove every `<!-- … -->` block (the scaffold's guidance comment), spanning
+/// lines. An unterminated comment drops the rest, matching the CLI's regex strip.
+fn strip_html_comments(s: &str) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(start) = rest.find("<!--") {
+        out.push_str(&rest[..start]);
+        match rest[start..].find("-->") {
+            Some(end) => rest = &rest[start + end + 3..],
+            None => {
+                rest = "";
+                break;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The plan's Vision — north-star prose from the README's `## Vision` section
+/// (heading "Vision" or "Видение"), body up to the next heading or EOF, with the
+/// guidance comment stripped. None when absent or still the scaffold placeholder.
+/// Mirrors `extractVision` in scripts/cli/phases.mjs.
+fn extract_vision(readme: &str) -> Option<String> {
+    let lines: Vec<&str> = readme.lines().collect();
+    let head = lines.iter().position(|l| is_vision_heading(l))?;
+    let mut body = String::new();
+    for line in &lines[head + 1..] {
+        if is_heading(line) {
+            break;
+        }
+        body.push_str(line);
+        body.push('\n');
+    }
+    let body = strip_html_comments(&body);
+    let body = body.trim();
+    if body.is_empty() || body == VISION_PLACEHOLDER {
+        None
+    } else {
+        Some(body.to_string())
+    }
 }
 
 /// Every `Phase-<n>.md` in a plan folder, parsed and sorted by number.
@@ -202,12 +277,14 @@ pub fn read_plans(project_basename: &str, project_path: &Path) -> Vec<Plan> {
         if !path.is_dir() {
             continue; // skip the root README.md
         }
-        let Some(task_number) = read_plan_task(&path) else {
+        let readme = std::fs::read_to_string(path.join("README.md")).unwrap_or_default();
+        let Some(task_number) = read_task(&readme) else {
             continue; // plan not linked to a tracker task → nothing to show on a card
         };
         out.push(Plan {
             task_number,
             project: project_basename.to_string(),
+            vision: extract_vision(&readme),
             phases: read_phase_files(&path),
         });
     }
@@ -349,7 +426,32 @@ mod tests {
         assert_eq!(plans[0].phases.len(), 2);
         assert_eq!(plans[0].phases[0].num, 1);
         assert!(plans[0].phases[0].subs[0].done);
+        assert_eq!(plans[0].vision, None); // README has no `## Vision` section
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn extracts_vision_section() {
+        // filled; section ends at the next heading
+        let md = "# T\n\nCC-task: #1\n\n## Vision\nцель и flow\n\n## Notes\nx\n";
+        assert_eq!(extract_vision(md).as_deref(), Some("цель и flow"));
+        // Cyrillic heading must match (the CLI had an ASCII-\b bug here)
+        assert_eq!(
+            extract_vision("# T\n\n## Видение\nкраулим\n").as_deref(),
+            Some("краулим"),
+        );
+        // still the scaffold placeholder → no vision
+        let ph = format!("# T\n\n## Vision\n{VISION_PLACEHOLDER}\n");
+        assert_eq!(extract_vision(&ph), None);
+        // "Visionary" is a prefix, not the Vision heading
+        assert_eq!(extract_vision("# T\n\n## Visionary outlook\nno\n"), None);
+        // runs to EOF; the guidance comment is stripped
+        assert_eq!(
+            extract_vision("# T\n\n## Vision\n<!-- guide -->\nlast to eof\n").as_deref(),
+            Some("last to eof"),
+        );
+        // no section at all
+        assert_eq!(extract_vision("# T\n\n## Notes\nnothing\n"), None);
     }
 
     #[test]

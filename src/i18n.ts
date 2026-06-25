@@ -154,6 +154,7 @@ const messages = {
     todoPlan: "Plan",
     todoPlanHint: "you write it — not generated",
     phasesLabel: "Phases",
+    visionLabel: "Vision",
     phasesSetting: "Phases in tasks",
     phasesSettingDesc:
       "Show phase checkboxes on task cards (parked here for now; moves to the tasks settings later).",
@@ -625,6 +626,7 @@ const messages = {
     todoPlan: "План",
     todoPlanHint: "пишешь ты — не генерируется",
     phasesLabel: "Фазы",
+    visionLabel: "Видение",
     phasesSetting: "Фазы в задачах",
     phasesSettingDesc:
       "Показывать чекбоксы фаз на карточках задач (пока здесь; позже переедет в настройки задач).",
