@@ -282,6 +282,13 @@ function phaseModeContext(project, todos, active, file, plans) {
     lines.push(
       `- plan "${p.slug}" (${link}): phase ${p.current.num}/${p.total} "${p.current.title}"${next}`,
     );
+    if (p.vision) {
+      const v = p.vision.replace(/\s+/g, " ").trim();
+      const capped = v.length > 500 ? v.slice(0, 500) + "…" : v;
+      lines.push(
+        `  ★ vision (the plan's north star — keep this phase true to it; if it pulls away, stop and flag it): ${capped}`,
+      );
+    }
     if (p.handoff) lines.push(`  ↪ handoff from last session: ${p.handoff}`);
   }
 
