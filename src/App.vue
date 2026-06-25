@@ -76,6 +76,29 @@ export interface ForecastData {
     extra_usage: TierForecast | null;
 }
 
+// One line in a nightly-triage digest (#35): a finding the agent surfaced or an
+// advisory move it proposed. `number`/`id` loosely tie it back to a todo; either
+// may be absent for a board-wide note. Mirrors triage.rs::DigestItem.
+export interface DigestItem {
+    kind: string;
+    number?: number;
+    id?: string;
+    subject: string;
+    note: string;
+}
+
+// The latest nightly-triage digest, read from triage-digest.json. Read-only on
+// the tracker side — the triage agent owns writes via the cc-triage CLI. Mirrors
+// triage.rs::TriageDigest.
+export interface TriageDigest {
+    version: number;
+    generated_at: string;
+    project?: string | null;
+    headline: string;
+    summary: string;
+    items: DigestItem[];
+}
+
 const { t, locale } = useI18n();
 
 const {
@@ -421,6 +444,22 @@ async function todoToast(a: {
     await notify(title, body);
 }
 
+// A fresh nightly-triage digest (#35) landed. The backend already debounced by
+// the digest timestamp and gated on the task-board toggle; here we just honour an
+// active mute and show the digest's own headline (falling back to a generic line
+// if the run left it empty).
+async function triageToast(a: { headline: string; project: string }) {
+    if (
+        notificationsMutedUntil.value &&
+        Date.now() < new Date(notificationsMutedUntil.value).getTime()
+    ) {
+        return;
+    }
+    const headline = a.headline?.trim() || t("triageAlertEmpty");
+    const body = a.project ? `${headline} · ${a.project}` : headline;
+    await notify(t("triageAlertTitle"), body);
+}
+
 // Consumption since local midnight, in the unit implied by ccAnalyticsEnabled
 // ($ from CC analytics, else % of the weekly limit). Uses existing commands.
 async function loadTodaySpent() {
@@ -762,6 +801,12 @@ onMounted(async () => {
             "todo-status-alert",
             (e) => {
                 void todoToast(e.payload);
+            },
+        ),
+        await listen<{ headline: string; project: string }>(
+            "triage-alert",
+            (e) => {
+                void triageToast(e.payload);
             },
         ),
         await listen<string>("project-resolved", async (e) => {

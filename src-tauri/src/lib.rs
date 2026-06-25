@@ -9,6 +9,8 @@ pub mod stats;
 pub mod status;
 pub mod sysmon;
 pub mod todos;
+pub mod triage;
+pub mod triage_schedule;
 pub mod usage;
 
 use std::collections::{HashMap, HashSet};
@@ -752,6 +754,132 @@ fn spawn_memory_loop(app: AppHandle) {
     });
 }
 
+// --- Nightly-triage watch (#35): notify when a fresh digest lands ---
+
+/// Emitted when a fresh nightly-triage digest is written, so the frontend can
+/// raise a desktop notification. Mirrors the `memory-alert` / `service-alert`
+/// flow. The body is the digest's own `headline`; `project` is the board it
+/// covered (may be empty for a board-wide note).
+#[derive(Serialize, Clone)]
+struct TriageAlert {
+    headline: String,
+    project: String,
+}
+
+/// The digest is rewritten at most once a night, so a relaxed cadence is plenty —
+/// like the memory watch, this only reads one small file per tick.
+const TRIAGE_CHECK_INTERVAL: Duration = Duration::from_secs(120);
+
+fn spawn_triage_loop(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let path = match triage_digest_path(&app) {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        // The `generated_at` of the digest we last saw. A fresh run carries a new
+        // timestamp, so the same digest never fires twice. `None` = nothing seen
+        // yet.
+        let mut last_seen: Option<String> = None;
+        // The first pass only records a baseline. A digest already on disk at
+        // startup is shown by the in-app card (Phase 3); firing a desktop
+        // notification on every app launch for an already-written digest would be
+        // noise. The notification's value is "a fresh triage landed while you were
+        // working".
+        let mut first = true;
+
+        loop {
+            if let Some(d) = triage::load(&path) {
+                if !d.generated_at.is_empty() && last_seen.as_deref() != Some(d.generated_at.as_str())
+                {
+                    // Gate the toast, but advance `last_seen` regardless — so
+                    // toggling notifications off then on never replays a stale
+                    // digest (unlike the memory loop, which skips its baseline
+                    // update while disabled). Reuses the task-board toggle: a
+                    // triage digest is the same family as a todo status change.
+                    let enabled = app
+                        .state::<Mutex<AppConfig>>()
+                        .lock()
+                        .unwrap()
+                        .todo_notifications_enabled;
+                    if !first && enabled {
+                        let _ = app.emit(
+                            "triage-alert",
+                            TriageAlert {
+                                headline: d.headline.clone(),
+                                project: d.project.clone().unwrap_or_default(),
+                            },
+                        );
+                    }
+                    last_seen = Some(d.generated_at);
+                }
+            }
+            first = false;
+            tokio::time::sleep(TRIAGE_CHECK_INTERVAL).await;
+        }
+    });
+}
+
+// --- Nightly-triage SCHEDULER (#35): run the read-only triage once a day ---
+
+/// How often the scheduler checks whether today's run is due. A minute is plenty —
+/// this is a once-a-day, date-gated job, not a precise alarm.
+const TRIAGE_SCHED_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Once-a-day loop: when enabled and the local clock has passed the configured
+/// time and we haven't run today, spawn a headless `claude -p` triage. Gating on
+/// "last completed run date != today" gives free catch-up — a slot missed while
+/// the app was closed fires the moment the app is next open past the time. The run
+/// blocks, so it goes on a worker thread.
+fn spawn_triage_scheduler(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(TRIAGE_SCHED_INTERVAL).await;
+
+            let dir = match app.path().app_data_dir() {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            let mut cfg = triage_schedule::load(&dir);
+            if !cfg.enabled {
+                continue;
+            }
+            let now = chrono::Local::now();
+            let today = now.format("%Y-%m-%d").to_string();
+            if cfg.last_run.as_deref() == Some(today.as_str()) {
+                continue; // already ran today
+            }
+            if !triage_schedule::is_due(&now, &cfg.time) {
+                continue; // not time yet
+            }
+
+            let cli = match cc_hook_script_path(&app) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            let home = match app.path().home_dir() {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+            let model = cfg.model.clone();
+            let (rdir, rhome) = (dir.clone(), home);
+            let res = tokio::task::spawn_blocking(move || {
+                triage_schedule::run_triage(&rhome, &rdir, &cli, &model)
+            })
+            .await;
+
+            // Mark today done regardless of outcome (no retry storm); surface any
+            // error to the UI via last_error.
+            cfg.last_run = Some(today);
+            cfg.last_error = match res {
+                Ok(Ok(())) => None,
+                Ok(Err(e)) => Some(e),
+                Err(e) => Some(e.to_string()),
+            };
+            let _ = triage_schedule::save(&dir, &cfg);
+        }
+    });
+}
+
 // --- System resource monitor (whole-machine CPU + RAM for the mini panel) ---
 
 // How often the mini panel gets a fresh CPU/RAM reading.
@@ -1062,6 +1190,62 @@ fn todos_path(app: &AppHandle) -> Result<PathBuf, String> {
 #[tauri::command]
 fn get_todos(app: AppHandle) -> Result<Vec<todos::Todo>, String> {
     Ok(todos::load(&todos_path(&app)?).todos)
+}
+
+/// Path to the nightly-triage digest, a sibling of todos.json in the app data
+/// dir (see triage.rs / the cc-triage CLI). Read-only from the tracker's side.
+fn triage_digest_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).ok();
+    Ok(dir.join("triage-digest.json"))
+}
+
+/// The latest nightly-triage digest, or None if no run has produced one yet (or
+/// the file is unreadable). The triage agent writes it via the cc-triage CLI;
+/// the tracker only reads it.
+#[tauri::command]
+fn get_triage_digest(app: AppHandle) -> Result<Option<triage::TriageDigest>, String> {
+    Ok(triage::load(&triage_digest_path(&app)?))
+}
+
+/// Current nightly-triage schedule config (enabled / time / model + last-run
+/// bookkeeping) for the in-app controls. Forgiving: defaults if never set.
+#[tauri::command]
+fn get_triage_schedule(app: AppHandle) -> Result<triage_schedule::ScheduleConfig, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    Ok(triage_schedule::load(&dir))
+}
+
+/// Persist the schedule from the UI toggle/time/model. Validates the time and
+/// snaps the model; the scheduler loop picks up the change on its next tick.
+#[tauri::command]
+fn set_triage_schedule(
+    app: AppHandle,
+    enabled: bool,
+    time: String,
+    model: String,
+) -> Result<triage_schedule::ScheduleConfig, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).ok();
+    let mut cfg = triage_schedule::load(&dir);
+    cfg.enabled = enabled;
+    cfg.time = triage_schedule::normalize_time(&time).ok_or("invalid time (use HH:MM)")?;
+    cfg.model = triage_schedule::normalize_model(&model);
+    triage_schedule::save(&dir, &cfg)?;
+    Ok(cfg)
+}
+
+/// Run the triage once, right now (the "Run now" button). Blocks until `claude`
+/// finishes so the UI can show the outcome; the digest lands via the watcher.
+#[tauri::command]
+async fn run_triage_now(app: AppHandle) -> Result<(), String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let home = app.path().home_dir().map_err(|e| e.to_string())?;
+    let cli = cc_hook_script_path(&app)?;
+    let model = triage_schedule::load(&dir).model;
+    tokio::task::spawn_blocking(move || triage_schedule::run_triage(&home, &dir, &cli, &model))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// Distinct project names the tracker has seen (from cc_usage), for the
@@ -1729,6 +1913,8 @@ pub fn run() {
             spawn_sysmon_loop(app.handle().clone());
             spawn_todos_watch(app.handle().clone());
             spawn_memory_loop(app.handle().clone());
+            spawn_triage_loop(app.handle().clone());
+            spawn_triage_scheduler(app.handle().clone());
 
             Ok(())
         })
@@ -1758,6 +1944,10 @@ pub fn run() {
             get_analytics_ext,
             export_analytics_json,
             get_todos,
+            get_triage_digest,
+            get_triage_schedule,
+            set_triage_schedule,
+            run_triage_now,
             get_cc_projects,
             get_raw_projects,
             get_project_links,
