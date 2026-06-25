@@ -668,9 +668,13 @@ const triageGroups = computed<{ kind: string; items: DigestItem[] }[]>(() => {
   return out;
 });
 
-const triageHeadline = computed(
-  () => triageDigest.value?.headline?.trim() || t("triageAlertEmpty"),
-);
+const triageHeadline = computed(() => {
+  const h = triageDigest.value?.headline?.trim();
+  if (h) return h;
+  // A digest with no headline → "ready"; no digest at all → the schedule label,
+  // so the always-visible chip reads sensibly before the first run.
+  return triageDigest.value ? t("triageAlertEmpty") : t("triageSchedule");
+});
 
 function triageKindLabel(kind: string): string {
   const key = TRIAGE_KIND_LABEL[kind];
@@ -702,6 +706,70 @@ function triageGoToTask(num?: number) {
   if (!triageHasTask(num)) return;
   triageOpen.value = false;
   openTask(num as number);
+}
+
+// --- Nightly-triage SCHEDULE controls (#35) ---
+// The in-app scheduler runs a headless `claude -p` triage once a day (backend
+// `spawn_triage_scheduler`). These controls just read/write its config; the digest
+// it produces is shown by the popover above.
+interface TriageSchedule {
+  enabled: boolean;
+  time: string;
+  model: string;
+  last_run: string | null;
+  last_error: string | null;
+}
+const schedEnabled = ref(false);
+const schedTime = ref("08:00");
+const schedModel = ref("haiku");
+const schedLastRun = ref<string | null>(null);
+const schedLastError = ref<string | null>(null);
+const triageRunning = ref(false);
+
+async function loadTriageSchedule() {
+  try {
+    const s = await invoke<TriageSchedule>("get_triage_schedule");
+    schedEnabled.value = s.enabled;
+    schedTime.value = s.time || "08:00";
+    schedModel.value = s.model || "haiku";
+    schedLastRun.value = s.last_run;
+    schedLastError.value = s.last_error;
+  } catch {
+    // not under Tauri
+  }
+}
+
+// Persist the toggle/time/model; the backend validates and echoes the normalized
+// values back (e.g. zero-padded time), so we reflect those.
+async function saveTriageSchedule() {
+  try {
+    const s = await invoke<TriageSchedule>("set_triage_schedule", {
+      enabled: schedEnabled.value,
+      time: schedTime.value,
+      model: schedModel.value,
+    });
+    schedTime.value = s.time;
+    schedModel.value = s.model;
+  } catch (e) {
+    errorMsg.value = String(e);
+  }
+}
+
+// Run the triage immediately. Awaits the headless run, then refreshes the digest
+// + schedule state (so last_run/last_error update).
+async function runTriageNow() {
+  if (triageRunning.value) return;
+  triageRunning.value = true;
+  schedLastError.value = null;
+  try {
+    await invoke("run_triage_now");
+    await loadTriageDigest();
+  } catch (e) {
+    schedLastError.value = String(e);
+  } finally {
+    triageRunning.value = false;
+    await loadTriageSchedule();
+  }
 }
 
 // Distinct other tasks this one references inline (#N) across its description and
@@ -1030,12 +1098,14 @@ onMounted(async () => {
   // windows); refresh the chip so it reflects the latest run.
   unlistenTriage = await listen("triage-alert", () => {
     void loadTriageDigest();
+    void loadTriageSchedule();
   });
   await loadTodos();
   await refreshKnownProjects();
   void loadPhasesEnabled();
   void refreshPhasePlans();
   void loadTriageDigest();
+  void loadTriageSchedule();
   // Persisted webview: refresh the picker each time the window is brought to
   // front, so a project used since the last view (now in cc_usage) shows up.
   const { getCurrentWindow } = await import("@tauri-apps/api/window");
@@ -1045,6 +1115,7 @@ onMounted(async () => {
       void loadPhasesEnabled();
       void refreshPhasePlans();
       void loadTriageDigest();
+      void loadTriageSchedule();
     }
   });
 });
@@ -1065,7 +1136,7 @@ onUnmounted(() => {
       <div class="tw-title">
         <h1>{{ t("tasksTitle") }}</h1>
         <span class="tw-open">{{ openCount }} {{ t("todoOpenItems") }}</span>
-        <div v-if="triageDigest" class="tw-triage">
+        <div class="tw-triage">
           <button
             class="tw-triage-chip"
             :class="{ open: triageOpen }"
@@ -1085,37 +1156,88 @@ onUnmounted(() => {
             <div class="tw-triage-pop">
               <div class="tw-triage-pop-head">
                 <span class="tw-triage-pop-title">{{ t("triageAlertTitle") }}</span>
-                <span class="tw-triage-meta">
+                <span class="tw-triage-meta" v-if="triageDigest">
                   <span v-if="triageDigest.project">{{ triageDigest.project }}</span>
                   <span v-if="triageGeneratedLabel">{{ triageGeneratedLabel }}</span>
                 </span>
               </div>
-              <p v-if="triageDigest.summary" class="tw-triage-summary">
-                {{ triageDigest.summary }}
-              </p>
-              <div v-if="!triageGroups.length" class="tw-triage-clean">
-                {{ t("triageCardClean") }}
-              </div>
-              <div v-for="g in triageGroups" :key="g.kind" class="tw-triage-group">
-                <div class="tw-triage-group-head" :class="`k-${g.kind}`">
-                  <span class="tw-triage-dot"></span>
-                  <span>{{ triageKindLabel(g.kind) }}</span>
-                  <span class="tw-triage-count">{{ g.items.length }}</span>
+              <!-- Schedule controls FIRST, so they're reachable without scrolling
+                   past a long digest (#35); always shown. -->
+              <div class="tw-triage-sched" :class="{ 'has-digest': triageDigest }">
+                <label class="tw-sched-toggle">
+                  <input
+                    type="checkbox"
+                    v-model="schedEnabled"
+                    @change="saveTriageSchedule"
+                  />
+                  <span>{{ t("triageScheduleEnable") }}</span>
+                </label>
+                <div v-if="schedEnabled" class="tw-sched-row">
+                  <input
+                    type="time"
+                    class="tw-sched-time"
+                    v-model="schedTime"
+                    @change="saveTriageSchedule"
+                  />
+                  <select
+                    class="tw-sched-model"
+                    v-model="schedModel"
+                    @change="saveTriageSchedule"
+                  >
+                    <option value="haiku">Haiku</option>
+                    <option value="sonnet">Sonnet</option>
+                    <option value="opus">Opus</option>
+                  </select>
                 </div>
-                <ul class="tw-triage-list">
-                  <li v-for="(it, i) in g.items" :key="i" class="tw-triage-item">
-                    <a
-                      v-if="triageHasTask(it.number)"
-                      class="tw-ref tw-triage-ref"
-                      @click.prevent="triageGoToTask(it.number)"
-                      >#{{ it.number }}</a
-                    ><span v-else-if="it.number != null" class="tw-triage-num"
-                      >#{{ it.number }}</span
-                    ><span class="tw-triage-subject">{{ it.subject }}</span
-                    ><span v-if="it.note" class="tw-triage-note">{{ it.note }}</span>
-                  </li>
-                </ul>
+                <div class="tw-sched-actions">
+                  <button
+                    type="button"
+                    class="tw-btn tw-sched-run"
+                    :disabled="triageRunning"
+                    @click="runTriageNow"
+                  >
+                    {{ triageRunning ? t("triageRunning") : t("triageRunNow") }}
+                  </button>
+                  <span
+                    v-if="schedLastRun && !schedLastError"
+                    class="tw-sched-status"
+                    >{{ t("triageLastRun", { date: schedLastRun }) }}</span
+                  >
+                </div>
+                <div v-if="schedLastError" class="tw-sched-err">
+                  {{ t("triageRunFailed") }}
+                </div>
               </div>
+              <template v-if="triageDigest">
+                <p v-if="triageDigest.summary" class="tw-triage-summary">
+                  {{ triageDigest.summary }}
+                </p>
+                <div v-if="!triageGroups.length" class="tw-triage-clean">
+                  {{ t("triageCardClean") }}
+                </div>
+                <div v-for="g in triageGroups" :key="g.kind" class="tw-triage-group">
+                  <div class="tw-triage-group-head" :class="`k-${g.kind}`">
+                    <span class="tw-triage-dot"></span>
+                    <span>{{ triageKindLabel(g.kind) }}</span>
+                    <span class="tw-triage-count">{{ g.items.length }}</span>
+                  </div>
+                  <ul class="tw-triage-list">
+                    <li v-for="(it, i) in g.items" :key="i" class="tw-triage-item">
+                      <div class="tw-triage-line">
+                        <a
+                          v-if="triageHasTask(it.number)"
+                          class="tw-ref tw-triage-ref"
+                          @click.prevent="triageGoToTask(it.number)"
+                          >#{{ it.number }}</a
+                        ><span v-else-if="it.number != null" class="tw-triage-num"
+                          >#{{ it.number }}</span
+                        ><span class="tw-triage-subject">{{ it.subject }}</span>
+                      </div>
+                      <div v-if="it.note" class="tw-triage-note">{{ it.note }}</div>
+                    </li>
+                  </ul>
+                </div>
+              </template>
             </div>
           </template>
         </div>
@@ -2655,7 +2777,72 @@ onUnmounted(() => {
 }
 .tw-triage-note {
   color: var(--text-3);
-  margin-left: 5px;
+  margin-top: 1px;
+  padding-left: 16px;
+  position: relative;
+}
+.tw-triage-note::before {
+  content: "→";
+  position: absolute;
+  left: 2px;
+  color: var(--text-4);
+}
+
+/* Nightly-triage schedule controls (#35), in the digest popover footer. */
+.tw-triage-sched {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+/* Controls sit above the digest; when one follows, divide them from it. */
+.tw-triage-sched.has-digest {
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--stroke-strong);
+}
+.tw-sched-toggle {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  color: var(--text-2);
+  cursor: pointer;
+}
+.tw-sched-toggle input {
+  cursor: pointer;
+}
+.tw-sched-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.tw-sched-time,
+.tw-sched-model {
+  font-family: var(--segoe);
+  font-size: 12px;
+  padding: 3px 6px;
+  background: var(--card-bg);
+  color: var(--text);
+  border: 1px solid var(--stroke-strong);
+  border-radius: 6px;
+  /* Render the native time-picker icon + spinners light on the dark theme
+     (was black-on-black). The app is dark-only. */
+  color-scheme: dark;
+}
+.tw-sched-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.tw-sched-run {
+  font-size: 12px;
+}
+.tw-sched-status {
+  font-size: 11px;
+  color: var(--text-4);
+}
+.tw-sched-err {
+  font-size: 11px;
+  color: var(--warning);
 }
 
 /* Inline-reference autocomplete menu */

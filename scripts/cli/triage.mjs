@@ -228,8 +228,11 @@ function cmdShow(args) {
     process.stdout.write("\nitems:\n");
     for (const it of items) {
       const num = it.number != null ? `#${it.number} ` : "";
-      const note = it.note ? ` — ${it.note}` : "";
-      process.stdout.write(`  [${it.kind}] ${num}${it.subject || ""}${note}\n`);
+      // Subject on its own line, the note (the advice) indented below with an
+      // arrow — keeps "which task" and "what to do" visually separate, mirroring
+      // the in-app digest popover.
+      process.stdout.write(`  [${it.kind}] ${num}${it.subject || ""}\n`);
+      if (it.note) process.stdout.write(`        → ${it.note}\n`);
     }
   }
 }
