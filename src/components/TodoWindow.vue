@@ -1244,7 +1244,10 @@ onUnmounted(() => {
               <span v-else class="tw-richtext-empty">{{ t("todoNoDescription") }}</span>
             </div>
           </label>
-          <label class="tw-field">
+          <!-- The free-form plan note. Hidden once the task has a structured phase
+               plan (Vision + phases below ARE the plan) — kept only if it still holds
+               legacy text, so nothing is silently dropped. -->
+          <label v-if="!(phasesEnabled && phasesFor(detail)) || !!detail?.plan" class="tw-field">
             <span>{{ t("todoPlan") }} <em class="tw-hint">{{ t("todoPlanHint") }}</em></span>
             <textarea v-model="draft.plan" class="tw-input tw-area" rows="5"></textarea>
           </label>
@@ -1253,7 +1256,7 @@ onUnmounted(() => {
                The cc-phases CLI is the only writer; here it's display-only. -->
           <div v-if="phasesEnabled && phasesFor(detail)" class="tw-field tw-phases">
             <div class="tw-phases-hd">
-              <span>{{ t("phasesLabel") }}</span>
+              <span>{{ t("todoPlan") }}</span>
               <span class="tw-phases-prog">{{ phaseProgress(detail) }}</span>
             </div>
             <!-- The plan's north star (README ## Vision), read-only here; the
