@@ -145,6 +145,27 @@ export async function initUpdater() {
     void checkForUpdate(true); // check on startup
 }
 
+// Populate the read-only display fields (version + saved check interval) for a
+// window that shows the updater UI but doesn't own background checking — i.e. the
+// standalone settings window. initUpdater() (run by the main window) owns the
+// periodic checker; calling it here would only duplicate the timer + startup
+// check, so we load just the display state. The "Check for updates" button still
+// works (checkForUpdate is independent).
+export async function loadUpdaterDisplay() {
+    try {
+        const { getVersion } = await import("@tauri-apps/api/app");
+        currentVersion.value = await getVersion();
+    } catch {
+        // running outside Tauri (e.g. plain vite preview)
+    }
+    try {
+        const store = await loadStore();
+        checkHours.value = (await store.get<number>("updateCheckHours")) ?? 6;
+    } catch {
+        // first run
+    }
+}
+
 export function useUpdater() {
     return {
         status,

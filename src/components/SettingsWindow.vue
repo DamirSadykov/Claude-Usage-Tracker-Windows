@@ -9,6 +9,7 @@ import { ref, computed, onMounted, onUnmounted } from "vue";
 import { useI18n, type Composer } from "vue-i18n";
 import { invoke } from "@tauri-apps/api/core";
 import i18n from "../i18n";
+import { loadUpdaterDisplay } from "../updater";
 import SettingsPanel from "./SettingsPanel.vue";
 import {
     DEFAULT_THRESHOLDS,
@@ -191,6 +192,9 @@ const unlisteners: Array<() => void> = [];
 
 onMounted(async () => {
     await loadSettings();
+    // The Updates tab shows app version + saved check interval; the main window's
+    // initUpdater() owns periodic checking, so here we only load the display.
+    void loadUpdaterDisplay();
     const { listen } = await import("@tauri-apps/api/event");
     unlisteners.push(
         // The gear that opened us tells which tab to show.
