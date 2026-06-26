@@ -179,7 +179,7 @@ function main() {
       const note = [
         `The Claude Usage Tracker has ${active.length} open task(s) for project "${project}", but none are due today and all are below the "task priority in context" threshold — none are shown here.`,
         `See them or re-prioritize via the CLI (${CLI_NOTE}); lower the threshold in the tracker's settings to surface more:`,
-        `· list every task: <cli> todos list`,
+        `· list this project's tasks: <cli> todos list (defaults to this project + global; add --all for every project)`,
         `· set a priority: <cli> todos set-priority <id> <high|medium|low|none>`,
         crossProjectNote,
         `File (don't edit): ${file}`,
@@ -250,7 +250,7 @@ function main() {
       `· set priority: <cli> todos set-priority <id> <high|medium|low|none> — priority decides which tasks reach this context (the threshold lives in the tracker's settings).`,
       `· new follow-up: <cli> todos add "<subject>" [--project <name>] [--priority high|medium|low] [--scheduled YYYY-MM-DD] [--description <text>] — lands in backlog. Only add what the user asked to track — their list, not your scratchpad.`,
       `· note a finding: <cli> todos comment add <id> --text "<body>" — shows in the task thread as you; only when the user wants it recorded. Reference another task as #N (e.g. "blocked by #${refExample}").`,
-      `· see current tasks: <cli> todos list`,
+      `· see current tasks: <cli> todos list — this project (cwd) + global; --all spans every project.`,
       crossProjectNote,
       `File (don't edit): ${file}`,
     ].join("\n");
