@@ -699,55 +699,36 @@ fn kb(bytes: u64) -> u64 {
 
 fn spawn_memory_loop(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
-        // Per-project total bytes from the previous scan; absent = not yet seen,
-        // so a project's first sighting only sets a baseline (no delta alert).
-        let mut prev: HashMap<String, u64> = HashMap::new();
-        // First enabled pass also runs the one-time absolute (already-bloated) check.
-        let mut first = true;
+        // Per-project debounced watcher. Each only alerts once its total has
+        // settled, so reorganizing memory (moving bytes between files without
+        // changing the total) is silent — fixing the alert flood when a bloated
+        // MEMORY.md is split into thematic files. See memory::Watch (#48).
+        let mut watches: HashMap<String, memory::Watch> = HashMap::new();
 
         loop {
             let enabled =
                 { app.state::<Mutex<AppConfig>>().lock().unwrap().memory_bloat_enabled };
             if enabled {
                 for s in memory::scan() {
-                    let label = memory::label(&s.project);
-                    if first {
-                        // Already-bloated index or a blob-sized entry from before this run.
-                        if s.memory_md > memory::MEMORY_MD_LIMIT {
-                            let _ = app.emit(
-                                "memory-alert",
-                                MemoryAlert {
-                                    kind: "large".into(),
-                                    project: label,
-                                    detail: format!("MEMORY.md {} KB", kb(s.memory_md)),
-                                },
-                            );
-                        } else if s.max_entry > memory::ENTRY_LIMIT {
-                            let _ = app.emit(
-                                "memory-alert",
-                                MemoryAlert {
-                                    kind: "large".into(),
-                                    project: label,
-                                    detail: format!("{} {} KB", s.max_entry_name, kb(s.max_entry)),
-                                },
-                            );
+                    let Some(alert) = watches.entry(s.project.clone()).or_default().observe(&s)
+                    else {
+                        continue;
+                    };
+                    let (kind, detail) = match alert {
+                        memory::Alert::Large { name, bytes } => {
+                            ("large", format!("{} {} KB", name, kb(bytes)))
                         }
-                    } else if let Some(&old) = prev.get(&s.project) {
-                        // Ongoing: a sudden jump = something big was pasted in.
-                        if s.total >= old.saturating_add(memory::DELTA_LIMIT) {
-                            let _ = app.emit(
-                                "memory-alert",
-                                MemoryAlert {
-                                    kind: "grew".into(),
-                                    project: label,
-                                    detail: format!("+{} KB", kb(s.total - old)),
-                                },
-                            );
-                        }
-                    }
-                    prev.insert(s.project, s.total);
+                        memory::Alert::Grew { delta } => ("grew", format!("+{} KB", kb(delta))),
+                    };
+                    let _ = app.emit(
+                        "memory-alert",
+                        MemoryAlert {
+                            kind: kind.into(),
+                            project: memory::label(&s.project),
+                            detail,
+                        },
+                    );
                 }
-                first = false;
             }
             tokio::time::sleep(MEMORY_CHECK_INTERVAL).await;
         }

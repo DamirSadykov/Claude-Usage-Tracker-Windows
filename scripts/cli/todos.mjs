@@ -16,7 +16,8 @@
 //   set-priority <id> <level>       level ∈ high|medium|low|none
 //   comment add <id> --text "<body>" [--by claude|user]
 //   comment list <id> [--json]
-//   list [--project <name>] [--json]
+//   list [--project <name> | --all] [--priority <level>] [--json]
+//        defaults to THIS project (cwd basename) + project-less tasks; --all spans every project
 //
 // Exit code is non-zero on any error (bad status, unknown id, usage), so a
 // caller can tell success from failure.
@@ -307,9 +308,19 @@ function cmdList(args) {
   const file = todosPath();
   let todos = load(file).todos.filter(Boolean);
   const pi = args.indexOf("--project");
-  if (pi !== -1 && args[pi + 1]) {
+  const hasProject = pi !== -1 && args[pi + 1] && !args[pi + 1].startsWith("--");
+  if (hasProject) {
     const p = args[pi + 1];
     todos = todos.filter((t) => (t.project || "") === p);
+  } else if (!args.includes("--all")) {
+    // Default scope: THIS session's project (the cwd basename) plus project-less
+    // (global) tasks — mirroring the SessionStart hook's filter (hook.mjs), so a
+    // bare `todos list` shows the current board instead of every project's tasks.
+    // `--all` opts back into the full cross-project list; `--project <name>`
+    // targets another board. cwd is the project dir (the CLI runs there), same as
+    // cmdAdd derives `cwdProject`.
+    const cwdProject = path.basename(process.cwd().replace(/[\\/]+$/, ""));
+    todos = todos.filter((t) => !t.project || t.project === cwdProject);
   }
   const pri = args.indexOf("--priority");
   if (pri !== -1 && args[pri + 1]) {
@@ -383,7 +394,8 @@ function usage(code) {
       " | none\n" +
       '  comment add <id> --text "<body>" [--by claude|user]\n' +
       "  comment list <id> [--json]\n" +
-      "  list [--project <name>] [--json]\n" +
+      "  list [--project <name> | --all] [--priority <level>] [--json]\n" +
+      "                                  default: this project (cwd) + global; --all = every project\n" +
       "  related <project> [--json]      projects that work with <project>\n" +
       "  groups [--json]                 list association groups\n",
   );
