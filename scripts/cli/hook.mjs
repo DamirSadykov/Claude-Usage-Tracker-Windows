@@ -24,7 +24,7 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { readPlansForHook } from "./phases.mjs";
+import { readPlansForHook, markPlanDoneForDoneTasks } from "./phases.mjs";
 
 // The unified CLI is this module's grandparent-relative entry (scripts/cli.mjs);
 // resolve its absolute path so the contract below can hand Claude exact,
@@ -141,9 +141,32 @@ function main() {
   // If this project is mid-PLAN, the session is aimed at the CURRENT phase, not
   // the task board — surface the phase (focused) and do NOT dump the task list.
   // Read-only and guarded: any failure falls through to plain todo mode.
+  //
+  // A plan whose linked tracker task is `done` is finished work, even if some
+  // phase boxes were never ticked. We mark such plans done (markPlanDoneForDone-
+  // Tasks below) so they read complete in `phases list` too, not just here — a
+  // done task has no open plan to keep around. The task status (not the phase
+  // files) is the trigger, so this catches a status flip made in the tracker UI
+  // too — the CLI isn't the only path to done.
+  const donePlanTasks = new Set(
+    todos
+      .filter((t) => t && t.number != null && col(t.status) === "done")
+      .map((t) => t.number),
+  );
+  // Best-effort reconcile (guarded — a write failure must never break a session).
+  // After it, a done-task plan has no open phase, so the `p.current` filter drops
+  // it on its own. The extra task-status guard below is the fallback for when the
+  // write couldn't land (e.g. a read-only checkout): hide it from the hook anyway.
+  try {
+    markPlanDoneForDoneTasks(cwd, (n) => donePlanTasks.has(n));
+  } catch {
+    // ignore — fall through to the read-only display filter
+  }
   let phasePlans = [];
   try {
-    phasePlans = readPlansForHook(cwd).filter((p) => p.current);
+    phasePlans = readPlansForHook(cwd).filter(
+      (p) => p.current && !(p.task != null && donePlanTasks.has(p.task)),
+    );
   } catch {
     phasePlans = [];
   }

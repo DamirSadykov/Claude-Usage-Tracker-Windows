@@ -888,3 +888,66 @@ export function readPlansForHook(root) {
   }
   return out;
 }
+
+// Reconcile plans against finished tracker tasks. If a plan's linked task is
+// `done`, the work it tracked is finished even if some boxes were never ticked —
+// so mark every phase (and its subphases) done, the same write `phases done`
+// performs. The plan then has no open phase: it drops out of the SessionStart
+// hook AND reads complete in `phases list`, instead of lingering at e.g. 4/5.
+// A done task has no open plan to keep around.
+//
+// `isDone(taskNumber) => boolean` is supplied by the caller, which owns the todo
+// statuses (this module never reads todos.json). Returns the slugs it changed.
+// Best-effort and self-contained: one unreadable/unwritable plan or phase is
+// skipped, never thrown, so a SessionStart caller can never be broken by it.
+export function markPlanDoneForDoneTasks(root, isDone) {
+  const phasesDir = path.join(root, ".claude", "phases");
+  let dirents;
+  try {
+    dirents = readdirSync(phasesDir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const changed = [];
+  for (const ent of dirents) {
+    if (!ent.isDirectory()) continue;
+    const slug = ent.name;
+    const dir = path.join(phasesDir, slug);
+
+    let task = null;
+    try {
+      const meta = readFileSync(path.join(dir, "README.md"), "utf8");
+      const t = meta.match(/CC-task:\s*#?(\d+)/i);
+      if (t) task = Number(t[1]);
+    } catch {
+      continue; // no README → can't know the task → leave the plan alone
+    }
+    if (task == null || !isDone(task)) continue;
+
+    let files;
+    try {
+      files = readdirSync(dir);
+    } catch {
+      continue;
+    }
+    let touched = false;
+    for (const f of files) {
+      const m = f.match(/^Phase-(\d+)\.md$/);
+      if (!m) continue;
+      const file = path.join(dir, f);
+      try {
+        const phase = parsePhase(readFileSync(file, "utf8"), Number(m[1]));
+        // Already fully done (phase box + every subphase) → nothing to write.
+        if (phase.done && phase.subs.every((s) => s.done)) continue;
+        phase.done = true;
+        for (const s of phase.subs) s.done = true;
+        writeAtomic(file, serializePhase(phase));
+        touched = true;
+      } catch {
+        // unreadable/unwritable single phase → skip it, keep going
+      }
+    }
+    if (touched) changed.push(slug);
+  }
+  return changed;
+}
