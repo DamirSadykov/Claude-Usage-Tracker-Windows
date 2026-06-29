@@ -10,10 +10,12 @@
 // `todos.rs::STATUSES` and the kanban columns in TodoWindow.vue.
 //
 // Commands (run as `cli.mjs todos <cmd>`):
-//   add "<subject>" [--project <name>] [--status <status>] [--priority <level>]
+//   add "<subject>" [--project <name> | --global] [--status <status>] [--priority <level>]
 //                   [--description <text>] [--plan <text>] [--estimate <min>] [--scheduled <YYYY-MM-DD>]
+//                   no --project defaults to the current project (cwd basename); --global = project-less
 //   set-status <id> <status>        status ∈ backlog|queue|in_progress|review|done
 //   set-priority <id> <level>       level ∈ high|medium|low|none
+//   set-project <id> <name>         tie to a project; <--global|none|clear> to clear
 //   comment add <id> --text "<body>" [--by claude|user]
 //   comment list <id> [--json]
 //   list [--project <name> | --all] [--status <col>[,<col>]] [--priority <level>] [--json]
@@ -159,6 +161,33 @@ function cmdSetPriority(id, level) {
   process.stdout.write(`ok: ${id} priority -> ${priority || "unset"}\n`);
 }
 
+// Set (or clear) a todo's project (issue #54: a task filed with the wrong/empty
+// project couldn't be fixed from the CLI before — only in the app). <name> ties
+// it to that board; `--global`/`none`/`clear` makes it project-less. Clearing
+// removes the field so the file stays clean (matches the Rust skip_serializing_if).
+function cmdSetProject(id, value) {
+  if (!id || value == null)
+    fail("usage: cli todos set-project <id> <project | --global>");
+  const v = String(value).trim();
+  const clear = v === "" || v === "--global" || /^(none|clear|global)$/i.test(v);
+  const next = clear ? null : v;
+  const file = todosPath();
+  const data = load(file);
+  const todo = data.todos.find((t) => t && t.id === id);
+  if (!todo) fail(`no todo with id ${id}`);
+  if ((todo.project ?? null) === next) {
+    process.stdout.write(`ok: ${id} already ${next ? `project "${next}"` : "global"}\n`);
+    return;
+  }
+  if (next) todo.project = next;
+  else delete todo.project;
+  todo.updated_at = new Date().toISOString();
+  save(file, data);
+  process.stdout.write(
+    `ok: ${id} project -> ${next ? `"${next}"` : "global (project-less)"}\n`,
+  );
+}
+
 // Minimal `--flag value` parser: collects positional args and flag pairs.
 // A flag with no following value (or followed by another --flag) becomes `true`.
 function parseArgs(args) {
@@ -182,8 +211,9 @@ function parseArgs(args) {
 }
 
 const ADD_USAGE =
-  'usage: cli todos add "<subject>" [--project <name>] [--from <project>] [--status <status>] ' +
-  "[--priority high|medium|low] [--description <text>] [--plan <text>] [--estimate <min>] [--scheduled <YYYY-MM-DD>] [--by user|claude]";
+  'usage: cli todos add "<subject>" [--project <name> | --global] [--from <project>] [--status <status>] ' +
+  "[--priority high|medium|low] [--description <text>] [--plan <text>] [--estimate <min>] [--scheduled <YYYY-MM-DD>] [--by user|claude]\n" +
+  "       (no --project → the current project; --global files a project-less task)";
 
 // Create a new todo. Mirrors the field set the tracker writes (todos.rs / the
 // TodoWindow form): id is a fresh UUID, created_at/updated_at stamped now,
@@ -210,13 +240,25 @@ function cmdAdd(args) {
   const now = new Date().toISOString();
   const file = todosPath();
   const data = load(file);
-  const target = typeof flags.project === "string" ? flags.project : null;
-  // Provenance (issue #13): the project this task was filed FROM. Auto-derived
-  // from the session's working directory — the CLI runs in the project's cwd, so
-  // basename(cwd) is the current project — but only when the task targets a
-  // DIFFERENT project (cross-project). Same-project adds leave it empty; --from
-  // overrides the auto value.
   const cwdProject = path.basename(process.cwd().replace(/[\\/]+$/, ""));
+  // Project resolution (issue #54): a bare `add` defaults to the CURRENT project
+  // (cwd basename), mirroring `todos list` and the SessionStart hook — a follow-up
+  // filed from a session belongs to that session's project, not the global board.
+  // (A project-less task surfaces in EVERY project's context, which was the leak:
+  // adds without --project used to land global.) `--project <name>` targets another
+  // board; `--global` (or `--project ""`) files an explicitly project-less task.
+  let target;
+  if (flags.global) {
+    target = null;
+  } else if (typeof flags.project === "string") {
+    const p = flags.project.trim();
+    target = p ? p : null;
+  } else {
+    target = cwdProject;
+  }
+  // Provenance (issue #13): the project this task was filed FROM. Auto-set to the
+  // current project only when the task targets a DIFFERENT one (cross-project);
+  // same-project and global adds leave it empty. --from overrides the auto value.
   let from =
     typeof flags.from === "string" && flags.from.trim() ? flags.from.trim() : null;
   if (from === null && target && target !== cwdProject) from = cwdProject;
@@ -245,7 +287,7 @@ function cmdAdd(args) {
   data.todos.push(todo);
   save(file, data);
   process.stdout.write(
-    `ok: added #${todo.number} ${todo.id} [${status}] ${subject}\n`,
+    `ok: added #${todo.number} ${todo.id} [${status}] (${target ? `project ${target}` : "global"}) ${subject}\n`,
   );
 }
 
@@ -405,14 +447,16 @@ function cmdGroups(args) {
 function usage(code) {
   process.stdout.write(
     "cli todos - Claude Usage Tracker todo CLI\n\n" +
-      '  add "<subject>" [--project <name>] [--from <project>] [--status <status>]\n' +
+      '  add "<subject>" [--project <name> | --global] [--from <project>] [--status <status>]\n' +
       "                  [--description <text>] [--plan <text>] [--estimate <min>] [--scheduled <YYYY-MM-DD>]\n" +
+      "                  no --project → the current project (cwd); --global = project-less\n" +
       "  set-status <id> <status>        status ∈ " +
       STATUSES.join(" | ") +
       "\n" +
       "  set-priority <id> <level>       level ∈ " +
       PRIORITIES.join(" | ") +
       " | none\n" +
+      "  set-project <id> <name>         tie to a project; <--global|none> to clear\n" +
       '  comment add <id> --text "<body>" [--by claude|user]\n' +
       "  comment list <id> [--json]\n" +
       "  list [--project <name> | --all] [--status <col>[,<col>]] [--priority <level>] [--json]\n" +
@@ -438,6 +482,9 @@ export function run(args) {
       break;
     case "set-priority":
       cmdSetPriority(rest[0], rest[1]);
+      break;
+    case "set-project":
+      cmdSetProject(rest[0], rest[1]);
       break;
     case "comment":
       cmdComment(rest);
