@@ -210,16 +210,31 @@ fn strip_html_comments(s: &str) -> String {
     out
 }
 
+/// The ATX heading level (count of leading `#`) of a heading line, or 0 when the
+/// line is not a heading. Lets a section end only at a heading of the SAME or a
+/// HIGHER level, so deeper sub-headings stay inside the section body.
+fn heading_level(line: &str) -> usize {
+    if is_heading(line) {
+        line.bytes().take_while(|&b| b == b'#').count()
+    } else {
+        0
+    }
+}
+
 /// The plan's Vision — north-star prose from the README's `## Vision` section
-/// (heading "Vision" or "Видение"), body up to the next heading or EOF, with the
-/// guidance comment stripped. None when absent or still the scaffold placeholder.
+/// (heading "Vision" or "Видение"), body up to the next heading of the SAME or a
+/// HIGHER level (or EOF), with the guidance comment stripped. None when absent or
+/// still the scaffold placeholder. A DEEPER sub-heading (e.g. `### Flow`) stays in
+/// the body so a structured multi-line vision isn't silently truncated (issue #58).
 /// Mirrors `extractVision` in scripts/cli/phases.mjs.
 fn extract_vision(readme: &str) -> Option<String> {
     let lines: Vec<&str> = readme.lines().collect();
     let head = lines.iter().position(|l| is_vision_heading(l))?;
+    let vis_level = heading_level(lines[head]);
     let mut body = String::new();
     for line in &lines[head + 1..] {
-        if is_heading(line) {
+        let lvl = heading_level(line);
+        if lvl != 0 && lvl <= vis_level {
             break;
         }
         body.push_str(line);
@@ -452,6 +467,13 @@ mod tests {
         );
         // no section at all
         assert_eq!(extract_vision("# T\n\n## Notes\nnothing\n"), None);
+        // a DEEPER sub-heading stays in the body (issue #58); a same-level `## …`
+        // still ends the section — so the `### Flow` block is kept but `## Notes` is not
+        assert_eq!(
+            extract_vision("# T\n\n## Vision\nintro\n\n### Flow\nstep one\n\n## Notes\nx\n")
+                .as_deref(),
+            Some("intro\n\n### Flow\nstep one"),
+        );
     }
 
     #[test]
