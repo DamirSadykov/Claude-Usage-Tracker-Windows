@@ -92,6 +92,18 @@ function sanitize(s) {
     .trim();
 }
 
+// For FREEFORM prose (handoff, vision) — unlike sanitize, KEEP the author's line
+// breaks (issue #58 #1/#4): these don't follow the one-line `N.k` phase grammar,
+// and a multi-section baton/north-star must survive into the next session with its
+// structure intact. Normalize EOLs, drop trailing space per line, trim.
+function multiline(s) {
+  return String(s ?? "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/[ \t]+$/gm, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 // English-only, folder-safe title: letters/digits to start, then letters/digits/
 // space/_/- . Enforced because the title becomes a directory name.
 const TITLE_RE = /^[A-Za-z0-9][A-Za-z0-9 _-]*$/;
@@ -619,6 +631,12 @@ function cmdVerify(args) {
       'README "## Vision" section is empty — the SessionStart hook has no north star to surface; fill it so the phases stay true to the plan\'s intent',
     );
   for (const p of plan.phases) {
+    // An empty phase title leaves the SessionStart hook showing `phase N/total ""`
+    // — no orientation anchor (issue #58 #6). Warn so it gets a title.
+    if (!p.title)
+      warnings.push(
+        `Phase ${p.num} has an empty title — the SessionStart hook shows it as "(untitled)"; set one: cli phases edit ${p.num} --title "…"`,
+      );
     const seen = new Set();
     for (const s of p.subs) {
       if (seen.has(s.num)) problems.push(`duplicate subphase ${p.num}.${s.num}`);
@@ -684,7 +702,7 @@ function cmdVision(args) {
     process.stdout.write(`ok: vision cleared for "${slug}"\n`);
     return;
   }
-  const text = sanitize(positional[0]);
+  const text = multiline(positional[0]);
   if (!text) {
     const v = readPlanMeta(slug).vision;
     process.stdout.write(
@@ -713,7 +731,7 @@ function cmdHandoff(args) {
     }
     return;
   }
-  const text = sanitize(positional[0]);
+  const text = multiline(positional[0]);
   if (!text) {
     try {
       process.stdout.write(readFileSync(handoffFile(slug), "utf8"));
@@ -864,11 +882,15 @@ export function readPlansForHook(root) {
     const nextSub = current ? current.subs.find((s) => !s.done) || null : null;
     let handoff = null;
     try {
-      // Stored as "# Handoff (date)\n\n<baton>"; surface just the baton line.
-      const body = readFileSync(handoffFile(slug), "utf8")
-        .replace(/^#.*$/m, "")
-        .replace(/\s+/g, " ")
-        .trim();
+      // Read from THIS plan's dir (root-relative), not handoffFile() — that one is
+      // process.cwd()-based, and the hook's `root` (the session cwd from stdin) may
+      // differ; everything else here already reads under `dir`.
+      // Stored as "# Handoff (date)\n\n<baton>"; drop only the heading line and
+      // KEEP the body's own line breaks so a multi-section baton survives into the
+      // next session (the hook renders it as an indented block — issue #58 #4).
+      const body = multiline(
+        readFileSync(path.join(dir, "HANDOFF.md"), "utf8").replace(/^#[^\n]*\n?/, ""),
+      );
       if (body) handoff = body;
     } catch {
       // no handoff → null

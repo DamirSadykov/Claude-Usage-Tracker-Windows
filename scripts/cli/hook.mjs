@@ -273,7 +273,7 @@ function main() {
       `· set priority: <cli> todos set-priority <id> <high|medium|low|none> — priority decides which tasks reach this context (the threshold lives in the tracker's settings).`,
       `· new follow-up: <cli> todos add "<subject>" [--project <name>] [--priority high|medium|low] [--scheduled YYYY-MM-DD] [--description <text>] — lands in backlog. Only add what the user asked to track — their list, not your scratchpad.`,
       `· note a finding: <cli> todos comment add <id> --text "<body>" — shows in the task thread as you; only when the user wants it recorded. Reference another task as #N (e.g. "blocked by #${refExample}").`,
-      `· see current tasks: <cli> todos list — this project (cwd) + global; --all spans every project.`,
+      `· see current tasks: <cli> todos list — this project (cwd) + global; --all spans every project; --status <col>[,<col>] filters by column (e.g. --status review,done) so the list isn't the whole board.`,
       crossProjectNote,
       `File (don't edit): ${file}`,
     ].join("\n");
@@ -299,6 +299,27 @@ function main() {
   process.stdout.write(note + "\n");
 }
 
+// Render a possibly multi-line value as an indented block under a one-line label,
+// KEEPING the author's line breaks (issue #58 #1/#4). Vision and handoff are the
+// only carriers of cross-session intent; flattening a multi-section vision/handoff
+// to one line (the old behaviour) erased its structure, and the 500-char cap on
+// vision sliced off the current phase's own goal. Single-line values stay inline.
+// A generous char ceiling keeps a runaway value from flooding the session context.
+function block(label, text, pad = "    ", cap = 2000) {
+  let body = String(text)
+    .replace(/\r\n?/g, "\n")
+    .replace(/[ \t]+$/gm, "") // trailing space per line
+    .replace(/\n{3,}/g, "\n\n") // collapse 3+ blank lines to one
+    .trim();
+  if (body.length > cap) body = body.slice(0, cap).trimEnd() + " …";
+  if (!body.includes("\n")) return `${label} ${body}`;
+  const indented = body
+    .split("\n")
+    .map((l) => (l ? pad + l : ""))
+    .join("\n");
+  return `${label}\n${indented}`;
+}
+
 // PHASE MODE (issue #16): when the current project has a plan with an unfinished
 // phase, the session is aimed at that phase — so we surface the phase INSTEAD of
 // the task board (the full todo list is noise here, and bloats context). We still
@@ -322,17 +343,23 @@ function phaseModeContext(project, todos, active, file, plans) {
     const next = p.nextSub
       ? ` — next: ${p.current.num}.${p.nextSub.num} ${p.nextSub.title}`
       : "";
+    // An empty phase title shows as `phase 2/2 ""` — a missing orientation anchor
+    // (issue #58 #6). Fall back to an actionable nudge instead of a bare "".
+    const titleShown = p.current.title
+      ? `"${p.current.title}"`
+      : `(untitled — set one: <cli> phases edit ${p.current.num} --title "…")`;
     lines.push(
-      `- plan "${p.slug}" (${link}): phase ${p.current.num}/${p.total} "${p.current.title}"${next}`,
+      `- plan "${p.slug}" (${link}): phase ${p.current.num}/${p.total} ${titleShown}${next}`,
     );
     if (p.vision) {
-      const v = p.vision.replace(/\s+/g, " ").trim();
-      const capped = v.length > 500 ? v.slice(0, 500) + "…" : v;
       lines.push(
-        `  ★ vision (the plan's north star — keep this phase true to it; if it pulls away, stop and flag it): ${capped}`,
+        block(
+          `  ★ vision (the plan's north star — keep this phase true to it; if it pulls away, stop and flag it):`,
+          p.vision,
+        ),
       );
     }
-    if (p.handoff) lines.push(`  ↪ handoff from last session: ${p.handoff}`);
+    if (p.handoff) lines.push(block(`  ↪ handoff from last session:`, p.handoff));
   }
 
   const linkedIds = new Set(linked.map((t) => t.id));

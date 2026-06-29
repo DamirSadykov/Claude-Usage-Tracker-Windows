@@ -16,8 +16,9 @@
 //   set-priority <id> <level>       level ∈ high|medium|low|none
 //   comment add <id> --text "<body>" [--by claude|user]
 //   comment list <id> [--json]
-//   list [--project <name> | --all] [--priority <level>] [--json]
-//        defaults to THIS project (cwd basename) + project-less tasks; --all spans every project
+//   list [--project <name> | --all] [--status <col>[,<col>]] [--priority <level>] [--json]
+//        defaults to THIS project (cwd basename) + project-less tasks; --all spans every project.
+//        --status filters by kanban column (backlog|queue|in_progress|review|done), comma-separated to combine
 //
 // Exit code is non-zero on any error (bad status, unknown id, usage), so a
 // caller can tell success from failure.
@@ -28,6 +29,11 @@ import path from "node:path";
 
 // Kanban columns, in board order. Keep in lockstep with todos.rs::STATUSES.
 const STATUSES = ["backlog", "queue", "in_progress", "review", "done"];
+
+// Normalize a possibly-legacy status to a real column. Pre-column tasks stored
+// `pending`; the tracker migrates them to `backlog` on load and the SessionStart
+// hook does the same — mirror it so `--status` matches what the board shows.
+const col = (s) => (STATUSES.includes(s) ? s : "backlog");
 
 // Priority buckets, most to least important; "" = unset. Keep in lockstep with
 // todos.rs::PRIORITIES and TodoWindow.vue. The SessionStart hook ranks by this
@@ -322,6 +328,21 @@ function cmdList(args) {
     const cwdProject = path.basename(process.cwd().replace(/[\\/]+$/, ""));
     todos = todos.filter((t) => !t.project || t.project === cwdProject);
   }
+  // --status <col>[,<col>]: keep only the named kanban columns (a bare `list`
+  // shows the whole board, done included, which floods context). Comma-separate
+  // to combine (e.g. `--status review,done`); legacy statuses fold to backlog.
+  const si = args.indexOf("--status");
+  if (si !== -1) {
+    const val = args[si + 1];
+    if (!val || val.startsWith("--"))
+      fail(`--status needs a value: ${STATUSES.join(" | ")} (comma-separate to combine, e.g. review,done)`);
+    const wanted = val.toLowerCase().split(",").map((s) => s.trim()).filter(Boolean);
+    const bad = wanted.filter((s) => !STATUSES.includes(s));
+    if (bad.length)
+      fail(`invalid --status "${bad.join(",")}". valid: ${STATUSES.join(" | ")}`);
+    const want = new Set(wanted);
+    todos = todos.filter((t) => want.has(col(t.status)));
+  }
   const pri = args.indexOf("--priority");
   if (pri !== -1 && args[pri + 1]) {
     const want = normalizePriority(args[pri + 1]);
@@ -394,8 +415,11 @@ function usage(code) {
       " | none\n" +
       '  comment add <id> --text "<body>" [--by claude|user]\n' +
       "  comment list <id> [--json]\n" +
-      "  list [--project <name> | --all] [--priority <level>] [--json]\n" +
-      "                                  default: this project (cwd) + global; --all = every project\n" +
+      "  list [--project <name> | --all] [--status <col>[,<col>]] [--priority <level>] [--json]\n" +
+      "                                  default: this project (cwd) + global (open + done); --all = every project\n" +
+      "                                  --status filters by column: " +
+      STATUSES.join(" | ") +
+      " (comma-separate to combine)\n" +
       "  related <project> [--json]      projects that work with <project>\n" +
       "  groups [--json]                 list association groups\n",
   );
