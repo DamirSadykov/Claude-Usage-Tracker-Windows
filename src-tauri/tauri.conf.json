@@ -96,6 +96,7 @@
       "../scripts/cli.mjs": "scripts/cli.mjs",
       "../scripts/cli/todos.mjs": "scripts/cli/todos.mjs",
       "../scripts/cli/phases.mjs": "scripts/cli/phases.mjs",
+      "../scripts/cli/triage.mjs": "scripts/cli/triage.mjs",
       "../scripts/cli/hook.mjs": "scripts/cli/hook.mjs"
     },
     "icon": [
