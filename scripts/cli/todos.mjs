@@ -276,8 +276,11 @@ function cmdAdd(args) {
     estimate_minutes: estimate,
     scheduled_for: typeof flags.scheduled === "string" ? flags.scheduled : null,
     plan: typeof flags.plan === "string" ? flags.plan : "",
-    project: target,
-    from,
+    // Omit project/from when absent (global / same-project), mirroring the Rust
+    // skip_serializing_if and `set-project`'s clear path — a global add no longer
+    // writes a redundant `"project": null` (issue #54 review B1).
+    ...(target ? { project: target } : {}),
+    ...(from ? { from } : {}),
     // This CLI is Claude's interface (the hook tells Claude to use it), so a
     // task added here is AI-composed unless the caller overrides with --by user.
     created_by: typeof flags.by === "string" ? flags.by : "claude",

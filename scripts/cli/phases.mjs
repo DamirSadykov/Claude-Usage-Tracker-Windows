@@ -266,9 +266,14 @@ function extractVision(readmeText) {
     /^#{1,6}\s+(vision|видение)(?![a-zа-яё])/i.test(l),
   );
   if (i < 0) return null;
+  // The section ends at the next heading of the SAME or a HIGHER level (a sibling/
+  // parent), so a DEEPER sub-heading (e.g. `### Flow`) stays inside the body — a
+  // structured multi-line vision isn't silently truncated (issue #58).
+  const visLevel = lines[i].match(/^(#{1,6})/)[1].length;
   const body = [];
   for (i += 1; i < lines.length; i++) {
-    if (/^#{1,6}\s+/.test(lines[i])) break; // next heading ends the section
+    const m = lines[i].match(/^(#{1,6})\s+/);
+    if (m && m[1].length <= visLevel) break;
     body.push(lines[i]);
   }
   const text = body
@@ -285,8 +290,15 @@ function locateVisionSection(lines) {
     /^#{1,6}\s+(vision|видение)(?![a-zа-яё])/i.test(l),
   );
   if (head < 0) return null;
+  // Same level-aware boundary as extractVision, so writing a new vision replaces
+  // exactly the body that reading extracts — deeper sub-headings are part of it.
+  const visLevel = lines[head].match(/^(#{1,6})/)[1].length;
   let end = head + 1;
-  while (end < lines.length && !/^#{1,6}\s+/.test(lines[end])) end++;
+  while (end < lines.length) {
+    const m = lines[end].match(/^(#{1,6})\s+/);
+    if (m && m[1].length <= visLevel) break;
+    end++;
+  }
   return { head, bodyStart: head + 1, bodyEnd: end };
 }
 
