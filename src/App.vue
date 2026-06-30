@@ -411,15 +411,14 @@ async function serviceToast(a: { kind: string; text: string }) {
 }
 
 // Memory-bloat notifications (#33) come pre-decided by the backend (a sudden
-// jump or an already-oversized index/entry); we localize the wrapper and honour
-// the toggle. `detail` is e.g. "+7 KB" or "MEMORY.md 40 KB".
-async function memoryToast(a: { kind: string; project: string; detail: string }) {
+// jump in the active project's memory); we localize the wrapper and honour the
+// toggle. `detail` is e.g. "+7 KB".
+async function memoryToast(a: { project: string; detail: string }) {
     if (!memoryBloatEnabled.value) return;
-    const body =
-        a.kind === "large"
-            ? t("memAlertLarge", { project: a.project, detail: a.detail })
-            : t("memAlertGrew", { project: a.project, detail: a.detail });
-    await notify(t("memAlertTitle"), body);
+    await notify(
+        t("memAlertTitle"),
+        t("memAlertGrew", { project: a.project, detail: a.detail }),
+    );
 }
 
 // A todo moved into review/done by an external writer (the cc-todos CLI or a
@@ -755,7 +754,7 @@ onMounted(async () => {
                 void serviceToast(e.payload);
             },
         ),
-        await listen<{ kind: string; project: string; detail: string }>(
+        await listen<{ project: string; detail: string }>(
             "memory-alert",
             (e) => {
                 void memoryToast(e.payload);

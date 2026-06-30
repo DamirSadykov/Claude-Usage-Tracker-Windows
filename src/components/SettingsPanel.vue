@@ -884,7 +884,7 @@ function handleSave() {
         </div>
       </div>
 
-      <!-- Memory-bloat watch (#33) — sudden growth / oversized index notification -->
+      <!-- Memory-bloat watch (#33) — sudden-growth notification for the active project -->
       <div class="card toggle-card" @click="localMemBloat = !localMemBloat">
         <div style="flex: 1; min-width: 0">
           <div class="card-title" style="font-size: 13px">{{ t('memBloatSetting') }}</div>
