@@ -675,16 +675,14 @@ fn spawn_status_loop(app: AppHandle) {
 
 // --- Memory-bloat watch (#33): notify on sudden growth or a bloated index ---
 
-/// Emitted when a project's Claude memory grows suddenly (a pasted log/blob) or
-/// its index is already oversized, so the frontend can raise a desktop
-/// notification. Mirrors the `service-alert` flow.
+/// Emitted when the active project's Claude memory grows suddenly (a pasted
+/// log/blob), so the frontend can raise a desktop notification. Mirrors the
+/// `service-alert` flow.
 #[derive(Serialize, Clone)]
 struct MemoryAlert {
-    /// `grew` (sudden delta this run) | `large` (already oversized at startup).
-    kind: String,
     /// Human-friendly project label.
     project: String,
-    /// Localizable detail, e.g. "+7 KB" or "MEMORY.md 40 KB".
+    /// Localizable detail, e.g. "+7 KB".
     detail: String,
 }
 
@@ -699,35 +697,30 @@ fn kb(bytes: u64) -> u64 {
 
 fn spawn_memory_loop(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
-        // Per-project debounced watcher. Each only alerts once its total has
+        // Per-project debounced watcher, keyed by project so switching projects
+        // resumes each one's baseline. Each only alerts once its total has
         // settled, so reorganizing memory (moving bytes between files without
         // changing the total) is silent — fixing the alert flood when a bloated
-        // MEMORY.md is split into thematic files. See memory::Watch (#48).
+        // MEMORY.md is split into thematic files. See memory::Watch (#48). We only
+        // scan the ACTIVE project, so an alert is about what you're working on now.
         let mut watches: HashMap<String, memory::Watch> = HashMap::new();
 
         loop {
             let enabled =
                 { app.state::<Mutex<AppConfig>>().lock().unwrap().memory_bloat_enabled };
             if enabled {
-                for s in memory::scan() {
-                    let Some(alert) = watches.entry(s.project.clone()).or_default().observe(&s)
-                    else {
-                        continue;
-                    };
-                    let (kind, detail) = match alert {
-                        memory::Alert::Large { name, bytes } => {
-                            ("large", format!("{} {} KB", name, kb(bytes)))
-                        }
-                        memory::Alert::Grew { delta } => ("grew", format!("+{} KB", kb(delta))),
-                    };
-                    let _ = app.emit(
-                        "memory-alert",
-                        MemoryAlert {
-                            kind: kind.into(),
-                            project: memory::label(&s.project),
-                            detail,
-                        },
-                    );
+                if let Some(s) = memory::scan() {
+                    if let Some(delta) =
+                        watches.entry(s.project.clone()).or_default().observe(&s)
+                    {
+                        let _ = app.emit(
+                            "memory-alert",
+                            MemoryAlert {
+                                project: memory::label(&s.project),
+                                detail: format!("+{} KB", kb(delta)),
+                            },
+                        );
+                    }
                 }
             }
             tokio::time::sleep(MEMORY_CHECK_INTERVAL).await;

@@ -2,24 +2,22 @@
 //!
 //! Claude Code keeps a per-project memory under
 //! `~/.claude/projects/<encoded-cwd>/memory/`: a `MEMORY.md` index that is
-//! loaded IN FULL every session (so it truncates past a size, silently dropping
-//! facts) plus one `*.md` file per fact. A pasted log / blob bloats either the
-//! index or an entry and quietly overflows the budget.
+//! loaded IN FULL every session plus one `*.md` file per fact. A pasted log /
+//! blob bloats the total and quietly overflows the budget.
 //!
-//! This module only STATS files (never reads contents), so a periodic scan is
-//! cheap. [`scan`] returns per-project sizes; `lib.rs::spawn_memory_loop` turns
-//! them into a desktop notification on a sudden jump (delta) or, once at startup,
-//! an already-bloated index/entry (absolute). Thresholds are derived from real
-//! memory: healthy indexes are <3 KB and entries 1-6 KB; observed breakage ~27 KB.
+//! We watch ONLY the *active* project — the one whose transcript was written most
+//! recently — so a bloat alert is about what you're working on now, not every
+//! project that ever lived on disk. The module only STATS files (never reads
+//! contents), so a scan is cheap. [`scan`] returns the active project's size;
+//! `lib.rs::spawn_memory_loop` turns a sudden settled jump (delta) into a desktop
+//! notification. The growth threshold is derived from real memory: a normal new
+//! fact is 1-3 KB, so a multi-KB jump is a paste/blob, not an edit.
 
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
-/// `MEMORY.md` loads in full each session; past this it risks a partial load.
-pub const MEMORY_MD_LIMIT: u64 = 10 * 1024;
-/// A single entry this large is almost certainly a blob / log dump, not a fact.
-pub const ENTRY_LIMIT: u64 = 12 * 1024;
-/// A jump this large in a project's total memory between scans is suspicious
-/// (a normal new fact is 1-3 KB).
+/// A jump this large in the active project's total memory between settled scans
+/// is suspicious (a normal new fact is 1-3 KB).
 pub const DELTA_LIMIT: u64 = 5 * 1024;
 /// How many consecutive scans a project's total must hold steady before we judge
 /// it. This DEBOUNCES a reorganization (a "распил" of a bloated `MEMORY.md` into
@@ -33,24 +31,8 @@ pub const SETTLE_SCANS: u32 = 2;
 pub struct MemStat {
     /// The project's memory dir name (the encoded cwd, e.g. `D--projects-foo`).
     pub project: String,
-    /// Sum of every `*.md` in `memory/`.
+    /// Sum of every `*.md` in `memory/` (the index plus all fact files).
     pub total: u64,
-    /// `MEMORY.md` size (the always-loaded index).
-    pub memory_md: u64,
-    /// Largest non-index `*.md` and its name.
-    pub max_entry: u64,
-    pub max_entry_name: String,
-}
-
-/// What a settled scan decided — surfaced by [`Watch::observe`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Alert {
-    /// The index or an entry was ALREADY oversized when first settled (one-time
-    /// per project). `name` is the file, `bytes` its size.
-    Large { name: String, bytes: u64 },
-    /// The total jumped `delta` bytes above the last stable baseline — a paste or
-    /// blob, not a reorganization.
-    Grew { delta: u64 },
 }
 
 /// Per-project, debounced bloat watcher. It tracks a STABLE baseline and only
@@ -60,23 +42,23 @@ pub enum Alert {
 ///
 /// Replaces the old "compare against the immediately-previous scan" logic, which
 /// counted transient intermediate sizes (new files written before the index is
-/// trimmed) as growth, and re-fired the absolute check on every app launch.
+/// trimmed) as growth.
 #[derive(Clone, Debug, Default)]
 pub struct Watch {
     /// Previous raw total; `None` until the first scan.
     last: Option<u64>,
     /// Consecutive scans the total has equalled `last`.
     stable_for: u32,
-    /// Last SETTLED total; `None` until the first settle (which also runs the
-    /// one-time already-oversized check).
+    /// Last SETTLED total; `None` until the first settle.
     baseline: Option<u64>,
 }
 
 impl Watch {
-    /// Feed one scan of a project's [`MemStat`]. Returns `Some(Alert)` only when
-    /// the reading has settled (held steady for [`SETTLE_SCANS`] scans) AND crosses
-    /// a threshold; `None` while the total is still churning or within limits.
-    pub fn observe(&mut self, s: &MemStat) -> Option<Alert> {
+    /// Feed one scan of a project's [`MemStat`]. Returns `Some(delta_bytes)` only
+    /// when the reading has settled (held steady for [`SETTLE_SCANS`] scans) AND
+    /// grew at least [`DELTA_LIMIT`] above the last stable baseline; `None` while
+    /// the total is still churning or within limits.
+    pub fn observe(&mut self, s: &MemStat) -> Option<u64> {
         match self.last {
             None => {
                 // First sighting: establish a reading, don't judge it yet.
@@ -100,36 +82,18 @@ impl Watch {
 
         match self.baseline {
             None => {
-                // First settled observation: adopt it as the baseline and run the
-                // one-time "already oversized" check (the index/entry was big
-                // before we started watching, not something that just grew).
+                // First settled observation: adopt it as the baseline silently.
+                // A project that was already large before we started watching is
+                // not "growth" — only a jump from here on is.
                 self.baseline = Some(s.total);
-                if s.memory_md > MEMORY_MD_LIMIT {
-                    Some(Alert::Large {
-                        name: "MEMORY.md".into(),
-                        bytes: s.memory_md,
-                    })
-                } else if s.max_entry > ENTRY_LIMIT {
-                    Some(Alert::Large {
-                        name: s.max_entry_name.clone(),
-                        bytes: s.max_entry,
-                    })
-                } else {
-                    None
-                }
+                None
             }
             Some(base) => {
                 // Re-baseline to this plateau regardless: a reorganization that
                 // returns to ~the same total has delta ~0 and stays silent, while
                 // gradual growth never accumulates past the threshold in one settle.
                 self.baseline = Some(s.total);
-                if s.total >= base.saturating_add(DELTA_LIMIT) {
-                    Some(Alert::Grew {
-                        delta: s.total - base,
-                    })
-                } else {
-                    None
-                }
+                (s.total >= base.saturating_add(DELTA_LIMIT)).then_some(s.total - base)
             }
         }
     }
@@ -142,58 +106,72 @@ fn claude_projects_dir() -> Option<PathBuf> {
     p.is_dir().then_some(p)
 }
 
+/// Newest mtime among a transcript dir's `*.jsonl` files; `None` if it has none.
+/// This is the project's "last activity" signal — content appends bump a file's
+/// mtime, whereas the dir's own mtime only changes on file create/delete.
+fn newest_transcript_mtime(dir: &Path) -> Option<SystemTime> {
+    let mut newest: Option<SystemTime> = None;
+    for ent in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = ent.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        if let Ok(mt) = ent.metadata().and_then(|m| m.modified()) {
+            if newest.is_none_or(|n| mt > n) {
+                newest = Some(mt);
+            }
+        }
+    }
+    newest
+}
+
+/// Among `(project_dir_name, newest_transcript_mtime)` pairs, the name with the
+/// newest mtime. Pure so it's testable without touching the clock or filesystem.
+fn pick_active(candidates: Vec<(String, SystemTime)>) -> Option<String> {
+    candidates.into_iter().max_by_key(|(_, t)| *t).map(|(n, _)| n)
+}
+
+/// The encoded dir name of the active project — the one whose transcript was
+/// written most recently. `None` when no project under `root` has a transcript.
+fn active_project(root: &Path) -> Option<String> {
+    let mut candidates = Vec::new();
+    for ent in std::fs::read_dir(root).ok()?.flatten() {
+        let dir = ent.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        if let Some(mt) = newest_transcript_mtime(&dir) {
+            candidates.push((ent.file_name().to_string_lossy().into_owned(), mt));
+        }
+    }
+    pick_active(candidates)
+}
+
 /// Stat one `memory/` dir into a [`MemStat`] (no content reads).
 fn stat_dir(project: String, dir: &Path) -> Option<MemStat> {
     let files = std::fs::read_dir(dir).ok()?;
     let mut total = 0u64;
-    let mut memory_md = 0u64;
-    let mut max_entry = 0u64;
-    let mut max_entry_name = String::new();
     for f in files.flatten() {
         let path = f.path();
         if path.extension().and_then(|e| e.to_str()) != Some("md") {
             continue;
         }
-        let size = f.metadata().map(|m| m.len()).unwrap_or(0);
-        total += size;
-        let name = f.file_name().to_string_lossy().into_owned();
-        if name.eq_ignore_ascii_case("MEMORY.md") {
-            memory_md = size;
-        } else if size > max_entry {
-            max_entry = size;
-            max_entry_name = name;
-        }
+        total += f.metadata().map(|m| m.len()).unwrap_or(0);
     }
-    Some(MemStat {
-        project,
-        total,
-        memory_md,
-        max_entry,
-        max_entry_name,
-    })
+    Some(MemStat { project, total })
 }
 
-/// Scan every project's `memory/` dir. Cheap (stat only). One entry per project
-/// that has a `memory/` dir; empty on any IO problem (never errors a caller).
-pub fn scan() -> Vec<MemStat> {
-    let Some(root) = claude_projects_dir() else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(&root) else {
-        return out;
-    };
-    for ent in entries.flatten() {
-        let dir = ent.path().join("memory");
-        if !dir.is_dir() {
-            continue;
-        }
-        let project = ent.file_name().to_string_lossy().into_owned();
-        if let Some(stat) = stat_dir(project, &dir) {
-            out.push(stat);
-        }
+/// Stat the ACTIVE project's `memory/` dir. `None` when there's no detectable
+/// active project or it has no `memory/` dir. Cheap (stat only); never errors a
+/// caller.
+pub fn scan() -> Option<MemStat> {
+    let root = claude_projects_dir()?;
+    let project = active_project(&root)?;
+    let dir = root.join(&project).join("memory");
+    if !dir.is_dir() {
+        return None;
     }
-    out
+    stat_dir(project, &dir)
 }
 
 /// A friendlier label for a notification: drop a leading drive marker so
@@ -211,6 +189,7 @@ pub fn label(project: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn label_strips_drive_marker() {
@@ -221,7 +200,22 @@ mod tests {
     }
 
     #[test]
-    fn stat_dir_sums_md_and_finds_largest_entry() {
+    fn pick_active_takes_newest_mtime() {
+        let t0 = SystemTime::UNIX_EPOCH;
+        let t1 = t0 + Duration::from_secs(10);
+        let t2 = t0 + Duration::from_secs(20);
+        let active = pick_active(vec![
+            ("old".into(), t0),
+            ("newest".into(), t2),
+            ("mid".into(), t1),
+        ]);
+        assert_eq!(active.as_deref(), Some("newest"));
+        // No candidates → no active project.
+        assert_eq!(pick_active(vec![]), None);
+    }
+
+    #[test]
+    fn stat_dir_sums_md_files() {
         let dir = std::env::temp_dir().join("cut_mem_stat_test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -232,42 +226,27 @@ mod tests {
 
         let s = stat_dir("proj".into(), &dir).unwrap();
         assert_eq!(s.total, 900); // 100 + 500 + 300, txt excluded
-        assert_eq!(s.memory_md, 100);
-        assert_eq!(s.max_entry, 500);
-        assert_eq!(s.max_entry_name, "a.md");
+        assert_eq!(s.project, "proj");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // A MemStat with a given total and (optionally) an oversized index/entry.
-    fn stat(total: u64, memory_md: u64, max_entry: u64) -> MemStat {
+    // A MemStat with a given total.
+    fn stat(total: u64) -> MemStat {
         MemStat {
             project: "p".into(),
             total,
-            memory_md,
-            max_entry,
-            max_entry_name: "big.md".into(),
         }
     }
 
     #[test]
-    fn settles_then_flags_already_oversized_index_once() {
+    fn first_settle_adopts_baseline_silently() {
         let mut w = Watch::default();
-        let s = stat(27 * 1024, 27 * 1024, 0);
+        // Even an already-large total only establishes the baseline — no alert,
+        // because it didn't *grow* while we were watching.
+        let s = stat(40 * 1024);
         assert_eq!(w.observe(&s), None); // first sighting — establish only
-        for _ in 0..(SETTLE_SCANS - 1) {
-            assert_eq!(w.observe(&s), None); // settling, not yet judged
-        }
-        // The scan that reaches SETTLE_SCANS fires the one-time Large.
-        assert_eq!(
-            w.observe(&s),
-            Some(Alert::Large {
-                name: "MEMORY.md".into(),
-                bytes: 27 * 1024
-            })
-        );
-        // It does NOT re-fire while sitting on the same stable plateau.
         for _ in 0..(SETTLE_SCANS + 2) {
-            assert_eq!(w.observe(&s), None);
+            assert_eq!(w.observe(&s), None); // settles, adopts baseline, stays quiet
         }
     }
 
@@ -275,12 +254,12 @@ mod tests {
     fn reorg_keeping_total_steady_never_alerts() {
         let mut w = Watch::default();
         let base = 20 * 1024;
-        let healthy = stat(base, 8 * 1024, 0); // index under limit, total 20 KB
+        let healthy = stat(base);
         for _ in 0..=SETTLE_SCANS {
             assert_eq!(w.observe(&healthy), None); // settle a clean baseline
         }
         // A "распил": total spikes (new files written) then returns (index trimmed).
-        let spike = stat(base + 15 * 1024, 8 * 1024, 0);
+        let spike = stat(base + 15 * 1024);
         assert_eq!(w.observe(&spike), None); // churn — not settled
         assert_eq!(w.observe(&healthy), None); // back down — not settled
         // Even once it settles again at the original total, delta ~0 ⇒ silent.
@@ -290,31 +269,31 @@ mod tests {
     }
 
     #[test]
-    fn sudden_settled_growth_flags_grew_once() {
+    fn sudden_settled_growth_flags_delta_once() {
         let mut w = Watch::default();
         let base = 20 * 1024;
-        let healthy = stat(base, 8 * 1024, 0);
+        let healthy = stat(base);
         for _ in 0..=SETTLE_SCANS {
             assert_eq!(w.observe(&healthy), None);
         }
         // A blob is pasted: +10 KB, and it stays.
-        let grown = stat(base + 10 * 1024, 8 * 1024, 0);
-        let mut alerts = Vec::new();
+        let grown = stat(base + 10 * 1024);
+        let mut deltas = Vec::new();
         for _ in 0..=SETTLE_SCANS {
-            if let Some(a) = w.observe(&grown) {
-                alerts.push(a);
+            if let Some(d) = w.observe(&grown) {
+                deltas.push(d);
             }
         }
-        assert_eq!(alerts, vec![Alert::Grew { delta: 10 * 1024 }]);
+        assert_eq!(deltas, vec![10 * 1024]);
     }
 
     #[test]
     fn churning_total_never_settles_so_never_alerts() {
         let mut w = Watch::default();
-        // A total that changes every scan never reaches SETTLE_SCANS — so even an
-        // oversized index (memory_md > limit) stays silent until things settle.
+        // A total that changes every scan never reaches SETTLE_SCANS, so growth
+        // that never plateaus stays silent until things settle.
         for i in 0..8u64 {
-            let s = stat((20 + i) * 1024, 30 * 1024, 0);
+            let s = stat((20 + i) * 1024);
             assert_eq!(w.observe(&s), None);
         }
     }

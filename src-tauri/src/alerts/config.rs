@@ -121,9 +121,8 @@ pub struct AppConfig {
     pub service_status_interval: u64,
     #[serde(default = "default_true")]
     pub service_status_notify: bool,
-    // Memory-bloat watch (#33): notify when a project's Claude memory grows
-    // suddenly (a pasted log/blob) or its MEMORY.md index is already oversized
-    // (risks a silent partial load). Independent of `notifications_enabled`.
+    // Memory-bloat watch (#33): notify when the active project's Claude memory
+    // grows suddenly (a pasted log/blob). Independent of `notifications_enabled`.
     // On by default.
     #[serde(default = "default_true")]
     pub memory_bloat_enabled: bool,
