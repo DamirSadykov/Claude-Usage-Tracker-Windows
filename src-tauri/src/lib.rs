@@ -69,6 +69,25 @@ fn set_pin(pinned: bool) {
     PINNED.store(pinned, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Non-production profile label ("Dev" / "Preview"), or None for prod. Storage
+/// dirs, the single-instance mutex and the window/tray labels all key off the
+/// identifier; this maps it to a short badge shared by setup() and the frontend.
+fn env_label(identifier: &str) -> Option<&'static str> {
+    match identifier {
+        "com.claude-usage-tracker.dev" => Some("Dev"),
+        "com.claude-usage-tracker.preview" => Some("Preview"),
+        _ => None,
+    }
+}
+
+/// Exposes the environment label to the frontend. The flyout and mini windows
+/// are frameless (no native titlebar), so they render this as a header badge;
+/// the framed windows already get the suffix via `set_title` in setup().
+#[tauri::command]
+fn app_env_label(app: AppHandle) -> Option<String> {
+    env_label(&app.config().identifier).map(str::to_string)
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1780,6 +1799,29 @@ pub fn run() {
             let version = app.package_info().version.to_string();
             info!("Claude Usage Tracker v{} starting", version);
 
+            // Environment labelling for non-production profiles. A single
+            // per-profile overlay (identifier) already isolates storage dirs and
+            // the single-instance mutex; here we mirror it into the UI. Framed
+            // windows (analytics/todos/settings) get the suffix on their native
+            // title; the frameless flyout/mini render `app_env_label` as a badge.
+            // The window array and tray tooltip are NOT duplicated in the JSON
+            // overlay (JSON Merge Patch replaces arrays wholesale), and the
+            // tooltip base is hardcoded (not productName) so preview never doubles.
+            if let Some(label) = env_label(&app.config().identifier) {
+                let suffix = format!(" ({label})");
+                for (_win_label, window) in app.webview_windows() {
+                    // "mini" ships with an empty title on purpose — leave it be.
+                    if let Ok(current) = window.title() {
+                        if !current.is_empty() {
+                            let _ = window.set_title(&format!("{current}{suffix}"));
+                        }
+                    }
+                }
+                if let Some(tray) = app.tray_by_id("main-tray") {
+                    let _ = tray.set_tooltip(Some(format!("Claude Usage Tracker{suffix}")));
+                }
+            }
+
             // Diagnostics: route panics to a marker file in the log dir, and pick
             // up any report left by a crash on the previous run.
             let diag_store = Arc::new(DiagStore::default());
@@ -1976,6 +2018,7 @@ pub fn run() {
             open_log_dir,
             report_frontend_error,
             set_pin,
+            app_env_label,
             open_analytics_window,
             get_analytics_ext,
             export_analytics_json,

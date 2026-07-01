@@ -118,9 +118,29 @@ The installer will be available at `src-tauri/target/release/bundle/`.
 
 ### Development
 
-```bash
-npm run tauri dev
-```
+The app runs in three isolated **profiles**. Each has its own data directory,
+single-instance lock, and tray/window label, so they can all run at the same time
+without clobbering each other — every storage path is derived from the Tauri
+`identifier`.
+
+| Profile | Command | Identifier | Data dir (`%APPDATA%`) |
+|---|---|---|---|
+| **dev** | `npm run app:dev` | `com.claude-usage-tracker.dev` | `…-tracker.dev\` |
+| **preview** | `npm run app:preview` | `com.claude-usage-tracker.preview` | `…-tracker.preview\` |
+| **prod** | `npm run tauri build` / CI release | `com.claude-usage-tracker.app` | `…-tracker.app\` |
+
+- **dev** — fast debug iteration. Always use `npm run app:dev`; plain
+  `npm run tauri dev` would write to the **production** data directory.
+- **preview** — an optimized release build in isolation, for testing the real
+  installer and first-run experience without touching production data. It installs
+  as a separate "Claude Usage Tracker (Preview)" program and its updater is
+  disabled.
+- **prod** — what users get; built by CI on a release tag. The base
+  `tauri.conf.json` is the production config and is never touched by the overlays.
+
+The dev/preview overlays live in `src-tauri/tauri.conf.dev.json` and
+`src-tauri/tauri.conf.preview.json`; they are merged on top of the base config via
+`--config` (JSON Merge Patch).
 
 ## Configuration
 
