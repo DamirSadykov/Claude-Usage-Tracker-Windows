@@ -63,8 +63,8 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: "Claude Usage Tracker ${{ github.ref_name }}"
+          tagName: ${{ github.event.release.tag_name }}
+          releaseName: "Claude Usage Tracker ${{ github.event.release.tag_name }}"
           releaseBody: ${{ steps.notes.outputs.BODY }}
           releaseDraft: false
           prerelease: false
@@ -80,4 +80,4 @@ jobs:
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release edit "${{ github.ref_name }}" --notes-file RELEASE_NOTES.md
+        run: gh release edit "${{ github.event.release.tag_name }}" --notes-file RELEASE_NOTES.md
