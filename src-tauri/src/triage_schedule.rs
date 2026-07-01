@@ -73,6 +73,48 @@ fn config_path(data_dir: &Path) -> PathBuf {
     data_dir.join("triage-schedule.json")
 }
 
+/// The effective audit prompt and whether it's a user override, for the settings
+/// editor. `text` is what a run would actually use (custom file or baked default).
+#[derive(Debug, Clone, Serialize)]
+pub struct PromptInfo {
+    pub text: String,
+    pub is_custom: bool,
+}
+
+/// Path to the user's custom prompt override, beside the board. When present and
+/// non-empty it replaces the baked-in template for every run.
+fn prompt_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("triage-prompt.md")
+}
+
+/// Effective prompt + whether it's a user override. A missing, empty, or unreadable
+/// override falls back to the baked default, so a bad edit can never wedge a run.
+pub fn load_prompt(data_dir: &Path) -> (String, bool) {
+    if let Ok(s) = std::fs::read_to_string(prompt_path(data_dir)) {
+        if !s.trim().is_empty() {
+            return (s, true);
+        }
+    }
+    (PROMPT_TEMPLATE.to_string(), false)
+}
+
+/// Write a custom prompt override atomically (temp + rename).
+pub fn save_prompt(data_dir: &Path, text: &str) -> Result<(), String> {
+    let p = prompt_path(data_dir);
+    let tmp = p.with_extension("md.tmp");
+    std::fs::write(&tmp, text).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &p).map_err(|e| e.to_string())
+}
+
+/// Drop the override, reverting to the baked default. Idempotent (missing = ok).
+pub fn reset_prompt(data_dir: &Path) -> Result<(), String> {
+    match std::fs::remove_file(prompt_path(data_dir)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 /// Read the config; a missing or malformed file yields defaults.
 pub fn load(data_dir: &Path) -> ScheduleConfig {
     std::fs::read_to_string(config_path(data_dir))
@@ -259,7 +301,10 @@ pub fn run_triage(home: &Path, data_dir: &Path, cli_path: &str, model: &str) -> 
     // Step 2 — the headless agent: Read board.json, Write the digest. Read+Write are
     // its ONLY tools, so it can't mutate the board and never hits an interactive
     // permission prompt (the failure mode of giving it a shell command to run).
-    let prompt = PROMPT_TEMPLATE
+    // Use the user's custom prompt if they set one in settings, else the baked
+    // template. Placeholders are substituted the same way regardless.
+    let (template, _is_custom) = load_prompt(data_dir);
+    let prompt = template
         .replace("<BOARD>", &board_s)
         .replace("<STAGING>", &staging_s)
         .replace("<TODAY>", &today);
