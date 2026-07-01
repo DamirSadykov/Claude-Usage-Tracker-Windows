@@ -123,7 +123,7 @@ function metricVal(tokens: number, cost: number): number {
   return metric.value === "cost" ? cost : tokens;
 }
 
-// "claude-opus-4-7" → "Opus 4.7"
+// "claude-opus-4-7" → "Opus 4.7", "claude-sonnet-5" → "Sonnet 5"
 function modelLabel(m: string): string {
   const fam = m.includes("fable")
     ? "Fable"
@@ -134,8 +134,12 @@ function modelLabel(m: string): string {
         : m.includes("haiku")
           ? "Haiku"
           : m;
-  const ver = m.match(/(\d+)-(\d+)/);
-  return ver ? `${fam} ${ver[1]}.${ver[2]}` : fam;
+  // Version sits right after the family: opus-4-8 → 4.8, sonnet-5 → 5 (no minor),
+  // haiku-4-5-20251001 → 4.5 (trailing date snapshot ignored). Minor is 1–2 digits
+  // with a no-trailing-digit guard so an 8-digit date can't be read as a minor.
+  const ver = m.match(/(?:fable|opus|sonnet|haiku)-(\d+)(?:-(\d{1,2})(?!\d))?/);
+  if (!ver) return fam;
+  return ver[2] ? `${fam} ${ver[1]}.${ver[2]}` : `${fam} ${ver[1]}`;
 }
 
 // Each family anchors a hue; individual versions within a family get distinct
