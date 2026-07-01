@@ -165,6 +165,9 @@ const error = ref("");
 const errorReportable = ref(false);
 const loading = ref(false);
 const showAbout = ref(false);
+// Non-production profile badge ("Dev"/"Preview") shown in the flyout header —
+// the frameless main/mini windows have no native titlebar to carry the suffix.
+const envBadge = ref<string | null>(null);
 
 interface DiagReport {
     kind: string;
@@ -723,6 +726,12 @@ onMounted(async () => {
 
     await loadSettings();
 
+    try {
+        envBadge.value = await invoke<string | null>("app_env_label");
+    } catch {
+        /* not under Tauri */
+    }
+
     const { listen } = await import("@tauri-apps/api/event");
     unlisteners.push(
         await listen<{ usage: UsageData; levels: UsageLevels }>(
@@ -856,7 +865,9 @@ onUnmounted(() => {
                     >
                         <circle cx="8" cy="8" r="6" />
                     </svg>
-                    Claude Usage
+                    Claude Usage<span v-if="envBadge" class="env-badge">{{
+                        envBadge
+                    }}</span>
                 </div>
             </div>
             <div class="fly-hd-right">
@@ -1264,5 +1275,20 @@ onUnmounted(() => {
 
 .link-btn:hover {
     color: var(--text-2);
+}
+
+/* Non-production environment badge next to "Claude Usage" in the header. */
+.env-badge {
+    margin-left: 6px;
+    padding: 1px 5px;
+    border-radius: 4px;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--accent);
+    border: 1px solid var(--accent);
+    background: rgba(217, 119, 87, 0.12);
+    vertical-align: middle;
 }
 </style>

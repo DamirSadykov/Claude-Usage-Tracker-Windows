@@ -11,7 +11,9 @@
     "changelog": "git-cliff",
     "changelog:latest": "git-cliff --latest --strip header",
     "bump": "node scripts/bump-version.mjs",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "app:dev": "tauri dev --config src-tauri/tauri.conf.dev.json",
+    "app:preview": "tauri build --config src-tauri/tauri.conf.preview.json"
   },
   "dependencies": {
     "@fontsource/fira-code": "^5.2.7",

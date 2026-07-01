@@ -1,0 +1,12 @@
+{
+  "productName": "Claude Usage Tracker (Preview)",
+  "identifier": "com.claude-usage-tracker.preview",
+  "bundle": {
+    "createUpdaterArtifacts": false
+  },
+  "plugins": {
+    "updater": {
+      "active": false
+    }
+  }
+}
