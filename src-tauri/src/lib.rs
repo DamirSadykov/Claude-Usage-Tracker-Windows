@@ -1222,6 +1222,37 @@ async fn run_triage_now(app: AppHandle) -> Result<(), String> {
         .map_err(|e| e.to_string())?
 }
 
+/// The audit prompt for the settings editor: the effective text (custom override
+/// or baked default) plus whether it's a user override.
+#[tauri::command]
+fn get_triage_prompt(app: AppHandle) -> Result<triage_schedule::PromptInfo, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let (text, is_custom) = triage_schedule::load_prompt(&dir);
+    Ok(triage_schedule::PromptInfo { text, is_custom })
+}
+
+/// Save a custom audit prompt from the settings editor. An empty/whitespace value
+/// resets to the baked default rather than persisting a prompt that can't run.
+#[tauri::command]
+fn set_triage_prompt(app: AppHandle, text: String) -> Result<(), String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).ok();
+    if text.trim().is_empty() {
+        return triage_schedule::reset_prompt(&dir);
+    }
+    triage_schedule::save_prompt(&dir, &text)
+}
+
+/// Drop the custom audit prompt, reverting to the baked default; returns the
+/// (now default) prompt so the editor can refresh in place.
+#[tauri::command]
+fn reset_triage_prompt(app: AppHandle) -> Result<triage_schedule::PromptInfo, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    triage_schedule::reset_prompt(&dir)?;
+    let (text, is_custom) = triage_schedule::load_prompt(&dir);
+    Ok(triage_schedule::PromptInfo { text, is_custom })
+}
+
 /// Distinct project names the tracker has seen (from cc_usage), for the
 /// task-manager's project picker. Empty if analytics has never ingested.
 #[tauri::command]
@@ -1953,6 +1984,9 @@ pub fn run() {
             get_triage_schedule,
             set_triage_schedule,
             run_triage_now,
+            get_triage_prompt,
+            set_triage_prompt,
+            reset_triage_prompt,
             get_cc_projects,
             get_raw_projects,
             get_project_links,

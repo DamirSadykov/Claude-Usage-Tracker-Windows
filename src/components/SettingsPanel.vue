@@ -315,9 +315,9 @@ async function doInstallCcHook() {
 onMounted(loadCcHookStatus);
 
 // --- Phases in tasks (issue #16) ---
-// Parked in the Updates tab FOR NOW; later it moves into the tasks settings.
-// A UI-only flag stored straight in settings.json (like ignoredInsights above) —
-// no backend config — so relocating it won't touch the Save flow. Default ON.
+// Lives in the Tasks tab. A UI-only flag stored straight in settings.json (like
+// ignoredInsights above) — no backend config, so it stays out of the Save flow.
+// Default ON.
 const phasesEnabled = ref(true);
 
 async function loadPhasesEnabled() {
@@ -409,6 +409,151 @@ async function setSessionCtx(v: string) {
 }
 
 onMounted(loadSessionCtx);
+
+// --- Task context in sessions (master hook switch) ---
+// A UI-only flag in settings.json read by the SessionStart hook: when OFF, the
+// hook injects nothing into a session (no task board, no phase context). Default
+// ON. Same store-write pattern as phasesEnabled above.
+const hookContextEnabled = ref(true);
+
+async function loadHookContext() {
+  try {
+    const { load: loadStore } = await import("@tauri-apps/plugin-store");
+    const store = await loadStore("settings.json");
+    const v = await store.get<boolean>("hookContextEnabled");
+    if (typeof v === "boolean") hookContextEnabled.value = v;
+  } catch {}
+}
+
+async function toggleHookContext() {
+  hookContextEnabled.value = !hookContextEnabled.value;
+  try {
+    const { load: loadStore } = await import("@tauri-apps/plugin-store");
+    const store = await loadStore("settings.json");
+    await store.set("hookContextEnabled", hookContextEnabled.value);
+    await store.save();
+  } catch {}
+}
+
+onMounted(loadHookContext);
+
+// --- Task audit schedule (#35) ---
+// Moved here from the tasks window. The in-app scheduler runs a headless
+// `claude -p` audit once a day (backend `spawn_triage_scheduler`); these controls
+// just read/write its config via the same backend commands. The digest it produces
+// is still shown by the tasks-window chip.
+interface TriageSchedule {
+  enabled: boolean;
+  time: string;
+  model: string;
+  last_run: string | null;
+  last_error: string | null;
+}
+const schedEnabled = ref(false);
+const schedTime = ref("08:00");
+const schedModel = ref("haiku");
+const schedLastRun = ref<string | null>(null);
+const schedLastError = ref<string | null>(null);
+const triageRunning = ref(false);
+
+async function loadTriageSchedule() {
+  try {
+    const s = await invoke<TriageSchedule>("get_triage_schedule");
+    schedEnabled.value = s.enabled;
+    schedTime.value = s.time || "08:00";
+    schedModel.value = s.model || "haiku";
+    schedLastRun.value = s.last_run;
+    schedLastError.value = s.last_error;
+  } catch {
+    // not under Tauri
+  }
+}
+
+// Persist the toggle/time/model; the backend validates and echoes the normalized
+// values back (e.g. zero-padded time), so we reflect those.
+async function saveTriageSchedule() {
+  try {
+    const s = await invoke<TriageSchedule>("set_triage_schedule", {
+      enabled: schedEnabled.value,
+      time: schedTime.value,
+      model: schedModel.value,
+    });
+    schedTime.value = s.time;
+    schedModel.value = s.model;
+  } catch (e) {
+    schedLastError.value = String(e);
+  }
+}
+
+function toggleSched() {
+  schedEnabled.value = !schedEnabled.value;
+  void saveTriageSchedule();
+}
+
+// Run the audit immediately, then refresh schedule state (last_run/last_error).
+async function runTriageNow() {
+  if (triageRunning.value) return;
+  triageRunning.value = true;
+  schedLastError.value = null;
+  try {
+    await invoke("run_triage_now");
+  } catch (e) {
+    schedLastError.value = String(e);
+  } finally {
+    triageRunning.value = false;
+    await loadTriageSchedule();
+  }
+}
+
+onMounted(loadTriageSchedule);
+
+// --- Audit prompt editor (#35) ---
+// The full prompt the audit model runs is handed to settings: the backend returns
+// the effective text (a custom override, else the baked default); saving writes an
+// override, reset drops it. Collapsed by default — this is an advanced knob.
+interface TriagePrompt {
+  text: string;
+  is_custom: boolean;
+}
+const triagePrompt = ref("");
+const triagePromptCustom = ref(false);
+const promptOpen = ref(false);
+const promptSaved = ref(false);
+let promptSavedTimer: ReturnType<typeof setTimeout> | null = null;
+
+async function loadTriagePrompt() {
+  try {
+    const info = await invoke<TriagePrompt>("get_triage_prompt");
+    triagePrompt.value = info.text;
+    triagePromptCustom.value = info.is_custom;
+  } catch {
+    // not under Tauri
+  }
+}
+
+async function saveTriagePrompt() {
+  try {
+    await invoke("set_triage_prompt", { text: triagePrompt.value });
+    await loadTriagePrompt();
+    promptSaved.value = true;
+    if (promptSavedTimer) clearTimeout(promptSavedTimer);
+    promptSavedTimer = setTimeout(() => (promptSaved.value = false), 2000);
+  } catch {
+    // write failed (rare) → leave the editor as-is; nothing persisted
+  }
+}
+
+async function resetTriagePrompt() {
+  try {
+    const info = await invoke<TriagePrompt>("reset_triage_prompt");
+    triagePrompt.value = info.text;
+    triagePromptCustom.value = info.is_custom;
+  } catch {
+    // not under Tauri
+  }
+}
+
+onMounted(loadTriagePrompt);
 
 // Keep each threshold triple strictly ascending with a 1% gap so the colour
 // bands can't overlap. Fixed slider scale (5..99) + clamping — dynamic min/max
@@ -1105,6 +1250,17 @@ function handleSave() {
         </button>
       </div>
 
+      <!-- Master switch: does the SessionStart hook inject task/phase context? -->
+      <div class="card toggle-card" @click="toggleHookContext">
+        <div style="flex: 1; min-width: 0">
+          <div class="card-title" style="font-size: 13px">{{ t('hookContextSetting') }}</div>
+          <div class="card-sub">{{ t('hookContextSettingDesc') }}</div>
+        </div>
+        <div class="toggle" :class="{ on: hookContextEnabled }">
+          <div class="toggle-knob"></div>
+        </div>
+      </div>
+
       <!-- Phases in tasks (issue #16) — UI-only flag in settings.json. -->
       <div class="card toggle-card" @click="togglePhasesEnabled">
         <div style="flex: 1; min-width: 0">
@@ -1142,6 +1298,84 @@ function handleSave() {
           <option v-for="m in SESSION_CTX_MODES" :key="m" :value="m">{{ sessionCtxLabel(m) }}</option>
         </select>
         <div class="field-hint">{{ t('sessionCtxDesc') }}</div>
+      </div>
+
+      <!-- Task audit schedule (#35) — daily headless audit of the task board.
+           Moved here from the tasks window; the digest still shows in that window. -->
+      <div class="card">
+        <div class="field-label">{{ t('triageSchedule') }}</div>
+        <div class="tier-row" @click="toggleSched">
+          <span class="tier-name">{{ t('triageScheduleEnable') }}</span>
+          <div class="toggle" :class="{ on: schedEnabled }">
+            <div class="toggle-knob"></div>
+          </div>
+        </div>
+        <div
+          v-if="schedEnabled"
+          class="card-row"
+          style="align-items: center; gap: 10px; margin-top: 8px"
+        >
+          <input
+            type="time"
+            class="field-input"
+            style="flex: 0 0 auto; width: auto"
+            v-model="schedTime"
+            @change="saveTriageSchedule"
+          />
+          <select
+            class="field-input"
+            style="flex: 1"
+            v-model="schedModel"
+            @change="saveTriageSchedule"
+          >
+            <option value="haiku">Haiku</option>
+            <option value="sonnet">Sonnet</option>
+            <option value="opus">Opus</option>
+          </select>
+        </div>
+        <div class="budget-suggest" style="margin-top: 10px">
+          <button type="button" class="suggest-btn" :disabled="triageRunning" @click="runTriageNow">
+            {{ triageRunning ? t('triageRunning') : t('triageRunNow') }}
+          </button>
+          <span
+            v-if="schedLastRun && !schedLastError"
+            class="field-hint"
+            style="margin: 0"
+          >{{ t('triageLastRun', { date: schedLastRun }) }}</span>
+        </div>
+        <div v-if="schedLastError" class="field-hint" style="color: #f87171; margin-top: 6px">
+          {{ t('triageRunFailed') }}
+        </div>
+      </div>
+
+      <!-- Editable audit prompt (advanced): full control over what the audit looks
+           for; an empty save / reset reverts to the shipped default. -->
+      <div class="card">
+        <div class="card-row" style="align-items: center">
+          <div class="field-label" style="margin-bottom: 0">{{ t('triagePromptTitle') }}</div>
+          <button type="button" class="suggest-btn" @click="promptOpen = !promptOpen">
+            {{ promptOpen ? t('triagePromptHide') : t('triagePromptEdit') }}
+          </button>
+        </div>
+        <div class="field-hint" style="margin-top: 6px">{{ t('triagePromptDesc') }}</div>
+        <template v-if="promptOpen">
+          <textarea
+            v-model="triagePrompt"
+            class="field-input prompt-editor"
+            rows="16"
+            spellcheck="false"
+          ></textarea>
+          <div class="budget-suggest" style="margin-top: 8px">
+            <span class="field-hint" style="margin: 0">
+              {{ triagePromptCustom ? t('triagePromptCustom') : t('triagePromptDefault') }}<template v-if="promptSaved"> · {{ t('triagePromptSaved') }} ✓</template>
+            </span>
+            <span style="display: flex; gap: 8px; flex-shrink: 0">
+              <button type="button" class="suggest-btn" @click="resetTriagePrompt">{{ t('triagePromptReset') }}</button>
+              <button type="button" class="suggest-btn" @click="saveTriagePrompt">{{ t('save') }}</button>
+            </span>
+          </div>
+          <div class="field-hint" style="margin-top: 6px">{{ t('triagePromptVars') }}</div>
+        </template>
       </div>
       </template>
     </div>
@@ -1588,5 +1822,14 @@ function handleSave() {
 
 .suggest-btn:hover {
   background: rgba(255, 255, 255, 0.06);
+}
+
+.prompt-editor {
+  margin-top: 8px;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  resize: vertical;
+  min-height: 200px;
 }
 </style>

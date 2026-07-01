@@ -153,7 +153,7 @@ const knownProjects = ref<string[]>([]);
 // Read-only: authored by the cc-phases CLI in each project's .claude/phases/.
 const phasePlans = ref<Map<string, PhasePlan>>(new Map());
 
-// UI toggle (Settings → Updates, issue #16): when off, hide all phase UI. Stored
+// UI toggle (Settings → Tasks, issue #16): when off, hide all phase UI. Stored
 // straight in settings.json by the settings panel; read here on mount/focus.
 const phasesEnabled = ref(true);
 
@@ -716,69 +716,9 @@ function triageGoToTask(num?: number) {
   openTask(num as number);
 }
 
-// --- Nightly-triage SCHEDULE controls (#35) ---
-// The in-app scheduler runs a headless `claude -p` triage once a day (backend
-// `spawn_triage_scheduler`). These controls just read/write its config; the digest
-// it produces is shown by the popover above.
-interface TriageSchedule {
-  enabled: boolean;
-  time: string;
-  model: string;
-  last_run: string | null;
-  last_error: string | null;
-}
-const schedEnabled = ref(false);
-const schedTime = ref("08:00");
-const schedModel = ref("haiku");
-const schedLastRun = ref<string | null>(null);
-const schedLastError = ref<string | null>(null);
-const triageRunning = ref(false);
-
-async function loadTriageSchedule() {
-  try {
-    const s = await invoke<TriageSchedule>("get_triage_schedule");
-    schedEnabled.value = s.enabled;
-    schedTime.value = s.time || "08:00";
-    schedModel.value = s.model || "haiku";
-    schedLastRun.value = s.last_run;
-    schedLastError.value = s.last_error;
-  } catch {
-    // not under Tauri
-  }
-}
-
-// Persist the toggle/time/model; the backend validates and echoes the normalized
-// values back (e.g. zero-padded time), so we reflect those.
-async function saveTriageSchedule() {
-  try {
-    const s = await invoke<TriageSchedule>("set_triage_schedule", {
-      enabled: schedEnabled.value,
-      time: schedTime.value,
-      model: schedModel.value,
-    });
-    schedTime.value = s.time;
-    schedModel.value = s.model;
-  } catch (e) {
-    errorMsg.value = String(e);
-  }
-}
-
-// Run the triage immediately. Awaits the headless run, then refreshes the digest
-// + schedule state (so last_run/last_error update).
-async function runTriageNow() {
-  if (triageRunning.value) return;
-  triageRunning.value = true;
-  schedLastError.value = null;
-  try {
-    await invoke("run_triage_now");
-    await loadTriageDigest();
-  } catch (e) {
-    schedLastError.value = String(e);
-  } finally {
-    triageRunning.value = false;
-    await loadTriageSchedule();
-  }
-}
+// The audit SCHEDULE controls (enable/time/model/run-now, #35) moved to
+// Settings → Tasks. This window keeps only the READ-ONLY digest chip/popover
+// below; the schedule config now lives in the settings panel.
 
 // Distinct other tasks this one references inline (#N) across its description and
 // comments — drives the card's link chip. Uses tokenize so it counts exactly
@@ -1028,7 +968,7 @@ let unlistenTriage: (() => void) | null = null;
 // reaches the picker. We also kick a background ingest (like the Analytics
 // window) so a brand-new project lands in cc_usage even if Analytics was never
 // opened this session.
-// Read the phases UI toggle from the shared settings store (Settings → Updates).
+// Read the phases UI toggle from the shared settings store (Settings → Tasks).
 async function loadPhasesEnabled() {
   try {
     const { load: loadStore } = await import("@tauri-apps/plugin-store");
@@ -1106,14 +1046,12 @@ onMounted(async () => {
   // windows); refresh the chip so it reflects the latest run.
   unlistenTriage = await listen("triage-alert", () => {
     void loadTriageDigest();
-    void loadTriageSchedule();
   });
   await loadTodos();
   await refreshKnownProjects();
   void loadPhasesEnabled();
   void refreshPhasePlans();
   void loadTriageDigest();
-  void loadTriageSchedule();
   // Persisted webview: refresh the picker each time the window is brought to
   // front, so a project used since the last view (now in cc_usage) shows up.
   const { getCurrentWindow } = await import("@tauri-apps/api/window");
@@ -1123,7 +1061,6 @@ onMounted(async () => {
       void loadPhasesEnabled();
       void refreshPhasePlans();
       void loadTriageDigest();
-      void loadTriageSchedule();
     }
   });
 });
@@ -1169,52 +1106,10 @@ onUnmounted(() => {
                   <span v-if="triageGeneratedLabel">{{ triageGeneratedLabel }}</span>
                 </span>
               </div>
-              <!-- Schedule controls FIRST, so they're reachable without scrolling
-                   past a long digest (#35); always shown. -->
-              <div class="tw-triage-sched" :class="{ 'has-digest': triageDigest }">
-                <label class="tw-sched-toggle">
-                  <input
-                    type="checkbox"
-                    v-model="schedEnabled"
-                    @change="saveTriageSchedule"
-                  />
-                  <span>{{ t("triageScheduleEnable") }}</span>
-                </label>
-                <div v-if="schedEnabled" class="tw-sched-row">
-                  <input
-                    type="time"
-                    class="tw-sched-time"
-                    v-model="schedTime"
-                    @change="saveTriageSchedule"
-                  />
-                  <select
-                    class="tw-sched-model"
-                    v-model="schedModel"
-                    @change="saveTriageSchedule"
-                  >
-                    <option value="haiku">Haiku</option>
-                    <option value="sonnet">Sonnet</option>
-                    <option value="opus">Opus</option>
-                  </select>
-                </div>
-                <div class="tw-sched-actions">
-                  <button
-                    type="button"
-                    class="tw-btn tw-sched-run"
-                    :disabled="triageRunning"
-                    @click="runTriageNow"
-                  >
-                    {{ triageRunning ? t("triageRunning") : t("triageRunNow") }}
-                  </button>
-                  <span
-                    v-if="schedLastRun && !schedLastError"
-                    class="tw-sched-status"
-                    >{{ t("triageLastRun", { date: schedLastRun }) }}</span
-                  >
-                </div>
-                <div v-if="schedLastError" class="tw-sched-err">
-                  {{ t("triageRunFailed") }}
-                </div>
+              <!-- Schedule config moved to Settings → Tasks (#35). When nothing
+                   has run yet, point there instead of showing an empty popover. -->
+              <div v-if="!triageDigest" class="tw-triage-clean">
+                {{ t("triageNoRuns") }}
               </div>
               <template v-if="triageDigest">
                 <p v-if="triageDigest.summary" class="tw-triage-summary">
@@ -1278,9 +1173,8 @@ onUnmounted(() => {
         {{ t("todoGuide") }}
       </button>
       <button class="tw-guide" :title="t('settings')" @click="openSettings">
-        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4">
-          <circle cx="8" cy="8" r="2.2" />
-          <path d="M8 1.5v1.8M8 12.7v1.8M14.5 8h-1.8M3.3 8H1.5M12.6 3.4l-1.3 1.3M4.7 11.3l-1.3 1.3M12.6 12.6l-1.3-1.3M4.7 4.7L3.4 3.4" stroke-linecap="round" />
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+          <path d="M19.43 12.98c.04-.32.07-.64.07-.98s-.03-.66-.07-.98l2.11-1.65c.19-.15.24-.42.12-.64l-2-3.46c-.12-.22-.39-.3-.61-.22l-2.49 1c-.52-.4-1.08-.73-1.69-.98l-.38-2.65C14.46 2.18 14.25 2 14 2h-4c-.25 0-.46.18-.49.42l-.38 2.65c-.61.25-1.17.59-1.69.98l-2.49-1c-.23-.09-.49 0-.61.22l-2 3.46c-.13.22-.07.49.12.64l2.11 1.65c-.04.32-.07.65-.07.98s.03.66.07.98l-2.11 1.65c-.19.15-.24.42-.12.64l2 3.46c.12.22.39.3.61.22l2.49-1c.52.4 1.08.73 1.69.98l.38 2.65c.03.24.18.42.43.42h4c.25 0 .46-.18.49-.42l.38-2.65c.61-.25 1.17-.59 1.69-.98l2.49 1c.23.09.49 0 .61-.22l2-3.46c.12-.22.07-.49-.12-.64l-2.11-1.65zM12 15.5c-1.93 0-3-1.07-3-3.5s1.07-3.5 3-3.5 3 1.07 3 3.5-1.07 3.5-3 3.5z" />
         </svg>
         {{ t("settings") }}
       </button>
@@ -2834,63 +2728,6 @@ onUnmounted(() => {
   position: absolute;
   left: 2px;
   color: var(--text-4);
-}
-
-/* Nightly-triage schedule controls (#35), in the digest popover footer. */
-.tw-triage-sched {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-/* Controls sit above the digest; when one follows, divide them from it. */
-.tw-triage-sched.has-digest {
-  padding-bottom: 10px;
-  border-bottom: 1px solid var(--stroke-strong);
-}
-.tw-sched-toggle {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  font-size: 12px;
-  color: var(--text-2);
-  cursor: pointer;
-}
-.tw-sched-toggle input {
-  cursor: pointer;
-}
-.tw-sched-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.tw-sched-time,
-.tw-sched-model {
-  font-family: var(--segoe);
-  font-size: 12px;
-  padding: 3px 6px;
-  background: var(--card-bg);
-  color: var(--text);
-  border: 1px solid var(--stroke-strong);
-  border-radius: 6px;
-  /* Render the native time-picker icon + spinners light on the dark theme
-     (was black-on-black). The app is dark-only. */
-  color-scheme: dark;
-}
-.tw-sched-actions {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-.tw-sched-run {
-  font-size: 12px;
-}
-.tw-sched-status {
-  font-size: 11px;
-  color: var(--text-4);
-}
-.tw-sched-err {
-  font-size: 11px;
-  color: var(--warning);
 }
 
 /* Inline-reference autocomplete menu */

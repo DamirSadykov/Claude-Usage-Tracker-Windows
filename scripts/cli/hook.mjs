@@ -82,6 +82,24 @@ function sessionContextMode(appData) {
   return "phase";
 }
 
+// Master switch (settings.json `hookContextEnabled`, written by SettingsPanel):
+// when false, the hook injects NOTHING into the session — no task board and no
+// phase context. Default true (inject). Read-only and forgiving: a missing file,
+// bad JSON, or absent key falls back to on.
+function hookContextEnabled(appData) {
+  try {
+    const raw = readFileSync(
+      path.join(appData, "com.claude-usage-tracker.app", "settings.json"),
+      "utf8",
+    );
+    const v = JSON.parse(raw).hookContextEnabled;
+    if (typeof v === "boolean") return v;
+  } catch {
+    // no settings file / bad JSON / missing key → default on
+  }
+  return true;
+}
+
 // Local calendar date as YYYY-MM-DD — "today" is the USER's day, not UTC (a
 // scheduled_for date is a plain local date). Used to surface due/overdue tasks.
 function localToday() {
@@ -105,6 +123,8 @@ function main() {
   const appData =
     process.env.APPDATA ||
     path.join(process.env.USERPROFILE || "", "AppData", "Roaming");
+  // Master off-switch: the user turned off task/phase context injection entirely.
+  if (!hookContextEnabled(appData)) return;
   const file = path.join(appData, "com.claude-usage-tracker.app", "todos.json");
 
   let data = null;
