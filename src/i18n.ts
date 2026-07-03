@@ -28,6 +28,9 @@ const messages = {
     configure: "Configure",
     retry: "Retry",
     loading: "Loading…",
+    loadTimeout:
+        "Couldn't fetch usage data. Your session key may have expired — check it in settings and your connection.",
+    updateSessionKey: "Update session key",
     save: "Save",
     sessionKey: "Session Key",
     sessionKeyPlaceholder: "Paste sessionKey from claude.ai cookie",
@@ -535,6 +538,9 @@ const messages = {
     configure: "Настроить",
     retry: "Повторить",
     loading: "Загрузка данных…",
+    loadTimeout:
+        "Не удалось получить данные. Возможно, истёк ключ сессии — проверьте его в настройках и подключение к сети.",
+    updateSessionKey: "Обновить ключ сессии",
     save: "Сохранить",
     sessionKey: "Session Key",
     sessionKeyPlaceholder: "Вставьте sessionKey из cookie claude.ai",
