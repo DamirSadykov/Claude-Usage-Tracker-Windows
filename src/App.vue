@@ -163,7 +163,45 @@ const sessionActive = computed(() => {
 });
 const error = ref("");
 const errorReportable = ref(false);
+// The current error is a rejected/expired session key (backend `session_expired`
+// flag, or our own load-timeout guess). Swaps the "Report a problem" affordance
+// for a "go update the key" one.
+const sessionExpired = ref(false);
 const loading = ref(false);
+// Watchdog for the loading state. `loading` is driven purely by backend events
+// (`usage-updated` / `usage-error`); if one is ever missed — a startup race, a
+// skipped cycle on an empty/invalid config, an event dropped by WebView2 — the
+// spinner would otherwise never clear. When we begin loading we arm this timer,
+// and if no usage event settles it in time we surface an error (typically an
+// expired session key) instead of spinning forever.
+let loadWatchdog: ReturnType<typeof setTimeout> | null = null;
+// A bit above the backend's 30s HTTP timeout, so a genuinely slow-but-working
+// fetch still settles the spinner before the watchdog fires.
+const LOAD_WATCHDOG_MS = 40_000;
+function beginLoading() {
+    loading.value = true;
+    if (loadWatchdog !== null) clearTimeout(loadWatchdog);
+    loadWatchdog = setTimeout(() => {
+        loadWatchdog = null;
+        if (!loading.value) return;
+        loading.value = false;
+        // Only claim a timeout if we still have nothing to show — a stale
+        // cached `usage` shouldn't be masked by the error banner.
+        if (!error.value) {
+            error.value = t("loadTimeout");
+            errorReportable.value = false;
+            // A silent backend is most often an expired key — offer the fix.
+            sessionExpired.value = true;
+        }
+    }, LOAD_WATCHDOG_MS);
+}
+function settleLoading() {
+    loading.value = false;
+    if (loadWatchdog !== null) {
+        clearTimeout(loadWatchdog);
+        loadWatchdog = null;
+    }
+}
 const showAbout = ref(false);
 // Non-production profile badge ("Dev"/"Preview") shown in the flyout header —
 // the frameless main/mini windows have no native titlebar to carry the suffix.
@@ -375,7 +413,7 @@ function buildConfig() {
 
 async function applyConfig() {
     if (!configured.value) return;
-    loading.value = true;
+    beginLoading();
     await invoke("configure", { config: buildConfig() });
 }
 
@@ -515,7 +553,7 @@ async function setMute(until: string | null) {
 
 async function refresh() {
     if (!configured.value) return;
-    loading.value = true;
+    beginLoading();
     await invoke("refresh_now");
 }
 
@@ -741,17 +779,19 @@ onMounted(async () => {
                 levels.value = e.payload.levels;
                 error.value = "";
                 errorReportable.value = false;
-                loading.value = false;
+                sessionExpired.value = false;
+                settleLoading();
                 void loadTodaySpent();
                 void loadForecast();
             },
         ),
-        await listen<{ message: string; reportable: boolean }>(
+        await listen<{ message: string; reportable: boolean; session_expired?: boolean }>(
             "usage-error",
             (e) => {
                 error.value = String(e.payload?.message ?? e.payload);
                 errorReportable.value = e.payload?.reportable ?? false;
-                loading.value = false;
+                sessionExpired.value = e.payload?.session_expired ?? false;
+                settleLoading();
             },
         ),
         await listen<AlertEvent>("alert", (e) => {
@@ -844,6 +884,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
     unlisteners.forEach((u) => u());
+    if (loadWatchdog !== null) clearTimeout(loadWatchdog);
 });
 </script>
 
@@ -1085,6 +1126,14 @@ onUnmounted(() => {
                     >
                         {{ error }}
                     </p>
+                    <button
+                        v-if="sessionExpired"
+                        class="btn-primary"
+                        @click="openSettings('account')"
+                        style="margin-top: 10px; width: 100%"
+                    >
+                        {{ t("updateSessionKey") }}
+                    </button>
                     <button
                         class="btn-secondary"
                         @click="refresh"

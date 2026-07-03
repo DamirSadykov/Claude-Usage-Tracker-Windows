@@ -206,10 +206,13 @@ struct UsageUpdate {
 
 /// An error surfaced to the frontend. `reportable` tells the UI it can offer the
 /// "Report a problem" button (a diagnostic report is waiting in `DiagStore`).
+/// `session_expired` flags the specific "cookie rejected" case so the UI can
+/// point the user at the session key instead of the generic error/report path.
 #[derive(Serialize, Clone)]
 struct UsageError {
     message: String,
     reportable: bool,
+    session_expired: bool,
 }
 
 // --- Diagnostics helpers ---
@@ -276,6 +279,7 @@ async fn run_cycle(
         Ok(u) => u,
         Err(e) => {
             let msg = e.to_string();
+            let session_expired = e.session_expired;
             record_diag(
                 app,
                 "usage-fetch",
@@ -286,7 +290,10 @@ async fn run_cycle(
                 "usage-error",
                 UsageError {
                     message: msg,
-                    reportable: true,
+                    // An expired cookie isn't an app bug — don't invite a report,
+                    // send the user to the session key instead.
+                    reportable: !session_expired,
+                    session_expired,
                 },
             );
             return None;

@@ -171,10 +171,47 @@ const DEFAULT_TIER: UsageTier = UsageTier {
 
 // --- Fetch usage ---
 
-pub async fn fetch_usage(
-    session_key: &str,
-    org_id: &str,
-) -> Result<UsageData, Box<dyn std::error::Error + Send + Sync>> {
+/// A failed usage fetch. `session_expired` is the one bit the UI acts on: it's
+/// set only when the failure is specifically a rejected/expired session cookie
+/// — an HTTP 401/403, or a redirect to the login page (claude.ai answering an
+/// unauthenticated API call with HTML instead of a 401). Network errors, a wrong
+/// org id (404) and a Claude outage (5xx) are NOT expired-cookie — they leave
+/// this false so the UI doesn't wrongly send the user to re-enter a valid key.
+#[derive(Debug)]
+pub struct FetchError {
+    pub message: String,
+    pub session_expired: bool,
+}
+
+impl FetchError {
+    /// A failure that is not (or not known to be) an expired cookie.
+    fn plain(message: String) -> Self {
+        Self { message, session_expired: false }
+    }
+}
+
+impl std::fmt::Display for FetchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for FetchError {}
+
+/// Heuristic for "the server bounced us to a login page". A 2xx whose body isn't
+/// the expected JSON is almost always claude.ai serving its HTML login shell (or
+/// a redirect landing there) because the session cookie was rejected — so we
+/// read it as an expired key rather than an opaque "unexpected JSON".
+fn looks_like_login_page(final_url: &reqwest::Url, body: &str) -> bool {
+    let path = final_url.path();
+    let redirected_away = final_url.host_str() != Some("claude.ai")
+        || path.contains("login")
+        || path.contains("auth");
+    let html = body.trim_start().starts_with('<');
+    redirected_away || html
+}
+
+pub async fn fetch_usage(session_key: &str, org_id: &str) -> Result<UsageData, FetchError> {
     // Diagnostics for the common "data won't fetch on another PC" report: we
     // log whether the inputs are present and their lengths — never the values.
     debug!(
@@ -194,7 +231,10 @@ pub async fn fetch_usage(
             // Most likely a session key with characters that aren't valid in an
             // HTTP header value (stray whitespace / non-ASCII from a bad paste).
             warn!("fetch_usage: invalid request headers (check the session key): {}", e);
-            return Err(format!("Некорректный ключ сессии (заголовок запроса): {}", e).into());
+            return Err(FetchError::plain(format!(
+                "Некорректный ключ сессии (заголовок запроса): {}",
+                e
+            )));
         }
     };
 
@@ -209,20 +249,30 @@ pub async fn fetch_usage(
     let usage_resp = match usage_resp {
         Ok(r) => r,
         Err(e) => {
+            // A transport failure (no connection / TLS / timeout) — NOT the
+            // cookie. Leave session_expired false so the UI blames the network.
             warn!("fetch_usage: usage request failed ({})", describe_net_error(&e));
-            return Err(format!("Сетевая ошибка запроса usage: {}", describe_net_error(&e)).into());
+            return Err(FetchError::plain(format!(
+                "Сетевая ошибка запроса usage: {}",
+                describe_net_error(&e)
+            )));
         }
     };
 
+    // Final URL after any redirects — a bounce to a login/auth page is our
+    // strongest "cookie rejected" signal on an otherwise-2xx response.
+    let final_url = usage_resp.url().clone();
     let status = usage_resp.status();
     if !status.is_success() {
         let body = usage_resp.text().await.unwrap_or_default();
         warn!(
-            "fetch_usage: usage API returned {} (body {} bytes): {}",
+            "fetch_usage: usage API returned {} (final_url {}, body {} bytes): {}",
             status,
+            final_url,
             body.len(),
             snippet(&body)
         );
+        let session_expired = matches!(status.as_u16(), 401 | 403);
         let hint = match status.as_u16() {
             401 | 403 => " — ключ сессии недействителен или истёк",
             404 => " — проверьте Organization ID",
@@ -231,23 +281,39 @@ pub async fn fetch_usage(
             500..=599 => " — сервис Claude временно недоступен, повторите позже",
             _ => "",
         };
-        return Err(format!("API вернул {}{}", status, hint).into());
+        return Err(FetchError {
+            message: format!("API вернул {}{}", status, hint),
+            session_expired,
+        });
     }
 
     // Read as text first so a non-JSON response (e.g. an HTML login page when the
     // session cookie is rejected) shows up as a readable snippet in the log
     // instead of an opaque "decode error".
-    let body = usage_resp
-        .text()
-        .await
-        .map_err(|e| format!("Не удалось прочитать тело ответа usage: {}", describe_net_error(&e)))?;
+    let body = usage_resp.text().await.map_err(|e| {
+        FetchError::plain(format!(
+            "Не удалось прочитать тело ответа usage: {}",
+            describe_net_error(&e)
+        ))
+    })?;
     let api: ApiResponse = serde_json::from_str(&body).map_err(|e| {
         warn!(
-            "fetch_usage: usage body is not the expected JSON ({} bytes): {}",
+            "fetch_usage: usage body is not the expected JSON (final_url {}, {} bytes): {}",
+            final_url,
             body.len(),
             snippet(&body)
         );
-        format!("Ответ usage — не ожидаемый JSON: {}", e)
+        // A 2xx that isn't our JSON is almost always the login page → treat it as
+        // an expired cookie so the user is sent to refresh the key, not puzzled
+        // by "unexpected JSON".
+        if looks_like_login_page(&final_url, &body) {
+            FetchError {
+                message: "Ключ сессии истёк — Claude вернул страницу входа вместо данных".into(),
+                session_expired: true,
+            }
+        } else {
+            FetchError::plain(format!("Ответ usage — не ожидаемый JSON: {}", e))
+        }
     })?;
     debug!("fetch_usage: usage parsed OK ({} bytes)", body.len());
 
@@ -614,5 +680,20 @@ mod tests {
         }"#;
         let u = parse(json, None);
         assert_eq!(u.extra_usage.unwrap().currency, "USD");
+    }
+
+    #[test]
+    fn login_page_is_recognised_as_expired_cookie() {
+        let usage = reqwest::Url::parse("https://claude.ai/api/organizations/x/usage").unwrap();
+        // Real JSON on the real endpoint → not a login page.
+        assert!(!looks_like_login_page(&usage, r#"{"seven_day":{}}"#));
+        // 2xx on the endpoint but an HTML shell came back → expired cookie.
+        assert!(looks_like_login_page(&usage, "<!DOCTYPE html><html>…"));
+        // Redirected to /login (even with a non-HTML body) → expired.
+        let login = reqwest::Url::parse("https://claude.ai/login").unwrap();
+        assert!(looks_like_login_page(&login, "whatever"));
+        // Bounced to a different host (auth provider) → expired.
+        let other = reqwest::Url::parse("https://auth.anthropic.com/authorize").unwrap();
+        assert!(looks_like_login_page(&other, "{}"));
     }
 }
