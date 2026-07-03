@@ -33,3 +33,19 @@ chrono = { version = "0.4", features = ["serde"] }
 # Only the `system` feature: read global CPU + RAM. No disk/network/process
 # scanning — keeps the binary small and avoids behavioural-AV-sensitive calls.
 sysinfo = { version = "0.39.3", default-features = false, features = ["system"] }
+# External-integration device identity (plan External-integration-public-side, phase 2):
+# pure ed25519 math + OS RNG + base64 — no crypto-protect syscalls, so the
+# behavioural-AV surface stays as above. At-rest key sealing (phase 2.2) is a
+# separate decision behind `identity::SecretStore`.
+ed25519-dalek = "2"
+getrandom = "0.2"
+base64 = "0.22"
+
+# DPAPI (CryptProtectData) for at-rest sealing of the device private key
+# (identity::DpapiStore, phase 2.2). Windows-only; tauri already pulls windows-sys
+# transitively, so the marginal cost is just the enabled feature set.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Security_Cryptography",
+    "Win32_Foundation",
+] }

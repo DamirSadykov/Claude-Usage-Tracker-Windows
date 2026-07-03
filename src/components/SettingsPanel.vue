@@ -13,6 +13,7 @@ import type { AlertTiers, AlertTierKey, AlertTypes, AlertTypeKey } from "../thre
 import { useUpdater } from "../updater";
 import { INSIGHT_KINDS } from "../insightKinds";
 import { FONT_OPTIONS, applyFont } from "../fontSwitch";
+import EnrollmentPanel from "./EnrollmentPanel.vue";
 
 const TIER_LABELS: Record<AlertTierKey, string> = {
   five_hour: "session5h",
@@ -33,7 +34,7 @@ const { t } = useI18n();
 // Settings are grouped into topic tabs. The panel now lives in a dedicated
 // settings window (issue #45); each screen's gear opens it on a matching tab via
 // the `openTab` prop (the window forwards the backend's `settings-open` event).
-type SettingsTab = "account" | "limits" | "notifications" | "budget" | "insights" | "tasks" | "updates";
+type SettingsTab = "account" | "limits" | "notifications" | "budget" | "insights" | "tasks" | "integrations" | "updates";
 const tab = ref<SettingsTab>("account");
 
 const {
@@ -708,6 +709,18 @@ function handleSave() {
       <button
         type="button"
         class="settings-tab"
+        :class="{ active: tab === 'integrations' }"
+        @click="tab = 'integrations'"
+      >
+        <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4">
+          <path d="M6.5 9.5L4.8 11.2a2.4 2.4 0 0 1-3.4-3.4l2-2a2.4 2.4 0 0 1 3.4 0" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M9.5 6.5l1.7-1.7a2.4 2.4 0 0 1 3.4 3.4l-2 2a2.4 2.4 0 0 1-3.4 0" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <span>{{ t('tabIntegrations') }}</span>
+      </button>
+      <button
+        type="button"
+        class="settings-tab"
         :class="{ active: tab === 'updates' }"
         @click="tab = 'updates'"
       >
@@ -1188,6 +1201,11 @@ function handleSave() {
           </div>
         </div>
       </div>
+      </template>
+
+      <!-- ===== Integrations ===== -->
+      <template v-if="tab === 'integrations'">
+        <EnrollmentPanel />
       </template>
 
       <!-- ===== Updates ===== -->

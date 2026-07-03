@@ -1,6 +1,9 @@
 pub mod alerts;
 pub mod cc;
 pub mod domain;
+pub mod enroll;
+pub mod external;
+pub mod identity;
 pub mod memory;
 pub mod phases;
 pub mod project_groups;
@@ -1192,6 +1195,269 @@ fn get_todos(app: AppHandle) -> Result<Vec<todos::Todo>, String> {
     Ok(todos::load(&todos_path(&app)?).todos)
 }
 
+// --- External-integration enrollment (plan External-integration-public-side, phase 4.2) ---
+
+/// Sealed device-key file, a sibling of todos.json (identity.rs owns the format).
+fn device_key_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).ok();
+    Ok(dir.join("device_key.bin"))
+}
+
+/// Persisted binding (account this device bound to). Sibling of todos.json.
+fn enrollment_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).ok();
+    Ok(dir.join("enrollment.json"))
+}
+
+/// Dev-only at-rest store for non-Windows builds: the key blob is written as-is.
+/// The shipping target is Windows, where the private key is DPAPI-sealed; this
+/// exists only so the crate builds/tests on a dev mac/linux.
+#[cfg(not(windows))]
+struct PlainStore;
+#[cfg(not(windows))]
+impl identity::SecretStore for PlainStore {
+    fn seal(&self, p: &[u8]) -> Result<Vec<u8>, String> {
+        Ok(p.to_vec())
+    }
+    fn unseal(&self, c: &[u8]) -> Result<Vec<u8>, String> {
+        Ok(c.to_vec())
+    }
+}
+
+/// Load (or first-run generate) this device's Ed25519 identity. The private key
+/// is DPAPI-sealed on Windows; a plaintext dev fallback is used off-Windows.
+fn load_identity(app: &AppHandle) -> Result<identity::DeviceIdentity, String> {
+    let path = device_key_path(app)?;
+    #[cfg(windows)]
+    {
+        identity::load_or_create(&path, &identity::DpapiStore)
+    }
+    #[cfg(not(windows))]
+    {
+        identity::load_or_create(&path, &PlainStore)
+    }
+}
+
+/// Public identity + current binding, for the enrollment UI.
+#[derive(Serialize)]
+struct EnrollmentStatus {
+    device_id: String,
+    public_key: String,
+    account: Option<String>,
+    enrolled_at: Option<String>,
+}
+
+/// A successful binding, returned to the enrollment UI.
+#[derive(Serialize)]
+struct BoundAccount {
+    account: String,
+    enrolled_at: String,
+}
+
+/// Device identity + whether this install is already bound to an account.
+#[tauri::command]
+fn enrollment_status(app: AppHandle) -> Result<EnrollmentStatus, String> {
+    let identity = load_identity(&app)?;
+    let state = enroll::EnrollmentState::load(&enrollment_path(&app)?)?;
+    Ok(EnrollmentStatus {
+        device_id: identity.device_id().to_string(),
+        public_key: identity.public_key_b64(),
+        account: state.account,
+        enrolled_at: state.enrolled_at,
+    })
+}
+
+/// Flow B: redeem the corp-issued pairing code the user typed in, binding this
+/// device's public key to its account at the resolver's `/enroll/bind`. `Ok` on
+/// success (binding persisted); `Err` on a bad/expired code (401), a missing
+/// resolver URL, a network failure, or an unexpected status. The device does NOT
+/// generate the code — the corp service does (see `enroll.rs`).
+#[tauri::command]
+async fn enroll_bind(app: AppHandle, code: String, url: String) -> Result<BoundAccount, String> {
+    // Single-word arg names (`code`, `url`) so the JS↔Rust key mapping is identity
+    // — no reliance on Tauri's camelCase→snake_case conversion. The resolver URL is
+    // passed straight from the Integrations tab, so binding works with the value
+    // the user just typed — no dependency on `configure` pushing it first.
+    let resolver_url = url.trim().trim_end_matches('/').to_string();
+    if resolver_url.is_empty() {
+        return Err("Не задан URL resolver'а — укажите его в настройках".into());
+    }
+    let code = code.trim().to_string();
+    if code.is_empty() {
+        return Err("Введите код привязки".into());
+    }
+
+    let identity = load_identity(&app)?;
+    let public_key = identity.public_key_b64();
+    let device_id = identity.device_id().to_string();
+    let body = enroll::BindRequest {
+        proof: &code,
+        public_key: &public_key,
+        device_id: &device_id,
+    };
+
+    let resp = reqwest::Client::new()
+        .post(format!("{resolver_url}/enroll/bind"))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Не удалось связаться с resolver: {e}"))?;
+
+    match resp.status() {
+        reqwest::StatusCode::OK => {
+            let parsed: enroll::BindResponse = resp.json().await.map_err(|e| e.to_string())?;
+            let state = enroll::EnrollmentState {
+                account: Some(parsed.account.clone()),
+                enrolled_at: Some(parsed.enrolled_at.clone()),
+                resolver_url: Some(resolver_url),
+            };
+            state.save(&enrollment_path(&app)?)?;
+            Ok(BoundAccount {
+                account: parsed.account,
+                enrolled_at: parsed.enrolled_at,
+            })
+        }
+        reqwest::StatusCode::UNAUTHORIZED => {
+            Err("Код неверный или истёк — запросите новый код в корп-сервисе".into())
+        }
+        s => Err(format!("Resolver вернул неожиданный статус {s}")),
+    }
+}
+
+/// Forget the local binding (does NOT unbind on the resolver — that is a later
+/// concern). Lets the user re-run enrollment, e.g. after switching accounts.
+#[tauri::command]
+fn enroll_reset(app: AppHandle) -> Result<(), String> {
+    let path = enrollment_path(&app)?;
+    if path.exists() {
+        std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+// --- External-integration poll client (plan External-integration-public-side, phase 5) ---
+
+/// Readonly mirror of external tasks, a sibling of todos.json (external.rs owns the
+/// format). The resolver-facing poll folds into this file; the UI reads it.
+fn external_tasks_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).ok();
+    Ok(dir.join("external_tasks.json"))
+}
+
+/// Emitted after a poll that produced status changes, so the frontend can raise a
+/// desktop notification. Mirrors the `service-alert` / `memory-alert` flow; the
+/// user designs the concrete UX on top of this on real data (phase 5 handoff).
+#[derive(Serialize, Clone)]
+struct ExternalTasksUpdate {
+    /// The full mirror after this poll (freshest task first).
+    tasks: Vec<external::ExternalTask>,
+    /// Net status changes this poll surfaced (empty is never emitted).
+    changes: Vec<external::StatusChange>,
+}
+
+/// Cadence of the background poll. External tasks change on human timescales, so a
+/// relaxed minute keeps this off the network hot path; a manual `poll_external`
+/// command lets the user refresh on demand between ticks.
+const EXTERNAL_POLL_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Poll the resolver once, fold the delivered events into `external_tasks.json`,
+/// and return the mirror + detected changes. `Ok(None)` when this device isn't
+/// enrolled yet (no binding / no resolver URL) — a benign no-op, not an error, so
+/// the background loop can call it every tick without spamming failures. On a
+/// successful poll it also emits `external-tasks-updated` iff something changed.
+async fn poll_external_once(app: &AppHandle) -> Result<Option<ExternalTasksUpdate>, String> {
+    let state = enroll::EnrollmentState::load(&enrollment_path(app)?)?;
+    let (Some(resolver_url), true) = (state.resolver_url.clone(), state.is_bound()) else {
+        return Ok(None);
+    };
+    let resolver_url = resolver_url.trim_end_matches('/').to_string();
+
+    let identity = load_identity(app)?;
+    let device_id = identity.device_id().to_string();
+    // RFC3339 with the resolver's expected precision; signed verbatim so no
+    // reformatting can desync our signature from the resolver's challenge.
+    let ts = chrono::Utc::now().to_rfc3339();
+    let signature = identity.sign_b64(external::poll_challenge(&device_id, &ts).as_bytes());
+
+    let body = external::PollRequest {
+        device_id,
+        ts: ts.clone(),
+        signature,
+    };
+
+    let resp = reqwest::Client::new()
+        .post(format!("{resolver_url}/poll"))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("Не удалось связаться с resolver: {e}"))?;
+
+    let messages: Vec<external::MessageIn> = match resp.status() {
+        reqwest::StatusCode::OK => resp.json().await.map_err(|e| e.to_string())?,
+        reqwest::StatusCode::UNAUTHORIZED => {
+            // The device's binding is gone/invalid (e.g. resolver store reset). Not
+            // fatal to the app; the user can re-enroll from the Integrations tab.
+            return Err("Устройство не авторизовано resolver'ом — привяжитесь заново".into());
+        }
+        s => return Err(format!("Resolver вернул неожиданный статус {s}")),
+    };
+
+    let path = external_tasks_path(app)?;
+    let mut cache = external::ExternalTasksCache::load(&path)?;
+    let changes = cache.apply(messages);
+    cache.last_poll_at = Some(ts);
+    cache.save(&path)?;
+
+    let update = ExternalTasksUpdate {
+        tasks: cache.tasks,
+        changes,
+    };
+    if !update.changes.is_empty() {
+        let _ = app.emit("external-tasks-updated", update.clone());
+    }
+    Ok(Some(update))
+}
+
+/// Manual refresh from the Integrations tab. `Ok(None)` = not enrolled (the UI
+/// shows the enrollment prompt instead of a task list).
+#[tauri::command]
+async fn poll_external(app: AppHandle) -> Result<Option<ExternalTasksUpdate>, String> {
+    poll_external_once(&app).await
+}
+
+/// The current mirror for the UI, without polling (fast, offline-friendly read).
+#[tauri::command]
+fn get_external_tasks(app: AppHandle) -> Result<external::ExternalTasksCache, String> {
+    external::ExternalTasksCache::load(&external_tasks_path(&app)?)
+}
+
+/// Background poll loop: mirror external tasks while the device is enrolled. Skips
+/// silently when unenrolled (returns `Ok(None)`), backs off on transient failures
+/// so a resolver outage doesn't hammer the network.
+fn spawn_external_poll_loop(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let mut fail: u32 = 0;
+        loop {
+            let mut sleep = EXTERNAL_POLL_INTERVAL;
+            match poll_external_once(&app).await {
+                Ok(_) => fail = 0,
+                Err(e) => {
+                    fail = fail.saturating_add(1);
+                    warn!("External poll failed (attempt {}): {}", fail, e);
+                    // Exponential backoff capped at ~16x, so a down resolver or a
+                    // dropped binding doesn't retry every 60s in a tight loop.
+                    let shift = fail.min(4);
+                    sleep = EXTERNAL_POLL_INTERVAL.saturating_mul(1u32 << shift);
+                }
+            }
+            tokio::time::sleep(sleep).await;
+        }
+    });
+}
+
 /// Path to the nightly-triage digest, a sibling of todos.json in the app data
 /// dir (see triage.rs / the cc-triage CLI). Read-only from the tracker's side.
 fn triage_digest_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -2000,6 +2266,7 @@ pub fn run() {
             spawn_memory_loop(app.handle().clone());
             spawn_triage_loop(app.handle().clone());
             spawn_triage_scheduler(app.handle().clone());
+            spawn_external_poll_loop(app.handle().clone());
 
             Ok(())
         })
@@ -2052,6 +2319,11 @@ pub fn run() {
             get_phase_plans,
             open_todo_window,
             open_settings_window,
+            enrollment_status,
+            enroll_bind,
+            enroll_reset,
+            poll_external,
+            get_external_tasks,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

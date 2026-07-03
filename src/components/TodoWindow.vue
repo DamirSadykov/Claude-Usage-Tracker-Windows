@@ -14,6 +14,14 @@ import { invoke } from "@tauri-apps/api/core";
 import ProjectAutocomplete from "./ProjectAutocomplete.vue";
 import ProjectLabel from "./ProjectLabel.vue";
 import { useProjectLinks } from "../projectLinks";
+import {
+  EXT_BUCKETS,
+  resolveBucket,
+  bucketClass,
+  STATUS_MAP_KEY,
+  type StatusMap,
+  type ExtBucketId,
+} from "../externalStatus";
 import i18n from "../i18n";
 import type { TriageDigest, DigestItem } from "../App.vue";
 
@@ -957,10 +965,245 @@ function fmtEstimate(min: number | null | undefined) {
   return m ? `${h}${t("hourShort")} ${m}${t("minShort")}` : `${h}${t("hourShort")}`;
 }
 
+// --- External tasks (readonly mirror; plan External-integration-public-side, ph6) ---
+// The tracker OWNS todos (above); external tasks are a READONLY mirror folded on the
+// backend into external_tasks.json and surfaced via get_external_tasks / poll_external
+// + the `external-tasks-updated` event. They carry SOURCE-NATIVE status strings (not
+// our 5 columns), so they live in a separate "External" mode — a grouped-by-source
+// list, never the kanban board — and are never editable/draggable here.
+interface ExternalTask {
+  task_id: string;
+  source: string;
+  title: string;
+  status: string;
+  url: string;
+  updated_at: string;
+  priority?: string | null;
+  assignee?: string | null;
+  // Forward-compat DTO: the private side will start sending these (project now,
+  // description maybe). Optional so today's payloads (without them) stay valid;
+  // the UI renders them only when present.
+  description?: string | null;
+  project?: string | null;
+  last_event_ts: string;
+  last_event_kind: string;
+}
+interface ExternalTasksCache {
+  tasks: ExternalTask[];
+  last_poll_at?: string | null;
+}
+interface StatusChange {
+  task_id: string;
+  source: string;
+  to: string;
+}
+interface ExternalTasksUpdate {
+  tasks: ExternalTask[];
+  changes: StatusChange[];
+}
+
+// Top-level view mode: the owned board ("local") vs the readonly mirror ("external").
+const taskMode = ref<"local" | "external">("local");
+const externalTasks = ref<ExternalTask[]>([]);
+const externalLastPoll = ref<string | null>(null);
+const externalRefreshing = ref(false);
+// Whether this device is enrolled — drives the empty tab's "connect a resolver"
+// prompt vs the plain "nothing mirrored yet" message.
+const externalBound = ref(false);
+// Keys (source::task_id) whose status changed during this session, so the list can
+// badge "изменилось" until the user leaves the tab (then they've been seen).
+const externalChanged = ref<Set<string>>(new Set());
+
+function extKey(source: string, taskId: string): string {
+  return `${source}::${taskId}`;
+}
+function externalIsChanged(t: ExternalTask): boolean {
+  return externalChanged.value.has(extKey(t.source, t.task_id));
+}
+
+const externalCount = computed(() => externalTasks.value.length);
+
+// User-owned status→bucket overrides (Settings → Integrations), read from
+// settings.json. Empty = fall back to the keyword heuristic in externalStatus.ts.
+const statusMap = ref<StatusMap>({});
+async function loadStatusMap() {
+  try {
+    const { load: loadStore } = await import("@tauri-apps/plugin-store");
+    const store = await loadStore("settings.json");
+    statusMap.value = (await store.get<StatusMap>(STATUS_MAP_KEY)) ?? {};
+  } catch {
+    // store missing / not under Tauri → keep the heuristic defaults
+  }
+}
+
+// Pill colour follows the SAME resolution as the column, so a remapped status
+// recolours to match its new column.
+function extStatusClass(status: string): string {
+  return bucketClass(resolveBucket(status, statusMap.value));
+}
+
+// Readonly kanban: fixed columns, source statuses resolved to a bucket via the user
+// map (heuristic default). Cards DON'T drag — status is owned upstream. The "other"
+// column only appears when something landed there. Tasks keep the backend's
+// freshest-first order within each column.
+interface ExtColumn {
+  id: ExtBucketId;
+  label: string;
+  dot: string;
+  tasks: ExternalTask[];
+}
+const externalColumns = computed<ExtColumn[]>(() => {
+  const buckets: Record<ExtBucketId, ExternalTask[]> = { open: [], active: [], done: [], other: [] };
+  for (const tk of externalTasks.value) buckets[resolveBucket(tk.status, statusMap.value)].push(tk);
+  const cols: ExtColumn[] = [];
+  for (const b of EXT_BUCKETS) {
+    // "other" is a catch-all — show it only when non-empty; the three real
+    // columns always render (even empty) so the board reads as a kanban.
+    if (b.id === "other" && !buckets.other.length) continue;
+    cols.push({ id: b.id, label: t(b.labelKey), dot: b.dot, tasks: buckets[b.id] });
+  }
+  return cols;
+});
+
+// Read the persisted mirror without polling (fast, offline-friendly). Also drives
+// the "External · N" count chip while in local mode.
+async function loadExternalTasks() {
+  try {
+    const cache = await invoke<ExternalTasksCache>("get_external_tasks");
+    externalTasks.value = cache.tasks ?? [];
+    externalLastPoll.value = cache.last_poll_at ?? null;
+  } catch (e) {
+    errorMsg.value = String(e);
+  }
+}
+
+// Enrolled? poll_external returns null when not bound; we read enrollment_status so
+// the empty tab can point at Settings → Integrations instead of looking broken.
+async function refreshExternalBound() {
+  try {
+    const status = await invoke<{ account: string | null }>("enrollment_status");
+    externalBound.value = !!status?.account;
+  } catch {
+    externalBound.value = false;
+  }
+}
+
+function applyExternalUpdate(update: ExternalTasksUpdate) {
+  externalTasks.value = update.tasks ?? [];
+  for (const c of update.changes ?? []) externalChanged.value.add(extKey(c.source, c.task_id));
+  externalBound.value = true;
+}
+
+// Manual refresh (the tab's Refresh button). null = not enrolled.
+async function refreshExternal() {
+  if (externalRefreshing.value) return;
+  externalRefreshing.value = true;
+  try {
+    const update = await invoke<ExternalTasksUpdate | null>("poll_external");
+    if (update) applyExternalUpdate(update);
+    else externalBound.value = false;
+    await loadExternalTasks(); // pick up the fresh last_poll_at
+  } catch (e) {
+    errorMsg.value = String(e);
+  } finally {
+    externalRefreshing.value = false;
+  }
+}
+
+function switchMode(m: "local" | "external") {
+  taskMode.value = m;
+  if (m === "external") {
+    void refreshExternalBound();
+    void loadExternalTasks();
+    void loadStatusMap();
+  } else {
+    // Left the tab → the "изменилось" badges have been seen; clear them, and drop
+    // any open detail so re-entering the tab lands on the list.
+    externalChanged.value = new Set();
+    externalDetailKey.value = null;
+  }
+}
+
+async function openExternal(url: string) {
+  if (url) await openLink(url);
+}
+
+// --- External detail (readonly card) ---
+// Opening an external task shows a readonly detail of what the mirror KNOWS: the
+// contract deliberately omits the raw description (sanitised away on the private
+// side; the `url` is the door to the full task), so there's no editable body — this
+// is a metadata + provenance view, keyed by source::task_id so a live poll that
+// updates the task re-renders it in place.
+const externalDetailKey = ref<string | null>(null);
+const externalDetailTask = computed<ExternalTask | null>(() => {
+  if (!externalDetailKey.value) return null;
+  return (
+    externalTasks.value.find(
+      (t) => extKey(t.source, t.task_id) === externalDetailKey.value,
+    ) ?? null
+  );
+});
+function openExternalDetail(t: ExternalTask) {
+  externalDetailKey.value = extKey(t.source, t.task_id);
+}
+function closeExternalDetail() {
+  externalDetailKey.value = null;
+}
+
+// Human label for an envelope `type` (contract §1.1: the four fixed event forms).
+function eventKindLabel(kind: string): string {
+  switch (kind) {
+    case "task_created":
+      return t("extEventCreated");
+    case "task_status_changed":
+      return t("extEventStatus");
+    case "task_moved":
+      return t("extEventMoved");
+    case "task_comment_added":
+      return t("extEventComment");
+    default:
+      return kind;
+  }
+}
+
+// Absolute timestamp for the detail meta (relTime gives the relative one).
+function fmtDateTime(iso: string | undefined | null): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleString(locale.value === "ru" ? "ru-RU" : "en-US", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+// Open the shared settings window on the Integrations tab (the enrollment screen).
+async function openIntegrations() {
+  await invoke("open_settings_window", { tab: "integrations" });
+}
+
+// "just now" / "N min ago" / "N h ago" for a recent RFC3339 timestamp; older or
+// unparseable falls back to the absolute fmtTime.
+function relTime(iso: string | undefined | null): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  const min = Math.floor((Date.now() - d.getTime()) / 60000);
+  if (min < 1) return t("todoJustNow");
+  if (min < 60) return `${min}${t("minShort")} ${t("todoAgo")}`;
+  const h = Math.floor(min / 60);
+  if (h < 24) return `${h}${t("hourShort")} ${t("todoAgo")}`;
+  return fmtTime(iso);
+}
+
 let unlistenLocale: (() => void) | null = null;
 let unlistenTodos: (() => void) | null = null;
 let unlistenFocus: (() => void) | null = null;
 let unlistenTriage: (() => void) | null = null;
+let unlistenExternal: (() => void) | null = null;
 
 // Refresh the project picker from cc_usage. The todos window is a persisted
 // webview (created once at startup, then shown/hidden), so `onMounted` runs a
@@ -1047,7 +1290,15 @@ onMounted(async () => {
   unlistenTriage = await listen("triage-alert", () => {
     void loadTriageDigest();
   });
+  // A poll folded new external events; refresh the mirror + flag changed tasks.
+  // Fires whether or not the External tab is open, so the count chip stays live.
+  unlistenExternal = await listen<ExternalTasksUpdate>("external-tasks-updated", (e) => {
+    applyExternalUpdate(e.payload);
+  });
   await loadTodos();
+  // Populate the "External · N" count chip even while in local mode.
+  void loadExternalTasks();
+  void loadStatusMap();
   await refreshKnownProjects();
   void loadPhasesEnabled();
   void refreshPhasePlans();
@@ -1061,6 +1312,9 @@ onMounted(async () => {
       void loadPhasesEnabled();
       void refreshPhasePlans();
       void loadTriageDigest();
+      // Pick up a status remap done in the Settings → Integrations window.
+      void loadStatusMap();
+      void loadExternalTasks();
     }
   });
 });
@@ -1070,16 +1324,25 @@ onUnmounted(() => {
   if (unlistenTodos) unlistenTodos();
   if (unlistenFocus) unlistenFocus();
   if (unlistenTriage) unlistenTriage();
+  if (unlistenExternal) unlistenExternal();
 });
 </script>
 
 <template>
   <div class="tw-root">
-    <!-- BOARD VIEW -->
-    <template v-if="view === 'board'">
+    <!-- BOARD VIEW (owned todos) -->
+    <template v-if="taskMode === 'local' && view === 'board'">
     <header class="tw-head">
       <div class="tw-title">
         <h1>{{ t("tasksTitle") }}</h1>
+        <div class="tw-modes">
+          <button class="tw-mode active" @click="switchMode('local')">
+            {{ t("todoModeLocal") }}
+          </button>
+          <button class="tw-mode" @click="switchMode('external')">
+            {{ t("todoModeExternal") }}<span v-if="externalCount" class="tw-mode-count">{{ externalCount }}</span>
+          </button>
+        </div>
         <span class="tw-open">{{ openCount }} {{ t("todoOpenItems") }}</span>
         <div class="tw-triage">
           <button
@@ -1287,7 +1550,7 @@ onUnmounted(() => {
     </template>
 
     <!-- DETAIL VIEW: master-detail editor (left = project siblings, right = fields) -->
-    <template v-else>
+    <template v-else-if="taskMode === 'local'">
       <header class="tw-head">
         <button class="tw-back" @click="closeDetail">
           <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 3.5 5 8l4.5 4.5" /></svg>
@@ -1536,6 +1799,166 @@ onUnmounted(() => {
       </div>
     </template>
 
+    <!-- EXTERNAL VIEW: readonly mirror of external tasks, grouped by source (ph6) -->
+    <template v-else>
+      <!-- LIST sub-view: grouped readonly cards -->
+      <template v-if="!externalDetailTask">
+      <header class="tw-head">
+        <div class="tw-title">
+          <h1>{{ t("tasksTitle") }}</h1>
+          <div class="tw-modes">
+            <button class="tw-mode" @click="switchMode('local')">
+              {{ t("todoModeLocal") }}
+            </button>
+            <button class="tw-mode active" @click="switchMode('external')">
+              {{ t("todoModeExternal") }}<span v-if="externalCount" class="tw-mode-count">{{ externalCount }}</span>
+            </button>
+          </div>
+        </div>
+        <div class="tw-spacer"></div>
+        <span v-if="externalLastPoll" class="tw-ext-poll">
+          {{ t("todoExtLastPoll") }} {{ relTime(externalLastPoll) }}
+        </span>
+        <button class="tw-guide" :disabled="externalRefreshing" @click="refreshExternal">
+          <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9" />
+            <path d="M13.5 2.5v3h-3" />
+          </svg>
+          {{ externalRefreshing ? t("todoExtRefreshing") : t("todoExtRefresh") }}
+        </button>
+        <button class="tw-guide" :title="t('settings')" @click="openSettings">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M19.43 12.98c.04-.32.07-.64.07-.98s-.03-.66-.07-.98l2.11-1.65c.19-.15.24-.42.12-.64l-2-3.46c-.12-.22-.39-.3-.61-.22l-2.49 1c-.52-.4-1.08-.73-1.69-.98l-.38-2.65C14.46 2.18 14.25 2 14 2h-4c-.25 0-.46.18-.49.42l-.38 2.65c-.61.25-1.17.59-1.69.98l-2.49-1c-.23-.09-.49 0-.61.22l-2 3.46c-.13.22-.07.49.12.64l2.11 1.65c-.04.32-.07.65-.07.98s.03.66.07.98l-2.11 1.65c-.19.15-.24.42-.12.64l2 3.46c.12.22.39.3.61.22l2.49-1c.52.4 1.08.73 1.69.98l.38 2.65c.03.24.18.42.43.42h4c.25 0 .46-.18.49-.42l.38-2.65c.61-.25 1.17-.59 1.69-.98l2.49 1c.23.09.49 0 .61-.22l2-3.46c.12-.22.07-.49-.12-.64l-2.11-1.65zM12 15.5c-1.93 0-3-1.07-3-3.5s1.07-3.5 3-3.5 3 1.07 3 3.5-1.07 3.5-3 3.5z" />
+          </svg>
+          {{ t("settings") }}
+        </button>
+      </header>
+
+      <div v-if="errorMsg" class="tw-error">{{ errorMsg }}</div>
+
+      <!-- Not enrolled: nothing to mirror until a resolver is connected. -->
+      <div v-if="!externalBound && !externalCount" class="tw-empty tw-ext-empty">
+        <p>{{ t("todoExtNotBound") }}</p>
+        <button class="tw-btn" @click="openIntegrations">{{ t("todoExtOpenSettings") }}</button>
+      </div>
+      <!-- Enrolled but the mirror is still empty. -->
+      <div v-else-if="!externalCount" class="tw-empty">{{ t("todoExtEmpty") }}</div>
+
+      <main v-else class="tw-ext-board">
+        <section v-for="col in externalColumns" :key="col.id" class="tw-col tw-ext-col">
+          <div class="tw-col-head">
+            <span class="tw-col-dot" :style="{ background: col.dot }"></span>
+            <span class="tw-col-name">{{ col.label }}</span>
+            <span class="tw-col-count">{{ col.tasks.length }}</span>
+          </div>
+          <div class="tw-col-body scroll">
+            <article
+              v-for="tk in col.tasks"
+              :key="tk.source + '::' + tk.task_id"
+              class="tw-ext-card"
+              :class="{ changed: externalIsChanged(tk) }"
+              role="button"
+              tabindex="0"
+              @click="openExternalDetail(tk)"
+              @keyup.enter="openExternalDetail(tk)"
+            >
+              <div class="tw-ext-row">
+                <span class="tw-ext-source-badge">{{ tk.source }}</span>
+                <span v-if="externalIsChanged(tk)" class="tw-ext-changed" :title="t('todoExtChanged')">•</span>
+                <a class="tw-ext-link" :title="tk.url" @click.stop.prevent="openExternal(tk.url)">
+                  <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M6 3H3.5v9.5h9.5V10" />
+                    <path d="M9 3h4v4M13 3l-6 6" />
+                  </svg>
+                </a>
+              </div>
+              <div class="tw-ext-card-title">{{ tk.title }}</div>
+              <div class="tw-ext-card-foot">
+                <span class="tw-ext-status" :class="extStatusClass(tk.status)">{{ tk.status }}</span>
+                <span v-if="tk.assignee" class="tw-ext-assignee">{{ tk.assignee }}</span>
+              </div>
+            </article>
+            <div v-if="!col.tasks.length" class="tw-col-empty">—</div>
+          </div>
+        </section>
+      </main>
+      </template>
+
+      <!-- DETAIL sub-view: readonly metadata + provenance for one external task -->
+      <template v-else-if="externalDetailTask">
+        <header class="tw-head">
+          <button class="tw-back" @click="closeExternalDetail">
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 3.5 5 8l4.5 4.5" /></svg>
+            {{ t("todoBack") }}
+          </button>
+          <div class="tw-title">
+            <span class="tw-ext-detail-source">{{ externalDetailTask.source }}</span>
+          </div>
+        </header>
+
+        <main class="tw-ext-detail">
+          <div class="tw-ext-detail-card">
+            <div class="tw-ext-detail-top">
+              <span class="tw-ext-status" :class="extStatusClass(externalDetailTask.status)">
+                {{ externalDetailTask.status }}
+              </span>
+              <span v-if="externalIsChanged(externalDetailTask)" class="tw-ext-changed">
+                • {{ t("todoExtChanged") }}
+              </span>
+            </div>
+            <h1 class="tw-ext-detail-title">{{ externalDetailTask.title }}</h1>
+
+            <dl class="tw-ext-detail-meta">
+              <div class="tw-ext-detail-row">
+                <dt>{{ t("extfSource") }}</dt>
+                <dd>{{ externalDetailTask.source }}</dd>
+              </div>
+              <div v-if="externalDetailTask.project" class="tw-ext-detail-row">
+                <dt>{{ t("extfProject") }}</dt>
+                <dd>{{ externalDetailTask.project }}</dd>
+              </div>
+              <div v-if="externalDetailTask.assignee" class="tw-ext-detail-row">
+                <dt>{{ t("extfAssignee") }}</dt>
+                <dd>{{ externalDetailTask.assignee }}</dd>
+              </div>
+              <div v-if="externalDetailTask.priority" class="tw-ext-detail-row">
+                <dt>{{ t("extfPriority") }}</dt>
+                <dd>{{ priorityLabel(externalDetailTask.priority) }}</dd>
+              </div>
+              <div class="tw-ext-detail-row">
+                <dt>{{ t("extfUpdated") }}</dt>
+                <dd>{{ fmtDateTime(externalDetailTask.updated_at) }}</dd>
+              </div>
+              <div v-if="externalDetailTask.last_event_kind" class="tw-ext-detail-row">
+                <dt>{{ t("extfLastEvent") }}</dt>
+                <dd>
+                  {{ eventKindLabel(externalDetailTask.last_event_kind) }}
+                  <span v-if="relTime(externalDetailTask.last_event_ts)" class="tw-ext-detail-dim">
+                    · {{ relTime(externalDetailTask.last_event_ts) }}
+                  </span>
+                </dd>
+              </div>
+            </dl>
+
+            <!-- Sanitised description, once the source provides it (DTO groundwork). -->
+            <div v-if="externalDetailTask.description" class="tw-ext-detail-desc">
+              {{ externalDetailTask.description }}
+            </div>
+
+            <button class="tw-btn" @click="openExternal(externalDetailTask.url)">
+              <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="margin-right:6px">
+                <path d="M6 3H3.5v9.5h9.5V10" />
+                <path d="M9 3h4v4M13 3l-6 6" />
+              </svg>
+              {{ t("todoExtOpenSource") }}
+            </button>
+
+            <p class="tw-ext-detail-note">{{ t("todoExtDescNote") }}</p>
+          </div>
+        </main>
+      </template>
+    </template>
+
     <!-- Delete confirmation (issue #21) -->
     <div v-if="pendingDelete" class="tw-modal" @click.self="cancelDelete">
       <div class="tw-form tw-confirm">
@@ -1741,6 +2164,267 @@ onUnmounted(() => {
   font-size: 13px;
   text-align: center;
   padding: 40px 0;
+}
+
+/* Mode switcher: owned board vs readonly external mirror (ph6). */
+.tw-modes {
+  display: inline-flex;
+  gap: 2px;
+  background: var(--card-bg);
+  border: 1px solid var(--stroke-strong);
+  border-radius: 7px;
+  padding: 2px;
+}
+.tw-mode {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: none;
+  background: transparent;
+  color: var(--text-3);
+  border-radius: 5px;
+  padding: 4px 10px;
+  font-size: 12px;
+  font-family: var(--segoe);
+  cursor: pointer;
+  transition: background 120ms, color 120ms;
+}
+.tw-mode:hover {
+  color: var(--text);
+}
+.tw-mode:not(.active):hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+/* Theme-proof active state: a translucent accent tint (sits dark over the card) with
+   white text — readable under ANY accent (blue/purple/claude/mint), unlike a dark
+   on-accent text that only worked for the light-blue default. */
+.tw-mode.active {
+  background: var(--accent-soft);
+  color: var(--text);
+  font-weight: 600;
+  box-shadow: inset 0 0 0 1px var(--accent-soft);
+}
+.tw-mode-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.14);
+  color: inherit;
+  font-size: 10.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+/* External (readonly mirror) — kanban board */
+.tw-ext-poll {
+  font-size: 11.5px;
+  color: var(--text-4);
+  white-space: nowrap;
+}
+.tw-ext-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  max-width: 360px;
+  margin: 0 auto;
+  line-height: 1.5;
+}
+/* Board layout mirrors the local one (.tw-board), so external tasks read as a
+   familiar kanban — but the cards are readonly (no drag: status is owned upstream). */
+.tw-ext-board {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  gap: 12px;
+  padding: 14px 16px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  align-items: stretch;
+}
+.tw-ext-card {
+  background: var(--card-bg);
+  border: 1px solid var(--stroke-strong);
+  border-left: 3px solid var(--stroke-strong);
+  border-radius: 6px;
+  padding: 9px 11px;
+  cursor: pointer;
+  transition: border-color 120ms, background 120ms;
+}
+.tw-ext-card:hover {
+  border-color: var(--accent);
+  background: var(--card-bg-hover, rgba(255, 255, 255, 0.03));
+}
+.tw-ext-card:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.tw-ext-card.changed {
+  border-left-color: var(--accent);
+}
+.tw-ext-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.tw-ext-source-badge {
+  flex: 1;
+  min-width: 0;
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--text-4);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tw-ext-changed {
+  flex-shrink: 0;
+  font-size: 14px;
+  line-height: 1;
+  color: var(--accent);
+}
+.tw-ext-link {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-4);
+  cursor: pointer;
+  transition: color 120ms;
+}
+.tw-ext-link:hover {
+  color: var(--accent);
+}
+.tw-ext-card-title {
+  margin: 6px 0 8px;
+  font-size: 13px;
+  line-height: 1.35;
+  color: var(--text);
+}
+.tw-ext-card-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.tw-ext-status {
+  flex-shrink: 0;
+  font-size: 10.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  padding: 2px 7px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-3);
+  white-space: nowrap;
+}
+.tw-ext-status.s-done {
+  background: rgba(108, 203, 95, 0.16);
+  color: #6ccb5f;
+}
+.tw-ext-status.s-active {
+  background: rgba(76, 194, 255, 0.16);
+  color: #4cc2ff;
+}
+.tw-ext-status.s-open {
+  background: rgba(154, 160, 170, 0.16);
+  color: #b6bcc6;
+}
+.tw-ext-assignee {
+  font-size: 11.5px;
+  color: var(--text-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* External detail (readonly metadata + provenance) */
+.tw-ext-detail-source {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-3);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.tw-ext-detail {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 16px;
+}
+.tw-ext-detail-card {
+  max-width: 560px;
+  margin: 0 auto;
+  background: var(--card-bg);
+  border: 1px solid var(--stroke-strong);
+  border-radius: 8px;
+  padding: 18px 20px;
+}
+.tw-ext-detail-top {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.tw-ext-detail-title {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text);
+  line-height: 1.35;
+  margin: 0 0 16px;
+}
+.tw-ext-detail-meta {
+  margin: 0 0 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+.tw-ext-detail-row {
+  display: flex;
+  gap: 12px;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--stroke-weak, rgba(255, 255, 255, 0.05));
+  font-size: 13px;
+}
+.tw-ext-detail-row:last-child {
+  border-bottom: none;
+}
+.tw-ext-detail-row dt {
+  flex: 0 0 120px;
+  color: var(--text-4);
+}
+.tw-ext-detail-row dd {
+  flex: 1;
+  margin: 0;
+  color: var(--text-2);
+}
+.tw-ext-detail-dim {
+  color: var(--text-4);
+}
+.tw-ext-detail-desc {
+  margin: 0 0 16px;
+  padding: 12px 14px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--stroke-strong);
+  border-radius: 6px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-2);
+  white-space: pre-wrap;
+}
+.tw-ext-detail-note {
+  margin: 14px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-4);
+}
+.tw-ext-detail-card .tw-btn {
+  display: inline-flex;
+  align-items: center;
 }
 
 /* Board */
