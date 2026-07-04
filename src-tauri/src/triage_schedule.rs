@@ -286,8 +286,10 @@ pub fn run_triage(home: &Path, data_dir: &Path, cli_path: &str, model: &str) -> 
     append_log(&log, &format!("\n===== triage run {stamp} (model={model}) ====="));
 
     // Step 1 — export the board for the agent to read. Deterministic; if this fails
-    // there's nothing to triage, so bail before spending a model call.
-    let board_out = run_node(&node, cli_path, &["todos", "list", "--json"])?;
+    // there's nothing to triage, so bail before spending a model call. `--all` spans
+    // every project: `run_node` doesn't set a cwd, so a bare `list` would filter by
+    // the app process's working dir (not a project name) and export an empty board.
+    let board_out = run_node(&node, cli_path, &["todos", "list", "--all", "--json"])?;
     if !board_out.status.success() {
         let err = String::from_utf8_lossy(&board_out.stderr);
         append_log(&log, &format!("[board export failed] {err}"));
