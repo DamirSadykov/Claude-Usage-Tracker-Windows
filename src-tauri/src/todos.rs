@@ -68,6 +68,13 @@ pub struct Todo {
     /// reverse direction by scanning. Empty → omitted from the file.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub links: Vec<String>,
+    /// Ids of todos this one DEPENDS ON — the directed edges of the task graph
+    /// (#88). `a.depends_on = [b]` means b must be done before a; b blocks a.
+    /// Kept acyclic and within a single project board (enforced by [`add_dep`]).
+    /// Distinct from `links`/inline `#N`, which are non-blocking references the
+    /// graph draws as a second, dashed edge. Empty → omitted from the file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
     /// Who composed this todo: `"user"` (hand-written in the UI) or `"claude"`
     /// (the cc-todos CLI). Empty (legacy rows) renders as a user task — no AI
     /// badge — so existing files need no migration.
@@ -230,6 +237,83 @@ pub fn set_status(file: &mut TodoFile, id: &str, status: &str, now: &str) -> boo
     }
 }
 
+/// The project board a todo belongs to, normalized: a project-less (global) task
+/// reads as `""`. Two todos share a board iff this value matches. Used to keep
+/// dependency edges within one project (#88).
+fn board_of<'a>(t: &'a Todo) -> &'a str {
+    t.project.as_deref().unwrap_or("")
+}
+
+/// True if a `depends_on` edge from `from_id` to `on_id` would close a cycle,
+/// i.e. `on_id` already reaches `from_id` by following `depends_on`. A plain DFS
+/// over the current edges; the graph is small (one board) so this stays cheap.
+fn dep_reaches(file: &TodoFile, start: &str, target: &str) -> bool {
+    let mut stack = vec![start.to_string()];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(id) = stack.pop() {
+        if id == target {
+            return true;
+        }
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        if let Some(t) = file.todos.iter().find(|t| t.id == id) {
+            for d in &t.depends_on {
+                stack.push(d.clone());
+            }
+        }
+    }
+    false
+}
+
+/// Add a dependency edge: `from_id` depends on `on_id` (on_id blocks from_id).
+/// Rejects a self-edge, a missing endpoint, a cross-board edge, or an edge that
+/// would create a cycle — so the stored graph is always a within-board DAG.
+/// Idempotent: re-adding an existing edge is a no-op success. Bumps `updated_at`
+/// on the dependent when an edge is actually added.
+pub fn add_dep(file: &mut TodoFile, from_id: &str, on_id: &str, now: &str) -> Result<(), String> {
+    if from_id == on_id {
+        return Err("a task can't depend on itself".into());
+    }
+    let on = file
+        .todos
+        .iter()
+        .find(|t| t.id == on_id)
+        .ok_or_else(|| format!("no task with id {on_id}"))?;
+    let from = file
+        .todos
+        .iter()
+        .find(|t| t.id == from_id)
+        .ok_or_else(|| format!("no task with id {from_id}"))?;
+    if board_of(from) != board_of(on) {
+        return Err("dependencies must stay within one project board".into());
+    }
+    // A cycle forms if `on_id` can already reach `from_id` via depends_on.
+    if dep_reaches(file, on_id, from_id) {
+        return Err("that dependency would create a cycle".into());
+    }
+    let from = file.todos.iter_mut().find(|t| t.id == from_id).unwrap();
+    if !from.depends_on.iter().any(|d| d == on_id) {
+        from.depends_on.push(on_id.to_string());
+        from.updated_at = now.to_string();
+    }
+    Ok(())
+}
+
+/// Remove a dependency edge (`from_id` no longer depends on `on_id`). Returns
+/// true if an edge was actually removed. Bumps `updated_at` on change.
+pub fn remove_dep(file: &mut TodoFile, from_id: &str, on_id: &str, now: &str) -> bool {
+    if let Some(from) = file.todos.iter_mut().find(|t| t.id == from_id) {
+        let before = from.depends_on.len();
+        from.depends_on.retain(|d| d != on_id);
+        if from.depends_on.len() != before {
+            from.updated_at = now.to_string();
+            return true;
+        }
+    }
+    false
+}
+
 /// The kanban columns, left to right. The frontend mirrors this order; the hook
 /// only cares whether a status is `done`.
 pub const STATUSES: [&str; 5] = ["backlog", "queue", "in_progress", "review", "done"];
@@ -282,6 +366,7 @@ mod tests {
             from: None,
             comments: Vec::new(),
             links: Vec::new(),
+            depends_on: Vec::new(),
             created_by: String::new(),
             created_at: String::new(),
             updated_at: String::new(),
@@ -417,6 +502,98 @@ mod tests {
         let back = load(&path);
         assert_eq!(back.todos.iter().find(|t| t.id == "a").unwrap().priority, "high");
         assert_eq!(back.todos.iter().find(|t| t.id == "b").unwrap().priority, "");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn board_todo(id: &str, project: Option<&str>) -> Todo {
+        let mut t = todo(id, "backlog");
+        t.project = project.map(|s| s.to_string());
+        t
+    }
+
+    #[test]
+    fn add_dep_records_edge_and_is_idempotent() {
+        let mut f = TodoFile::default();
+        f.todos = vec![board_todo("a", Some("p")), board_todo("b", Some("p"))];
+        // a depends on b.
+        assert!(add_dep(&mut f, "a", "b", "T2").is_ok());
+        let a = f.todos.iter().find(|t| t.id == "a").unwrap();
+        assert_eq!(a.depends_on, vec!["b".to_string()]);
+        assert_eq!(a.updated_at, "T2");
+        // Re-adding the same edge is a no-op success (no duplicate).
+        assert!(add_dep(&mut f, "a", "b", "T3").is_ok());
+        assert_eq!(
+            f.todos.iter().find(|t| t.id == "a").unwrap().depends_on.len(),
+            1
+        );
+    }
+
+    #[test]
+    fn add_dep_rejects_self_missing_cross_board_and_cycle() {
+        let mut f = TodoFile::default();
+        f.todos = vec![
+            board_todo("a", Some("p")),
+            board_todo("b", Some("p")),
+            board_todo("c", Some("q")),
+        ];
+        assert!(add_dep(&mut f, "a", "a", "T").is_err()); // self
+        assert!(add_dep(&mut f, "a", "missing", "T").is_err()); // missing endpoint
+        assert!(add_dep(&mut f, "a", "c", "T").is_err()); // cross-board (p vs q)
+        // Build a→b, then b→a must be rejected as a cycle.
+        assert!(add_dep(&mut f, "a", "b", "T").is_ok());
+        assert!(add_dep(&mut f, "b", "a", "T").is_err());
+        // The rejected edge left b clean.
+        assert!(f.todos.iter().find(|t| t.id == "b").unwrap().depends_on.is_empty());
+    }
+
+    #[test]
+    fn add_dep_rejects_transitive_cycle() {
+        let mut f = TodoFile::default();
+        f.todos = vec![
+            board_todo("a", Some("p")),
+            board_todo("b", Some("p")),
+            board_todo("c", Some("p")),
+        ];
+        // a→b→c, then c→a would close the loop.
+        assert!(add_dep(&mut f, "a", "b", "T").is_ok());
+        assert!(add_dep(&mut f, "b", "c", "T").is_ok());
+        assert!(add_dep(&mut f, "c", "a", "T").is_err());
+    }
+
+    #[test]
+    fn add_dep_allows_edges_between_global_tasks() {
+        let mut f = TodoFile::default();
+        // Two project-less tasks share the "" board.
+        f.todos = vec![board_todo("a", None), board_todo("b", None)];
+        assert!(add_dep(&mut f, "a", "b", "T").is_ok());
+    }
+
+    #[test]
+    fn remove_dep_reports_change() {
+        let mut f = TodoFile::default();
+        f.todos = vec![board_todo("a", Some("p")), board_todo("b", Some("p"))];
+        add_dep(&mut f, "a", "b", "T").unwrap();
+        assert!(remove_dep(&mut f, "a", "b", "T2"));
+        assert!(f.todos.iter().find(|t| t.id == "a").unwrap().depends_on.is_empty());
+        // Removing a non-existent edge reports no change.
+        assert!(!remove_dep(&mut f, "a", "b", "T3"));
+    }
+
+    #[test]
+    fn depends_on_empty_is_omitted_from_file() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("cut_todos_deps_test.json");
+        let _ = std::fs::remove_file(&path);
+        let mut f = TodoFile::default();
+        f.todos = vec![board_todo("a", Some("p")), board_todo("b", Some("p"))];
+        add_dep(&mut f, "a", "b", "T").unwrap();
+        save(&path, &f).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("\"depends_on\""));
+        // Only the dependent task serializes the field; b (empty) omits it.
+        assert_eq!(raw.matches("\"depends_on\"").count(), 1);
+        let back = load(&path);
+        assert_eq!(back.todos.iter().find(|t| t.id == "a").unwrap().depends_on, vec!["b".to_string()]);
         let _ = std::fs::remove_file(&path);
     }
 

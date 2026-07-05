@@ -21,6 +21,9 @@
 //   list [--project <name> | --all] [--status <col>[,<col>]] [--priority <level>] [--json]
 //        defaults to THIS project (cwd basename) + project-less tasks; --all spans every project.
 //        --status filters by kanban column (backlog|queue|in_progress|review|done), comma-separated to combine
+//   dep add|rm|list <task> [<depends-on>]  task-graph deps (#88): blocking edges, within one board, acyclic
+//   ref add|rm|list <task> [<target>]      task-graph refs (#88): non-blocking links, cross-project ok
+//        <task>/<target> accept an id, a bare number, or #N
 //
 // Exit code is non-zero on any error (bad status, unknown id, usage), so a
 // caller can tell success from failure.
@@ -410,6 +413,258 @@ function cmdList(args) {
   }
 }
 
+// Resolve a task locator to its todo object. Accepts an id, a bare number, or a
+// `#N` reference — the graph/dep CLI is friendlier with the human-facing #N the
+// board shows. Returns undefined if nothing matches.
+function resolveTask(data, token) {
+  const t = String(token ?? "").trim();
+  if (!t) return undefined;
+  const byId = data.todos.find((x) => x && x.id === t);
+  if (byId) return byId;
+  const num = t.startsWith("#") ? t.slice(1) : t;
+  if (/^\d+$/.test(num)) {
+    const n = parseInt(num, 10);
+    return data.todos.find((x) => x && x.number === n);
+  }
+  return undefined;
+}
+
+// The board a task belongs to, normalized (global = ""). Mirrors todos.rs::board_of.
+const boardOf = (t) => t.project || "";
+
+// True if `start` reaches `target` by following depends_on — a cycle guard.
+// Mirrors todos.rs::dep_reaches (plain DFS over the small within-board graph).
+function depReaches(data, start, target) {
+  const stack = [start];
+  const seen = new Set();
+  while (stack.length) {
+    const id = stack.pop();
+    if (id === target) return true;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const t = data.todos.find((x) => x && x.id === id);
+    if (t && Array.isArray(t.depends_on)) stack.push(...t.depends_on);
+  }
+  return false;
+}
+
+// Task numbers referenced inline via `#N` in a task's description/plan (mirrors
+// GraphView.inlineRefs). These are ref-graph edges that live in the task TEXT,
+// not in the `links` array — surfaced by `ref list` but only unlinkable by
+// editing the text, never by `ref rm`. Self-mentions (#own-number) are dropped.
+function inlineRefNumbers(t) {
+  const text = `${t.description || ""}\n${t.plan || ""}`;
+  const out = new Set();
+  for (const m of text.matchAll(/#(\d+)/g)) {
+    const n = parseInt(m[1], 10);
+    if (n !== t.number) out.add(n);
+  }
+  return [...out];
+}
+
+const DEP_USAGE =
+  "usage: cli todos dep add <task> <depends-on>   (task depends on depends-on)\n" +
+  "       cli todos dep rm  <task> <depends-on>\n" +
+  "       cli todos dep list <task> [--json]\n" +
+  "       <task> is an id, a number, or #N";
+
+// Manage task-graph dependency edges (#88), mirroring todos.rs::add_dep/remove_dep:
+// `dep add A B` makes A depend on B (B blocks A). Edges stay acyclic and within
+// one project board. `dep list` shows both directions (depends-on + blocks).
+function cmdDep(args) {
+  const [sub, ...rest] = args;
+  const file = todosPath();
+  const data = load(file);
+  if (sub === "add" || sub === "rm") {
+    const from = resolveTask(data, rest[0]);
+    const on = resolveTask(data, rest[1]);
+    if (!from || !on) fail(DEP_USAGE);
+    if (sub === "add") {
+      if (from.id === on.id) fail("a task can't depend on itself");
+      if (boardOf(from) !== boardOf(on))
+        fail("dependencies must stay within one project board");
+      if (depReaches(data, on.id, from.id))
+        fail("that dependency would create a cycle");
+      if (!Array.isArray(from.depends_on)) from.depends_on = [];
+      if (from.depends_on.includes(on.id)) {
+        process.stdout.write(`ok: #${from.number} already depends on #${on.number}\n`);
+        return;
+      }
+      from.depends_on.push(on.id);
+      from.updated_at = new Date().toISOString();
+      save(file, data);
+      process.stdout.write(`ok: #${from.number} now depends on #${on.number}\n`);
+      return;
+    }
+    // rm
+    const before = Array.isArray(from.depends_on) ? from.depends_on.length : 0;
+    if (before) from.depends_on = from.depends_on.filter((d) => d !== on.id);
+    if ((from.depends_on?.length ?? 0) !== before) {
+      if (!from.depends_on.length) delete from.depends_on;
+      from.updated_at = new Date().toISOString();
+      save(file, data);
+      process.stdout.write(`ok: #${from.number} no longer depends on #${on.number}\n`);
+    } else {
+      process.stdout.write(`ok: #${from.number} did not depend on #${on.number}\n`);
+    }
+    return;
+  }
+  if (sub === "list") {
+    const t = resolveTask(data, rest.find((a) => !a.startsWith("--")));
+    if (!t) fail(DEP_USAGE);
+    const deps = (Array.isArray(t.depends_on) ? t.depends_on : [])
+      .map((id) => data.todos.find((x) => x && x.id === id))
+      .filter(Boolean);
+    const blocks = data.todos.filter(
+      (x) => x && Array.isArray(x.depends_on) && x.depends_on.includes(t.id),
+    );
+    if (rest.includes("--json")) {
+      process.stdout.write(
+        JSON.stringify(
+          {
+            task: { id: t.id, number: t.number, subject: t.subject },
+            depends_on: deps.map((d) => ({ id: d.id, number: d.number, subject: d.subject })),
+            blocks: blocks.map((b) => ({ id: b.id, number: b.number, subject: b.subject })),
+          },
+          null,
+          2,
+        ) + "\n",
+      );
+      return;
+    }
+    process.stdout.write(`#${t.number} ${t.subject}\n`);
+    process.stdout.write(
+      `  depends on: ${deps.length ? deps.map((d) => "#" + d.number).join(", ") : "(none)"}\n`,
+    );
+    process.stdout.write(
+      `  blocks:     ${blocks.length ? blocks.map((b) => "#" + b.number).join(", ") : "(none)"}\n`,
+    );
+    return;
+  }
+  fail(DEP_USAGE);
+}
+
+const REF_USAGE =
+  "usage: cli todos ref add <task> <target>    (task references target; non-blocking)\n" +
+  "       cli todos ref rm  <task> <target>\n" +
+  "       cli todos ref list <task> [--json]\n" +
+  "       <task>/<target> is an id, a number, or #N. Cross-project refs are allowed.";
+
+// Manage ref-graph links (#88): the non-blocking references drawn on the Ref tab,
+// stored in `x.links` (todos.rs). This is the LLM's write path — the UI Ref tab
+// is read-only. Validation deliberately DIFFERS from `dep`: a ref may cross
+// project boards (that's exactly what renders an external node) and can never form
+// a blocking cycle, so the only guards are self-link and target-exists. Inline
+// `#N` mentions in the task text are ALSO ref edges but live in the text; this
+// command manages the explicit `links` array, which the graph shows alongside them.
+function cmdRef(args) {
+  const [sub, ...rest] = args;
+  const file = todosPath();
+  const data = load(file);
+  if (sub === "add" || sub === "rm") {
+    const from = resolveTask(data, rest[0]);
+    const to = resolveTask(data, rest[1]);
+    if (!from || !to) fail(REF_USAGE);
+    if (sub === "add") {
+      if (from.id === to.id) fail("a task can't reference itself");
+      if (!Array.isArray(from.links)) from.links = [];
+      if (from.links.includes(to.id)) {
+        process.stdout.write(`ok: #${from.number} already references #${to.number}\n`);
+        return;
+      }
+      from.links.push(to.id);
+      from.updated_at = new Date().toISOString();
+      save(file, data);
+      const cross = boardOf(from) !== boardOf(to) ? " (cross-project)" : "";
+      const dup = inlineRefNumbers(from).includes(to.number)
+        ? ` (note: the text already mentions #${to.number} inline — the edge existed already)`
+        : "";
+      process.stdout.write(`ok: #${from.number} now references #${to.number}${cross}${dup}\n`);
+      return;
+    }
+    // rm removes only the EXPLICIT link. An inline `#N` in the text keeps drawing
+    // the edge — say so, so the caller knows why it may still appear on the graph.
+    const before = Array.isArray(from.links) ? from.links.length : 0;
+    if (before) from.links = from.links.filter((l) => l !== to.id);
+    if ((from.links?.length ?? 0) !== before) {
+      if (!from.links.length) delete from.links;
+      from.updated_at = new Date().toISOString();
+      save(file, data);
+      const inline = inlineRefNumbers(from).includes(to.number)
+        ? ` (still mentions #${to.number} inline — edit the text to drop that edge)`
+        : "";
+      process.stdout.write(`ok: #${from.number} no longer references #${to.number}${inline}\n`);
+    } else {
+      const inline = inlineRefNumbers(from).includes(to.number)
+        ? ` (it mentions #${to.number} inline; edit the text to drop that edge)`
+        : "";
+      process.stdout.write(`ok: #${from.number} had no explicit link to #${to.number}${inline}\n`);
+    }
+    return;
+  }
+  if (sub === "list") {
+    const t = resolveTask(data, rest.find((a) => !a.startsWith("--")));
+    if (!t) fail(REF_USAGE);
+    // Outgoing = explicit links (source "link") + inline #N mentions (source
+    // "inline"); a target reachable both ways is reported once as "link+inline".
+    const outMap = new Map();
+    for (const id of Array.isArray(t.links) ? t.links : []) {
+      const x = data.todos.find((y) => y && y.id === id);
+      if (x) outMap.set(x.id, { task: x, via: new Set(["link"]) });
+    }
+    for (const n of inlineRefNumbers(t)) {
+      const x = data.todos.find((y) => y && y.number === n);
+      if (!x) continue;
+      const e = outMap.get(x.id);
+      if (e) e.via.add("inline");
+      else outMap.set(x.id, { task: x, via: new Set(["inline"]) });
+    }
+    // Incoming = tasks that reference THIS one via a link or an inline mention.
+    const incoming = data.todos.filter((x) => {
+      if (!x || x.id === t.id) return false;
+      const viaLink = Array.isArray(x.links) && x.links.includes(t.id);
+      const viaInline = t.number != null && inlineRefNumbers(x).includes(t.number);
+      return viaLink || viaInline;
+    });
+    const fmtVia = (via) => [...via].sort().reverse().join("+"); // link+inline
+    const out = [...outMap.values()];
+    if (rest.includes("--json")) {
+      process.stdout.write(
+        JSON.stringify(
+          {
+            task: { id: t.id, number: t.number, subject: t.subject },
+            references: out.map((e) => ({
+              id: e.task.id,
+              number: e.task.number,
+              subject: e.task.subject,
+              via: [...e.via].sort(),
+              cross_project: boardOf(e.task) !== boardOf(t),
+            })),
+            referenced_by: incoming.map((x) => ({
+              id: x.id,
+              number: x.number,
+              subject: x.subject,
+              cross_project: boardOf(x) !== boardOf(t),
+            })),
+          },
+          null,
+          2,
+        ) + "\n",
+      );
+      return;
+    }
+    process.stdout.write(`#${t.number} ${t.subject}\n`);
+    process.stdout.write(
+      `  references:    ${out.length ? out.map((e) => `#${e.task.number}⟨${fmtVia(e.via)}⟩`).join(", ") : "(none)"}\n`,
+    );
+    process.stdout.write(
+      `  referenced by: ${incoming.length ? incoming.map((x) => "#" + x.number).join(", ") : "(none)"}\n`,
+    );
+    return;
+  }
+  fail(REF_USAGE);
+}
+
 // List the projects related to <project> via association groups, so a session in
 // one project can file a task against a sibling project (e.g. engine ↔ advmcp).
 // Plain text prints one related project per line (empty → a friendly note);
@@ -467,6 +722,12 @@ function usage(code) {
       "                                  --status filters by column: " +
       STATUSES.join(" | ") +
       " (comma-separate to combine)\n" +
+      "  dep add <task> <depends-on>     task-graph edge: <task> depends on <depends-on> (id|N|#N)\n" +
+      "  dep rm  <task> <depends-on>     remove a dependency edge\n" +
+      "  dep list <task> [--json]        show a task's depends-on + blocks\n" +
+      "  ref add <task> <target>         ref-graph edge: <task> references <target> (non-blocking, cross-project ok)\n" +
+      "  ref rm  <task> <target>         remove an explicit ref link (inline #N stays; edit text to drop)\n" +
+      "  ref list <task> [--json]        show a task's references + referenced-by (link + inline #N)\n" +
       "  related <project> [--json]      projects that work with <project>\n" +
       "  groups [--json]                 list association groups\n",
   );
@@ -494,6 +755,12 @@ export function run(args) {
       break;
     case "list":
       cmdList(rest);
+      break;
+    case "dep":
+      cmdDep(rest);
+      break;
+    case "ref":
+      cmdRef(rest);
       break;
     case "related":
       cmdRelated(rest);

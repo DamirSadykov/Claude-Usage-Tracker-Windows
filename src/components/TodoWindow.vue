@@ -13,6 +13,7 @@ import { useI18n, type Composer } from "vue-i18n";
 import { invoke } from "@tauri-apps/api/core";
 import ProjectAutocomplete from "./ProjectAutocomplete.vue";
 import ProjectLabel from "./ProjectLabel.vue";
+import GraphView from "./GraphView.vue";
 import { useProjectLinks } from "../projectLinks";
 import i18n from "../i18n";
 import type { TriageDigest, DigestItem } from "../App.vue";
@@ -61,6 +62,7 @@ export interface Todo {
   from?: string | null; // project this task was filed from (cross-project; issue #13)
   comments?: Comment[];
   links?: string[];
+  depends_on?: string[]; // ids of tasks this one depends on — task-graph edges (#88)
   created_by?: string; // "user" | "claude" ("" / absent = user, no AI badge)
   created_at: string;
   updated_at: string;
@@ -620,6 +622,24 @@ async function openSettings() {
   await invoke("open_settings_window", { tab: "tasks" });
 }
 
+// Board vs graph view (#88): the graph is an alternative rendering of the SAME
+// filtered board, toggled in place — not a separate window. It shares this
+// window's `todos` and `projectFilter`.
+const viewMode = ref<"board" | "graph">("board");
+
+// GraphView mutates dependencies through the backend and hands back the fresh
+// list; adopt it so both views stay in lockstep without a reload round-trip.
+function onGraphUpdate(list: Todo[]) {
+  todos.value = list;
+}
+
+// Clicking a graph node opens that task's card — the same detail panel the board
+// uses (it overlays the graph and returns to it on close).
+function onGraphOpen(id: string) {
+  const todo = todos.value.find((x) => x.id === id);
+  if (todo) openDetail(todo);
+}
+
 // Navigate a #N reference to that task's detail; a @name reference back to the
 // board filtered to that project.
 function openTask(number: number) {
@@ -1165,6 +1185,39 @@ onUnmounted(() => {
         <input type="checkbox" v-model="showDone" />
         {{ t("todoShowDone") }}
       </label>
+      <div class="tw-viewtoggle" role="tablist">
+        <button
+          class="tw-vt"
+          :class="{ active: viewMode === 'board' }"
+          role="tab"
+          :aria-selected="viewMode === 'board'"
+          :title="t('viewBoard')"
+          @click="viewMode = 'board'"
+        >
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4">
+            <rect x="1.5" y="2.5" width="3.6" height="11" rx="1" />
+            <rect x="6.2" y="2.5" width="3.6" height="7.5" rx="1" />
+            <rect x="10.9" y="2.5" width="3.6" height="9.5" rx="1" />
+          </svg>
+          {{ t("viewBoard") }}
+        </button>
+        <button
+          class="tw-vt"
+          :class="{ active: viewMode === 'graph' }"
+          role="tab"
+          :aria-selected="viewMode === 'graph'"
+          :title="t('viewGraph')"
+          @click="viewMode = 'graph'"
+        >
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="4" cy="4" r="2" />
+            <circle cx="12" cy="4" r="2" />
+            <circle cx="8" cy="12.5" r="2" />
+            <path d="M5.6 5.4 8 10.6M10.4 5.4 8 10.6" />
+          </svg>
+          {{ t("viewGraph") }}
+        </button>
+      </div>
       <button class="tw-guide" :title="t('todoGuideHint')" @click="openGuide">
         <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
           <path d="M2.5 3.2c1.8-.6 3.7-.6 5.5.3 1.8-.9 3.7-.9 5.5-.3v8.6c-1.8-.6-3.7-.6-5.5.3-1.8-.9-3.7-.9-5.5-.3z" />
@@ -1184,6 +1237,15 @@ onUnmounted(() => {
     <div v-if="errorMsg" class="tw-error">{{ errorMsg }}</div>
 
     <div v-if="loading" class="tw-empty">{{ t("loading") }}</div>
+
+    <!-- Task graph: an alternative view of the same filtered board (#88) -->
+    <GraphView
+      v-else-if="viewMode === 'graph'"
+      :todos="todos"
+      :project="projectFilter"
+      @update="onGraphUpdate"
+      @open="onGraphOpen"
+    />
 
     <!-- Kanban board -->
     <main v-else class="tw-board">
@@ -1713,6 +1775,39 @@ onUnmounted(() => {
   border-color: var(--accent);
 }
 .tw-guide svg {
+  opacity: 0.85;
+}
+/* Segmented Board/Graph view switch (#88). */
+.tw-viewtoggle {
+  display: inline-flex;
+  border: 1px solid var(--stroke-strong);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.tw-vt {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  border: none;
+  background: var(--card-bg);
+  color: var(--text-3);
+  padding: 6px 10px;
+  font-size: 12px;
+  font-family: var(--segoe);
+  cursor: pointer;
+  transition: color 120ms, background 120ms;
+}
+.tw-vt + .tw-vt {
+  border-left: 1px solid var(--stroke-strong);
+}
+.tw-vt:hover {
+  color: var(--text);
+}
+.tw-vt.active {
+  background: var(--accent);
+  color: #06283b;
+}
+.tw-vt svg {
   opacity: 0.85;
 }
 .tw-add {

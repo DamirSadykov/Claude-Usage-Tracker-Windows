@@ -1628,6 +1628,40 @@ fn set_todo_status(
     })
 }
 
+/// Add a dependency edge for the task graph (#88): `from_id` depends on `on_id`.
+/// Validation (self/missing/cross-board/cycle) lives in [`todos::add_dep`]; a
+/// rejection surfaces its message to the UI and the file is left untouched.
+#[tauri::command]
+fn add_todo_dep(
+    app: AppHandle,
+    from_id: String,
+    on_id: String,
+) -> Result<Vec<todos::Todo>, String> {
+    let now = chrono::Utc::now().to_rfc3339();
+    // Capture the validation result out of the mutate closure so a rejected edge
+    // fails the command (write_todos_locked still persists the untouched file,
+    // which is a harmless no-op — nothing changed).
+    let mut outcome = Ok(());
+    let todos = write_todos_locked(&app, |file| {
+        outcome = todos::add_dep(file, &from_id, &on_id, &now);
+    })?;
+    outcome.map(|()| todos)
+}
+
+/// Remove a dependency edge (`from_id` no longer depends on `on_id`). A no-op if
+/// the edge was absent.
+#[tauri::command]
+fn remove_todo_dep(
+    app: AppHandle,
+    from_id: String,
+    on_id: String,
+) -> Result<Vec<todos::Todo>, String> {
+    let now = chrono::Utc::now().to_rfc3339();
+    write_todos_locked(&app, move |file| {
+        todos::remove_dep(file, &from_id, &on_id, &now);
+    })
+}
+
 /// All phase plans the tracker can find, across every project that has a
 /// `.claude/phases/` dir. Read-only: the plans are authored by the `cc-phases`
 /// CLI and live in each project. The frontend matches a plan to a task card by
@@ -2049,6 +2083,8 @@ pub fn run() {
             upsert_todo,
             delete_todo,
             set_todo_status,
+            add_todo_dep,
+            remove_todo_dep,
             get_phase_plans,
             open_todo_window,
             open_settings_window,
