@@ -556,6 +556,77 @@ async function resetTriagePrompt() {
 
 onMounted(loadTriagePrompt);
 
+// --- Task-ref migration & backups (#63) ---
+// Bare `#N` used to be treated as a task reference, but in prose it almost always
+// means a GitHub PR/issue — a number collision silently linked the wrong task. The
+// app now links only the explicit `t#N` form; this one-shot migration rewrites the
+// genuine `#N` task refs already in stored text to `t#N` so they keep linking. It
+// backs up todos.json first, and "Откатить" restores that backup.
+interface BackupInfo {
+  name: string;
+  when_ms: number;
+}
+interface MigrationReport {
+  refs: number;
+  tasks: number;
+  backup: string;
+}
+const migrating = ref(false);
+const restoring = ref(false);
+const migrateMsg = ref("");
+const latestBackup = ref<BackupInfo | null>(null);
+
+async function loadLatestBackup() {
+  try {
+    latestBackup.value = await invoke<BackupInfo | null>("latest_todo_backup");
+  } catch {
+    // not under Tauri
+  }
+}
+
+function fmtBackupTime(ms: number): string {
+  try {
+    return new Date(ms).toLocaleString();
+  } catch {
+    return "";
+  }
+}
+
+async function runMigration() {
+  if (migrating.value) return;
+  migrating.value = true;
+  migrateMsg.value = "";
+  try {
+    const r = await invoke<MigrationReport>("migrate_todo_refs");
+    migrateMsg.value =
+      r.refs === 0 ? t("migrateNone") : t("migrateDone", { refs: r.refs, tasks: r.tasks });
+    await loadLatestBackup();
+  } catch (e) {
+    migrateMsg.value = String(e);
+  } finally {
+    migrating.value = false;
+  }
+}
+
+async function runRestore() {
+  if (restoring.value || !latestBackup.value) return;
+  // Restoring overwrites the current board with the backup — confirm, since any
+  // edits made after that backup would be lost.
+  if (typeof window !== "undefined" && !window.confirm(t("migrateRestoreConfirm"))) return;
+  restoring.value = true;
+  try {
+    await invoke("restore_todo_backup", {});
+    migrateMsg.value = t("migrateRestored");
+    await loadLatestBackup();
+  } catch (e) {
+    migrateMsg.value = String(e);
+  } finally {
+    restoring.value = false;
+  }
+}
+
+onMounted(loadLatestBackup);
+
 // Keep each threshold triple strictly ascending with a 1% gap so the colour
 // bands can't overlap. Fixed slider scale (5..99) + clamping — dynamic min/max
 // would make neighbouring thumbs visually drift when their range changes.
@@ -1394,6 +1465,32 @@ function handleSave() {
           </div>
           <div class="field-hint" style="margin-top: 6px">{{ t('triagePromptVars') }}</div>
         </template>
+      </div>
+
+      <!-- Task-ref migration (#63): rewrite bare `#N` → `t#N`, with a backup and a
+           one-click restore. `#N` now reads as a PR/issue, only `t#N` links. -->
+      <div class="card">
+        <div class="field-label">{{ t('migrateTitle') }}</div>
+        <div class="field-hint" style="margin-top: 6px">{{ t('migrateDesc') }}</div>
+        <div class="budget-suggest" style="margin-top: 10px">
+          <span style="display: flex; gap: 8px; flex-shrink: 0">
+            <button type="button" class="suggest-btn" :disabled="migrating" @click="runMigration">
+              {{ migrating ? t('migrateRunning') : t('migrateRun') }}
+            </button>
+            <button
+              type="button"
+              class="suggest-btn"
+              :disabled="restoring || !latestBackup"
+              @click="runRestore"
+            >
+              {{ restoring ? t('migrateRestoring') : t('migrateRestore') }}
+            </button>
+          </span>
+          <span v-if="migrateMsg" class="field-hint" style="margin: 0">{{ migrateMsg }}</span>
+        </div>
+        <div v-if="latestBackup" class="field-hint" style="margin-top: 6px">
+          {{ t('migrateBackupAt', { date: fmtBackupTime(latestBackup.when_ms) }) }}
+        </div>
       </div>
       </template>
     </div>
