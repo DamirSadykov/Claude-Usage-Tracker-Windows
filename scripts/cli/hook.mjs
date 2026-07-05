@@ -292,7 +292,7 @@ function main() {
       `· move a task: <cli> todos set-status <id> <status> — <id> is the ⟨id⟩ above; <status> ∈ backlog | queue | in_progress | review | done. Don't edit other fields of existing tasks — leave them to the user.`,
       `· set priority: <cli> todos set-priority <id> <high|medium|low|none> — priority decides which tasks reach this context (the threshold lives in the tracker's settings).`,
       `· new follow-up: <cli> todos add "<subject>" [--project <name> | --global] [--priority high|medium|low] [--scheduled YYYY-MM-DD] [--description <text>] — lands in backlog for THIS project by default (--project targets another board, --global is project-less). Only add what the user asked to track — their list, not your scratchpad.`,
-      `· note a finding: <cli> todos comment add <id> --text "<body>" — shows in the task thread as you; only when the user wants it recorded. Reference another task as #N (e.g. "blocked by #${refExample}").`,
+      `· note a finding: <cli> todos comment add <id> --text "<body>" — shows in the task thread as you; only when the user wants it recorded. Reference another task as t#N (e.g. "blocked by t#${refExample}") — a bare #N is read as a GitHub PR/issue, NOT a task link, so always prefix task references with t.`,
       `· see current tasks: <cli> todos list — this project (cwd) + global; --all spans every project; --status <col>[,<col>] filters by column (e.g. --status review,done) so the list isn't the whole board.`,
       crossProjectNote,
       `File (don't edit): ${file}`,

@@ -506,7 +506,7 @@ const messages = {
       "Keep the placeholders <BOARD>, <STAGING>, <TODAY> (filled in at run time) and the digest output contract (kinds overdue / stale / no_priority / suggestion).",
     migrateTitle: "Task references (#N → t#N)",
     migrateDesc:
-      "A bare #N now reads as a GitHub PR/issue and no longer links to a task — only the explicit t#N form does. This rewrites the genuine #N task references already in your tasks to t#N. It backs up todos.json first; Restore undoes it.",
+      "A bare #N now reads as a GitHub PR/issue and no longer links to a task — only the explicit t#N form does. This rewrites the genuine #N task references already in your tasks to t#N. It backs up todos.json first; Restore undoes it. Optional: run it once to fix existing text — going forward the CLI and Claude Code hook already instruct the agent to write t#N.",
     migrateRun: "Migrate #N → t#N",
     migrateRunning: "Migrating…",
     migrateNone: "Nothing to migrate — no task references needed rewriting.",
@@ -1045,7 +1045,7 @@ const messages = {
       "Сохраняйте плейсхолдеры <BOARD>, <STAGING>, <TODAY> (подставляются при запуске) и контракт вывода дайджеста (виды overdue / stale / no_priority / suggestion).",
     migrateTitle: "Ссылки на задачи (#N → t#N)",
     migrateDesc:
-      "Голый #N теперь трактуется как PR/issue на GitHub и больше не ведёт на задачу — линкуется только явная форма t#N. Эта миграция перепишет настоящие #N-ссылки на задачи в ваших задачах в t#N. Перед записью делается бэкап todos.json; кнопка «Откатить» его восстанавливает.",
+      "Голый #N теперь трактуется как PR/issue на GitHub и больше не ведёт на задачу — линкуется только явная форма t#N. Эта миграция перепишет настоящие #N-ссылки на задачи в ваших задачах в t#N. Перед записью делается бэкап todos.json; кнопка «Откатить» его восстанавливает. Опционально: запустите один раз, чтобы поправить существующий текст — дальше CLI и хук Claude Code уже велят агенту писать t#N.",
     migrateRun: "Мигрировать #N → t#N",
     migrateRunning: "Миграция…",
     migrateNone: "Мигрировать нечего — переписывать ссылки не потребовалось.",
