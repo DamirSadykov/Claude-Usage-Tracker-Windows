@@ -448,14 +448,16 @@ function depReaches(data, start, target) {
   return false;
 }
 
-// Task numbers referenced inline via `#N` in a task's description/plan (mirrors
-// GraphView.inlineRefs). These are ref-graph edges that live in the task TEXT,
-// not in the `links` array — surfaced by `ref list` but only unlinkable by
-// editing the text, never by `ref rm`. Self-mentions (#own-number) are dropped.
+// Task numbers referenced inline via `t#N` in a task's description/plan (mirrors
+// GraphView.inlineRefs). `t#N`, NOT a bare `#N` (#63): in prose `#104` almost
+// always means a GitHub PR/issue, so a bare `#N` no longer links — only the
+// explicit `t#N` form does. These edges live in the task TEXT, not the `links`
+// array — surfaced by `ref list` but only unlinkable by editing the text, never
+// by `ref rm`. The `t` must not be a word tail; self-mentions are dropped.
 function inlineRefNumbers(t) {
   const text = `${t.description || ""}\n${t.plan || ""}`;
   const out = new Set();
-  for (const m of text.matchAll(/#(\d+)/g)) {
+  for (const m of text.matchAll(/(?<![A-Za-z0-9])[tT]#(\d+)/g)) {
     const n = parseInt(m[1], 10);
     if (n !== t.number) out.add(n);
   }
@@ -577,12 +579,12 @@ function cmdRef(args) {
       save(file, data);
       const cross = boardOf(from) !== boardOf(to) ? " (cross-project)" : "";
       const dup = inlineRefNumbers(from).includes(to.number)
-        ? ` (note: the text already mentions #${to.number} inline — the edge existed already)`
+        ? ` (note: the text already mentions t#${to.number} inline — the edge existed already)`
         : "";
       process.stdout.write(`ok: #${from.number} now references #${to.number}${cross}${dup}\n`);
       return;
     }
-    // rm removes only the EXPLICIT link. An inline `#N` in the text keeps drawing
+    // rm removes only the EXPLICIT link. An inline `t#N` in the text keeps drawing
     // the edge — say so, so the caller knows why it may still appear on the graph.
     const before = Array.isArray(from.links) ? from.links.length : 0;
     if (before) from.links = from.links.filter((l) => l !== to.id);
@@ -591,12 +593,12 @@ function cmdRef(args) {
       from.updated_at = new Date().toISOString();
       save(file, data);
       const inline = inlineRefNumbers(from).includes(to.number)
-        ? ` (still mentions #${to.number} inline — edit the text to drop that edge)`
+        ? ` (still mentions t#${to.number} inline — edit the text to drop that edge)`
         : "";
       process.stdout.write(`ok: #${from.number} no longer references #${to.number}${inline}\n`);
     } else {
       const inline = inlineRefNumbers(from).includes(to.number)
-        ? ` (it mentions #${to.number} inline; edit the text to drop that edge)`
+        ? ` (it mentions t#${to.number} inline; edit the text to drop that edge)`
         : "";
       process.stdout.write(`ok: #${from.number} had no explicit link to #${to.number}${inline}\n`);
     }
@@ -605,7 +607,7 @@ function cmdRef(args) {
   if (sub === "list") {
     const t = resolveTask(data, rest.find((a) => !a.startsWith("--")));
     if (!t) fail(REF_USAGE);
-    // Outgoing = explicit links (source "link") + inline #N mentions (source
+    // Outgoing = explicit links (source "link") + inline t#N mentions (source
     // "inline"); a target reachable both ways is reported once as "link+inline".
     const outMap = new Map();
     for (const id of Array.isArray(t.links) ? t.links : []) {
@@ -726,8 +728,8 @@ function usage(code) {
       "  dep rm  <task> <depends-on>     remove a dependency edge\n" +
       "  dep list <task> [--json]        show a task's depends-on + blocks\n" +
       "  ref add <task> <target>         ref-graph edge: <task> references <target> (non-blocking, cross-project ok)\n" +
-      "  ref rm  <task> <target>         remove an explicit ref link (inline #N stays; edit text to drop)\n" +
-      "  ref list <task> [--json]        show a task's references + referenced-by (link + inline #N)\n" +
+      "  ref rm  <task> <target>         remove an explicit ref link (inline t#N stays; edit text to drop)\n" +
+      "  ref list <task> [--json]        show a task's references + referenced-by (link + inline t#N)\n" +
       "  related <project> [--json]      projects that work with <project>\n" +
       "  groups [--json]                 list association groups\n",
   );

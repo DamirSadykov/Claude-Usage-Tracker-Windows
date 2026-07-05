@@ -198,11 +198,11 @@ const messages = {
     graphHintDeps:
       "Left-click a node to highlight its links · drag one node onto another to add a dependency · click the dot on an arrow to remove it · right-click a node to open it",
     graphHintRef:
-      "Left-click a node to highlight its links · right-click a node to open it · read-only: references come from #N mentions in the task text — unlink by editing it",
+      "Left-click a node to highlight its links · right-click a node to open it · read-only: references come from t#N mentions in the task text — unlink by editing it",
     graphRemoveDep: "Remove this dependency",
     graphDepRedundant: "Already linked: {path}",
     graphEmptyDeps: "No dependencies yet — drag one task onto another to make one blocked by the other",
-    graphEmptyRef: "No references on this board — mention a task by #N in another task's text to link them",
+    graphEmptyRef: "No references on this board — mention a task by t#N in another task's text to link them",
     graphResetView: "Reset view",
     graphStatusFilter: "Which statuses to show",
     todoFilterAll: "All projects",
@@ -504,6 +504,19 @@ const messages = {
     triagePromptSaved: "Saved",
     triagePromptVars:
       "Keep the placeholders <BOARD>, <STAGING>, <TODAY> (filled in at run time) and the digest output contract (kinds overdue / stale / no_priority / suggestion).",
+    migrateTitle: "Task references (#N → t#N)",
+    migrateDesc:
+      "A bare #N now reads as a GitHub PR/issue and no longer links to a task — only the explicit t#N form does. This rewrites the genuine #N task references already in your tasks to t#N. It backs up todos.json first; Restore undoes it.",
+    migrateRun: "Migrate #N → t#N",
+    migrateRunning: "Migrating…",
+    migrateNone: "Nothing to migrate — no task references needed rewriting.",
+    migrateDone: "Done: rewrote {refs} reference(s) across {tasks} task(s).",
+    migrateRestore: "Restore",
+    migrateRestoring: "Restoring…",
+    migrateRestored: "Restored from the latest backup.",
+    migrateRestoreConfirm:
+      "Restore todos.json from the latest backup? Any changes made after that backup will be lost.",
+    migrateBackupAt: "Latest backup: {date}",
     installCcHook: "Claude Code CLI + hook",
     installCcHookDesc:
       "Wire the SessionStart hook into ~/.claude/settings.json so every Claude Code session sees this project's tasks and edits them via the cc-todos CLI.",
@@ -724,11 +737,11 @@ const messages = {
     graphHintDeps:
       "ЛКМ по ноде — подсветить связи · перетащите ноду на другую — добавить зависимость · клик по точке на стрелке — удалить · ПКМ по ноде — открыть",
     graphHintRef:
-      "ЛКМ по ноде — подсветить связи · ПКМ по ноде — открыть · только чтение: ссылки из упоминаний #N в тексте, удаляются правкой текста",
+      "ЛКМ по ноде — подсветить связи · ПКМ по ноде — открыть · только чтение: ссылки из упоминаний t#N в тексте, удаляются правкой текста",
     graphRemoveDep: "Удалить эту зависимость",
     graphDepRedundant: "Связь уже есть: {path}",
     graphEmptyDeps: "Зависимостей пока нет — перетащите одну задачу на другую, чтобы связать их",
-    graphEmptyRef: "На этой доске нет ссылок — упомяните задачу через #N в тексте другой, чтобы связать",
+    graphEmptyRef: "На этой доске нет ссылок — упомяните задачу через t#N в тексте другой, чтобы связать",
     graphResetView: "Сбросить вид",
     graphStatusFilter: "Какие статусы показывать",
     todoFilterAll: "Все проекты",
@@ -1030,6 +1043,19 @@ const messages = {
     triagePromptSaved: "Сохранено",
     triagePromptVars:
       "Сохраняйте плейсхолдеры <BOARD>, <STAGING>, <TODAY> (подставляются при запуске) и контракт вывода дайджеста (виды overdue / stale / no_priority / suggestion).",
+    migrateTitle: "Ссылки на задачи (#N → t#N)",
+    migrateDesc:
+      "Голый #N теперь трактуется как PR/issue на GitHub и больше не ведёт на задачу — линкуется только явная форма t#N. Эта миграция перепишет настоящие #N-ссылки на задачи в ваших задачах в t#N. Перед записью делается бэкап todos.json; кнопка «Откатить» его восстанавливает.",
+    migrateRun: "Мигрировать #N → t#N",
+    migrateRunning: "Миграция…",
+    migrateNone: "Мигрировать нечего — переписывать ссылки не потребовалось.",
+    migrateDone: "Готово: переписано ссылок — {refs}, в задачах — {tasks}.",
+    migrateRestore: "Откатить",
+    migrateRestoring: "Восстановление…",
+    migrateRestored: "Восстановлено из последнего бэкапа.",
+    migrateRestoreConfirm:
+      "Восстановить todos.json из последнего бэкапа? Изменения, сделанные после этого бэкапа, будут потеряны.",
+    migrateBackupAt: "Последний бэкап: {date}",
     installCcHook: "CLI + хук Claude Code",
     installCcHookDesc:
       "Прописать SessionStart-хук в ~/.claude/settings.json, чтобы каждая сессия Claude Code видела задачи этого проекта и меняла их через CLI cc-todos.",

@@ -8,7 +8,7 @@
 //     style): x = dependency depth, parallel tasks stack in a column, arrows run
 //     across. This is the editable one: drag node→node to add an edge,
 //     right-click an arrow to remove it.
-//   • Ref — a graph of non-blocking mentions (`links` + inline `#N`), laid out by
+//   • Ref — a graph of non-blocking mentions (`links` + inline `t#N`), laid out by
 //     connected component. Cross-board ref targets show as dashed external nodes.
 // Each tab shows only the tasks that participate in that kind of link, so nothing
 // gets forced into a meaningless grid.
@@ -157,10 +157,14 @@ function wrapLines(text: string): string[] {
   return lines.length ? lines : [""];
 }
 
+// Inline task references in a task's text. `t#N`, NOT a bare `#N` (#63): in prose
+// `#104` almost always means a GitHub PR/issue, and matching it against task
+// numbers drew phantom (often cross-project) ref edges. Only the explicit `t#N`
+// form is a ref; the `t` must not be a word tail (lookbehind rejects `part#5`).
 function inlineRefs(x: Todo): number[] {
   const text = `${x.description || ""}\n${x.plan || ""}`;
   const out = new Set<number>();
-  for (const m of text.matchAll(/#(\d+)/g)) out.add(parseInt(m[1], 10));
+  for (const m of text.matchAll(/(?<![A-Za-z0-9])[tT]#(\d+)/g)) out.add(parseInt(m[1], 10));
   return [...out];
 }
 

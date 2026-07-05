@@ -12,7 +12,9 @@
 //! config). Writes are atomic (temp file + rename) so a crash mid-write can't
 //! corrupt the list shared between the tracker and Claude.
 
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -314,6 +316,186 @@ pub fn remove_dep(file: &mut TodoFile, from_id: &str, on_id: &str, now: &str) ->
     false
 }
 
+// --- Inline-ref migration (#63): bare `#N` → explicit `t#N` --------------------
+//
+// A bare `#N` in prose overwhelmingly means a GitHub PR/issue; when its number
+// collided with a task's, the old linker silently pointed at the wrong task. The
+// UI/graph/CLI now link ONLY the explicit `t#N` form, so this migration rewrites
+// the genuine task references already sitting in stored text to `t#N` (otherwise
+// they'd go dark). It is deliberately conservative — a `#N` is rewritten only when
+// it looks like a real task reference, never when it looks like a PR — and every
+// migration takes a backup first so a wrong guess is one click from undo.
+
+/// Words that, immediately before a `#N`, mark it as a GitHub PR/issue reference
+/// (leave it a bare `#N`) rather than a task reference.
+const PR_WORDS: [&str; 6] = ["pr", "pull", "request", "gh", "issue", "mr"];
+
+/// True if the text right before the `#` at `hash_idx` ends in a PR-indicator word
+/// (case-insensitive, whole word), e.g. `PR #14`, `pull request #3`, `GH #7`.
+fn preceded_by_pr_word(text: &str, hash_idx: usize) -> bool {
+    let before = text[..hash_idx].trim_end_matches([' ', '\t', ':', '-']);
+    let lower = before.to_lowercase();
+    PR_WORDS.iter().any(|w| {
+        lower.strip_suffix(w).map_or(false, |head| {
+            // whole word: nothing before, or a non-alphanumeric separator
+            head.chars().last().map_or(true, |c| !c.is_alphanumeric())
+        })
+    })
+}
+
+/// Rewrite bare `#N` task references to the explicit `t#N` form within one text
+/// field. A `#N` is converted only when: N is a known task number (`known`); it is
+/// not the tail of a word or already `t#N` (any letter/digit immediately before
+/// `#` disqualifies it); and it is not preceded by a PR-indicator word. Returns the
+/// rewritten text and how many references were converted.
+pub fn rewrite_inline_refs(text: &str, known: &HashSet<u32>) -> (String, usize) {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut count = 0usize;
+    let mut k = 0usize;
+    while k < chars.len() {
+        let (byte_idx, c) = chars[k];
+        if c == '#' {
+            let mut m = k + 1;
+            while m < chars.len() && chars[m].1.is_ascii_digit() {
+                m += 1;
+            }
+            if m > k + 1 {
+                // A letter/digit right before `#` means a word tail (`part#5`) or an
+                // already-migrated `t#5` — either way, not a bare ref to rewrite.
+                let word_tail = k > 0 && chars[k - 1].1.is_alphanumeric();
+                if !word_tail && !preceded_by_pr_word(text, byte_idx) {
+                    let digits: String = chars[k + 1..m].iter().map(|(_, ch)| *ch).collect();
+                    if matches!(digits.parse::<u32>(), Ok(n) if known.contains(&n)) {
+                        out.push('t');
+                        out.push('#');
+                        out.push_str(&digits);
+                        count += 1;
+                        k = m;
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(c);
+        k += 1;
+    }
+    (out, count)
+}
+
+/// Outcome of a migration pass: total references rewritten and how many tasks had
+/// at least one field changed.
+#[derive(Debug, Clone, Copy, Serialize, Default)]
+pub struct MigrationStats {
+    pub refs: usize,
+    pub tasks: usize,
+}
+
+/// Rewrite bare `#N` → `t#N` across every task's description, plan and comment
+/// bodies (the fields the UI/graph tokenize into links). Subjects are left alone —
+/// they render as plain titles, never as links. Timestamps are NOT bumped: this is
+/// a mechanical text migration, not a user edit, so it must not reorder the board.
+pub fn migrate_refs(file: &mut TodoFile) -> MigrationStats {
+    let known: HashSet<u32> = file.todos.iter().map(|t| t.number).filter(|n| *n > 0).collect();
+    let mut stats = MigrationStats::default();
+    for t in &mut file.todos {
+        let mut touched = 0usize;
+        let (desc, n) = rewrite_inline_refs(&t.description, &known);
+        if n > 0 {
+            t.description = desc;
+            touched += n;
+        }
+        let (plan, n) = rewrite_inline_refs(&t.plan, &known);
+        if n > 0 {
+            t.plan = plan;
+            touched += n;
+        }
+        for c in &mut t.comments {
+            let (body, n) = rewrite_inline_refs(&c.body, &known);
+            if n > 0 {
+                c.body = body;
+                touched += n;
+            }
+        }
+        if touched > 0 {
+            stats.refs += touched;
+            stats.tasks += 1;
+        }
+    }
+    stats
+}
+
+// --- Backups (safety net for the migration + any risky bulk edit) --------------
+
+/// Where timestamped backups of `todos.json` live: a `backups/` dir beside it.
+pub fn backup_dir(todos_path: &Path) -> PathBuf {
+    todos_path
+        .parent()
+        .map(|d| d.join("backups"))
+        .unwrap_or_else(|| PathBuf::from("backups"))
+}
+
+/// Metadata for one backup file, for the settings UI (name + when it was taken).
+#[derive(Debug, Clone, Serialize)]
+pub struct BackupInfo {
+    pub name: String,
+    pub when_ms: u64,
+}
+
+/// Copy the current `todos.json` to a timestamped file under [`backup_dir`],
+/// returning the backup's file name. Fails if the source can't be read.
+pub fn backup(todos_path: &Path) -> Result<String, String> {
+    let content = std::fs::read(todos_path).map_err(|e| e.to_string())?;
+    let dir = backup_dir(todos_path);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let name = format!("todos-{stamp}.json");
+    std::fs::write(dir.join(&name), &content).map_err(|e| e.to_string())?;
+    Ok(name)
+}
+
+/// The most recent backup (by file mtime), or None if none exist.
+pub fn latest_backup(todos_path: &Path) -> Option<BackupInfo> {
+    let dir = backup_dir(todos_path);
+    let mut best: Option<(SystemTime, String)> = None;
+    for entry in std::fs::read_dir(&dir).ok()?.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with("todos-") || !name.ends_with(".json") {
+            continue;
+        }
+        let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        if best.as_ref().map_or(true, |(t, _)| mtime > *t) {
+            best = Some((mtime, name));
+        }
+    }
+    best.map(|(t, name)| BackupInfo {
+        name,
+        when_ms: t
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+    })
+}
+
+/// Read and validate a backup by file name, returning its parsed store. The name
+/// must be a bare file name inside [`backup_dir`] (guards against path traversal),
+/// and its content must parse as a [`TodoFile`], so a restore can't install junk.
+pub fn read_backup(todos_path: &Path, name: &str) -> Result<TodoFile, String> {
+    if Path::new(name).file_name().map_or(true, |f| f != name) {
+        return Err("invalid backup name".into());
+    }
+    let src = backup_dir(todos_path).join(name);
+    let content = std::fs::read_to_string(&src).map_err(|e| e.to_string())?;
+    let mut file: TodoFile =
+        serde_json::from_str(&content).map_err(|e| format!("backup is not a valid todo file: {e}"))?;
+    for t in &mut file.todos {
+        t.status = canonical_status(&t.status).to_string();
+    }
+    Ok(file)
+}
+
 /// The kanban columns, left to right. The frontend mirrors this order; the hook
 /// only cares whether a status is `done`.
 pub const STATUSES: [&str; 5] = ["backlog", "queue", "in_progress", "review", "done"];
@@ -371,6 +553,90 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
         }
+    }
+
+    fn known(nums: &[u32]) -> HashSet<u32> {
+        nums.iter().copied().collect()
+    }
+
+    #[test]
+    fn rewrite_converts_plain_task_ref() {
+        let k = known(&[58, 52]);
+        let (out, n) = rewrite_inline_refs("хвост #58, см. #52", &k);
+        assert_eq!(out, "хвост t#58, см. t#52");
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn rewrite_skips_pr_and_unknown_and_migrated() {
+        let k = known(&[63, 104]);
+        // PR-worded → left as prose; unknown number → left; already t#N → untouched.
+        let (out, n) =
+            rewrite_inline_refs("merged PR #104, pull request #63, gone #999, done t#63", &k);
+        assert_eq!(out, "merged PR #104, pull request #63, gone #999, done t#63");
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn rewrite_skips_word_tail_but_takes_bracketed() {
+        let k = known(&[5]);
+        // `abc#5` is a word tail (not a ref); `(#5)` is a real ref.
+        let (out, n) = rewrite_inline_refs("abc#5 and (#5)", &k);
+        assert_eq!(out, "abc#5 and (t#5)");
+        assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn migrate_refs_covers_description_plan_and_comments() {
+        let mut f = TodoFile::default();
+        let mut a = todo("a", "backlog");
+        a.number = 1;
+        a.description = "blocks #2".into();
+        a.plan = "after #3 and PR #2".into();
+        a.comments = vec![Comment {
+            id: "c1".into(),
+            author: "user".into(),
+            body: "ref #3".into(),
+            created_at: String::new(),
+        }];
+        let mut b = todo("b", "backlog");
+        b.number = 2;
+        let mut c = todo("c", "backlog");
+        c.number = 3;
+        f.todos = vec![a, b, c];
+
+        let stats = migrate_refs(&mut f);
+        assert_eq!(stats.tasks, 1);
+        assert_eq!(stats.refs, 3); // desc #2, plan #3, comment #3 — plan's "PR #2" skipped
+        assert_eq!(f.todos[0].description, "blocks t#2");
+        assert_eq!(f.todos[0].plan, "after t#3 and PR #2");
+        assert_eq!(f.todos[0].comments[0].body, "ref t#3");
+        // A mechanical migration must not bump timestamps (no board reorder).
+        assert!(f.todos[0].updated_at.is_empty());
+    }
+
+    #[test]
+    fn backup_then_restore_round_trips() {
+        let dir = std::env::temp_dir().join(format!("ct-todos-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("todos.json");
+        let mut f = TodoFile::default();
+        let mut a = todo("a", "review");
+        a.number = 1;
+        f.todos = vec![a];
+        save(&path, &f).unwrap();
+
+        let name = backup(&path).unwrap();
+        assert!(name.starts_with("todos-") && name.ends_with(".json"));
+        assert_eq!(latest_backup(&path).unwrap().name, name);
+
+        let restored = read_backup(&path, &name).unwrap();
+        assert_eq!(restored.todos.len(), 1);
+        assert_eq!(restored.todos[0].status, "review");
+        // Path-traversal names are rejected.
+        assert!(read_backup(&path, "../todos.json").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

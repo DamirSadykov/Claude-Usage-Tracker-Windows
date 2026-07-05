@@ -50,7 +50,7 @@ export interface Comment {
 }
 export interface Todo {
   id: string;
-  number?: number; // stable human-facing number for inline #N references
+  number?: number; // stable human-facing number for inline t#N references
   subject: string;
   description: string;
   status: string;
@@ -506,19 +506,27 @@ function fmtTime(iso: string | undefined) {
 }
 
 // --- Mini editor: inline links & references (GitHub-style) ---
-// Split plain text into runs, marking URLs, task references (#N) and project
+// Split plain text into runs, marking URLs, task references (t#N) and project
 // references (@name). Deliberately NOT v-html: every run renders through Vue
 // text interpolation (escaped) — a crafted comment can't inject markup. Opened
-// URLs go through the backend `open_url` command (http/https only); #N/@name
+// URLs go through the backend `open_url` command (http/https only); t#N/@name
 // navigate inside the app.
+//
+// Task refs use `t#N`, NOT a bare `#N` (#63): in prose `#104` overwhelmingly means
+// a GitHub PR/issue, and when its number collided with a task's the link silently
+// pointed at the wrong task (even in another project). So `#N` is now plain text;
+// only the explicit `t#N` form links to a task.
 type Seg =
   | { kind: "text"; text: string }
   | { kind: "url"; text: string; href: string }
   | { kind: "task"; text: string; number: number; subject: string }
   | { kind: "project"; text: string; project: string };
 
-// One pass: URL | #digits | @slug. Classification by which group matched.
-const TOKEN_RE = /(https?:\/\/[^\s<>]+|www\.[^\s<>]+)|#(\d+)|@([A-Za-z0-9._\-]+)/g;
+// One pass: URL | t#digits (task ref) | @slug. Classification by which group
+// matched. The `t` is required (see above) and must not be the tail of a word
+// (the lookbehind rejects `part#5`); a bare `#N` matches nothing here.
+const TOKEN_RE =
+  /(https?:\/\/[^\s<>]+|www\.[^\s<>]+)|(?<![A-Za-z0-9])[tT]#(\d+)|@([A-Za-z0-9._\-]+)/g;
 
 // Stable lookups for resolving references while rendering.
 const byNumber = computed(() => {
@@ -573,9 +581,9 @@ function tokenize(text: string): Seg[] {
     } else if (m[2]) {
       const num = parseInt(m[2], 10);
       const tt = byNum.get(num);
-      // Only a number that maps to a real task becomes a link; otherwise it's
-      // left as plain text so a stray "#5" doesn't pretend to be a reference.
-      if (tt) seg = { kind: "task", text: `#${num}`, number: num, subject: tt.subject };
+      // Only a number that maps to a real task becomes a link; otherwise the
+      // `t#5` is left as plain text so it doesn't pretend to be a reference.
+      if (tt) seg = { kind: "task", text: `t#${num}`, number: num, subject: tt.subject };
     } else if (m[3]) {
       let proj = m[3];
       if (!projs.has(proj)) {
@@ -640,7 +648,7 @@ function onGraphOpen(id: string) {
   if (todo) openDetail(todo);
 }
 
-// Navigate a #N reference to that task's detail; a @name reference back to the
+// Navigate a t#N reference to that task's detail; a @name reference back to the
 // board filtered to that project.
 function openTask(number: number) {
   const t = byNumber.value.get(number);
@@ -740,7 +748,7 @@ function triageGoToTask(num?: number) {
 // Settings → Tasks. This window keeps only the READ-ONLY digest chip/popover
 // below; the schedule config now lives in the settings panel.
 
-// Distinct other tasks this one references inline (#N) across its description and
+// Distinct other tasks this one references inline (t#N) across its description and
 // comments — drives the card's link chip. Uses tokenize so it counts exactly
 // what renders as a reference (a #frag inside a URL isn't one) and only resolved
 // numbers.
@@ -763,9 +771,9 @@ const descMode = ref<"edit" | "preview">("edit");
 const descSegments = computed(() => tokenize(draft.value.description));
 
 // --- Inline-reference autocomplete (the "preview the task you mean" popup) ---
-// A GitHub-style trigger menu: typing `#` lists tasks (number + subject so you
+// A GitHub-style trigger menu: typing `t#` lists tasks (number + subject so you
 // can tell which one), `@` lists projects. It drives plain-text insertion — the
-// stored text stays `#12` / `@proj`, resolved at render time by tokenize().
+// stored text stays `t#12` / `@proj`, resolved at render time by tokenize().
 const descTextarea = ref<HTMLTextAreaElement | null>(null);
 const commentTextarea = ref<HTMLTextAreaElement | null>(null);
 const descMenuEl = ref<HTMLUListElement | null>(null);
@@ -782,9 +790,10 @@ async function scrollSelIntoView() {
 }
 interface MentionState {
   target: "desc" | "comment";
-  trigger: "#" | "@";
+  trigger: "#" | "@"; // logical kind: task picker vs project picker
   query: string;
-  start: number; // index of the trigger char in the text
+  start: number; // index of the FIRST trigger char (the `t` of `t#`, or `@`)
+  prefixLen: number; // trigger length: 2 for `t#`, 1 for `@`
   caret: number; // caret index (end of the query)
   sel: number; // highlighted candidate
 }
@@ -816,27 +825,36 @@ const mentionItems = computed<MentionItem[]>(() => {
       .slice()
       .sort((a, b) => (a.number ?? 0) - (b.number ?? 0))
       .slice(0, 50)
-      .map((t) => ({ label: `#${t.number}`, sub: t.subject, value: String(t.number) }));
+      .map((t) => ({ label: `t#${t.number}`, sub: t.subject, value: String(t.number) }));
   }
   let list = projects.value;
   if (q) list = list.filter((p) => p.toLowerCase().includes(q));
   return list.slice(0, 50).map((p) => ({ label: `@${p}`, sub: "", value: p }));
 });
 
-// A mention is a SESSION: it opens the moment a `#`/`@` is typed (at line start
-// or after whitespace) and stays open as you keep typing, so a `#` query can hold
-// the words of a task title (spaces and all), GitHub-style. The session ends when
-// the trigger is deleted, the caret leaves it, a newline/oversized/`@`-with-space
-// query appears, or you pick/escape. Picking inserts the NUMBER, not the title.
+// A mention is a SESSION: it opens the moment a `t#` (task) or `@` (project)
+// trigger is typed at line start or after whitespace, and stays open as you keep
+// typing, so a `t#` query can hold the words of a task title (spaces and all),
+// GitHub-style. The session ends when the trigger is deleted, the caret leaves it,
+// a newline/oversized/`@`-with-space query appears, or you pick/escape. Picking
+// inserts `t#<number>` / `@<project>`, not the title. A bare `#` does NOT trigger
+// the task picker (#63): `#N` is prose (a PR/issue), only `t#N` is a task ref.
 const MENTION_MAX_QUERY = 60;
+// True if position `i` is a word start — index 0 or preceded by whitespace — so a
+// `t#`/`@` mid-word (e.g. `art#5`, `email@host`) isn't hijacked into a picker.
+const atWordStart = (text: string, i: number) => i === 0 || /\s/.test(text[i - 1]);
 function onMentionInput(target: "desc" | "comment", e: Event) {
   const el = e.target as HTMLTextAreaElement;
   const text = el.value;
   const caret = el.selectionStart ?? text.length;
   const m = mention.value;
-  // Continue an open session while its trigger char is still in place.
-  if (m && m.target === target && caret > m.start && text[m.start] === m.trigger) {
-    const query = text.slice(m.start + 1, caret);
+  // Continue an open session while its trigger prefix is still intact.
+  const prefixIntact = (s: MentionState) =>
+    s.trigger === "@"
+      ? text[s.start] === "@"
+      : /[tT]/.test(text[s.start] ?? "") && text[s.start + 1] === "#";
+  if (m && m.target === target && caret >= m.start + m.prefixLen && prefixIntact(m)) {
+    const query = text.slice(m.start + m.prefixLen, caret);
     const ok =
       !query.includes("\n") &&
       query.length <= MENTION_MAX_QUERY &&
@@ -851,14 +869,17 @@ function onMentionInput(target: "desc" | "comment", e: Event) {
     }
     mention.value = null;
   }
-  // Open a new session only when the trigger char was JUST typed (the char right
-  // before the caret), so a `#` from elsewhere in the text isn't hijacked.
+  // Open a new session only when a trigger was JUST completed at the caret: `@`
+  // (1 char) or `t#` (2 chars, the `#` just typed after a word-start `t`).
   const prev = text[caret - 1];
-  if (
-    (prev === "#" || prev === "@") &&
-    (caret - 1 === 0 || /\s/.test(text[caret - 2]))
+  if (prev === "@" && atWordStart(text, caret - 1)) {
+    mention.value = { target, trigger: "@", query: "", start: caret - 1, prefixLen: 1, caret, sel: 0 };
+  } else if (
+    prev === "#" &&
+    /[tT]/.test(text[caret - 2] ?? "") &&
+    atWordStart(text, caret - 2)
   ) {
-    mention.value = { target, trigger: prev, query: "", start: caret - 1, caret, sel: 0 };
+    mention.value = { target, trigger: "#", query: "", start: caret - 2, prefixLen: 2, caret, sel: 0 };
   } else if (mention.value && mention.value.target === target) {
     mention.value = null;
   }
@@ -867,7 +888,7 @@ function onMentionInput(target: "desc" | "comment", e: Event) {
 async function pickMention(item: MentionItem) {
   const m = mention.value;
   if (!m) return;
-  const insert = (m.trigger === "#" ? `#${item.value}` : `@${item.value}`) + " ";
+  const insert = (m.trigger === "#" ? `t#${item.value}` : `@${item.value}`) + " ";
   const apply = (text: string) =>
     text.slice(0, m.start) + insert + text.slice(m.caret);
   if (m.target === "desc") draft.value.description = apply(draft.value.description);
@@ -2634,7 +2655,7 @@ onUnmounted(() => {
   font-style: italic;
 }
 
-/* Inline references (#N task, @name project) */
+/* Inline references (t#N task, @name project) */
 .tw-ref {
   color: var(--accent);
   background: var(--accent-soft);
