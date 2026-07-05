@@ -1628,6 +1628,99 @@ fn set_todo_status(
     })
 }
 
+/// Add a dependency edge for the task graph (#88): `from_id` depends on `on_id`.
+/// Validation (self/missing/cross-board/cycle) lives in [`todos::add_dep`]; a
+/// rejection surfaces its message to the UI and the file is left untouched.
+#[tauri::command]
+fn add_todo_dep(
+    app: AppHandle,
+    from_id: String,
+    on_id: String,
+) -> Result<Vec<todos::Todo>, String> {
+    let now = chrono::Utc::now().to_rfc3339();
+    // Capture the validation result out of the mutate closure so a rejected edge
+    // fails the command (write_todos_locked still persists the untouched file,
+    // which is a harmless no-op — nothing changed).
+    let mut outcome = Ok(());
+    let todos = write_todos_locked(&app, |file| {
+        outcome = todos::add_dep(file, &from_id, &on_id, &now);
+    })?;
+    outcome.map(|()| todos)
+}
+
+/// Remove a dependency edge (`from_id` no longer depends on `on_id`). A no-op if
+/// the edge was absent.
+#[tauri::command]
+fn remove_todo_dep(
+    app: AppHandle,
+    from_id: String,
+    on_id: String,
+) -> Result<Vec<todos::Todo>, String> {
+    let now = chrono::Utc::now().to_rfc3339();
+    write_todos_locked(&app, move |file| {
+        todos::remove_dep(file, &from_id, &on_id, &now);
+    })
+}
+
+/// Result of a task-ref migration for the settings UI: how much was rewritten and
+/// the backup taken first (empty `backup` when nothing changed → no backup made).
+#[derive(Serialize, Clone)]
+struct MigrationReport {
+    refs: usize,
+    tasks: usize,
+    backup: String,
+}
+
+/// Migrate stored `#N` task references to the explicit `t#N` form (#63). Backs up
+/// `todos.json` to a timestamped file BEFORE writing, so a wrong guess is one
+/// "Откатить" click away. A dry pass first counts the work: if nothing would
+/// change, it skips the backup and the write entirely.
+#[tauri::command]
+fn migrate_todo_refs(app: AppHandle) -> Result<MigrationReport, String> {
+    let path = todos_path(&app)?;
+    // Dry pass on a clone so we don't back up (or churn the file) for a no-op.
+    let mut probe = todos::load(&path);
+    let dry = todos::migrate_refs(&mut probe);
+    if dry.refs == 0 {
+        return Ok(MigrationReport { refs: 0, tasks: 0, backup: String::new() });
+    }
+    let backup = todos::backup(&path)?;
+    // Re-run under the write lock so the snapshot stays in lockstep and the count
+    // reflects exactly what was persisted.
+    let mut stats = todos::MigrationStats::default();
+    write_todos_locked(&app, |file| {
+        stats = todos::migrate_refs(file);
+    })?;
+    Ok(MigrationReport { refs: stats.refs, tasks: stats.tasks, backup })
+}
+
+/// The most recent `todos.json` backup, or None if none exist — drives whether the
+/// "Откатить" button is enabled and what timestamp it shows.
+#[tauri::command]
+fn latest_todo_backup(app: AppHandle) -> Result<Option<todos::BackupInfo>, String> {
+    Ok(todos::latest_backup(&todos_path(&app)?))
+}
+
+/// Restore `todos.json` from a backup (the most recent when `name` is omitted),
+/// undoing a migration or any bulk edit. The restored file is validated and
+/// installed under the write lock; the file watcher then pushes the reload to the
+/// todo window. Returns the restored list.
+#[tauri::command]
+fn restore_todo_backup(
+    app: AppHandle,
+    name: Option<String>,
+) -> Result<Vec<todos::Todo>, String> {
+    let path = todos_path(&app)?;
+    let name = match name {
+        Some(n) if !n.trim().is_empty() => n,
+        _ => todos::latest_backup(&path).ok_or("Нет доступного бэкапа для отката")?.name,
+    };
+    let restored = todos::read_backup(&path, &name)?;
+    write_todos_locked(&app, move |file| {
+        *file = restored;
+    })
+}
+
 /// All phase plans the tracker can find, across every project that has a
 /// `.claude/phases/` dir. Read-only: the plans are authored by the `cc-phases`
 /// CLI and live in each project. The frontend matches a plan to a task card by
@@ -2049,6 +2142,11 @@ pub fn run() {
             upsert_todo,
             delete_todo,
             set_todo_status,
+            add_todo_dep,
+            remove_todo_dep,
+            migrate_todo_refs,
+            latest_todo_backup,
+            restore_todo_backup,
             get_phase_plans,
             open_todo_window,
             open_settings_window,

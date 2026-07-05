@@ -13,6 +13,7 @@ import { useI18n, type Composer } from "vue-i18n";
 import { invoke } from "@tauri-apps/api/core";
 import ProjectAutocomplete from "./ProjectAutocomplete.vue";
 import ProjectLabel from "./ProjectLabel.vue";
+import GraphView from "./GraphView.vue";
 import { useProjectLinks } from "../projectLinks";
 import i18n from "../i18n";
 import type { TriageDigest, DigestItem } from "../App.vue";
@@ -49,7 +50,7 @@ export interface Comment {
 }
 export interface Todo {
   id: string;
-  number?: number; // stable human-facing number for inline #N references
+  number?: number; // stable human-facing number for inline t#N references
   subject: string;
   description: string;
   status: string;
@@ -61,6 +62,7 @@ export interface Todo {
   from?: string | null; // project this task was filed from (cross-project; issue #13)
   comments?: Comment[];
   links?: string[];
+  depends_on?: string[]; // ids of tasks this one depends on — task-graph edges (#88)
   created_by?: string; // "user" | "claude" ("" / absent = user, no AI badge)
   created_at: string;
   updated_at: string;
@@ -504,19 +506,27 @@ function fmtTime(iso: string | undefined) {
 }
 
 // --- Mini editor: inline links & references (GitHub-style) ---
-// Split plain text into runs, marking URLs, task references (#N) and project
+// Split plain text into runs, marking URLs, task references (t#N) and project
 // references (@name). Deliberately NOT v-html: every run renders through Vue
 // text interpolation (escaped) — a crafted comment can't inject markup. Opened
-// URLs go through the backend `open_url` command (http/https only); #N/@name
+// URLs go through the backend `open_url` command (http/https only); t#N/@name
 // navigate inside the app.
+//
+// Task refs use `t#N`, NOT a bare `#N` (#63): in prose `#104` overwhelmingly means
+// a GitHub PR/issue, and when its number collided with a task's the link silently
+// pointed at the wrong task (even in another project). So `#N` is now plain text;
+// only the explicit `t#N` form links to a task.
 type Seg =
   | { kind: "text"; text: string }
   | { kind: "url"; text: string; href: string }
   | { kind: "task"; text: string; number: number; subject: string }
   | { kind: "project"; text: string; project: string };
 
-// One pass: URL | #digits | @slug. Classification by which group matched.
-const TOKEN_RE = /(https?:\/\/[^\s<>]+|www\.[^\s<>]+)|#(\d+)|@([A-Za-z0-9._\-]+)/g;
+// One pass: URL | t#digits (task ref) | @slug. Classification by which group
+// matched. The `t` is required (see above) and must not be the tail of a word
+// (the lookbehind rejects `part#5`); a bare `#N` matches nothing here.
+const TOKEN_RE =
+  /(https?:\/\/[^\s<>]+|www\.[^\s<>]+)|(?<![A-Za-z0-9])[tT]#(\d+)|@([A-Za-z0-9._\-]+)/g;
 
 // Stable lookups for resolving references while rendering.
 const byNumber = computed(() => {
@@ -571,9 +581,9 @@ function tokenize(text: string): Seg[] {
     } else if (m[2]) {
       const num = parseInt(m[2], 10);
       const tt = byNum.get(num);
-      // Only a number that maps to a real task becomes a link; otherwise it's
-      // left as plain text so a stray "#5" doesn't pretend to be a reference.
-      if (tt) seg = { kind: "task", text: `#${num}`, number: num, subject: tt.subject };
+      // Only a number that maps to a real task becomes a link; otherwise the
+      // `t#5` is left as plain text so it doesn't pretend to be a reference.
+      if (tt) seg = { kind: "task", text: `t#${num}`, number: num, subject: tt.subject };
     } else if (m[3]) {
       let proj = m[3];
       if (!projs.has(proj)) {
@@ -620,7 +630,25 @@ async function openSettings() {
   await invoke("open_settings_window", { tab: "tasks" });
 }
 
-// Navigate a #N reference to that task's detail; a @name reference back to the
+// Board vs graph view (#88): the graph is an alternative rendering of the SAME
+// filtered board, toggled in place — not a separate window. It shares this
+// window's `todos` and `projectFilter`.
+const viewMode = ref<"board" | "graph">("board");
+
+// GraphView mutates dependencies through the backend and hands back the fresh
+// list; adopt it so both views stay in lockstep without a reload round-trip.
+function onGraphUpdate(list: Todo[]) {
+  todos.value = list;
+}
+
+// Clicking a graph node opens that task's card — the same detail panel the board
+// uses (it overlays the graph and returns to it on close).
+function onGraphOpen(id: string) {
+  const todo = todos.value.find((x) => x.id === id);
+  if (todo) openDetail(todo);
+}
+
+// Navigate a t#N reference to that task's detail; a @name reference back to the
 // board filtered to that project.
 function openTask(number: number) {
   const t = byNumber.value.get(number);
@@ -720,7 +748,7 @@ function triageGoToTask(num?: number) {
 // Settings → Tasks. This window keeps only the READ-ONLY digest chip/popover
 // below; the schedule config now lives in the settings panel.
 
-// Distinct other tasks this one references inline (#N) across its description and
+// Distinct other tasks this one references inline (t#N) across its description and
 // comments — drives the card's link chip. Uses tokenize so it counts exactly
 // what renders as a reference (a #frag inside a URL isn't one) and only resolved
 // numbers.
@@ -743,9 +771,9 @@ const descMode = ref<"edit" | "preview">("edit");
 const descSegments = computed(() => tokenize(draft.value.description));
 
 // --- Inline-reference autocomplete (the "preview the task you mean" popup) ---
-// A GitHub-style trigger menu: typing `#` lists tasks (number + subject so you
+// A GitHub-style trigger menu: typing `t#` lists tasks (number + subject so you
 // can tell which one), `@` lists projects. It drives plain-text insertion — the
-// stored text stays `#12` / `@proj`, resolved at render time by tokenize().
+// stored text stays `t#12` / `@proj`, resolved at render time by tokenize().
 const descTextarea = ref<HTMLTextAreaElement | null>(null);
 const commentTextarea = ref<HTMLTextAreaElement | null>(null);
 const descMenuEl = ref<HTMLUListElement | null>(null);
@@ -762,9 +790,10 @@ async function scrollSelIntoView() {
 }
 interface MentionState {
   target: "desc" | "comment";
-  trigger: "#" | "@";
+  trigger: "#" | "@"; // logical kind: task picker vs project picker
   query: string;
-  start: number; // index of the trigger char in the text
+  start: number; // index of the FIRST trigger char (the `t` of `t#`, or `@`)
+  prefixLen: number; // trigger length: 2 for `t#`, 1 for `@`
   caret: number; // caret index (end of the query)
   sel: number; // highlighted candidate
 }
@@ -796,27 +825,36 @@ const mentionItems = computed<MentionItem[]>(() => {
       .slice()
       .sort((a, b) => (a.number ?? 0) - (b.number ?? 0))
       .slice(0, 50)
-      .map((t) => ({ label: `#${t.number}`, sub: t.subject, value: String(t.number) }));
+      .map((t) => ({ label: `t#${t.number}`, sub: t.subject, value: String(t.number) }));
   }
   let list = projects.value;
   if (q) list = list.filter((p) => p.toLowerCase().includes(q));
   return list.slice(0, 50).map((p) => ({ label: `@${p}`, sub: "", value: p }));
 });
 
-// A mention is a SESSION: it opens the moment a `#`/`@` is typed (at line start
-// or after whitespace) and stays open as you keep typing, so a `#` query can hold
-// the words of a task title (spaces and all), GitHub-style. The session ends when
-// the trigger is deleted, the caret leaves it, a newline/oversized/`@`-with-space
-// query appears, or you pick/escape. Picking inserts the NUMBER, not the title.
+// A mention is a SESSION: it opens the moment a `t#` (task) or `@` (project)
+// trigger is typed at line start or after whitespace, and stays open as you keep
+// typing, so a `t#` query can hold the words of a task title (spaces and all),
+// GitHub-style. The session ends when the trigger is deleted, the caret leaves it,
+// a newline/oversized/`@`-with-space query appears, or you pick/escape. Picking
+// inserts `t#<number>` / `@<project>`, not the title. A bare `#` does NOT trigger
+// the task picker (#63): `#N` is prose (a PR/issue), only `t#N` is a task ref.
 const MENTION_MAX_QUERY = 60;
+// True if position `i` is a word start — index 0 or preceded by whitespace — so a
+// `t#`/`@` mid-word (e.g. `art#5`, `email@host`) isn't hijacked into a picker.
+const atWordStart = (text: string, i: number) => i === 0 || /\s/.test(text[i - 1]);
 function onMentionInput(target: "desc" | "comment", e: Event) {
   const el = e.target as HTMLTextAreaElement;
   const text = el.value;
   const caret = el.selectionStart ?? text.length;
   const m = mention.value;
-  // Continue an open session while its trigger char is still in place.
-  if (m && m.target === target && caret > m.start && text[m.start] === m.trigger) {
-    const query = text.slice(m.start + 1, caret);
+  // Continue an open session while its trigger prefix is still intact.
+  const prefixIntact = (s: MentionState) =>
+    s.trigger === "@"
+      ? text[s.start] === "@"
+      : /[tT]/.test(text[s.start] ?? "") && text[s.start + 1] === "#";
+  if (m && m.target === target && caret >= m.start + m.prefixLen && prefixIntact(m)) {
+    const query = text.slice(m.start + m.prefixLen, caret);
     const ok =
       !query.includes("\n") &&
       query.length <= MENTION_MAX_QUERY &&
@@ -831,14 +869,17 @@ function onMentionInput(target: "desc" | "comment", e: Event) {
     }
     mention.value = null;
   }
-  // Open a new session only when the trigger char was JUST typed (the char right
-  // before the caret), so a `#` from elsewhere in the text isn't hijacked.
+  // Open a new session only when a trigger was JUST completed at the caret: `@`
+  // (1 char) or `t#` (2 chars, the `#` just typed after a word-start `t`).
   const prev = text[caret - 1];
-  if (
-    (prev === "#" || prev === "@") &&
-    (caret - 1 === 0 || /\s/.test(text[caret - 2]))
+  if (prev === "@" && atWordStart(text, caret - 1)) {
+    mention.value = { target, trigger: "@", query: "", start: caret - 1, prefixLen: 1, caret, sel: 0 };
+  } else if (
+    prev === "#" &&
+    /[tT]/.test(text[caret - 2] ?? "") &&
+    atWordStart(text, caret - 2)
   ) {
-    mention.value = { target, trigger: prev, query: "", start: caret - 1, caret, sel: 0 };
+    mention.value = { target, trigger: "#", query: "", start: caret - 2, prefixLen: 2, caret, sel: 0 };
   } else if (mention.value && mention.value.target === target) {
     mention.value = null;
   }
@@ -847,7 +888,7 @@ function onMentionInput(target: "desc" | "comment", e: Event) {
 async function pickMention(item: MentionItem) {
   const m = mention.value;
   if (!m) return;
-  const insert = (m.trigger === "#" ? `#${item.value}` : `@${item.value}`) + " ";
+  const insert = (m.trigger === "#" ? `t#${item.value}` : `@${item.value}`) + " ";
   const apply = (text: string) =>
     text.slice(0, m.start) + insert + text.slice(m.caret);
   if (m.target === "desc") draft.value.description = apply(draft.value.description);
@@ -1165,6 +1206,39 @@ onUnmounted(() => {
         <input type="checkbox" v-model="showDone" />
         {{ t("todoShowDone") }}
       </label>
+      <div class="tw-viewtoggle" role="tablist">
+        <button
+          class="tw-vt"
+          :class="{ active: viewMode === 'board' }"
+          role="tab"
+          :aria-selected="viewMode === 'board'"
+          :title="t('viewBoard')"
+          @click="viewMode = 'board'"
+        >
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4">
+            <rect x="1.5" y="2.5" width="3.6" height="11" rx="1" />
+            <rect x="6.2" y="2.5" width="3.6" height="7.5" rx="1" />
+            <rect x="10.9" y="2.5" width="3.6" height="9.5" rx="1" />
+          </svg>
+          {{ t("viewBoard") }}
+        </button>
+        <button
+          class="tw-vt"
+          :class="{ active: viewMode === 'graph' }"
+          role="tab"
+          :aria-selected="viewMode === 'graph'"
+          :title="t('viewGraph')"
+          @click="viewMode = 'graph'"
+        >
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="4" cy="4" r="2" />
+            <circle cx="12" cy="4" r="2" />
+            <circle cx="8" cy="12.5" r="2" />
+            <path d="M5.6 5.4 8 10.6M10.4 5.4 8 10.6" />
+          </svg>
+          {{ t("viewGraph") }}
+        </button>
+      </div>
       <button class="tw-guide" :title="t('todoGuideHint')" @click="openGuide">
         <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
           <path d="M2.5 3.2c1.8-.6 3.7-.6 5.5.3 1.8-.9 3.7-.9 5.5-.3v8.6c-1.8-.6-3.7-.6-5.5.3-1.8-.9-3.7-.9-5.5-.3z" />
@@ -1184,6 +1258,15 @@ onUnmounted(() => {
     <div v-if="errorMsg" class="tw-error">{{ errorMsg }}</div>
 
     <div v-if="loading" class="tw-empty">{{ t("loading") }}</div>
+
+    <!-- Task graph: an alternative view of the same filtered board (#88) -->
+    <GraphView
+      v-else-if="viewMode === 'graph'"
+      :todos="todos"
+      :project="projectFilter"
+      @update="onGraphUpdate"
+      @open="onGraphOpen"
+    />
 
     <!-- Kanban board -->
     <main v-else class="tw-board">
@@ -1713,6 +1796,39 @@ onUnmounted(() => {
   border-color: var(--accent);
 }
 .tw-guide svg {
+  opacity: 0.85;
+}
+/* Segmented Board/Graph view switch (#88). */
+.tw-viewtoggle {
+  display: inline-flex;
+  border: 1px solid var(--stroke-strong);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.tw-vt {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  border: none;
+  background: var(--card-bg);
+  color: var(--text-3);
+  padding: 6px 10px;
+  font-size: 12px;
+  font-family: var(--segoe);
+  cursor: pointer;
+  transition: color 120ms, background 120ms;
+}
+.tw-vt + .tw-vt {
+  border-left: 1px solid var(--stroke-strong);
+}
+.tw-vt:hover {
+  color: var(--text);
+}
+.tw-vt.active {
+  background: var(--accent);
+  color: #06283b;
+}
+.tw-vt svg {
   opacity: 0.85;
 }
 .tw-add {
@@ -2539,7 +2655,7 @@ onUnmounted(() => {
   font-style: italic;
 }
 
-/* Inline references (#N task, @name project) */
+/* Inline references (t#N task, @name project) */
 .tw-ref {
   color: var(--accent);
   background: var(--accent-soft);
