@@ -16,6 +16,7 @@ const AREAS = {
   todos: "./cli/todos.mjs",
   phases: "./cli/phases.mjs",
   triage: "./cli/triage.mjs",
+  corrections: "./cli/corrections.mjs",
   hook: "./cli/hook.mjs",
 };
 
@@ -25,6 +26,7 @@ function usage(code) {
       "  todos   <…>   mutate the todo list (add / set-status / comment / list / …)\n" +
       "  phases  <…>   break a task into ordered phases (create / add / done / list / …)\n" +
       "  triage  <…>   publish/read the nightly-triage digest (publish / show / clear)\n" +
+      "  corrections <…> user-corrections outcome metric, layer 1 (scan / label-template / eval)\n" +
       "  hook          SessionStart hook (wired into ~/.claude/settings.json)\n\n" +
       "Run `cli <area> --help` for an area's commands.\n",
   );

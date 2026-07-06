@@ -1,5 +1,6 @@
 pub mod alerts;
 pub mod cc;
+pub mod corrections;
 pub mod domain;
 pub mod memory;
 pub mod phases;
@@ -1208,6 +1209,35 @@ fn get_triage_digest(app: AppHandle) -> Result<Option<triage::TriageDigest>, Str
     Ok(triage::load(&triage_digest_path(&app)?))
 }
 
+/// Path to the corrections-metrics file, a sibling of todos.json in the app data
+/// dir (see corrections.rs / `cli.mjs corrections publish`). Read-only here.
+fn corrections_metrics_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).ok();
+    Ok(dir.join("corrections-metrics.json"))
+}
+
+/// The latest user-corrections metric (task t#101), or None if no `publish` has
+/// produced one yet (or the file is unreadable). The CLI writes it; the tracker
+/// only reads it to show the outcome card.
+#[tauri::command]
+fn get_corrections_metrics(
+    app: AppHandle,
+) -> Result<Option<corrections::CorrectionsMetrics>, String> {
+    Ok(corrections::load(&corrections_metrics_path(&app)?))
+}
+
+/// Recompute the corrections metric now (runs `corrections publish --all` via
+/// node) so the card can be refreshed on demand. Blocking work runs off the
+/// async runtime; the frontend re-reads the freshened file when this resolves.
+#[tauri::command]
+async fn refresh_corrections_metrics(app: AppHandle) -> Result<(), String> {
+    let cli = cc_hook_script_path(&app)?;
+    tokio::task::spawn_blocking(move || triage_schedule::run_corrections_publish(&cli))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// Current nightly-triage schedule config (enabled / time / model + last-run
 /// bookkeeping) for the in-app controls. Forgiving: defaults if never set.
 #[tauri::command]
@@ -2123,6 +2153,8 @@ pub fn run() {
             get_analytics_ext,
             export_analytics_json,
             get_todos,
+            get_corrections_metrics,
+            refresh_corrections_metrics,
             get_triage_digest,
             get_triage_schedule,
             set_triage_schedule,

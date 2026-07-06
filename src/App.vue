@@ -100,6 +100,52 @@ export interface TriageDigest {
     items: DigestItem[];
 }
 
+// The latest user-corrections outcome metric (task t#101), read from
+// corrections-metrics.json. Read-only on the tracker side — `cli.mjs corrections
+// publish` owns writes. Mirrors corrections.rs::CorrectionsMetrics. Numbers are
+// layer-1 CANDIDATES (upper bound) from a heuristic net; classifying them further
+// is out of scope for this metric.
+export interface CorrectionsTotals {
+    sessions: number;
+    assistant_turns: number;
+    user_turns: number;
+    candidate_corrections: number;
+    done_claims: number;
+    rework_after_done: number;
+    likely_llm: number;
+    ambiguous: number;
+    corrections_per_session: number | null;
+    rework_after_done_rate: number | null;
+}
+export interface CorrectionsSessionStat {
+    assistant_turns: number;
+    user_turns: number;
+    candidate_corrections: number;
+    done_claims: number;
+    rework_after_done: number;
+    corrections_per_session: number | null;
+    rework_after_done_rate: number | null;
+}
+export interface CorrectionsSessionRow {
+    session: string;
+    project_dir?: string | null;
+    modified_at?: string | null;
+    stats: CorrectionsSessionStat;
+    likely_llm: number;
+    ambiguous: number;
+}
+export interface CorrectionsMetrics {
+    version: number;
+    contract_version: number;
+    generated_at: string;
+    scope: string;
+    project?: string | null;
+    totals: CorrectionsTotals;
+    // Per-session rows — the analytics card filters these by the active date
+    // range + project and re-aggregates the totals client-side.
+    sessions: CorrectionsSessionRow[];
+}
+
 const { t, locale } = useI18n();
 
 const {
