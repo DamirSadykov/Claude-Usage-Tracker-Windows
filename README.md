@@ -162,7 +162,10 @@ The task manager can be driven from a Claude Code session via the bundled `cc-to
 - `add "<subject>" [--project <name>] [--description <text>]` — create a task in the backlog
 - `set-status <id> <backlog|queue|in_progress|review|done>` — move a task across columns
 - `comment add <id> --text "<body>"` — leave a note on a task's thread
+- `dep` / `ref` — manage the task graph (blocking dependencies and non-blocking references)
 - `list` / `related <project>` / `groups` — inspect tasks and project links
+
+To reference one task from another's description or comment, write **`t#N`** (e.g. "blocked by `t#12`") — it renders as a live link. A bare `#N` is treated as a GitHub PR/issue and is left as plain text, so task references must be prefixed with `t`.
 
 Tasks created in Claude Code (via TodoWrite) are also picked up automatically, so the board reflects what your agent is working on.
 

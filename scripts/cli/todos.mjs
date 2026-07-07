@@ -267,7 +267,7 @@ function cmdAdd(args) {
   if (from === null && target && target !== cwdProject) from = cwdProject;
   const todo = {
     id: randomUUID(),
-    // Stable human-facing number for inline `#N` references, mirroring
+    // Stable human-facing number for inline `t#N` references, mirroring
     // todos.rs::ensure_numbers (next after the current max). The app backfills
     // any unnumbered rows on load, so a 0 here would still be fixed up later.
     number: nextNumber(data),
@@ -731,7 +731,10 @@ function usage(code) {
       "  ref rm  <task> <target>         remove an explicit ref link (inline t#N stays; edit text to drop)\n" +
       "  ref list <task> [--json]        show a task's references + referenced-by (link + inline t#N)\n" +
       "  related <project> [--json]      projects that work with <project>\n" +
-      "  groups [--json]                 list association groups\n",
+      "  groups [--json]                 list association groups\n" +
+      "\n" +
+      "  Inline task references (inside a description/comment): write t#N, e.g. \"blocked by t#12\".\n" +
+      "  A bare #N is read as a GitHub PR/issue and is NOT linked — always prefix a task reference with t.\n",
   );
   process.exit(code);
 }
