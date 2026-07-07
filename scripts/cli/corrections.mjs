@@ -95,7 +95,10 @@ function claudeProjectsDir() {
 }
 
 function encodeCwd(cwd) {
-  return String(cwd).replace(/[:\\/]/g, "-");
+  // Claude Code replaces `:` `\` `/` AND `.` with `-` when naming the project dir
+  // (a dotted path like `D:\projects\.clients\shop` → `D--projects--clients-shop`),
+  // so `.` must be encoded too or the default/`--project` scope misses the dir.
+  return String(cwd).replace(/[:\\/.]/g, "-");
 }
 
 // Resolve which transcript files to analyze. Precedence:
@@ -279,14 +282,26 @@ function assistantToolUses(entry) {
 // ── layer-1 lexical detector ─────────────────────────────────────────────────
 // High-recall, deliberately noisy. The external classifier prunes the false
 // positives; tune these with `eval` against hand labels, don't trust them raw.
-const NEGATION_OPENERS =
-  /^\s*(нет\b|не так|не то\b|неправильно|неверно|зачем|почему|я же (просил|говорил)|опять|снова|стоп\b|это не то|да нет|no\b|nope\b|wrong\b)/i;
-const CORRECTIVE_IMPERATIVES =
-  /\b(переделай|переделать|исправь|исправить|поправь|почини|верни|вернуть|убери|убрать|откати|откатить|замени|заменить|не надо было|не нужно было|сломал|сломано|ошиб(ся|ка|аешься)|revert|undo|fix (this|that|it))\b/i;
+// NOTE on word boundaries: JS `\b` is ASCII-only (`\w` = [A-Za-z0-9_]), so a `\b`
+// touching a Cyrillic letter never fires — it would silently kill every Russian
+// keyword and leave only the ASCII ones matching. We use the `u` flag + explicit
+// Unicode-aware boundaries `(?<![\p{L}\p{N}_])` / `(?![\p{L}\p{N}_])` instead.
+const WB_L = "(?<![\\p{L}\\p{N}_])"; // left boundary (no letter/number/_ before)
+const WB_R = "(?![\\p{L}\\p{N}_])"; //  right boundary (no letter/number/_ after)
+const NEGATION_OPENERS = new RegExp(
+  `^\\s*(нет${WB_R}|не так|не то${WB_R}|неправильно|неверно|зачем|почему|я же (просил|говорил)|опять|снова|стоп${WB_R}|это не то|да нет|no${WB_R}|nope${WB_R}|wrong${WB_R})`,
+  "iu",
+);
+const CORRECTIVE_IMPERATIVES = new RegExp(
+  `${WB_L}(переделай|переделать|исправь|исправить|поправь|почини|верни|вернуть|убери|убрать|откати|откатить|замени|заменить|не надо было|не нужно было|сломал|сломано|ошиб(ся|ка|аешься)|revert|undo|fix (this|that|it))${WB_R}`,
+  "iu",
+);
 
 // A "done"/completion claim in an assistant turn — the anchor for rework_after_done.
-const DONE_CLAIM =
-  /(готово\b|готов\b|сделал|сделано|исправил|починил|смерж|запушил|закоммит|всё чисто|все чисто|работает теперь|done\b|fixed\b|✓|✅)/i;
+const DONE_CLAIM = new RegExp(
+  `(готово${WB_R}|готов${WB_R}|сделал|сделано|исправил|починил|смерж|запушил|закоммит|всё чисто|все чисто|работает теперь|done${WB_R}|fixed${WB_R}|✓|✅)`,
+  "iu",
+);
 
 // Predict whether a real user turn is a correction candidate.
 // `precededBy` is 'reject' | 'interrupt' | null (the structural signal).
@@ -331,8 +346,25 @@ function snip(s) {
   return String(s || "").replace(/\s+/g, " ").trim().slice(0, EVIDENCE_CHARS);
 }
 
+// The real project name, from the `cwd` field the transcript entries carry — the
+// LAST path component, exactly as the app derives it (src-tauri/src/cc.rs::
+// project_name). The encoded `projectDir` is lossy (every separator became `-`),
+// so a consumer can't recover the project from it; this gives an exact key to
+// filter by. Null when no entry carries a cwd.
+function projectFromRows(rows) {
+  for (const { entry } of rows) {
+    const cwd = entry && entry.cwd;
+    if (typeof cwd === "string" && cwd.trim()) {
+      const name = cwd.replace(/[\\/]+$/, "").split(/[\\/]/).pop();
+      if (name) return name;
+    }
+  }
+  return null;
+}
+
 function analyzeSession(session, file, projectDir) {
   const rows = readEntries(file);
+  const project = projectFromRows(rows);
 
   const assistantMsgIds = new Set();
   let assistantAnon = 0; // assistant turns with no message.id (counted individually)
@@ -365,8 +397,21 @@ function analyzeSession(session, file, projectDir) {
 
     if (isAssistantTurn(entry)) {
       const id = entry.message.id;
+      // A FRESH assistant turn (new message id, or an anonymous one) means the
+      // assistant acted again. Both the structural signal (reject/interrupt) and a
+      // "done" claim bind only to the user turn IMMEDIATELY after them, so an
+      // intervening assistant turn invalidates both — otherwise a reject gets
+      // mis-attributed to a much later message, and rework_after_done fires when
+      // the correction isn't actually right after the done-claim. A multi-line
+      // turn shares one id, so later lines of the SAME turn don't reset again.
+      const isNewTurn = id ? !assistantMsgIds.has(id) : true;
       if (id) assistantMsgIds.add(id);
       else assistantAnon++;
+      if (isNewTurn) {
+        pendingSignal = null;
+        pendingRejectedTools = [];
+        pendingDone = false;
+      }
       for (const tu of assistantToolUses(entry)) toolNameById.set(tu.id, tu.name);
       const txt = assistantText(entry);
       if (txt.trim()) lastAssistantText = txt;
@@ -421,7 +466,7 @@ function analyzeSession(session, file, projectDir) {
     rework_after_done_rate: doneClaims > 0 ? reworkAfterDone / doneClaims : null,
   };
 
-  return { session, file, projectDir, stats, userTurns, candidates };
+  return { session, file, projectDir, project, stats, userTurns, candidates };
 }
 
 // Serialize a normalized user turn for the wire contract (snake_case).
@@ -481,6 +526,7 @@ function cmdScan(args) {
       sessions: results.map((r) => ({
         session: r.session,
         project_dir: r.projectDir,
+        project: r.project,
         stats: r.stats,
         candidates: r.candidates.map(turnToWire),
       })),
@@ -688,6 +734,7 @@ function cmdPublish(args) {
       return {
         session: r.session,
         project_dir: r.projectDir,
+        project: r.project,
         modified_at: mtime,
         stats: r.stats,
         likely_llm: llm,

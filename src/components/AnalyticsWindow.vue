@@ -259,11 +259,21 @@ function aggCorr(from: string, to: string) {
   if (!doc || !Array.isArray(doc.sessions)) return null;
   const proj = projectFilter.value.trim();
   const rows = doc.sessions.filter((s) => {
+    // A session with no timestamp can't be placed in a [from,to] window — exclude
+    // it rather than letting a falsy value skip the guard, which would count it in
+    // EVERY window (current AND previous), double-counting the trend.
     const m = s.modified_at || "";
-    if (m && (m < from || m > to)) return false;
-    // Project match: project_dir is the encoded cwd (…-<project>); a filter is a
-    // no-op when the published file is single-project and already that project.
-    if (proj && s.project_dir && !s.project_dir.endsWith(proj)) return false;
+    if (!m || m < from || m > to) return false;
+    // Project match: prefer the exact project name (from the transcript cwd, same
+    // key the token KPIs filter by); fall back to the lossy encoded dir suffix for
+    // older metrics files that predate the `project` field.
+    if (proj) {
+      if (s.project != null) {
+        if (s.project !== proj) return false;
+      } else if (s.project_dir && !s.project_dir.endsWith(proj)) {
+        return false;
+      }
+    }
     return true;
   });
   if (!rows.length) return null;

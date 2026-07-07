@@ -38,6 +38,7 @@ node scripts/cli.mjs corrections eval --labels <file> --json
     {
       "session": "<uuid>",
       "project_dir": "D--projects-MVPs-app",   // encoded cwd (папка транскрипта)
+      "project": "app",                        // имя проекта (последний сегмент cwd), точный ключ фильтра
       "stats": {
         "assistant_turns": 31,          // дедуп по message.id (один ход = неск. строк JSONL)
         "user_turns": 5,                // реальные набранные ходы пользователя
@@ -109,7 +110,7 @@ node scripts/cli.mjs corrections eval --labels <file> --json
 ```
 
 Positive = `correction`. Ходы с пустым `gold` пропускаются (`skipped`). Дисциплина
-holdout: разметить руками ~30 сессий, посчитать precision/recall, затюнить порог
+*holdout*: разметить руками ~30 сессий, посчитать precision/recall, затюнить порог
 слоя 1 по recall до того, как поверх кандидатов встанет шаг классификации.
 
 ## Оговорка о тренде

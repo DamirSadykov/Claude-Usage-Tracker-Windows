@@ -129,6 +129,9 @@ export interface CorrectionsSessionStat {
 export interface CorrectionsSessionRow {
     session: string;
     project_dir?: string | null;
+    // Exact project name (last path component of the transcript cwd), the same key
+    // the token KPIs filter by. Optional — older metrics files predate it.
+    project?: string | null;
     modified_at?: string | null;
     stats: CorrectionsSessionStat;
     likely_llm: number;
