@@ -1,0 +1,35 @@
+[package]
+name = "resolver"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Neutral event resolver for the external-integration feature (plan External-integration-public-side, phase 3)"
+
+# Standalone crate on purpose: NOT a workspace member of the Tauri app in
+# `src-tauri`. The resolver is a separate deployable (LAN Windows server now,
+# Docker/Linux later) and must build/ship independently of the desktop app, so it
+# keeps its own Cargo.lock and never perturbs the desktop release pipeline. The
+# repo has no root Cargo.toml, so `cd resolver && cargo build` resolves this crate
+# alone.
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Signature verification of poll requests. Same wire format as the desktop side
+# (src-tauri/src/identity.rs): Ed25519, base64, 32-byte key / 64-byte sig.
+ed25519-dalek = "2"
+base64 = "0.22"
+chrono = "0.4"
+# Constant-time ingest-token comparison (§4 design doc: tokens compared
+# constant-time, not `==`).
+subtle = "2"
+# Hashing the pairing code at rest (enrollment, phase 4): the resolver stores
+# only `hash(code)`, never the raw code (contract §"enrollment endpoints").
+sha2 = "0.10"
+
+[dev-dependencies]
+# Drive the router in-process (ServiceExt::oneshot) for endpoint tests.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
