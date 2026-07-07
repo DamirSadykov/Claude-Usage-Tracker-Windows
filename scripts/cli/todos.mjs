@@ -413,15 +413,17 @@ function cmdList(args) {
   }
 }
 
-// Resolve a task locator to its todo object. Accepts an id, a bare number, or a
-// `#N` reference — the graph/dep CLI is friendlier with the human-facing #N the
+// Resolve a task locator to its todo object. Accepts an id, a bare number, a
+// `#N` reference, or the `t#N` task-link form the hook/README train the agent to
+// write — the graph/dep CLI is friendlier with the human-facing notation the
 // board shows. Returns undefined if nothing matches.
 function resolveTask(data, token) {
   const t = String(token ?? "").trim();
   if (!t) return undefined;
   const byId = data.todos.find((x) => x && x.id === t);
   if (byId) return byId;
-  const num = t.startsWith("#") ? t.slice(1) : t;
+  // Strip an optional leading `t` (task-link form) then an optional `#`.
+  const num = t.replace(/^t?#?/i, "");
   if (/^\d+$/.test(num)) {
     const n = parseInt(num, 10);
     return data.todos.find((x) => x && x.number === n);

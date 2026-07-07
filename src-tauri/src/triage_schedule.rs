@@ -7,7 +7,7 @@
 //! (we gate on "last completed run date != today", not on an exact tick).
 //!
 //! The pass is deterministic on both ends, with the LLM only in the middle:
-//!   1. WE export the board (`cli.mjs todos list --json`) to a staging file.
+//!   1. WE export the whole board (`cli.mjs todos list --all --json`) to a staging file.
 //!   2. A HEADLESS `claude -p` reads that file and WRITES a digest JSON — its only
 //!      tools are `Read` and `Write` (no shell, no network), so it cannot touch the
 //!      board and cannot stall on an interactive permission prompt.
