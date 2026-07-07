@@ -41,6 +41,7 @@ mod tests {
             seven_day: seven,
             seven_day_opus: None,
             seven_day_sonnet: None,
+            scoped_weekly: Vec::new(),
             extra_usage: None,
             prepaid_balance: None,
             prepaid_currency: None,

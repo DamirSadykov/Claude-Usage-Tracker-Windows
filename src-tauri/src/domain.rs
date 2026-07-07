@@ -16,6 +16,9 @@ pub struct UsageLevels {
     pub seven_day: u8,
     pub seven_day_opus: Option<u8>,
     pub seven_day_sonnet: Option<u8>,
+    // Colour bucket per scoped weekly limit, in the same order as
+    // `UsageData::scoped_weekly`. Shares the weekly threshold set.
+    pub scoped_weekly: Vec<u8>,
     pub extra_usage: Option<u8>,
 }
 
@@ -34,6 +37,11 @@ pub fn compute_levels(u: &UsageData, cfg: &AppConfig) -> UsageLevels {
             .seven_day_sonnet
             .as_ref()
             .map(|t| tier_level(t.percent_used, weekly)),
+        scoped_weekly: u
+            .scoped_weekly
+            .iter()
+            .map(|t| tier_level(t.percent_used, weekly))
+            .collect(),
         extra_usage: u
             .extra_usage
             .as_ref()
@@ -97,10 +105,19 @@ mod tests {
     use super::*;
     use chrono::Timelike;
     use crate::stats::CcUsageRow;
-    use crate::usage::{ExtraUsage, UsageTier};
+    use crate::usage::{ExtraUsage, ScopedTier, UsageTier};
 
     fn tier(pct: f64) -> UsageTier {
         UsageTier {
+            percent_used: pct,
+            reset_at: None,
+            is_limited: false,
+        }
+    }
+
+    fn scoped(model: &str, pct: f64) -> ScopedTier {
+        ScopedTier {
+            model: model.into(),
             percent_used: pct,
             reset_at: None,
             is_limited: false,
@@ -167,6 +184,7 @@ mod tests {
             seven_day: tier(60.0),            // weekly [25,50,75] -> 2
             seven_day_opus: Some(tier(80.0)), // weekly -> 3
             seven_day_sonnet: None,
+            scoped_weekly: vec![scoped("Fable", 90.0)], // weekly -> 3
             extra_usage: Some(ExtraUsage {
                 used_credits: 1.0,
                 monthly_limit: 100.0,
@@ -181,6 +199,7 @@ mod tests {
         assert_eq!(l.seven_day, 2);
         assert_eq!(l.seven_day_opus, Some(3));
         assert_eq!(l.seven_day_sonnet, None);
+        assert_eq!(l.scoped_weekly, vec![3]); // Fable 90% -> weekly bucket 3
         assert_eq!(l.extra_usage, Some(0));
     }
 
@@ -210,6 +229,7 @@ mod tests {
             seven_day: tier(seven_day_pct),
             seven_day_opus: None,
             seven_day_sonnet: None,
+            scoped_weekly: Vec::new(),
             extra_usage: None,
             prepaid_balance: None,
             prepaid_currency: None,

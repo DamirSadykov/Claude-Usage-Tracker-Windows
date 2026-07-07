@@ -156,6 +156,12 @@ const fiveHour = computed(() => props.usage.five_hour);
 const sevenDay = computed(() => props.usage.seven_day);
 const opusDay = computed(() => props.usage.seven_day_opus);
 const sonnetDay = computed(() => props.usage.seven_day_sonnet);
+// Per-model weekly limits from the API's limits[] (e.g. Fable). Rendered
+// dynamically, one card each, in the order the backend returns them.
+const scopedWeekly = computed(() => props.usage.scoped_weekly ?? []);
+function scopedLevel(i: number): number {
+  return props.levels.scoped_weekly?.[i] ?? 0;
+}
 const sessionActive = computed(
   () => fiveHour.value.percent_used > 0 || fiveHour.value.reset_at !== null
 );
@@ -304,6 +310,33 @@ const prepaidBalance = computed(() => props.usage.prepaid_balance);
           v-if="sonnetPace !== null"
           class="pace-tick"
           :style="{ left: sonnetPace + '%' }"
+          :title="t('idealPace')"
+        ></span>
+      </div>
+    </div>
+
+    <!-- Per-model weekly limits (from limits[], e.g. Fable). One card each,
+         labelled by the model the API scopes the limit to. -->
+    <div v-for="(s, i) in scopedWeekly" :key="'scoped' + s.model" class="card">
+      <div class="card-row">
+        <div>
+          <div class="card-title">
+            {{ t('scopedWeekly', { model: s.model }) }}
+            <span v-if="s.is_limited" class="badge" style="color: #f87171">{{ t('limit') }}</span>
+          </div>
+          <div class="card-sub">{{ formatReset(s.reset_at) }}</div>
+        </div>
+        <div class="pct" :class="lvlClass(scopedLevel(i))">
+          {{ s.percent_used.toFixed(1) }}%
+        </div>
+      </div>
+      <div class="bar" :class="lvlClass(scopedLevel(i))">
+        <i :style="{ width: Math.min(s.percent_used, 100) + '%' }"></i>
+        <span v-for="k in 6" :key="'scseg' + k" class="day-seg" :style="{ left: (k / 7 * 100) + '%' }"></span>
+        <span
+          v-if="idealPace(s.reset_at) !== null"
+          class="pace-tick"
+          :style="{ left: idealPace(s.reset_at) + '%' }"
           :title="t('idealPace')"
         ></span>
       </div>
