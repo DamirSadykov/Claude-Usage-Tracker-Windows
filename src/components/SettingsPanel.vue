@@ -78,6 +78,7 @@ const props = defineProps<{
   memoryBloatEnabled: boolean;
   todoNotificationsEnabled: boolean;
   systemInfoEnabled: boolean;
+  correctionsEnabled: boolean;
   runtimeInsightsEnabled: boolean;
   runtimeInsightKinds: string[];
   locale: string;
@@ -111,6 +112,7 @@ const emit = defineEmits<{
     memoryBloatEnabled: boolean;
     todoNotificationsEnabled: boolean;
     systemInfoEnabled: boolean;
+    correctionsEnabled: boolean;
     locale: string;
     uiFont: string;
   }];
@@ -152,6 +154,7 @@ const localSvcNotify = ref(props.serviceStatusNotify);
 const localMemBloat = ref(props.memoryBloatEnabled);
 const localTodoNotify = ref(props.todoNotificationsEnabled);
 const localSystemInfo = ref(props.systemInfoEnabled);
+const localCorrections = ref(props.correctionsEnabled);
 const localLocale = ref(props.locale);
 const localFont = ref(props.uiFont);
 
@@ -200,6 +203,7 @@ watch(() => props.serviceStatusNotify, (v) => (localSvcNotify.value = v));
 watch(() => props.memoryBloatEnabled, (v) => (localMemBloat.value = v));
 watch(() => props.todoNotificationsEnabled, (v) => (localTodoNotify.value = v));
 watch(() => props.systemInfoEnabled, (v) => (localSystemInfo.value = v));
+watch(() => props.correctionsEnabled, (v) => (localCorrections.value = v));
 watch(() => props.locale, (v) => (localLocale.value = v));
 watch(() => props.uiFont, (v) => (localFont.value = v));
 
@@ -687,6 +691,7 @@ function handleSave() {
     memoryBloatEnabled: localMemBloat.value,
     todoNotificationsEnabled: localTodoNotify.value,
     systemInfoEnabled: localSystemInfo.value,
+    correctionsEnabled: localCorrections.value,
     locale: localLocale.value,
     uiFont: localFont.value,
   });
@@ -1128,6 +1133,18 @@ function handleSave() {
         <div class="cc-note-row">{{ t('ccAnalyticsReads') }}</div>
         <div class="cc-note-row">{{ t('ccAnalyticsData') }}</div>
         <div class="cc-note-row">{{ t('ccAnalyticsLocal') }}</div>
+      </div>
+
+      <!-- Outcome metric: user corrections mined from transcripts (opt-in, off by
+           default — deterministic, LLM-free, but reads every transcript). -->
+      <div class="card toggle-card" @click="localCorrections = !localCorrections">
+        <div style="flex: 1; min-width: 0">
+          <div class="card-title" style="font-size: 13px">{{ t('correctionsMetric') }}</div>
+          <div class="card-sub">{{ t('correctionsMetricDesc') }}</div>
+        </div>
+        <div class="toggle" :class="{ on: localCorrections }">
+          <div class="toggle-knob"></div>
+        </div>
       </div>
 
       <!-- Daily budget -->

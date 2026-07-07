@@ -881,6 +881,53 @@ fn spawn_triage_scheduler(app: AppHandle) {
     });
 }
 
+// --- Corrections-outcome metric publisher (t#101) ---
+
+// How often the loop wakes to check the toggle. Short so flipping the setting on
+// takes effect within a tick, not a full publish interval.
+const CORRECTIONS_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+// Minimum spacing between actual publishes. `corrections publish` reads every
+// transcript, so it's paced — not run every check tick.
+const CORRECTIONS_PUBLISH_INTERVAL: Duration = Duration::from_secs(30 * 60);
+
+/// Independent, LLM-free publisher for the corrections-outcome metric. Unlike the
+/// nightly triage (which drives an `claude -p` pass), `corrections publish` is a
+/// deterministic transcript scan, so it runs on its own light timer regardless of
+/// whether triage is enabled. Gated by `corrections_enabled`: publishes once soon
+/// after the toggle goes on (and at startup if already on), then every
+/// `CORRECTIONS_PUBLISH_INTERVAL`. Emits `corrections-updated` so an open analytics
+/// window re-reads the file.
+fn spawn_corrections_publisher(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let mut last_publish: Option<Instant> = None;
+        loop {
+            let enabled = {
+                app.state::<Mutex<AppConfig>>()
+                    .lock()
+                    .unwrap()
+                    .corrections_enabled
+            };
+            let due = enabled
+                && last_publish.map_or(true, |t| t.elapsed() >= CORRECTIONS_PUBLISH_INTERVAL);
+            if due {
+                if let Ok(cli) = cc_hook_script_path(&app) {
+                    let res = tokio::task::spawn_blocking(move || {
+                        triage_schedule::run_corrections_publish(&cli)
+                    })
+                    .await;
+                    // Best-effort: a scan failure just means the card keeps its last
+                    // data; log nothing louder than the existing diagnostics.
+                    last_publish = Some(Instant::now());
+                    if matches!(res, Ok(Ok(()))) {
+                        let _ = app.emit("corrections-updated", ());
+                    }
+                }
+            }
+            tokio::time::sleep(CORRECTIONS_CHECK_INTERVAL).await;
+        }
+    });
+}
+
 // --- System resource monitor (whole-machine CPU + RAM for the mini panel) ---
 
 // How often the mini panel gets a fresh CPU/RAM reading.
@@ -2123,6 +2170,7 @@ pub fn run() {
             spawn_memory_loop(app.handle().clone());
             spawn_triage_loop(app.handle().clone());
             spawn_triage_scheduler(app.handle().clone());
+            spawn_corrections_publisher(app.handle().clone());
 
             Ok(())
         })

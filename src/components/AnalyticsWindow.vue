@@ -212,6 +212,19 @@ const compare = ref<PeriodCompare | null>(null);
 // layer-1 CANDIDATES (upper bound) from a heuristic net; classifying them further
 // is out of scope for this metric.
 const corrections = ref<CorrectionsMetrics | null>(null);
+// Whether the outcome metric is enabled (settings toggle, off by default). The
+// Outcome card is hidden entirely when off, even if a stale metrics file exists.
+const correctionsEnabled = ref(false);
+
+async function loadCorrectionsEnabled() {
+  try {
+    const { load: loadStore } = await import("@tauri-apps/plugin-store");
+    const store = await loadStore("settings.json");
+    correctionsEnabled.value = (await store.get<boolean>("correctionsEnabled")) ?? false;
+  } catch {
+    correctionsEnabled.value = false;
+  }
+}
 
 async function loadCorrections() {
   try {
@@ -1208,6 +1221,7 @@ watch(activeTab, (tab) => {
   if (tab === "projects") void loadProjectMgmt();
 });
 let unlistenLinks: UnlistenFn | null = null;
+let unlistenCorr: UnlistenFn | null = null;
 onMounted(async () => {
   // Tile-help popover dismissal: Esc, outside click, and any scroll/resize
   // (capture phase catches scrolls inside `.aw-main`, the inner scroll area).
@@ -1220,6 +1234,7 @@ onMounted(async () => {
   await loadIgnored();
   await loadGoals();
   await load();
+  await loadCorrectionsEnabled();
   void loadCorrections();
 
   // Refresh if a merge happens (here or in another window) — keeps the breakdown,
@@ -1227,6 +1242,12 @@ onMounted(async () => {
   unlistenLinks = await listen("project-links-changed", () => {
     void reload();
     if (activeTab.value === "projects") void loadProjectMgmt();
+  });
+  // The background publisher (or the manual refresh) republished the metric →
+  // re-read the file and the toggle so an open window updates live.
+  unlistenCorr = await listen("corrections-updated", () => {
+    void loadCorrectionsEnabled();
+    void loadCorrections();
   });
 });
 
@@ -1236,6 +1257,7 @@ onUnmounted(() => {
   window.removeEventListener("scroll", onTilePopoverDismissScroll, true);
   window.removeEventListener("resize", onTilePopoverDismissScroll);
   unlistenLinks?.();
+  unlistenCorr?.();
 });
 </script>
 
@@ -1412,7 +1434,7 @@ onUnmounted(() => {
                Layer-1 candidates from the corrections publish, filtered to the
                active window client-side. An external anchor of quality — a
                correction comes from OUTSIDE the assistant loop. -->
-          <template v-if="corrAgg">
+          <template v-if="correctionsEnabled && corrAgg">
             <div class="aw-group-hd aw-group-hd-row">
               <span class="aw-corr-hd-title">
                 {{ t("sectionOutcome") }}

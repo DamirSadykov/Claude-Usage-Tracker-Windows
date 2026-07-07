@@ -197,6 +197,7 @@ const todoNotificationsEnabled = ref(true);
 const runtimeInsightsEnabled = ref(false);
 const runtimeInsightKinds = ref<string[]>(["long_session", "cold_rewrites"]);
 const systemInfoEnabled = ref(true);
+const correctionsEnabled = ref(false);
 const uiFont = ref(DEFAULT_FONT_ID);
 const todaySpent = ref<number | null>(null);
 const budgetUnit = computed<"usd" | "pct">(() =>
@@ -370,6 +371,8 @@ async function loadSettings() {
         }
         systemInfoEnabled.value =
             (await store.get<boolean>("systemInfoEnabled")) ?? true;
+        correctionsEnabled.value =
+            (await store.get<boolean>("correctionsEnabled")) ?? false;
         const savedLocale = await store.get<string>("locale");
         if (savedLocale) locale.value = savedLocale;
         uiFont.value = (await store.get<string>("uiFont")) ?? DEFAULT_FONT_ID;
@@ -419,6 +422,7 @@ async function saveSettings() {
     await store.set("runtimeInsightsEnabled", runtimeInsightsEnabled.value);
     await store.set("runtimeInsightKinds", [...runtimeInsightKinds.value]);
     await store.set("systemInfoEnabled", systemInfoEnabled.value);
+    await store.set("correctionsEnabled", correctionsEnabled.value);
     await store.set("locale", locale.value);
     await store.set("uiFont", uiFont.value);
     await store.save();
@@ -457,6 +461,7 @@ function buildConfig() {
         runtime_insights_enabled: runtimeInsightsEnabled.value,
         runtime_insight_kinds: [...runtimeInsightKinds.value],
         system_info_enabled: systemInfoEnabled.value,
+        corrections_enabled: correctionsEnabled.value,
     };
 }
 
@@ -704,6 +709,7 @@ async function handleSave(settings: {
     memoryBloatEnabled: boolean;
     todoNotificationsEnabled: boolean;
     systemInfoEnabled: boolean;
+    correctionsEnabled: boolean;
     locale: string;
     uiFont: string;
 }) {
@@ -732,6 +738,7 @@ async function handleSave(settings: {
     memoryBloatEnabled.value = settings.memoryBloatEnabled;
     todoNotificationsEnabled.value = settings.todoNotificationsEnabled;
     systemInfoEnabled.value = settings.systemInfoEnabled;
+    correctionsEnabled.value = settings.correctionsEnabled;
     locale.value = settings.locale;
     uiFont.value = settings.uiFont;
     applyFont(uiFont.value);

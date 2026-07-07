@@ -380,20 +380,12 @@ pub fn run_triage(home: &Path, data_dir: &Path, cli_path: &str, model: &str) -> 
     if !pub_err.trim().is_empty() {
         append_log(&log, &format!("[publish stderr] {pub_err}"));
     }
-    if !pub_out.status.success() {
-        return Err(format!("triage publish failed: {}", pub_err.trim()));
+    if pub_out.status.success() {
+        append_log(&log, "----- published -----");
+        Ok(())
+    } else {
+        Err(format!("triage publish failed: {}", pub_err.trim()))
     }
-    append_log(&log, "----- published -----");
-
-    // Step 4 — also refresh the corrections-outcome metric (t#101) so the Outcome
-    // card updates on the nightly run, not only when the user clicks the manual
-    // refresh button. Best-effort: corrections is an independent metric, so a
-    // failure here is logged but must NOT fail the triage run.
-    match run_corrections_publish(cli_path) {
-        Ok(()) => append_log(&log, "----- corrections published -----"),
-        Err(e) => append_log(&log, &format!("[corrections publish failed] {e}")),
-    }
-    Ok(())
 }
 
 #[cfg(test)]
