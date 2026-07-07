@@ -361,6 +361,7 @@ mod tests {
             },
             seven_day_opus: None,
             seven_day_sonnet: None,
+            scoped_weekly: Vec::new(),
             extra_usage: Some(crate::usage::ExtraUsage {
                 used_credits: 8.88,
                 monthly_limit: 30.0,

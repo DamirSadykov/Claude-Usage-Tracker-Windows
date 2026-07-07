@@ -43,11 +43,22 @@ export interface ExtraUsage {
     currency: string;
 }
 
+// A weekly limit scoped to one model, from the API's `limits[]`. The model shown
+// is dynamic (e.g. "Fable") — the API moved per-model caps here and now sends the
+// old flat seven_day_opus/sonnet fields as null.
+export interface ScopedTier {
+    model: string;
+    percent_used: number;
+    reset_at: string | null;
+    is_limited: boolean;
+}
+
 export interface UsageData {
     five_hour: UsageTier;
     seven_day: UsageTier;
     seven_day_opus: UsageTier | null;
     seven_day_sonnet: UsageTier | null;
+    scoped_weekly: ScopedTier[];
     extra_usage: ExtraUsage | null;
     prepaid_balance: number | null;
     prepaid_currency: string | null;
@@ -59,6 +70,7 @@ export interface UsageLevels {
     seven_day: number;
     seven_day_opus: number | null;
     seven_day_sonnet: number | null;
+    scoped_weekly: number[];
     extra_usage: number | null;
 }
 
