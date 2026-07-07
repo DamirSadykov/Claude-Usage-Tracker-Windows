@@ -237,6 +237,23 @@ fn run_node(node: &Path, cli_path: &str, args: &[&str]) -> Result<std::process::
     cmd.output().map_err(|e| format!("failed to run node {cli_path}: {e}"))
 }
 
+/// Recompute the user-corrections metric (task t#101) across all projects and
+/// write `corrections-metrics.json` — deterministic, LLM-free, just
+/// `node cli.mjs corrections publish --all`. `--all` because `run_node` sets no
+/// cwd, so a bare `publish` would scope to the app process's working dir instead
+/// of a project. Used by the in-app "refresh" button on the outcome card.
+pub fn run_corrections_publish(cli_path: &str) -> Result<(), String> {
+    let node = resolve_node();
+    let out = run_node(&node, cli_path, &["corrections", "publish", "--all"])?;
+    if !out.status.success() {
+        return Err(format!(
+            "corrections publish failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
 /// Don't flash a console window when spawning the headless run.
 #[cfg(windows)]
 fn no_window(cmd: &mut Command) {

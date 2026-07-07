@@ -1,7 +1,7 @@
 {
   "$schema": "https://raw.githubusercontent.com/nicegui/nicegui-tauri/v2/src-tauri/tauri.conf.json",
   "productName": "Claude Usage Tracker",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "identifier": "com.claude-usage-tracker.app",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -97,6 +97,7 @@
       "../scripts/cli/todos.mjs": "scripts/cli/todos.mjs",
       "../scripts/cli/phases.mjs": "scripts/cli/phases.mjs",
       "../scripts/cli/triage.mjs": "scripts/cli/triage.mjs",
+      "../scripts/cli/corrections.mjs": "scripts/cli/corrections.mjs",
       "../scripts/cli/hook.mjs": "scripts/cli/hook.mjs"
     },
     "icon": [

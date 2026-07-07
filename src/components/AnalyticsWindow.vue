@@ -11,6 +11,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import ProjectAutocomplete from "./ProjectAutocomplete.vue";
 import ProjectLabel from "./ProjectLabel.vue";
+import type { CorrectionsMetrics } from "../App.vue";
 import { useProjectLinks } from "../projectLinks";
 import { useProjectGroups, type ProjectGroup } from "../projectGroups";
 import { getInsightHelpHtml, hasInsightHelp } from "../insightHelp";
@@ -202,6 +203,134 @@ const loading = ref(false);
 const error = ref("");
 const data = ref<AnalyticsExt | null>(null);
 const compare = ref<PeriodCompare | null>(null);
+
+// --- User-corrections outcome metric (t#101) ---
+// Read once from corrections-metrics.json (whole history, written by `cli.mjs
+// corrections publish`). Unlike the token analytics, this file isn't date/project
+// filtered server-side, so the card filters its per-session rows CLIENT-SIDE by
+// the active range + project and re-aggregates — see `corrAgg`. Numbers are
+// layer-1 CANDIDATES (upper bound) from a heuristic net; classifying them further
+// is out of scope for this metric.
+const corrections = ref<CorrectionsMetrics | null>(null);
+// Whether the outcome metric is enabled (settings toggle, off by default). The
+// Outcome card is hidden entirely when off, even if a stale metrics file exists.
+const correctionsEnabled = ref(false);
+
+async function loadCorrectionsEnabled() {
+  try {
+    const { load: loadStore } = await import("@tauri-apps/plugin-store");
+    const store = await loadStore("settings.json");
+    correctionsEnabled.value = (await store.get<boolean>("correctionsEnabled")) ?? false;
+  } catch {
+    correctionsEnabled.value = false;
+  }
+}
+
+async function loadCorrections() {
+  try {
+    corrections.value =
+      (await invoke<CorrectionsMetrics | null>("get_corrections_metrics")) ?? null;
+  } catch {
+    corrections.value = null; // not under Tauri, or nothing published yet
+  }
+}
+
+// "Build your own integration" guide, opened in the OS browser (never navigate
+// the webview). Shown as a link beside the Outcome section header.
+const CORR_GUIDE_URL =
+  "https://github.com/DamirSadykov/Claude-Usage-Tracker-Windows/wiki/Corrections-Integration";
+async function openCorrGuide() {
+  try {
+    await invoke("open_url", { url: CORR_GUIDE_URL });
+  } catch {
+    /* not under Tauri */
+  }
+}
+
+// Manual refresh: the metrics file is only as fresh as the last publish, so this
+// re-runs `corrections publish --all` (via the backend) and re-reads the result.
+const corrRefreshing = ref(false);
+async function refreshCorr() {
+  if (corrRefreshing.value) return;
+  corrRefreshing.value = true;
+  try {
+    await invoke("refresh_corrections_metrics");
+    await loadCorrections();
+  } catch {
+    /* not under Tauri, or node/publish failed — leave the last data in place */
+  } finally {
+    corrRefreshing.value = false;
+  }
+}
+
+// Aggregate the metrics-file sessions that fall inside a [from,to] window and
+// match the project filter, into the same totals shape the CLI emits. `null`
+// when no metrics file exists or no session falls in range. Shared by the
+// current window (the card) and the previous window (the trend badge).
+function aggCorr(from: string, to: string) {
+  const doc = corrections.value;
+  if (!doc || !Array.isArray(doc.sessions)) return null;
+  const proj = projectFilter.value.trim();
+  const rows = doc.sessions.filter((s) => {
+    // A session with no timestamp can't be placed in a [from,to] window — exclude
+    // it rather than letting a falsy value skip the guard, which would count it in
+    // EVERY window (current AND previous), double-counting the trend.
+    const m = s.modified_at || "";
+    if (!m || m < from || m > to) return false;
+    // Project match: prefer the exact project name (from the transcript cwd, same
+    // key the token KPIs filter by); fall back to the lossy encoded dir suffix for
+    // older metrics files that predate the `project` field.
+    if (proj) {
+      if (s.project != null) {
+        if (s.project !== proj) return false;
+      } else if (s.project_dir && !s.project_dir.endsWith(proj)) {
+        return false;
+      }
+    }
+    return true;
+  });
+  if (!rows.length) return null;
+  const t0 = {
+    sessions: rows.length,
+    assistant_turns: 0,
+    user_turns: 0,
+    candidate_corrections: 0,
+    done_claims: 0,
+    rework_after_done: 0,
+    likely_llm: 0,
+    ambiguous: 0,
+  };
+  for (const s of rows) {
+    t0.assistant_turns += s.stats.assistant_turns;
+    t0.user_turns += s.stats.user_turns;
+    t0.candidate_corrections += s.stats.candidate_corrections;
+    t0.done_claims += s.stats.done_claims;
+    t0.rework_after_done += s.stats.rework_after_done;
+    t0.likely_llm += s.likely_llm;
+    t0.ambiguous += s.ambiguous;
+  }
+  return {
+    ...t0,
+    corrections_per_session:
+      t0.assistant_turns > 0 ? t0.candidate_corrections / t0.assistant_turns : null,
+    rework_after_done_rate:
+      t0.done_claims > 0 ? t0.rework_after_done / t0.done_claims : null,
+  };
+}
+
+// The card hides (null) rather than showing fake zeros when nothing's in range.
+const corrAgg = computed(() => aggCorr(fromIso.value, toIso.value));
+// Previous equal-length window (prev_to = cur_from), same as the token trends.
+const corrPrevAgg = computed(() => aggCorr(prevFromIso.value, fromIso.value));
+// Dynamics on the headline ratio: lower corrections/turn is better → "down"
+// polarity. Caveat lives in the tile help — only honest at a fixed task mix.
+const corrCpsTrend = computed(() =>
+  makeTrend(
+    corrAgg.value?.corrections_per_session ?? null,
+    corrPrevAgg.value?.corrections_per_session ?? null,
+    "down",
+  ),
+);
 
 // Efficiency goals, read from the shared store (SettingsPanel writes them).
 // goalCostPerHourMax is USD/hour; goalErrorRateMax is a FRACTION 0..1. null =
@@ -1092,6 +1221,7 @@ watch(activeTab, (tab) => {
   if (tab === "projects") void loadProjectMgmt();
 });
 let unlistenLinks: UnlistenFn | null = null;
+let unlistenCorr: UnlistenFn | null = null;
 onMounted(async () => {
   // Tile-help popover dismissal: Esc, outside click, and any scroll/resize
   // (capture phase catches scrolls inside `.aw-main`, the inner scroll area).
@@ -1104,12 +1234,20 @@ onMounted(async () => {
   await loadIgnored();
   await loadGoals();
   await load();
+  await loadCorrectionsEnabled();
+  void loadCorrections();
 
   // Refresh if a merge happens (here or in another window) — keeps the breakdown,
   // filter list and merge table in sync without a manual reload.
   unlistenLinks = await listen("project-links-changed", () => {
     void reload();
     if (activeTab.value === "projects") void loadProjectMgmt();
+  });
+  // The background publisher (or the manual refresh) republished the metric →
+  // re-read the file and the toggle so an open window updates live.
+  unlistenCorr = await listen("corrections-updated", () => {
+    void loadCorrectionsEnabled();
+    void loadCorrections();
   });
 });
 
@@ -1119,6 +1257,7 @@ onUnmounted(() => {
   window.removeEventListener("scroll", onTilePopoverDismissScroll, true);
   window.removeEventListener("resize", onTilePopoverDismissScroll);
   unlistenLinks?.();
+  unlistenCorr?.();
 });
 </script>
 
@@ -1290,6 +1429,91 @@ onUnmounted(() => {
               >{{ errorRateGoalState === 'ok' ? t('goalInGoal') : t('goalExceeded') }}</span>
             </div>
           </section>
+
+          <!-- Outcome: how often the user has to correct the assistant (t#101).
+               Layer-1 candidates from the corrections publish, filtered to the
+               active window client-side. An external anchor of quality — a
+               correction comes from OUTSIDE the assistant loop. -->
+          <template v-if="correctionsEnabled && corrAgg">
+            <div class="aw-group-hd aw-group-hd-row">
+              <span class="aw-corr-hd-title">
+                {{ t("sectionOutcome") }}
+                <button
+                  class="aw-corr-refresh"
+                  :class="{ spinning: corrRefreshing }"
+                  :disabled="corrRefreshing"
+                  :title="t('corrRefreshHint')"
+                  @click="refreshCorr"
+                >
+                  <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9" />
+                    <path d="M13.5 2.5V5H11" />
+                  </svg>
+                </button>
+              </span>
+              <button
+                class="aw-corr-guide"
+                :title="t('corrGuideHint')"
+                @click="openCorrGuide"
+              >
+                {{ t("corrGuideLink") }}
+                <svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M6 3.5h6.5V10" />
+                  <path d="M12.5 3.5 4 12" />
+                </svg>
+              </button>
+            </div>
+            <section class="aw-kpis">
+              <div class="aw-kpi" :title="t('corrPerSessionHint')">
+                <button
+                  class="aw-kpi-help"
+                  :title="t(tilePopover?.key === 'corrCpsHelp' ? 'hideHelp' : 'showHelp')"
+                  :aria-expanded="tilePopover?.key === 'corrCpsHelp'"
+                  @click="toggleTilePopover('corrCpsHelp', $event)"
+                >?</button>
+                <div class="aw-kpi-val">
+                  {{ corrAgg.corrections_per_session == null
+                     ? "—"
+                     : (corrAgg.corrections_per_session * 100).toFixed(1) + "%" }}
+                </div>
+                <div class="aw-kpi-lbl">{{ t("corrPerSession") }}</div>
+                <span
+                  class="aw-trend"
+                  :class="'t-' + corrCpsTrend.cls"
+                  :title="corrCpsTrend.arrow === 'none' ? t('trendNoData') : t('trendVsPrev')"
+                >
+                  <span class="aw-trend-arrow" :data-dir="corrCpsTrend.arrow"></span>{{ corrCpsTrend.text }}
+                </span>
+              </div>
+              <div class="aw-kpi" :title="t('corrReworkHint')">
+                <button
+                  class="aw-kpi-help"
+                  :title="t(tilePopover?.key === 'corrReworkHelp' ? 'hideHelp' : 'showHelp')"
+                  :aria-expanded="tilePopover?.key === 'corrReworkHelp'"
+                  @click="toggleTilePopover('corrReworkHelp', $event)"
+                >?</button>
+                <div class="aw-kpi-val">
+                  {{ corrAgg.rework_after_done_rate == null
+                     ? "—"
+                     : (corrAgg.rework_after_done_rate * 100).toFixed(1) + "%" }}
+                </div>
+                <div class="aw-kpi-lbl">{{ t("corrRework") }}</div>
+              </div>
+              <div class="aw-kpi" :title="t('corrCandidatesHint')">
+                <button
+                  class="aw-kpi-help"
+                  :title="t(tilePopover?.key === 'corrCandidatesHelp' ? 'hideHelp' : 'showHelp')"
+                  :aria-expanded="tilePopover?.key === 'corrCandidatesHelp'"
+                  @click="toggleTilePopover('corrCandidatesHelp', $event)"
+                >?</button>
+                <div class="aw-kpi-val">{{ corrAgg.candidate_corrections }}</div>
+                <div class="aw-kpi-lbl">
+                  {{ t("corrCandidates") }}
+                  <span class="aw-corr-split">{{ corrAgg.likely_llm }} {{ t("corrLikelyLlm") }} · {{ corrAgg.ambiguous }} {{ t("corrAmbiguous") }}</span>
+                </div>
+              </div>
+            </section>
+          </template>
 
           <!-- Productivity / ROI: active time, $/hour, $/commit, $/edit -->
           <template v-if="hasProductivity">
@@ -2001,6 +2225,65 @@ onUnmounted(() => {
   letter-spacing: 0.05em;
   margin-bottom: -6px;
 }
+/* Outcome header row: title on the left, integration-guide link on the right. */
+.aw-group-hd-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+.aw-corr-guide {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0;
+  border: none;
+  background: none;
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--accent, #6ea8fe);
+}
+.aw-corr-guide:hover {
+  text-decoration: underline;
+}
+.aw-corr-guide svg {
+  flex: none;
+  opacity: 0.85;
+}
+/* Refresh button beside the section title: recompute the metric on demand. */
+.aw-corr-hd-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.aw-corr-refresh {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px;
+  border: none;
+  background: none;
+  cursor: pointer;
+  color: var(--text-3, rgba(255, 255, 255, 0.6));
+}
+.aw-corr-refresh:hover:not(:disabled) {
+  color: var(--accent, #6ea8fe);
+}
+.aw-corr-refresh:disabled {
+  cursor: default;
+}
+.aw-corr-refresh.spinning svg {
+  animation: aw-corr-spin 0.8s linear infinite;
+}
+@keyframes aw-corr-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
 .aw-empty {
   flex: 1;
   display: flex;
@@ -2254,6 +2537,15 @@ onUnmounted(() => {
   text-transform: uppercase;
   letter-spacing: 0.05em;
   margin-top: 4px;
+}
+/* Fault split under the "Candidates" tile label (LLM · ambiguous). */
+.aw-corr-split {
+  display: block;
+  margin-top: 2px;
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 10px;
+  color: var(--text-3, rgba(255, 255, 255, 0.4));
 }
 
 /* Period-over-period trend badge: arrow + delta%, sitting under the KPI label.

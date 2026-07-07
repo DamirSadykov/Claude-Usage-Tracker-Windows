@@ -112,6 +112,55 @@ export interface TriageDigest {
     items: DigestItem[];
 }
 
+// The latest user-corrections outcome metric (task t#101), read from
+// corrections-metrics.json. Read-only on the tracker side — `cli.mjs corrections
+// publish` owns writes. Mirrors corrections.rs::CorrectionsMetrics. Numbers are
+// layer-1 CANDIDATES (upper bound) from a heuristic net; classifying them further
+// is out of scope for this metric.
+export interface CorrectionsTotals {
+    sessions: number;
+    assistant_turns: number;
+    user_turns: number;
+    candidate_corrections: number;
+    done_claims: number;
+    rework_after_done: number;
+    likely_llm: number;
+    ambiguous: number;
+    corrections_per_session: number | null;
+    rework_after_done_rate: number | null;
+}
+export interface CorrectionsSessionStat {
+    assistant_turns: number;
+    user_turns: number;
+    candidate_corrections: number;
+    done_claims: number;
+    rework_after_done: number;
+    corrections_per_session: number | null;
+    rework_after_done_rate: number | null;
+}
+export interface CorrectionsSessionRow {
+    session: string;
+    project_dir?: string | null;
+    // Exact project name (last path component of the transcript cwd), the same key
+    // the token KPIs filter by. Optional — older metrics files predate it.
+    project?: string | null;
+    modified_at?: string | null;
+    stats: CorrectionsSessionStat;
+    likely_llm: number;
+    ambiguous: number;
+}
+export interface CorrectionsMetrics {
+    version: number;
+    contract_version: number;
+    generated_at: string;
+    scope: string;
+    project?: string | null;
+    totals: CorrectionsTotals;
+    // Per-session rows — the analytics card filters these by the active date
+    // range + project and re-aggregates the totals client-side.
+    sessions: CorrectionsSessionRow[];
+}
+
 const { t, locale } = useI18n();
 
 const {
@@ -160,6 +209,7 @@ const todoNotificationsEnabled = ref(true);
 const runtimeInsightsEnabled = ref(false);
 const runtimeInsightKinds = ref<string[]>(["long_session", "cold_rewrites"]);
 const systemInfoEnabled = ref(true);
+const correctionsEnabled = ref(false);
 const uiFont = ref(DEFAULT_FONT_ID);
 const todaySpent = ref<number | null>(null);
 const budgetUnit = computed<"usd" | "pct">(() =>
@@ -333,6 +383,8 @@ async function loadSettings() {
         }
         systemInfoEnabled.value =
             (await store.get<boolean>("systemInfoEnabled")) ?? true;
+        correctionsEnabled.value =
+            (await store.get<boolean>("correctionsEnabled")) ?? false;
         const savedLocale = await store.get<string>("locale");
         if (savedLocale) locale.value = savedLocale;
         uiFont.value = (await store.get<string>("uiFont")) ?? DEFAULT_FONT_ID;
@@ -382,6 +434,7 @@ async function saveSettings() {
     await store.set("runtimeInsightsEnabled", runtimeInsightsEnabled.value);
     await store.set("runtimeInsightKinds", [...runtimeInsightKinds.value]);
     await store.set("systemInfoEnabled", systemInfoEnabled.value);
+    await store.set("correctionsEnabled", correctionsEnabled.value);
     await store.set("locale", locale.value);
     await store.set("uiFont", uiFont.value);
     await store.save();
@@ -420,6 +473,7 @@ function buildConfig() {
         runtime_insights_enabled: runtimeInsightsEnabled.value,
         runtime_insight_kinds: [...runtimeInsightKinds.value],
         system_info_enabled: systemInfoEnabled.value,
+        corrections_enabled: correctionsEnabled.value,
     };
 }
 
@@ -667,6 +721,7 @@ async function handleSave(settings: {
     memoryBloatEnabled: boolean;
     todoNotificationsEnabled: boolean;
     systemInfoEnabled: boolean;
+    correctionsEnabled: boolean;
     locale: string;
     uiFont: string;
 }) {
@@ -695,6 +750,7 @@ async function handleSave(settings: {
     memoryBloatEnabled.value = settings.memoryBloatEnabled;
     todoNotificationsEnabled.value = settings.todoNotificationsEnabled;
     systemInfoEnabled.value = settings.systemInfoEnabled;
+    correctionsEnabled.value = settings.correctionsEnabled;
     locale.value = settings.locale;
     uiFont.value = settings.uiFont;
     applyFont(uiFont.value);

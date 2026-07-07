@@ -1,5 +1,6 @@
 pub mod alerts;
 pub mod cc;
+pub mod corrections;
 pub mod domain;
 pub mod enroll;
 pub mod external;
@@ -883,6 +884,53 @@ fn spawn_triage_scheduler(app: AppHandle) {
     });
 }
 
+// --- Corrections-outcome metric publisher (t#101) ---
+
+// How often the loop wakes to check the toggle. Short so flipping the setting on
+// takes effect within a tick, not a full publish interval.
+const CORRECTIONS_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+// Minimum spacing between actual publishes. `corrections publish` reads every
+// transcript, so it's paced — not run every check tick.
+const CORRECTIONS_PUBLISH_INTERVAL: Duration = Duration::from_secs(30 * 60);
+
+/// Independent, LLM-free publisher for the corrections-outcome metric. Unlike the
+/// nightly triage (which drives an `claude -p` pass), `corrections publish` is a
+/// deterministic transcript scan, so it runs on its own light timer regardless of
+/// whether triage is enabled. Gated by `corrections_enabled`: publishes once soon
+/// after the toggle goes on (and at startup if already on), then every
+/// `CORRECTIONS_PUBLISH_INTERVAL`. Emits `corrections-updated` so an open analytics
+/// window re-reads the file.
+fn spawn_corrections_publisher(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let mut last_publish: Option<Instant> = None;
+        loop {
+            let enabled = {
+                app.state::<Mutex<AppConfig>>()
+                    .lock()
+                    .unwrap()
+                    .corrections_enabled
+            };
+            let due = enabled
+                && last_publish.map_or(true, |t| t.elapsed() >= CORRECTIONS_PUBLISH_INTERVAL);
+            if due {
+                if let Ok(cli) = cc_hook_script_path(&app) {
+                    let res = tokio::task::spawn_blocking(move || {
+                        triage_schedule::run_corrections_publish(&cli)
+                    })
+                    .await;
+                    // Best-effort: a scan failure just means the card keeps its last
+                    // data; log nothing louder than the existing diagnostics.
+                    last_publish = Some(Instant::now());
+                    if matches!(res, Ok(Ok(()))) {
+                        let _ = app.emit("corrections-updated", ());
+                    }
+                }
+            }
+            tokio::time::sleep(CORRECTIONS_CHECK_INTERVAL).await;
+        }
+    });
+}
+
 // --- System resource monitor (whole-machine CPU + RAM for the mini panel) ---
 
 // How often the mini panel gets a fresh CPU/RAM reading.
@@ -1472,6 +1520,35 @@ fn triage_digest_path(app: &AppHandle) -> Result<PathBuf, String> {
 #[tauri::command]
 fn get_triage_digest(app: AppHandle) -> Result<Option<triage::TriageDigest>, String> {
     Ok(triage::load(&triage_digest_path(&app)?))
+}
+
+/// Path to the corrections-metrics file, a sibling of todos.json in the app data
+/// dir (see corrections.rs / `cli.mjs corrections publish`). Read-only here.
+fn corrections_metrics_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).ok();
+    Ok(dir.join("corrections-metrics.json"))
+}
+
+/// The latest user-corrections metric (task t#101), or None if no `publish` has
+/// produced one yet (or the file is unreadable). The CLI writes it; the tracker
+/// only reads it to show the outcome card.
+#[tauri::command]
+fn get_corrections_metrics(
+    app: AppHandle,
+) -> Result<Option<corrections::CorrectionsMetrics>, String> {
+    Ok(corrections::load(&corrections_metrics_path(&app)?))
+}
+
+/// Recompute the corrections metric now (runs `corrections publish --all` via
+/// node) so the card can be refreshed on demand. Blocking work runs off the
+/// async runtime; the frontend re-reads the freshened file when this resolves.
+#[tauri::command]
+async fn refresh_corrections_metrics(app: AppHandle) -> Result<(), String> {
+    let cli = cc_hook_script_path(&app)?;
+    tokio::task::spawn_blocking(move || triage_schedule::run_corrections_publish(&cli))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 /// Current nightly-triage schedule config (enabled / time / model + last-run
@@ -2359,6 +2436,7 @@ pub fn run() {
             spawn_memory_loop(app.handle().clone());
             spawn_triage_loop(app.handle().clone());
             spawn_triage_scheduler(app.handle().clone());
+            spawn_corrections_publisher(app.handle().clone());
             spawn_external_poll_loop(app.handle().clone());
 
             Ok(())
@@ -2390,6 +2468,8 @@ pub fn run() {
             get_analytics_ext,
             export_analytics_json,
             get_todos,
+            get_corrections_metrics,
+            refresh_corrections_metrics,
             get_triage_digest,
             get_triage_schedule,
             set_triage_schedule,

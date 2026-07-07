@@ -75,6 +75,7 @@ const todoNotificationsEnabled = ref(true);
 const runtimeInsightsEnabled = ref(false);
 const runtimeInsightKinds = ref<string[]>(["long_session", "cold_rewrites"]);
 const systemInfoEnabled = ref(true);
+const correctionsEnabled = ref(false);
 const uiFont = ref(DEFAULT_FONT_ID);
 
 // Budget suggestion: needs live usage, which the backend broadcasts via
@@ -131,6 +132,7 @@ async function loadSettings() {
             }
         }
         systemInfoEnabled.value = (await store.get<boolean>("systemInfoEnabled")) ?? true;
+        correctionsEnabled.value = (await store.get<boolean>("correctionsEnabled")) ?? false;
         applyLocale(await store.get<string>("locale"));
         uiFont.value = (await store.get<string>("uiFont")) ?? DEFAULT_FONT_ID;
         applyFont(uiFont.value);
@@ -253,6 +255,7 @@ onUnmounted(() => {
             :memory-bloat-enabled="memoryBloatEnabled"
             :todo-notifications-enabled="todoNotificationsEnabled"
             :system-info-enabled="systemInfoEnabled"
+            :corrections-enabled="correctionsEnabled"
             :runtime-insights-enabled="runtimeInsightsEnabled"
             :runtime-insight-kinds="runtimeInsightKinds"
             :locale="locale"

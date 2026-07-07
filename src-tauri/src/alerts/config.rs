@@ -154,6 +154,12 @@ pub struct AppConfig {
     // (0..100), so it scales one side before the check.
     #[serde(default)]
     pub goal_error_rate_max: Option<f64>,
+    // Outcome metric — user corrections mined from transcripts (t#101). Opt-in,
+    // off by default: `corrections publish` is deterministic and LLM-free but reads
+    // EVERY transcript, so it runs only when the user turns it on. Gates the
+    // background publisher loop and the analytics Outcome card.
+    #[serde(default)]
+    pub corrections_enabled: bool,
 }
 
 fn default_true() -> bool {
@@ -196,6 +202,7 @@ impl Default for AppConfig {
             system_info_enabled: true,
             goal_cost_per_hour_max: None,
             goal_error_rate_max: None,
+            corrections_enabled: false,
         }
     }
 }
