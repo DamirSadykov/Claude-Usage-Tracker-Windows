@@ -58,6 +58,13 @@ pub struct UsageData {
     pub seven_day: UsageTier,
     pub seven_day_opus: Option<UsageTier>,
     pub seven_day_sonnet: Option<UsageTier>,
+    // Per-model weekly limits, as the API now reports them in `limits[]` with
+    // `kind: "weekly_scoped"` and a `scope.model.display_name` (e.g. "Fable").
+    // The old flat `seven_day_opus/sonnet` fields are kept above for backward
+    // compat, but the API has started sending them as `null` and moving the
+    // active scoped limit into `limits[]` — so the model shown here is dynamic,
+    // not a fixed Opus/Sonnet pair.
+    pub scoped_weekly: Vec<ScopedTier>,
     pub extra_usage: Option<ExtraUsage>,
     pub prepaid_balance: Option<f64>,
     pub prepaid_currency: Option<String>,
@@ -65,6 +72,16 @@ pub struct UsageData {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UsageTier {
+    pub percent_used: f64,
+    pub reset_at: Option<String>,
+    pub is_limited: bool,
+}
+
+/// A weekly limit scoped to a single model, carried over from the API's
+/// `limits[]` array. `model` is the human label (`scope.model.display_name`).
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ScopedTier {
+    pub model: String,
     pub percent_used: f64,
     pub reset_at: Option<String>,
     pub is_limited: bool,
@@ -91,7 +108,39 @@ struct ApiResponse {
     #[serde(default)]
     seven_day_sonnet: Option<ApiTier>,
     #[serde(default)]
+    limits: Vec<ApiLimit>,
+    #[serde(default)]
     extra_usage: Option<ApiExtraUsage>,
+}
+
+/// One entry of the API's `limits[]`. We only consume `weekly_scoped` ones (a
+/// per-model weekly cap); `session` / `weekly_all` duplicate the flat tiers we
+/// already read. `percent` is an integer-ish percent; `severity` gates the
+/// "limit reached" badge.
+#[derive(Debug, Deserialize)]
+struct ApiLimit {
+    #[serde(default)]
+    kind: String,
+    #[serde(default, deserialize_with = "null_default")]
+    percent: f64,
+    #[serde(default)]
+    resets_at: Option<String>,
+    #[serde(default)]
+    severity: Option<String>,
+    #[serde(default)]
+    scope: Option<ApiScope>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiScope {
+    #[serde(default)]
+    model: Option<ApiScopeModel>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiScopeModel {
+    #[serde(default)]
+    display_name: Option<String>,
 }
 
 /// Deserialize a scalar the API may send as an explicit `null`, falling back to
@@ -375,11 +424,34 @@ fn build_usage(api: ApiResponse, prepaid: Option<ApiPrepaidCredits>) -> UsageDat
         None => (None, None),
     };
 
+    // Pull the per-model weekly caps out of `limits[]`. Keep only `weekly_scoped`
+    // entries that actually name a model — a scope with no display_name can't be
+    // labelled, so it's dropped rather than shown as an anonymous bar.
+    let scoped_weekly = api
+        .limits
+        .into_iter()
+        .filter(|l| l.kind == "weekly_scoped")
+        .filter_map(|l| {
+            let model = l
+                .scope
+                .and_then(|s| s.model)
+                .and_then(|m| m.display_name)
+                .filter(|n| !n.is_empty())?;
+            Some(ScopedTier {
+                model,
+                percent_used: l.percent,
+                reset_at: l.resets_at,
+                is_limited: l.severity.as_deref() == Some("critical"),
+            })
+        })
+        .collect();
+
     UsageData {
         five_hour: api.five_hour.map(map_tier).unwrap_or(DEFAULT_TIER),
         seven_day: api.seven_day.map(map_tier).unwrap_or(DEFAULT_TIER),
         seven_day_opus: api.seven_day_opus.map(map_tier),
         seven_day_sonnet: api.seven_day_sonnet.map(map_tier),
+        scoped_weekly,
         extra_usage,
         prepaid_balance,
         prepaid_currency,
@@ -680,6 +752,45 @@ mod tests {
         }"#;
         let u = parse(json, None);
         assert_eq!(u.extra_usage.unwrap().currency, "USD");
+    }
+
+    #[test]
+    fn scoped_weekly_limits_are_extracted_by_model() {
+        // Real Max-5x payload: seven_day_sonnet/opus are null and the active
+        // per-model weekly cap has moved into limits[] as a `weekly_scoped`
+        // entry scoped to "Fable". session / weekly_all rows must be ignored.
+        let json = r#"{
+            "five_hour": {"utilization":3.0,"resets_at":"2026-07-07T07:10:00Z"},
+            "seven_day": {"utilization":22.0,"resets_at":"2026-07-12T11:00:00Z"},
+            "seven_day_opus": null,
+            "seven_day_sonnet": null,
+            "limits": [
+                {"kind":"session","group":"session","percent":3,"severity":"normal","resets_at":"2026-07-07T07:10:00Z","scope":null,"is_active":false},
+                {"kind":"weekly_all","group":"weekly","percent":22,"severity":"normal","resets_at":"2026-07-12T11:00:00Z","scope":null,"is_active":true},
+                {"kind":"weekly_scoped","group":"weekly","percent":2,"severity":"normal","resets_at":"2026-07-12T11:00:00Z","scope":{"model":{"id":null,"display_name":"Fable"},"surface":null},"is_active":false}
+            ]
+        }"#;
+        let u = parse(json, None);
+
+        assert!(u.seven_day_opus.is_none());
+        assert!(u.seven_day_sonnet.is_none());
+        assert_eq!(u.scoped_weekly.len(), 1, "only the weekly_scoped row is kept");
+        let f = &u.scoped_weekly[0];
+        assert_eq!(f.model, "Fable");
+        assert_eq!(f.percent_used, 2.0);
+        assert_eq!(f.reset_at.as_deref(), Some("2026-07-12T11:00:00Z"));
+        assert!(!f.is_limited, "severity=normal → not limited");
+    }
+
+    #[test]
+    fn scoped_weekly_absent_when_no_limits() {
+        // Old-shape payload without a limits[] array → empty scoped list, no panic.
+        let json = r#"{
+            "five_hour": { "utilization": 5.0 },
+            "seven_day": { "utilization": 5.0 }
+        }"#;
+        let u = parse(json, None);
+        assert!(u.scoped_weekly.is_empty());
     }
 
     #[test]
