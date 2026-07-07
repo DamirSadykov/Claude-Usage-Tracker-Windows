@@ -2,6 +2,8 @@ node_modules/
 dist/
 src-tauri/target/
 src-tauri/gen/
+resolver/target/
+resolver/resolver-store.json
 *.log
 .DS_Store
 Thumbs.db
