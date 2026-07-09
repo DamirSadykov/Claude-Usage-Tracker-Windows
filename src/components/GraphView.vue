@@ -107,6 +107,15 @@ interface GEdge {
   // A dep edge whose order already follows from a longer path — drawn faintly.
   redundant?: boolean;
 }
+// A project's bounding band on the Deps tab: heading + framed region around all of
+// that board's nodes, so "All projects" reads as separate pipelines.
+interface DepBand {
+  project: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
 
 const NODE_W = 190;
 const NODE_H = 46; // height of a single-line node; taller nodes add LINE_H each
@@ -116,6 +125,8 @@ const MAX_LINES = 3; // subject lines before ellipsis
 const COL_GAP = 250;
 const V_GAP = 26; // vertical gap between stacked nodes (deps pipeline)
 const MARGIN = 40;
+const BAND_HEAD = 30; // vertical room above a project group for its heading (deps)
+const BAND_GAP = 46; // gap between stacked project groups (deps)
 
 // Greedy word-wrap of a subject to fit the node: up to MAX_LINES lines of about
 // WRAP_CHARS each, ellipsis if it still overflows. A single over-long word is
@@ -235,8 +246,8 @@ const raw = computed(() => {
   return { tasks, boardIds, depEdges, refEdges, externalTargets };
 });
 
-// --- Deps tab: pipeline layout (longest-path levels) -----------------------
-const depModel = computed<{ nodes: GNode[]; edges: GEdge[] }>(() => {
+// --- Deps tab: per-project ALAP pipeline layout ----------------------------
+const depModel = computed<{ nodes: GNode[]; edges: GEdge[]; bands: DepBand[] }>(() => {
   const { tasks, depEdges } = raw.value;
   const inGraph = new Set<string>();
   for (const e of depEdges) {
@@ -250,39 +261,130 @@ const depModel = computed<{ nodes: GNode[]; edges: GEdge[] }>(() => {
     if (x) nodes.set(id, baseNode(x));
   }
 
-  const depOf = new Map<string, string[]>();
-  for (const id of inGraph) depOf.set(id, []);
-  for (const e of depEdges) depOf.get(e.toId)!.push(e.fromId);
-
-  const levelMemo = new Map<string, number>();
-  const levelOf = (id: string, guard: Set<string>): number => {
-    if (levelMemo.has(id)) return levelMemo.get(id)!;
-    if (guard.has(id)) return 0;
-    guard.add(id);
-    let lvl = 0;
-    for (const d of depOf.get(id) ?? []) lvl = Math.max(lvl, levelOf(d, guard) + 1);
-    guard.delete(id);
-    levelMemo.set(id, lvl);
-    return lvl;
-  };
-
-  const columns = new Map<number, string[]>();
+  // Upstream (prerequisites) and downstream (dependents) adjacency. Dep edges are
+  // always intra-board (the CLI / back end reject a cross-project dependency), so a
+  // node's neighbours are always on the same project board as the node itself.
+  const prereqOf = new Map<string, string[]>();
+  const dependentOf = new Map<string, string[]>();
   for (const id of inGraph) {
-    const lvl = levelOf(id, new Set());
-    if (!columns.has(lvl)) columns.set(lvl, []);
-    columns.get(lvl)!.push(id);
+    prereqOf.set(id, []);
+    dependentOf.set(id, []);
   }
+  for (const e of depEdges) {
+    prereqOf.get(e.toId)!.push(e.fromId);
+    dependentOf.get(e.fromId)!.push(e.toId);
+  }
+  const numOf = (id: string) => nodes.get(id)!.number ?? 0;
   const colHeight = (ids: string[]) =>
     ids.reduce((s, id) => s + nodes.get(id)!.h, 0) + (ids.length - 1) * V_GAP;
-  const bandH = Math.max(NODE_H, ...[...columns.values()].map(colHeight));
-  for (const [lvl, ids] of columns) {
-    let y = MARGIN + (bandH - colHeight(ids)) / 2;
+
+  // Longest path along `adj` (memoized, cycle-guarded). Reused for both ASAP depth
+  // (down prerequisites) and height-to-sink (down dependents).
+  const longest = (
+    id: string,
+    adj: Map<string, string[]>,
+    memo: Map<string, number>,
+    guard: Set<string>,
+  ): number => {
+    if (memo.has(id)) return memo.get(id)!;
+    if (guard.has(id)) return 0; // deps are acyclic, but never loop on a bad edge
+    guard.add(id);
+    let d = 0;
+    for (const nb of adj.get(id) ?? []) d = Math.max(d, longest(nb, adj, memo, guard) + 1);
+    guard.delete(id);
+    memo.set(id, d);
+    return d;
+  };
+
+  // Lay ONE project's dep-subgraph out in local coordinates (origin 0,0), writing
+  // x/y onto its nodes and returning the group's size. Column = ALAP level (as-late-
+  // as-possible): a prerequisite sits in the column DIRECTLY LEFT of what it blocks
+  // instead of being flung to depth 0 the moment it has no prerequisites of its own
+  // (#126: 124/125 belong one level before the key task 121). ASAP depth only fixes
+  // the pipeline length `maxLvl`; the level is maxLvl minus the height to a sink.
+  // Within a column, barycenter sweeps line connected tasks up level with each other
+  // and cut crossing arrows; task number seeds the order and breaks ties, so the
+  // layout stays stable across rebuilds.
+  const layoutGroup = (groupIds: string[]): { w: number; h: number } => {
+    const asapMemo = new Map<string, number>();
+    let maxLvl = 0;
+    for (const id of groupIds) maxLvl = Math.max(maxLvl, longest(id, prereqOf, asapMemo, new Set()));
+    const sinkMemo = new Map<string, number>();
+    const levelOf = (id: string) => maxLvl - longest(id, dependentOf, sinkMemo, new Set());
+
+    const columns = new Map<number, string[]>();
+    for (const id of groupIds) {
+      const lvl = levelOf(id);
+      (columns.get(lvl) ?? columns.set(lvl, []).get(lvl)!).push(id);
+    }
+    const levels = [...columns.keys()].sort((a, b) => a - b);
+    for (const lvl of levels) columns.get(lvl)!.sort((a, b) => numOf(a) - numOf(b));
+    const posOf = new Map<string, number>();
+    for (const lvl of levels) columns.get(lvl)!.forEach((id, i) => posOf.set(id, i));
+    for (let sweep = 0; sweep < 6; sweep++) {
+      const downward = sweep % 2 === 0; // alternate: align to prereqs, then to dependents
+      const walk = downward ? levels : [...levels].reverse();
+      const neighbourOf = downward ? prereqOf : dependentOf;
+      for (const lvl of walk) {
+        const colIds = columns.get(lvl)!;
+        const bary = new Map<string, number>();
+        for (const id of colIds) {
+          const rows = (neighbourOf.get(id) ?? [])
+            .map((nb) => posOf.get(nb))
+            .filter((v): v is number => v !== undefined);
+          bary.set(id, rows.length ? rows.reduce((s, v) => s + v, 0) / rows.length : posOf.get(id)!);
+        }
+        colIds.sort((a, b) => bary.get(a)! - bary.get(b)! || numOf(a) - numOf(b));
+        colIds.forEach((id, i) => posOf.set(id, i)); // later columns this sweep see the new rows
+      }
+    }
+    // x by the column's ORDINAL among occupied levels (ALAP can leave level 0 empty
+    // — pack columns left so there's no blank leading gap); y stacks the ordered
+    // column, centered in the group's tallest column.
+    const bandH = Math.max(NODE_H, ...levels.map((l) => colHeight(columns.get(l)!)));
+    levels.forEach((lvl, ord) => {
+      const ids = columns.get(lvl)!;
+      let y = (bandH - colHeight(ids)) / 2;
+      for (const id of ids) {
+        const n = nodes.get(id)!;
+        n.x = ord * COL_GAP;
+        n.y = y;
+        y += n.h + V_GAP;
+      }
+    });
+    const w = levels.length ? (levels.length - 1) * COL_GAP + NODE_W : NODE_W;
+    return { w, h: bandH };
+  };
+
+  // Split the graph by project board, lay each project out on its own, then stack
+  // the projects top-to-bottom with a clear gap + heading — so "All projects" reads
+  // as separate pipelines, not one interleaved grid. A single board (project filter
+  // set, or only one present) skips the heading and frame.
+  const groups = new Map<string, string[]>();
+  for (const id of inGraph) {
+    const p = boardOf(taskById.get(id)!);
+    (groups.get(p) ?? groups.set(p, []).get(p)!).push(id);
+  }
+  const showBands = groups.size > 1;
+  const order = [...groups.keys()].sort(
+    (a, b) => Math.min(...groups.get(a)!.map(numOf)) - Math.min(...groups.get(b)!.map(numOf)),
+  );
+  const bands: DepBand[] = [];
+  let curY = MARGIN;
+  for (const proj of order) {
+    const ids = groups.get(proj)!;
+    const { w, h } = layoutGroup(ids);
+    const headH = showBands ? BAND_HEAD : 0;
+    const offY = curY + headH;
     for (const id of ids) {
       const n = nodes.get(id)!;
-      n.x = MARGIN + lvl * COL_GAP;
-      n.y = y;
-      y += n.h + V_GAP;
+      n.x += MARGIN;
+      n.y += offY;
     }
+    if (showBands) {
+      bands.push({ project: proj || t("graphGlobalBoard"), x: MARGIN, y: curY, w, h: h + headH });
+    }
+    curY = offY + h + (showBands ? BAND_GAP : V_GAP);
   }
 
   // Soft transitive reduction: an edge u→v is REDUNDANT when v is already
@@ -312,7 +414,7 @@ const depModel = computed<{ nodes: GNode[]; edges: GEdge[] }>(() => {
     return { ...e, redundant };
   });
 
-  return { nodes: [...nodes.values()], edges };
+  return { nodes: [...nodes.values()], edges, bands };
 });
 
 // Deterministic force-directed placement (Obsidian-style): seed nodes on a circle
@@ -515,6 +617,8 @@ const refModel = computed<{ nodes: GNode[]; edges: GEdge[] }>(() => {
 const model = computed<{ nodes: GNode[]; edges: GEdge[] }>(() =>
   tab.value === "deps" ? depModel.value : refModel.value,
 );
+// Project frames — only on the Deps tab, and only when more than one board is shown.
+const depBands = computed<DepBand[]>(() => (tab.value === "deps" ? depModel.value.bands : []));
 const nodeById = computed(() => {
   const m = new Map<string, GNode>();
   for (const n of model.value.nodes) m.set(n.id, n);
@@ -574,6 +678,24 @@ function clipToBox(sx: number, sy: number, cx: number, cy: number, halfH: number
   return { x: cx + dx * s, y: cy + dy * s };
 }
 
+// Path + curve-midpoint for a dep edge. A neighbouring-column edge stays a straight
+// line (the pipeline reads crisply); an edge that LEAPS over one or more columns is
+// bowed into a cubic so it arcs around the intermediate nodes instead of cutting
+// straight through their boxes (e.g. #133 → #137 passing over #134/#135). It bows to
+// the side the target already leans (below/above the source), deepening with span.
+function depCurve(x1: number, y1: number, x2: number, y2: number) {
+  const dx = x2 - x1;
+  const span = Math.round(Math.abs(dx) / COL_GAP);
+  if (span <= 1) return { d: `M ${x1} ${y1} L ${x2} ${y2}`, mx: (x1 + x2) / 2, my: (y1 + y2) / 2 };
+  const dir = y2 >= y1 ? 1 : -1;
+  const bow = Math.min(80, 24 + (span - 1) * 18);
+  const cy = (y1 + y2) / 2 + dir * bow;
+  const c1x = x1 + dx * 0.4;
+  const c2x = x2 - dx * 0.4;
+  const d = `M ${x1} ${y1} C ${c1x} ${cy} ${c2x} ${cy} ${x2} ${y2}`;
+  return { d, mx: (x1 + 3 * c1x + 3 * c2x + x2) / 8, my: (y1 + 6 * cy + y2) / 8 };
+}
+
 interface EdgeGeom {
   key: string;
   kind: "dep" | "ref";
@@ -584,6 +706,9 @@ interface EdgeGeom {
   y1: number;
   x2: number;
   y2: number;
+  // Curve midpoint — where the remove-handle sits (curve-aware for bowed dep edges).
+  mx: number;
+  my: number;
 }
 const edgeGeoms = computed<EdgeGeom[]>(() => {
   const out: EdgeGeom[] = [];
@@ -595,6 +720,10 @@ const edgeGeoms = computed<EdgeGeom[]>(() => {
     const bc = { x: b.x + NODE_W / 2, y: b.y + b.h / 2 };
     const start = clipToBox(bc.x, bc.y, ac.x, ac.y, a.h / 2);
     const end = clipToBox(ac.x, ac.y, bc.x, bc.y, b.h / 2);
+    const mid =
+      e.kind === "dep"
+        ? depCurve(start.x, start.y, end.x, end.y)
+        : { mx: (start.x + end.x) / 2, my: (start.y + end.y) / 2 };
     out.push({
       key: `${e.kind}:${e.fromId}:${e.toId}`,
       kind: e.kind,
@@ -605,10 +734,17 @@ const edgeGeoms = computed<EdgeGeom[]>(() => {
       y1: start.y,
       x2: end.x,
       y2: end.y,
+      mx: mid.mx,
+      my: mid.my,
     });
   }
   return out;
 });
+
+// SVG path for a dep edge (straight for a one-column hop, bowed for a longer leap).
+function depPath(e: EdgeGeom): string {
+  return depCurve(e.x1, e.y1, e.x2, e.y2).d;
+}
 
 // --- Pan / zoom ------------------------------------------------------------
 const svgEl = ref<SVGSVGElement | null>(null);
@@ -910,6 +1046,21 @@ onUnmounted(() => {
       </defs>
 
       <g :transform="`translate(${tx},${ty}) scale(${scale})`" :class="{ 'has-sel': selected }">
+        <!-- Project frames (Deps, multi-board): a labelled box around each board's
+             pipeline so the projects read as separate graphs, not one grid. -->
+        <g class="bands">
+          <g v-for="b in depBands" :key="b.project" class="band">
+            <rect
+              class="band-box"
+              :x="b.x - 16"
+              :y="b.y - 8"
+              :width="b.w + 32"
+              :height="b.h + 16"
+              rx="12"
+            />
+            <text class="band-label" :x="b.x - 4" :y="b.y + 14">{{ b.project }}</text>
+          </g>
+        </g>
         <g class="edges">
           <template v-for="e in edgeGeoms" :key="e.key">
             <!-- Ref edges are READ-ONLY (mentions live in the task text; unlink by
@@ -923,29 +1074,17 @@ onUnmounted(() => {
               marker-end="url(#arrow-ref)"
             />
             <g v-else class="dep-group" :class="{ active: edgeActive(e), redundant: e.redundant }">
-              <line
-                class="edge dep"
-                :x1="e.x1"
-                :y1="e.y1"
-                :x2="e.x2"
-                :y2="e.y2"
-                marker-end="url(#arrow-dep)"
-              />
-              <!-- Wide transparent hit line: makes right-click-to-remove easy
-                   along the whole edge, not just the 2px stroke. -->
-              <line
-                class="edge-hit"
-                :x1="e.x1"
-                :y1="e.y1"
-                :x2="e.x2"
-                :y2="e.y2"
-                @contextmenu="onDepContext($event, e)"
-              />
-              <!-- Midpoint handle: a clear target to click and drop the link. -->
+              <!-- Straight for a one-column hop, bowed for a longer leap so it arcs
+                   around the intermediate columns' nodes instead of through them. -->
+              <path class="edge dep" :d="depPath(e)" marker-end="url(#arrow-dep)" />
+              <!-- Wide transparent hit path: right-click-to-remove along the whole
+                   edge, not just the 2px stroke. -->
+              <path class="edge-hit" :d="depPath(e)" @contextmenu="onDepContext($event, e)" />
+              <!-- Curve-midpoint handle: a clear target to click and drop the link. -->
               <circle
                 class="edge-handle"
-                :cx="(e.x1 + e.x2) / 2"
-                :cy="(e.y1 + e.y2) / 2"
+                :cx="e.mx"
+                :cy="e.my"
                 r="5"
                 @mousedown.stop
                 @click.stop="removeDep(e.toId, e.fromId)"
@@ -1115,6 +1254,20 @@ onUnmounted(() => {
 .gv-canvas.connecting {
   cursor: crosshair;
 }
+/* Project frame around a board's pipeline (Deps tab, multi-board view). */
+.band-box {
+  fill: rgba(255, 255, 255, 0.022);
+  stroke: #34383f;
+  stroke-width: 1.5;
+  stroke-dasharray: 3 5;
+  pointer-events: none;
+}
+.band-label {
+  fill: #7a808a;
+  font-size: 12px;
+  font-weight: 600;
+  pointer-events: none;
+}
 .edge {
   stroke-linecap: round;
   fill: none; /* ref edges are <path>; keep them unfilled */
@@ -1148,6 +1301,7 @@ onUnmounted(() => {
 }
 /* Fat invisible click target running along the whole dep edge. */
 .edge-hit {
+  fill: none; /* it's a <path> now — don't let an open curve fill-close into a blob */
   stroke: transparent;
   stroke-width: 16;
   pointer-events: stroke;
