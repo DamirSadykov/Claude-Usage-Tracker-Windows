@@ -830,7 +830,15 @@ function usage(code) {
       "  groups [--json]                 list association groups\n" +
       "\n" +
       "  Inline task references (inside a description/comment): write t#N, e.g. \"blocked by t#12\".\n" +
-      "  A bare #N is read as a GitHub PR/issue and is NOT linked — always prefix a task reference with t.\n",
+      "  A bare #N is read as a GitHub PR/issue and is NOT linked — always prefix a task reference with t.\n" +
+      "\n" +
+      "  Handoff (`handoff set`) — write for the NEXT task, the one that depends on this:\n" +
+      "    DO:  the concrete outcome a dependent builds on (files/paths, interfaces, schema,\n" +
+      "         decisions made); where it left off if unfinished; gotchas/constraints; the\n" +
+      "         suggested next step. Reference related tasks as t#N so context chains forward.\n" +
+      "    DON'T: restate the task's own subject/description (the dependent can read those);\n" +
+      "         session chatter or notes-to-self; step-by-step of how you got there; secrets.\n" +
+      "    Keep it short and specific — a baton, not a log. Empty is fine (nothing to pass on).\n",
   );
   process.exit(code);
 }
