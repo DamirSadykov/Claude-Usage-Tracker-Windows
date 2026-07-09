@@ -167,6 +167,8 @@ The task manager can be driven from a Claude Code session via the bundled `cc-to
 
 To reference one task from another's description or comment, write **`t#N`** (e.g. "blocked by `t#12`") — it renders as a live link. A bare `#N` is treated as a GitHub PR/issue and is left as plain text, so task references must be prefixed with `t`.
 
+For a *real* edge on the task graph — not just a mention in prose — use the CLI: `dep add <task> <depends-on>` makes a blocking dependency (kept acyclic, within one board), while `ref add <task> <target>` makes a non-blocking reference (may cross projects). An inline `t#N` only draws a ref edge; a blocking dependency can be created solely through `dep add`.
+
 Tasks created in Claude Code (via TodoWrite) are also picked up automatically, so the board reflects what your agent is working on.
 
 ## How Auto-Start Works
