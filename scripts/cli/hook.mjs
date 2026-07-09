@@ -295,6 +295,7 @@ function main() {
       `  add a follow-up → <cli> todos add "<subject>" [--project <name> | --global] [--priority high|medium|low] [--scheduled YYYY-MM-DD] [--description <text>]`,
       `  note a finding  → <cli> todos comment add <id> --text "<body>"`,
       `  link two tasks  → <cli> todos dep add <task> <depends-on>  (blocking, acyclic, one board)  ·  <cli> todos ref add <task> <target>  (non-blocking, cross-project ok)`,
+      `  carry handoff   → <cli> todos handoff <task>  (read what the tasks it depends on left off)  ·  <cli> todos handoff set <task> --text "<body>"  (leave yours for its dependents)`,
       `  see the board   → <cli> todos list  [--all | --status <col>[,<col>]]`,
       `Rules: <id> is the ⟨id⟩ shown above; add/dep/ref args also accept N|#N. Each command touches only its own field — leave the rest to the user. add/comment ONLY what the user asked to track, not your scratchpad; new tasks land in backlog. Reference a task in prose as t#${refExample} ("blocked by t#${refExample}") — a bare #N means a GitHub PR/issue, NOT a task link. An inline t#N draws only a ref edge, never a blocking dep — use \`dep add\` for that; \`dep rm\`/\`ref rm\`/\`dep list\`/\`ref list\` mirror add.`,
       crossProjectNote,

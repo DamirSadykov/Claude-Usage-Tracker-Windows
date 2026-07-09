@@ -669,6 +669,98 @@ function cmdRef(args) {
   fail(REF_USAGE);
 }
 
+const HANDOFF_USAGE =
+  "usage: cli todos handoff <task> [--json]            read the handoff of <task>'s DIRECT prerequisites\n" +
+  '       cli todos handoff set <task> --text "<body>"  set <task>\'s own handoff (passed to its dependents)\n' +
+  "       cli todos handoff clear <task>\n" +
+  "       <task> is an id, a number, or #N";
+
+// Handoff carried FORWARD along dependency edges (#141). A task's `handoff` is what
+// it produced / where it left off, written by the LLM (like a phases handoff). A
+// session working on a task reads the handoffs of the tasks it DEPENDS ON, so the
+// work it builds on is in context. Only DIRECT prerequisites are read — cumulative
+// context still flows because a handoff is authored prose that can itself reference
+// upstream tasks (t#N), so no transitive walk is needed. Mirrors the `handoff`
+// field in todos.rs.
+function cmdHandoff(args) {
+  const [sub, ...rest] = args;
+  const file = todosPath();
+  const data = load(file);
+
+  // WRITE — set / clear this task's own handoff.
+  if (sub === "set" || sub === "clear") {
+    const { positional, flags } = parseArgs(rest);
+    const t = resolveTask(data, positional[0]);
+    if (!t) fail(HANDOFF_USAGE);
+    if (sub === "set") {
+      const body = typeof flags.text === "string" ? flags.text : "";
+      if (!body.trim()) fail(HANDOFF_USAGE);
+      t.handoff = body;
+      t.updated_at = new Date().toISOString();
+      save(file, data);
+      process.stdout.write(`ok: handoff set on #${t.number}\n`);
+      return;
+    }
+    // clear
+    if (t.handoff) {
+      delete t.handoff;
+      t.updated_at = new Date().toISOString();
+      save(file, data);
+    }
+    process.stdout.write(`ok: handoff cleared on #${t.number}\n`);
+    return;
+  }
+
+  // READ — the handoffs of <task>'s direct prerequisites (what it inherits).
+  const { positional, flags } = parseArgs(args);
+  const t = resolveTask(data, positional[0]);
+  if (!t) fail(HANDOFF_USAGE);
+  const prereqs = (Array.isArray(t.depends_on) ? t.depends_on : [])
+    .map((id) => data.todos.find((x) => x && x.id === id))
+    .filter(Boolean);
+
+  if (flags.json) {
+    process.stdout.write(
+      JSON.stringify(
+        {
+          task: { id: t.id, number: t.number, subject: t.subject },
+          root: prereqs.length === 0,
+          prerequisites: prereqs.map((p) => ({
+            id: p.id,
+            number: p.number,
+            subject: p.subject,
+            status: p.status,
+            handoff: p.handoff || "",
+            has_handoff: !!(p.handoff && p.handoff.trim()),
+          })),
+        },
+        null,
+        2,
+      ) + "\n",
+    );
+    return;
+  }
+
+  // No dependencies → this is a root task; there's nothing upstream to inherit.
+  if (!prereqs.length) {
+    process.stdout.write(
+      `#${t.number} "${t.subject}" is a root task — it depends on nothing, so there is no upstream handoff to inherit.\n`,
+    );
+    return;
+  }
+  process.stdout.write(
+    `Handoff inherited by #${t.number} "${t.subject}" from its direct prerequisites:\n`,
+  );
+  for (const p of prereqs) {
+    process.stdout.write(`\n── t#${p.number} ${p.subject} [${p.status}] ──\n`);
+    if (p.handoff && p.handoff.trim()) {
+      process.stdout.write(p.handoff.trim() + "\n");
+    } else {
+      process.stdout.write(`(no handoff on t#${p.number} — proceed without it)\n`);
+    }
+  }
+}
+
 // List the projects related to <project> via association groups, so a session in
 // one project can file a task against a sibling project (e.g. engine ↔ advmcp).
 // Plain text prints one related project per line (empty → a friendly note);
@@ -732,6 +824,8 @@ function usage(code) {
       "  ref add <task> <target>         ref-graph edge: <task> references <target> (non-blocking, cross-project ok)\n" +
       "  ref rm  <task> <target>         remove an explicit ref link (inline t#N stays; edit text to drop)\n" +
       "  ref list <task> [--json]        show a task's references + referenced-by (link + inline t#N)\n" +
+      "  handoff <task> [--json]         read the handoff of <task>'s direct prerequisites (deps it inherits)\n" +
+      '  handoff set <task> --text "…"   set <task>\'s own handoff (carried to tasks that depend on it)\n' +
       "  related <project> [--json]      projects that work with <project>\n" +
       "  groups [--json]                 list association groups\n" +
       "\n" +
@@ -768,6 +862,9 @@ export function run(args) {
       break;
     case "ref":
       cmdRef(rest);
+      break;
+    case "handoff":
+      cmdHandoff(rest);
       break;
     case "related":
       cmdRelated(rest);
