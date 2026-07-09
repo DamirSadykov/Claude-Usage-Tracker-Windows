@@ -137,6 +137,16 @@ function cmdSetStatus(id, status) {
   todo.updated_at = new Date().toISOString();
   save(file, data);
   process.stdout.write(`ok: ${id} -> ${status}\n`);
+  // Anchor for the handoff mechanism (#141): moving a task INTO in_progress is the
+  // "starting this task" moment, so surface what it inherits from its prerequisites
+  // right here — the agent gets the baton without being told to ask for it. Only
+  // when there's actually a handoff to carry, so root/handoff-less starts stay quiet.
+  if (status === "in_progress") {
+    const prereqs = directPrereqs(data, todo);
+    if (prereqs.some((p) => p.handoff && p.handoff.trim())) {
+      process.stdout.write("\n" + formatInheritedHandoff(todo, prereqs));
+    }
+  }
 }
 
 // Set (or clear) a todo's priority bucket. `level` is high|medium|low, or
@@ -669,6 +679,28 @@ function cmdRef(args) {
   fail(REF_USAGE);
 }
 
+// Direct prerequisites of a task (the tasks it DEPENDS ON), resolved to objects.
+// Only direct depends_on — cumulative context rides the authored handoff text.
+function directPrereqs(data, t) {
+  return (Array.isArray(t.depends_on) ? t.depends_on : [])
+    .map((id) => data.todos.find((x) => x && x.id === id))
+    .filter(Boolean);
+}
+
+// Human-readable block of what a task inherits from its prerequisites' handoff.
+// Shared by `handoff <task>` and the in_progress anchor so both read identically.
+function formatInheritedHandoff(t, prereqs) {
+  let out = `Handoff inherited by #${t.number} "${t.subject}" from its direct prerequisites:\n`;
+  for (const p of prereqs) {
+    out += `\n── t#${p.number} ${p.subject} [${p.status}] ──\n`;
+    out +=
+      p.handoff && p.handoff.trim()
+        ? p.handoff.trim() + "\n"
+        : `(no handoff on t#${p.number} — proceed without it)\n`;
+  }
+  return out;
+}
+
 const HANDOFF_USAGE =
   "usage: cli todos handoff <task> [--json]            read the handoff of <task>'s DIRECT prerequisites\n" +
   '       cli todos handoff set <task> --text "<body>"  set <task>\'s own handoff (passed to its dependents)\n' +
@@ -715,9 +747,7 @@ function cmdHandoff(args) {
   const { positional, flags } = parseArgs(args);
   const t = resolveTask(data, positional[0]);
   if (!t) fail(HANDOFF_USAGE);
-  const prereqs = (Array.isArray(t.depends_on) ? t.depends_on : [])
-    .map((id) => data.todos.find((x) => x && x.id === id))
-    .filter(Boolean);
+  const prereqs = directPrereqs(data, t);
 
   if (flags.json) {
     process.stdout.write(
@@ -748,17 +778,7 @@ function cmdHandoff(args) {
     );
     return;
   }
-  process.stdout.write(
-    `Handoff inherited by #${t.number} "${t.subject}" from its direct prerequisites:\n`,
-  );
-  for (const p of prereqs) {
-    process.stdout.write(`\n── t#${p.number} ${p.subject} [${p.status}] ──\n`);
-    if (p.handoff && p.handoff.trim()) {
-      process.stdout.write(p.handoff.trim() + "\n");
-    } else {
-      process.stdout.write(`(no handoff on t#${p.number} — proceed without it)\n`);
-    }
-  }
+  process.stdout.write(formatInheritedHandoff(t, prereqs));
 }
 
 // List the projects related to <project> via association groups, so a session in
@@ -838,7 +858,9 @@ function usage(code) {
       "         suggested next step. Reference related tasks as t#N so context chains forward.\n" +
       "    DON'T: restate the task's own subject/description (the dependent can read those);\n" +
       "         session chatter or notes-to-self; step-by-step of how you got there; secrets.\n" +
-      "    Keep it short and specific — a baton, not a log. Empty is fine (nothing to pass on).\n",
+      "    Keep it short and specific — a baton, not a log. Empty is fine (nothing to pass on).\n" +
+      "  Moving a task to `in_progress` (set-status) AUTO-prints the handoff it inherits, so\n" +
+      "  starting a task hands you its prerequisites' batons without asking. `handoff <task>` re-reads it.\n",
   );
   process.exit(code);
 }
