@@ -2,6 +2,7 @@
 import { ref, watch, onMounted, onUnmounted } from "vue";
 import type { Ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
+import { open as openFileDialog, save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 import { useI18n } from "vue-i18n";
 import {
   ALERT_TIER_KEYS,
@@ -630,6 +631,108 @@ async function runRestore() {
 }
 
 onMounted(loadLatestBackup);
+
+// --- Board import / export (#181) ---
+// Carrying todos.json between machines by hand DESTROYS whatever the other machine
+// added: both number tasks with max+1, so the same number lands on different tasks
+// and a straight copy overwrites the board. Import here is a MERGE that never
+// overwrites — a taken number is reassigned, and an incoming task whose id already
+// exists locally is filed as a NEW task (a fork) instead of replacing the local one.
+// The user sees a preview of exactly that before anything is written.
+interface ImportItem {
+  subject: string;
+  kind: string; // "added" | "renumbered" | "forked"
+  from_number: number;
+  to_number: number;
+}
+interface ImportReport {
+  added: number;
+  renumbered: number;
+  forked: number;
+  unchanged: number; // already on the board, untouched since → skipped (import is idempotent)
+  dropped_edges: number;
+  rewritten_refs: number;
+  backup: string | null;
+  total_after: number;
+  items: ImportItem[];
+}
+const exporting = ref(false);
+const importing = ref(false);
+const ioMsg = ref("");
+// A previewed import awaiting the user's confirmation: nothing is written until then.
+const pendingImport = ref<{ path: string; report: ImportReport } | null>(null);
+
+function defaultExportName(): string {
+  const d = new Date();
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `todos-${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}.json`;
+}
+
+async function runExport() {
+  if (exporting.value) return;
+  ioMsg.value = "";
+  const path = await saveFileDialog({
+    defaultPath: defaultExportName(),
+    filters: [{ name: "JSON", extensions: ["json"] }],
+  });
+  if (!path) return; // user cancelled
+  exporting.value = true;
+  try {
+    const count = await invoke<number>("export_todos", { path });
+    ioMsg.value = t("ioExported", { count });
+  } catch (e) {
+    ioMsg.value = String(e);
+  } finally {
+    exporting.value = false;
+  }
+}
+
+async function pickImport() {
+  if (importing.value) return;
+  ioMsg.value = "";
+  pendingImport.value = null;
+  const picked = await openFileDialog({
+    multiple: false,
+    filters: [{ name: "JSON", extensions: ["json"] }],
+  });
+  const path = typeof picked === "string" ? picked : null;
+  if (!path) return; // user cancelled
+  importing.value = true;
+  try {
+    const report = await invoke<ImportReport>("preview_todo_import", { path });
+    if (report.added + report.renumbered + report.forked === 0) {
+      // Nothing to do. Distinguish "the file is empty" from "you already have all
+      // of it" — the second is the normal outcome of importing the same file twice.
+      ioMsg.value = report.unchanged > 0 ? t("ioImportNothingNew") : t("ioImportEmpty");
+      return;
+    }
+    pendingImport.value = { path, report };
+  } catch (e) {
+    ioMsg.value = String(e);
+  } finally {
+    importing.value = false;
+  }
+}
+
+async function confirmImport() {
+  if (!pendingImport.value || importing.value) return;
+  const { path } = pendingImport.value;
+  importing.value = true;
+  try {
+    const r = await invoke<ImportReport>("apply_todo_import", { path });
+    ioMsg.value = t("ioImported", {
+      added: r.added + r.renumbered,
+      forked: r.forked,
+      total: r.total_after,
+    });
+    pendingImport.value = null;
+    await loadLatestBackup(); // the import took one; "Откатить" now undoes it
+  } catch (e) {
+    ioMsg.value = String(e);
+  } finally {
+    importing.value = false;
+  }
+}
 
 // Keep each threshold triple strictly ascending with a 1% gap so the colour
 // bands can't overlap. Fixed slider scale (5..99) + clamping — dynamic min/max
@@ -1509,6 +1612,76 @@ function handleSave() {
           {{ t('migrateBackupAt', { date: fmtBackupTime(latestBackup.when_ms) }) }}
         </div>
       </div>
+
+      <!-- Board import / export (#181): moving a board between machines. Import is a
+           merge that never overwrites — see the script block for why a plain copy
+           of todos.json loses tasks. -->
+      <div class="card">
+        <div class="field-label">{{ t('ioTitle') }}</div>
+        <div class="field-hint" style="margin-top: 6px">{{ t('ioDesc') }}</div>
+        <div class="budget-suggest" style="margin-top: 10px">
+          <span style="display: flex; gap: 8px; flex-shrink: 0">
+            <button type="button" class="suggest-btn" :disabled="exporting" @click="runExport">
+              {{ exporting ? t('ioExporting') : t('ioExport') }}
+            </button>
+            <button
+              type="button"
+              class="suggest-btn"
+              :disabled="importing || !!pendingImport"
+              @click="pickImport"
+            >
+              {{ importing && !pendingImport ? t('ioReading') : t('ioImport') }}
+            </button>
+          </span>
+          <span v-if="ioMsg" class="field-hint" style="margin: 0">{{ ioMsg }}</span>
+        </div>
+
+        <!-- Preview: nothing has been written yet. Spell out the two non-obvious
+             outcomes (renumbered, forked) so the user knows what they're accepting. -->
+        <div v-if="pendingImport" class="io-preview">
+          <div class="io-preview-head">{{ t('ioPreviewTitle') }}</div>
+          <ul class="io-preview-stats">
+            <li v-if="pendingImport.report.added">
+              {{ t('ioStatAdded', { n: pendingImport.report.added }) }}
+            </li>
+            <li v-if="pendingImport.report.renumbered">
+              {{ t('ioStatRenumbered', { n: pendingImport.report.renumbered }) }}
+            </li>
+            <li v-if="pendingImport.report.forked">
+              {{ t('ioStatForked', { n: pendingImport.report.forked }) }}
+            </li>
+            <li v-if="pendingImport.report.unchanged">
+              {{ t('ioStatUnchanged', { n: pendingImport.report.unchanged }) }}
+            </li>
+            <li v-if="pendingImport.report.dropped_edges">
+              {{ t('ioStatDropped', { n: pendingImport.report.dropped_edges }) }}
+            </li>
+          </ul>
+          <div class="io-preview-list">
+            <div v-for="(it, i) in pendingImport.report.items.slice(0, 12)" :key="i" class="io-row">
+              <span class="io-kind" :class="'io-kind--' + it.kind">{{ t('ioKind_' + it.kind) }}</span>
+              <span class="io-num">
+                <template v-if="it.from_number !== it.to_number">
+                  #{{ it.from_number }} → #{{ it.to_number }}
+                </template>
+                <template v-else>#{{ it.to_number }}</template>
+              </span>
+              <span class="io-subj">{{ it.subject }}</span>
+            </div>
+            <div v-if="pendingImport.report.items.length > 12" class="field-hint" style="margin: 4px 0 0">
+              {{ t('ioMore', { n: pendingImport.report.items.length - 12 }) }}
+            </div>
+          </div>
+          <div style="display: flex; gap: 8px; margin-top: 10px">
+            <button type="button" class="suggest-btn" :disabled="importing" @click="confirmImport">
+              {{ importing ? t('ioApplying') : t('ioApply') }}
+            </button>
+            <button type="button" class="suggest-btn" :disabled="importing" @click="pendingImport = null">
+              {{ t('ioCancel') }}
+            </button>
+          </div>
+        </div>
+      </div>
       </template>
     </div>
 
@@ -1954,6 +2127,78 @@ function handleSave() {
 
 .suggest-btn:hover {
   background: rgba(255, 255, 255, 0.06);
+}
+
+/* Import preview (#181) — shown before anything is written. */
+.io-preview {
+  margin-top: 10px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.io-preview-head {
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.io-preview-stats {
+  margin: 0 0 8px;
+  padding-left: 18px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.io-preview-list {
+  max-height: 180px;
+  overflow-y: auto;
+}
+
+.io-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12px;
+  padding: 2px 0;
+}
+
+.io-kind {
+  flex-shrink: 0;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+/* Plain add vs the two outcomes the user must actually notice. */
+.io-kind--added {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--muted);
+}
+
+.io-kind--renumbered {
+  background: rgba(88, 166, 255, 0.16);
+  color: #58a6ff;
+}
+
+.io-kind--forked {
+  background: rgba(210, 153, 34, 0.18);
+  color: #d29922;
+}
+
+.io-num {
+  flex-shrink: 0;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  color: var(--muted);
+}
+
+.io-subj {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .prompt-editor {

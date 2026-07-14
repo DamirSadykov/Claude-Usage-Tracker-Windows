@@ -2064,6 +2064,55 @@ fn restore_todo_backup(
     })
 }
 
+/// Write the whole board to a file the user picked (#181). The frontend only opens
+/// the OS save dialog and hands the path down — the file is written here, so the app
+/// never needs a broad filesystem capability. Numbers are backfilled first so an
+/// exported board always carries stable `#N` references. Returns the task count.
+#[tauri::command]
+fn export_todos(app: AppHandle, path: String) -> Result<usize, String> {
+    let mut file = todos::load(&todos_path(&app)?);
+    todos::ensure_numbers(&mut file);
+    let count = file.todos.len();
+    todos::save(std::path::Path::new(&path), &file)?;
+    Ok(count)
+}
+
+/// Read an exported board and report what importing it WOULD do — nothing is
+/// written. Backs the preview the user confirms before the merge runs.
+#[tauri::command]
+fn preview_todo_import(app: AppHandle, path: String) -> Result<todos::ImportReport, String> {
+    let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let incoming = todos::parse_import(&content)?;
+    let mut local = todos::load(&todos_path(&app)?);
+    todos::ensure_numbers(&mut local);
+    let now = chrono::Utc::now().to_rfc3339();
+    let (_, report) = todos::merge_import(&local, &incoming, &now);
+    Ok(report)
+}
+
+/// Merge an exported board into the local one and persist it (#181). Takes a backup
+/// BEFORE writing (the merge only ever adds, but a bad file is one "Откатить" away),
+/// then runs the merge under the write lock so the watcher's snapshot stays in
+/// lockstep. An empty incoming file is a no-op: no backup, no write.
+#[tauri::command]
+fn apply_todo_import(app: AppHandle, path: String) -> Result<todos::ImportReport, String> {
+    let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let incoming = todos::parse_import(&content)?;
+    if incoming.todos.is_empty() {
+        return Ok(todos::ImportReport::default());
+    }
+    let backup = todos::backup(&todos_path(&app)?)?;
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut report = todos::ImportReport::default();
+    write_todos_locked(&app, |file| {
+        let (merged, r) = todos::merge_import(file, &incoming, &now);
+        *file = merged;
+        report = r;
+    })?;
+    report.backup = Some(backup);
+    Ok(report)
+}
+
 /// All phase plans the tracker can find, across every project that has a
 /// `.claude/phases/` dir. Read-only: the plans are authored by the `cc-phases`
 /// CLI and live in each project. The frontend matches a plan to a task card by
@@ -2235,6 +2284,7 @@ pub fn run() {
             }
         }))
         .plugin(tauri_plugin_store::Builder::default().build())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
@@ -2494,6 +2544,9 @@ pub fn run() {
             migrate_todo_refs,
             latest_todo_backup,
             restore_todo_backup,
+            export_todos,
+            preview_todo_import,
+            apply_todo_import,
             get_phase_plans,
             open_todo_window,
             open_settings_window,

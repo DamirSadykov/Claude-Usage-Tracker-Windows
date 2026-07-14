@@ -19,6 +19,7 @@
     "@fontsource/fira-code": "^5.2.7",
     "@fontsource/jetbrains-mono": "^5.2.8",
     "@fontsource/montserrat": "^5.2.8",
+    "@tauri-apps/plugin-dialog": "^2.7.1",
     "chart.js": "^4.5.1",
     "vue": "^3.5.13",
     "vue-i18n": "^11.4.4"
