@@ -1794,6 +1794,27 @@ fn settings_has_cc_hook(v: &serde_json::Value, event: &str) -> bool {
         })
 }
 
+/// The script path OUR SessionStart entry actually points at (the first quoted
+/// span of the command), whatever it is — not the path this build would wire.
+/// The two diverge after the app moves (a reinstall elsewhere, a dev checkout
+/// that was relocated), and that divergence is exactly the failure we hide today.
+fn wired_script_path(root: &serde_json::Value, event: &str) -> Option<String> {
+    root.get("hooks")?
+        .get(event)?
+        .as_array()?
+        .iter()
+        .filter_map(|g| g.get("hooks")?.as_array())
+        .flatten()
+        .filter_map(|h| h.get("command")?.as_str())
+        .find(|c| is_our_hook_command(c))
+        .and_then(|cmd| {
+            let start = cmd.find('"')?;
+            let rest = &cmd[start + 1..];
+            let end = rest.find('"')?;
+            Some(rest[..end].to_string())
+        })
+}
+
 #[derive(Serialize)]
 struct CcHookStatus {
     installed: bool,
@@ -1801,7 +1822,14 @@ struct CcHookStatus {
     /// existed has `installed: true` but no Stop entry, so the UI can offer a
     /// re-install rather than silently running without the guard.
     stop_installed: bool,
+    /// What this build WOULD wire (bundled resource, or the repo in dev).
     script_path: String,
+    /// What settings.json currently points at, and whether that file is still
+    /// there. A wired-but-missing script is the silent failure: Claude Code runs
+    /// `node "<gone>"`, gets nothing, and the session simply has no tasks — while
+    /// the UI, which used to check only that SOME entry existed, said "Installed".
+    wired_path: String,
+    wired_path_exists: bool,
     settings_path: String,
 }
 
@@ -1812,6 +1840,10 @@ fn cc_hook_status(app: AppHandle) -> Result<CcHookStatus, String> {
     let root = std::fs::read_to_string(&settings)
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+    let wired = root
+        .as_ref()
+        .and_then(|v| wired_script_path(v, "SessionStart"))
+        .unwrap_or_default();
     Ok(CcHookStatus {
         installed: root
             .as_ref()
@@ -1822,8 +1854,42 @@ fn cc_hook_status(app: AppHandle) -> Result<CcHookStatus, String> {
             .map(|v| settings_has_cc_hook(v, "Stop"))
             .unwrap_or(false),
         script_path: cc_hook_script_path(&app).unwrap_or_default(),
+        wired_path_exists: !wired.is_empty() && Path::new(&wired).exists(),
+        wired_path: wired,
         settings_path: settings.to_string_lossy().replace('\\', "/"),
     })
+}
+
+/// Re-point our hooks at this build when the wired script is GONE (app moved or
+/// reinstalled elsewhere, dev checkout relocated). Runs on every app start.
+///
+/// Deliberately narrow, because it edits a config the user owns:
+///   • only when our entry is ALREADY there — never wires the hook for someone
+///     who didn't ask for it;
+///   • only when the wired file does NOT exist — a live path that merely differs
+///     from this build's (a deliberate dev checkout) is left alone;
+///   • silent and best-effort: any failure leaves settings.json untouched.
+/// Returns the healed path, if it healed anything.
+fn heal_cc_hook(app: &AppHandle) -> Option<String> {
+    let settings_path = claude_settings_path(app).ok()?;
+    let mut root: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings_path).ok()?).ok()?;
+    if !root.is_object() || !settings_has_cc_hook(&root, "SessionStart") {
+        return None; // not our user — don't install anything uninvited
+    }
+    let wired = wired_script_path(&root, "SessionStart")?;
+    if Path::new(&wired).exists() {
+        return None; // still a real file → nothing to heal
+    }
+
+    let script = cc_hook_script_path(app).ok()?;
+    wire_hook_event(&mut root, "SessionStart", &format!("node \"{script}\" hook"));
+    wire_hook_event(&mut root, "Stop", &format!("node \"{script}\" stop-hook"));
+    let json = serde_json::to_string_pretty(&root).ok()?;
+    let tmp = settings_path.with_extension("json.tmp");
+    std::fs::write(&tmp, json.as_bytes()).ok()?;
+    std::fs::rename(&tmp, &settings_path).ok()?;
+    Some(script)
 }
 
 /// Wire one hook event (SessionStart / Stop) to `command` inside a settings root.
@@ -2347,6 +2413,17 @@ pub fn run() {
                 }
             }
 
+            // Self-heal the Claude Code hooks: if they're wired to a script that
+            // no longer exists (the app was reinstalled elsewhere, a dev checkout
+            // moved), re-point them at this build. Otherwise Claude Code keeps
+            // running `node "<gone>"` every session, gets nothing, and the tasks
+            // silently stop reaching it — with the settings panel still saying
+            // "Installed". Only touches settings.json when OUR entry is already
+            // there and its path is dead (see heal_cc_hook).
+            if let Some(healed) = heal_cc_hook(app.handle()) {
+                info!("Re-pointed the Claude Code hooks at {healed} (the wired script was gone)");
+            }
+
             // Diagnostics: route panics to a marker file in the log dir, and pick
             // up any report left by a crash on the previous run.
             let diag_store = Arc::new(DiagStore::default());
@@ -2703,6 +2780,40 @@ mod hook_install_tests {
         let legacy = wire_hook_event(&mut root, "SessionStart", SS_CMD);
         assert_eq!(legacy, vec![PathBuf::from("D:/x/scripts")]);
         assert_eq!(commands_for(&root, "SessionStart"), vec![SS_CMD]);
+    }
+
+    #[test]
+    fn reads_back_the_path_settings_actually_point_at() {
+        // The status must report the WIRED path, not the one this build would
+        // write — they diverge exactly when the install broke.
+        let root = serde_json::json!({
+            "hooks": {
+                "SessionStart": [
+                    { "hooks": [ { "type": "command", "command": r#"node "$HOME/other/tool.mjs""# } ] },
+                    { "hooks": [ { "type": "command", "command": r#"node "D:/gone/scripts/cli.mjs" hook"# } ] }
+                ]
+            }
+        });
+        assert_eq!(
+            wired_script_path(&root, "SessionStart").as_deref(),
+            Some("D:/gone/scripts/cli.mjs"),
+        );
+        // No entry of ours under Stop → nothing to report.
+        assert_eq!(wired_script_path(&root, "Stop"), None);
+    }
+
+    #[test]
+    fn healing_is_scoped_to_a_dead_path_on_an_existing_install() {
+        // The rule heal_cc_hook enforces, spelled out over its two inputs: we only
+        // rewrite when our entry EXISTS and the file it points at is GONE. A live
+        // path that merely differs from this build's (a deliberate dev checkout)
+        // must be left alone — healing it would hijack the user's own wiring.
+        let this_file = file!(); // a path that definitely exists
+        let should_heal = |has_entry: bool, wired: &str| has_entry && !Path::new(wired).exists();
+
+        assert!(should_heal(true, "D:/gone/scripts/cli.mjs")); // ours, dead → heal
+        assert!(!should_heal(true, this_file)); // ours, alive → leave it
+        assert!(!should_heal(false, "D:/gone/scripts/cli.mjs")); // not ours → never wire uninvited
     }
 
     #[test]

@@ -638,6 +638,8 @@ const messages = {
     installCcHookOff: "Not installed",
     installCcHookStopMissing:
       "The Stop hook (HANDOFF guard) isn't wired yet — reinstall to add it.",
+    installCcHookBroken:
+      "The wired script no longer exists — Claude Code has been getting nothing from it. Reinstall to re-point the hook (the app also repairs this on start).",
     installCcHookBtn: "Install",
     installCcHookReinstall: "Reinstall / update path",
     installCcHookDone: "Done — wired {path}",
@@ -1293,6 +1295,8 @@ const messages = {
     installCcHookOff: "Не установлено",
     installCcHookStopMissing:
       "Хук Stop (guard HANDOFF) ещё не прописан — переустановите, чтобы добавить его.",
+    installCcHookBroken:
+      "Прописанного скрипта больше нет на диске — Claude Code всё это время не получал от него ничего. Переустановите, чтобы перенацелить хук (приложение также чинит это при старте).",
     installCcHookBtn: "Установить",
     installCcHookReinstall: "Переустановить / обновить путь",
     installCcHookDone: "Готово — прописан {path}",

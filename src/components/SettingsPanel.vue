@@ -296,6 +296,12 @@ interface CcHookStatus {
   installed: boolean;
   stop_installed: boolean;
   script_path: string;
+  /// What settings.json points at right now, and whether that file still exists.
+  /// A wired-but-missing script is the silent failure mode: Claude Code runs
+  /// `node "<gone>"` and the session just has no tasks. The app re-points the
+  /// hooks on start (heal_cc_hook); this surfaces the state in the meantime.
+  wired_path: string;
+  wired_path_exists: boolean;
   settings_path: string;
 }
 const ccHookStatus = ref<CcHookStatus | null>(null);
@@ -1517,6 +1523,18 @@ function handleSave() {
           <div class="card-sub">{{ t('installCcHookDesc') }}</div>
           <div v-if="ccHookStatus" class="card-sub" style="margin-top: 6px">
             {{ ccHookStatus.installed ? t('installCcHookOn') : t('installCcHookOff') }}
+            <span v-if="ccHookStatus.installed && ccHookStatus.wired_path" class="muted">
+              — {{ ccHookStatus.wired_path }}
+            </span>
+          </div>
+          <!-- Wired, but the script is gone: Claude Code has been running
+               `node "<gone>"` and getting nothing. -->
+          <div
+            v-if="ccHookStatus && ccHookStatus.installed && !ccHookStatus.wired_path_exists"
+            class="field-hint"
+            style="margin-top: 4px; color: #f87171"
+          >
+            {{ t('installCcHookBroken') }}
           </div>
           <!-- Installed before the Stop guard existed: the SessionStart hook runs,
                but nothing checks the handoff at session end until a re-install. -->
