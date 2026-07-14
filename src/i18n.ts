@@ -185,9 +185,16 @@ const messages = {
     phasesSetting: "Phases in tasks",
     phasesSettingDesc:
       "Show phase checkboxes on task cards.",
-    handoffGuardSetting: "HANDOFF guard at session end",
+    handoffGuardSetting: "HANDOFF guard at session end (plans)",
     handoffGuardSettingDesc:
-      "If a session worked a phase plan but left its handoff older than that work, block the stop once and ask Claude to write the baton (Stop hook). Off: a session can end with no handoff.",
+      "If a session worked a phase plan but left its handoff older than that work — or wrote an empty one — block the stop once and ask Claude for a real baton (Stop hook). Off: a session can end with no handoff.",
+    taskGuardSetting: "HANDOFF guard for tasks",
+    taskGuardDesc:
+      "Which tasks must leave a handoff before the session ends. A task's baton is what a dependent task inherits — without it, the next task starts blind.",
+    taskGuardBoth: "Submitted and unfinished",
+    taskGuardSubmitted: "Only moved to review/done",
+    taskGuardUnfinished: "Only left in progress",
+    taskGuardOff: "Off",
     todoEstimate: "Estimate (min)",
     todoScheduledFor: "When",
     todoPriority: "Priority",
@@ -833,9 +840,16 @@ const messages = {
     phasesSetting: "Фазы в задачах",
     phasesSettingDesc:
       "Показывать чекбоксы фаз на карточках задач.",
-    handoffGuardSetting: "Guard HANDOFF в конце сессии",
+    handoffGuardSetting: "Guard HANDOFF в конце сессии (планы)",
     handoffGuardSettingDesc:
-      "Если сессия работала с планом фаз, но handoff остался старше этой работы — один раз заблокировать выход и попросить Claude записать батон (хук Stop). Выкл.: сессия может завершиться без handoff.",
+      "Если сессия работала с планом фаз, но handoff остался старше этой работы — или записан пустым — один раз заблокировать выход и попросить Claude оставить настоящий батон (хук Stop). Выкл.: сессия может завершиться без handoff.",
+    taskGuardSetting: "Guard HANDOFF для задач",
+    taskGuardDesc:
+      "Какие задачи обязаны оставить handoff до конца сессии. Батон задачи — это то, что наследует зависимая задача; без него следующая задача стартует вслепую.",
+    taskGuardBoth: "Сданные и недоделанные",
+    taskGuardSubmitted: "Только переведённые в review/done",
+    taskGuardUnfinished: "Только оставленные в работе",
+    taskGuardOff: "Выключен",
     todoEstimate: "Оценка (мин)",
     todoScheduledFor: "Когда",
     todoPriority: "Приоритет",

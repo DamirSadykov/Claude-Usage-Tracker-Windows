@@ -11,7 +11,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync, utimesSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { auditPlans, batonComplaints } from "./stop-hook.mjs";
+import { auditPlans, auditTasks, batonComplaints } from "./stop-hook.mjs";
 
 // A session that started at T; mutations after it are "this session's work".
 const SESSION_START = Date.parse("2026-07-14T12:00:00Z");
@@ -165,6 +165,95 @@ describe("auditPlans — substance of a FRESH baton", () => {
     expect(
       auditPlans(root, SESSION_START, () => false, () => ({ title: "Do the thing", desc: "" })),
     ).toEqual([]);
+  });
+});
+
+describe("auditTasks", () => {
+  const iso = (h) => new Date(at(`2026-07-14T${h}:00Z`)).toISOString();
+  // A task this session touched: `updated_at` after the session start.
+  const task = (over = {}) => ({
+    id: "id-1",
+    number: 59,
+    subject: "Guard свежести HANDOFF",
+    description: "",
+    project: "tracker",
+    status: "review",
+    updated_at: iso("14:31"),
+    handoff: GOOD_BATON,
+    handoff_at: iso("14:40"),
+    ...over,
+  });
+
+  it("clears a submitted task that left a real, freshly written baton", () => {
+    expect(auditTasks([task()], "tracker", SESSION_START)).toEqual([]);
+  });
+
+  it("flags a task moved to review with no handoff", () => {
+    const found = auditTasks(
+      [task({ handoff: "", handoff_at: undefined })],
+      "tracker",
+      SESSION_START,
+    );
+    expect(found).toHaveLength(1);
+    expect(found[0]).toMatchObject({ number: 59, kind: "submitted", stale: true, hadBaton: false });
+  });
+
+  it("flags a baton left by an EARLIER session (updated_at is not enough)", () => {
+    // The trap the dedicated handoff_at stamp exists for: any edit bumps
+    // updated_at, so an old baton on a task touched today would look fresh.
+    const found = auditTasks(
+      [task({ handoff_at: iso("09:00") })], // before SESSION_START (12:00)
+      "tracker",
+      SESSION_START,
+    );
+    expect(found).toHaveLength(1);
+    expect(found[0]).toMatchObject({ stale: true, hadBaton: true });
+  });
+
+  it("flags a task left in_progress as unfinished work owing a baton", () => {
+    const found = auditTasks(
+      [task({ status: "in_progress", handoff: "", handoff_at: undefined })],
+      "tracker",
+      SESSION_START,
+    );
+    expect(found[0].kind).toBe("unfinished");
+  });
+
+  it("flags a fresh task baton that is only a receipt", () => {
+    const found = auditTasks(
+      [task({ handoff: "готово" })],
+      "tracker",
+      SESSION_START,
+    );
+    expect(found[0]).toMatchObject({ stale: false, kind: "submitted" });
+    expect(found[0].complaints.length).toBeGreaterThan(0);
+  });
+
+  it("flags a task baton that just parrots the task's own subject", () => {
+    const found = auditTasks([task({ handoff: "Guard свежести HANDOFF" })], "tracker", SESSION_START);
+    expect(found[0].complaints.join(" ")).toMatch(/restates/);
+  });
+
+  it("ignores a task the session never touched, and one it merely re-prioritized", () => {
+    const untouched = task({ id: "old", updated_at: iso("09:00"), handoff: "", handoff_at: undefined });
+    const backlog = task({ id: "b", number: 22, status: "backlog", handoff: "", handoff_at: undefined });
+    expect(auditTasks([untouched, backlog], "tracker", SESSION_START)).toEqual([]);
+  });
+
+  it("ignores tasks of another project", () => {
+    const other = task({ project: "some-other-app", handoff: "", handoff_at: undefined });
+    expect(auditTasks([other], "tracker", SESSION_START)).toEqual([]);
+  });
+
+  it("honours the mode: off / submitted / unfinished / both", () => {
+    const submitted = task({ id: "s", number: 1, status: "review", handoff: "", handoff_at: undefined });
+    const unfinished = task({ id: "u", number: 2, status: "in_progress", handoff: "", handoff_at: undefined });
+    const all = [submitted, unfinished];
+    const nums = (mode) => auditTasks(all, "tracker", SESSION_START, mode).map((t) => t.number);
+    expect(nums("off")).toEqual([]);
+    expect(nums("submitted")).toEqual([1]);
+    expect(nums("unfinished")).toEqual([2]);
+    expect(nums("both")).toEqual([1, 2]);
   });
 });
 

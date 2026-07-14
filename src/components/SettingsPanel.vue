@@ -474,6 +474,41 @@ async function toggleHandoffGuard() {
 
 onMounted(loadHandoffGuard);
 
+// The same guard, one level up: which TASKS must leave a handoff before a session
+// ends (read by the Stop hook). "submitted" = moved to review/done this session;
+// "unfinished" = worked and left in_progress; "both" (default); "off".
+const TASK_GUARD_MODES = ["both", "submitted", "unfinished", "off"] as const;
+const taskHandoffGuard = ref<string>("both");
+
+function taskGuardLabel(m: string): string {
+  if (m === "off") return t("taskGuardOff");
+  if (m === "submitted") return t("taskGuardSubmitted");
+  if (m === "unfinished") return t("taskGuardUnfinished");
+  return t("taskGuardBoth");
+}
+
+async function loadTaskGuard() {
+  try {
+    const { load: loadStore } = await import("@tauri-apps/plugin-store");
+    const store = await loadStore("settings.json");
+    const v = await store.get<string>("taskHandoffGuard");
+    if (typeof v === "string" && (TASK_GUARD_MODES as readonly string[]).includes(v))
+      taskHandoffGuard.value = v;
+  } catch {}
+}
+
+async function setTaskGuard(v: string) {
+  taskHandoffGuard.value = v;
+  try {
+    const { load: loadStore } = await import("@tauri-apps/plugin-store");
+    const store = await loadStore("settings.json");
+    await store.set("taskHandoffGuard", v);
+    await store.save();
+  } catch {}
+}
+
+onMounted(loadTaskGuard);
+
 // --- Task audit schedule (#35) ---
 // Moved here from the tasks window. The in-app scheduler runs a headless
 // `claude -p` audit once a day (backend `spawn_triage_scheduler`); these controls
@@ -1521,7 +1556,7 @@ function handleSave() {
         </div>
       </div>
 
-      <!-- HANDOFF freshness guard (issue #59) — UI-only flag in settings.json,
+      <!-- HANDOFF guard for PLANS (issue #59) — UI-only flag in settings.json,
            read by the Stop hook to block a session that leaves a stale baton. -->
       <div class="card toggle-card" @click="toggleHandoffGuard">
         <div style="flex: 1; min-width: 0">
@@ -1531,6 +1566,19 @@ function handleSave() {
         <div class="toggle" :class="{ on: phaseHandoffGuard }">
           <div class="toggle-knob"></div>
         </div>
+      </div>
+
+      <!-- The same guard for TASKS: which tasks must leave a handoff (Stop hook). -->
+      <div class="card">
+        <div class="field-label">{{ t('taskGuardSetting') }}</div>
+        <select
+          class="field-input"
+          :value="taskHandoffGuard"
+          @change="setTaskGuard(($event.target as HTMLSelectElement).value)"
+        >
+          <option v-for="m in TASK_GUARD_MODES" :key="m" :value="m">{{ taskGuardLabel(m) }}</option>
+        </select>
+        <div class="field-hint">{{ t('taskGuardDesc') }}</div>
       </div>
 
       <!-- Task priority in context (issue #32) — UI-only flag in settings.json,

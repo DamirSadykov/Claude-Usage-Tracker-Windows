@@ -1,10 +1,13 @@
-// `cli.mjs stop-hook` — Claude Code Stop hook: the HANDOFF freshness guard (#59).
+// `cli.mjs stop-hook` — Claude Code Stop hook: the HANDOFF guard (#59).
 //
-// The plan's HANDOFF.md is the ONLY carrier of context from one phase-session to
-// the next (the SessionStart hook surfaces it), but it is written BY HAND — the
-// nudge to write one lives at session START, and nothing ever checks it at the
-// END. So a session ticks phases, ends, and the baton it should have left is
-// simply missing; the next session picks the phase up blind.
+// A handoff is the ONLY carrier of context out of a session, in BOTH flows the
+// tracker runs:
+//   • a PLAN's HANDOFF.md → the next phase-session (SessionStart surfaces it),
+//   • a TASK's `handoff`  → whatever DEPENDS ON that task (todos.rs, #141).
+// Both are written BY HAND, and the nudge to write one lives at session START —
+// nothing ever checked them at the END. So a session ticks phases or finishes a
+// task, ends, and the baton it should have left is simply missing; the next
+// session picks the work up blind.
 //
 // This guard closes that leak, on two levels:
 //   • FRESHNESS — file facts, not a digest of the turn: if the session touched a
@@ -24,8 +27,10 @@
 // session that genuinely needs no baton can just stop again.
 //
 // Wired as a global Stop hook in ~/.claude/settings.json by the tracker's
-// installer (`install_cc_hook` in lib.rs writes both SessionStart and Stop), and
-// gated by the `phaseHandoffGuard` setting (SettingsPanel, default ON).
+// installer (`install_cc_hook` in lib.rs writes both SessionStart and Stop). Two
+// independent switches in settings.json (SettingsPanel): `phaseHandoffGuard`
+// (bool, default ON) for plans, `taskHandoffGuard` (off|submitted|unfinished|both,
+// default both) for tasks.
 //
 // Like the SessionStart hook, it must NEVER break a session: anything unexpected
 // (no stdin, unreadable transcript, no plans, bad JSON) is a silent no-op.
@@ -251,25 +256,108 @@ export function auditPlans(cwd, sinceMs, isTaskDone = () => false, phaseOf = () 
   return out;
 }
 
-// Todo statuses live in the tracker's todos.json — the same file the SessionStart
-// hook reads. Returns a `number -> is done` predicate; a missing/unreadable file
-// means "nothing is done", which only ever makes the guard stricter.
-function doneTaskLookup(appData) {
+// --- the SAME leak, one level up: tasks ---------------------------------------
+//
+// A task hands its baton to whatever depends on it (todos.rs `handoff`, surfaced
+// when a dependent moves to in_progress). It leaks exactly like a phase's: written
+// by hand, nudged only at session start. So a session finishes a task, moves it to
+// review, and the next task starts blind.
+//
+// Which tasks owe a baton is the user's call (`taskHandoffGuard` in settings.json):
+//   "off"        — don't guard tasks at all
+//   "submitted"  — a task this session moved to review/done
+//   "unfinished" — a task this session worked and LEFT in_progress
+//   "both"       — either (default)
+//
+// "This session worked it" = `updated_at` after the session start. Whether the
+// baton is fresh is `handoff_at`, NOT updated_at — an edit of any kind bumps the
+// latter, so without the dedicated stamp a year-old handoff on a task touched
+// today would read as freshly written.
+const TASK_GUARD_MODES = ["off", "submitted", "unfinished", "both"];
+
+function taskGuardMode(appData) {
+  try {
+    const raw = readFileSync(
+      path.join(appData, "com.claude-usage-tracker.app", "settings.json"),
+      "utf8",
+    );
+    const v = JSON.parse(raw).taskHandoffGuard;
+    if (typeof v === "string" && TASK_GUARD_MODES.includes(v)) return v;
+  } catch {
+    // no settings file / bad JSON / missing key → default
+  }
+  return "both";
+}
+
+const wants = (mode, kind) => mode === "both" || mode === kind;
+
+// The tasks of THIS project that owe a baton and haven't left one. Same two-level
+// judgement as for phases: is it there (fresh), and is it a baton at all.
+// `todos` is todos.json's array; `project` the cwd basename. Exported for the tests.
+export function auditTasks(todos, project, sinceMs, mode = "both") {
+  if (mode === "off" || !Array.isArray(todos)) return [];
+  const out = [];
+  for (const t of todos) {
+    if (!t || (t.project && t.project !== project)) continue;
+    const touchedAt = Date.parse(t.updated_at);
+    if (!Number.isFinite(touchedAt) || touchedAt <= sinceMs) continue; // untouched this session
+
+    const kind =
+      t.status === "review" || t.status === "done"
+        ? "submitted"
+        : t.status === "in_progress"
+          ? "unfinished"
+          : null;
+    if (!kind || !wants(mode, kind)) continue;
+
+    // A baton written BEFORE this session belongs to older work — the session's
+    // own findings never made it in.
+    const handoffAt = Date.parse(t.handoff_at);
+    const fresh = Number.isFinite(handoffAt) && handoffAt > sinceMs;
+    if (!fresh) {
+      out.push({
+        number: t.number,
+        id: t.id,
+        subject: t.subject,
+        kind,
+        stale: true,
+        hadBaton: !!String(t.handoff || "").trim(),
+        complaints: [],
+      });
+      continue;
+    }
+    // Fresh — but is it a baton, or a receipt? Parroting is measured against the
+    // task's own subject/description: a dependent reads those from the board.
+    const complaints = batonComplaints(t.handoff, {
+      title: t.subject,
+      desc: t.description,
+    });
+    if (complaints.length)
+      out.push({
+        number: t.number,
+        id: t.id,
+        subject: t.subject,
+        kind,
+        stale: false,
+        hadBaton: true,
+        complaints,
+      });
+  }
+  return out;
+}
+
+// The tracker's todos.json — the same file the SessionStart hook reads. Returns
+// the array, or [] when it's missing/unreadable (the guard then only sees plans).
+function readTodos(appData) {
   try {
     const raw = readFileSync(
       path.join(appData, "com.claude-usage-tracker.app", "todos.json"),
       "utf8",
     );
     const todos = JSON.parse(raw).todos;
-    if (!Array.isArray(todos)) return () => false;
-    const done = new Set(
-      todos
-        .filter((t) => t && t.number != null && t.status === "done")
-        .map((t) => t.number),
-    );
-    return (n) => done.has(n);
+    return Array.isArray(todos) ? todos : [];
   } catch {
-    return () => false;
+    return [];
   }
 }
 
@@ -279,12 +367,15 @@ const hhmm = (ms) => {
   return `${z(d.getHours())}:${z(d.getMinutes())}`;
 };
 
-function reason(findings) {
+// The block message: what's missing, per plan and per task, then how to fix it.
+// Only the sections with findings are rendered.
+function reason(plans, tasks) {
   const lines = [
-    `STOP blocked — this session worked a phase plan, but the HANDOFF baton it leaves behind doesn't do its job.`,
+    `STOP blocked — this session's work leaves no usable HANDOFF behind.`,
     ``,
   ];
-  for (const p of findings) {
+
+  for (const p of plans) {
     if (p.kind === "stale") {
       const when = p.handoffAt
         ? `HANDOFF.md last written ${hhmm(p.handoffAt)} — BEFORE that`
@@ -295,21 +386,46 @@ function reason(findings) {
       for (const c of p.complaints) lines.push(`      – ${c}`);
     }
   }
+  for (const t of tasks) {
+    const what =
+      t.kind === "submitted"
+        ? "you moved it to review/done"
+        : "you worked it and left it in_progress";
+    if (t.stale) {
+      lines.push(
+        `  · task #${t.number} "${t.subject}": ${what}, but ${
+          t.hadBaton ? "its handoff is from an earlier session" : "it has no handoff"
+        }.`,
+      );
+    } else {
+      lines.push(`  · task #${t.number} "${t.subject}": the handoff isn't a baton —`);
+      for (const c of t.complaints) lines.push(`      – ${c}`);
+    }
+  }
+
   lines.push(
     ``,
-    `The handoff is the ONLY thing the next session inherits about this plan (the`,
-    `SessionStart hook surfaces it, and nothing else about this session survives).`,
-    `Write it for the person picking up the NEXT phase: what's done that they build`,
-    `on, the decision or gotcha they'd otherwise re-discover, and the concrete first`,
-    `move — not a summary of the phase they can already read in Phase-N.md.`,
+    `A handoff is the ONLY thing that survives this session: the SessionStart hook`,
+    `surfaces a plan's baton to the next phase, and a task's baton to whatever`,
+    `DEPENDS ON it. Write for whoever picks the work up next — what's done that they`,
+    `build on, the decision or gotcha they'd otherwise re-discover, and the concrete`,
+    `first move. Not a summary of the phase/task they can already read.`,
     ``,
-    ...findings.map(
-      (p) =>
-        `  node "${CLI}" phases handoff "<what's done; decision/gotcha; next step>" --plan ${p.slug}`,
-    ),
+  );
+  for (const p of plans) {
+    lines.push(
+      `  node "${CLI}" phases handoff "<what's done; decision/gotcha; next step>" --plan ${p.slug}`,
+    );
+  }
+  for (const t of tasks) {
+    lines.push(
+      `  node "${CLI}" todos handoff set ${t.number} --text "<what's done; decision/gotcha; next step>"`,
+    );
+  }
+  lines.push(
     ``,
-    `If this session's phase work genuinely needs no baton, say so and stop again —`,
-    `this guard fires once per stop.`,
+    `If this work genuinely needs no baton, say so and stop again — this guard fires`,
+    `once per stop.`,
   );
   return lines.join("\n");
 }
@@ -329,10 +445,20 @@ function main() {
   const appData =
     process.env.APPDATA ||
     path.join(process.env.USERPROFILE || "", "AppData", "Roaming");
-  if (!guardEnabled(appData)) return;
+  const phaseGuard = guardEnabled(appData);
+  const taskMode = taskGuardMode(appData);
+  if (!phaseGuard && taskMode === "off") return; // both halves switched off
 
   const since = sessionStartMs(input.transcript_path);
   if (since == null) return; // unknown session window → stand down
+
+  const todos = readTodos(appData);
+  const doneTask = (() => {
+    const done = new Set(
+      todos.filter((t) => t && t.number != null && t.status === "done").map((t) => t.number),
+    );
+    return (n) => done.has(n);
+  })();
 
   // The plan's CURRENT phase (title/desc) — a baton that merely parrots it carries
   // nothing the next session can't already read. readPlansForHook is the same
@@ -345,11 +471,13 @@ function main() {
     // unreadable plans → skip the parroting check, keep the rest
   }
 
-  const findings = auditPlans(cwd, since, doneTaskLookup(appData), currentPhase);
-  if (!findings.length) return;
+  const plans = phaseGuard ? auditPlans(cwd, since, doneTask, currentPhase) : [];
+  const project = path.basename(String(cwd).replace(/[\\/]+$/, ""));
+  const tasks = auditTasks(todos, project, since, taskMode);
+  if (!plans.length && !tasks.length) return;
 
   // Exit 2 is the Stop hook's "block": stderr goes back to Claude as the reason.
-  process.stderr.write(reason(findings) + "\n");
+  process.stderr.write(reason(plans, tasks) + "\n");
   process.exit(2);
 }
 

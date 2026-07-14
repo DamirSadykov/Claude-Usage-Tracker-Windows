@@ -728,7 +728,11 @@ function cmdHandoff(args) {
       const body = typeof flags.text === "string" ? flags.text : "";
       if (!body.trim()) fail(HANDOFF_USAGE);
       t.handoff = body;
-      t.updated_at = new Date().toISOString();
+      // `handoff_at` (todos.rs) is when the BATON was written, as opposed to
+      // updated_at, which any edit bumps. The Stop guard reads it to tell a baton
+      // written for this session's work from one an earlier session left behind.
+      t.handoff_at = new Date().toISOString();
+      t.updated_at = t.handoff_at;
       save(file, data);
       process.stdout.write(`ok: handoff set on #${t.number}\n`);
       return;
@@ -736,6 +740,7 @@ function cmdHandoff(args) {
     // clear
     if (t.handoff) {
       delete t.handoff;
+      delete t.handoff_at;
       t.updated_at = new Date().toISOString();
       save(file, data);
     }
