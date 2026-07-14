@@ -116,8 +116,17 @@ tempting to write the same thing into the handoff, a tracker comment, AND a
   where an in-phase log is genuinely orthogonal to the baton. A normal phase
   doesn't need one.
 
-**A stale baton blocks the stop.** If the session touched a plan's phase files and
-the handoff is older than that work, the tracker's Stop hook blocks the stop once
-and asks for the baton (settings → "HANDOFF guard at session end"). It goes by
-file mtimes, not by how the session looked, so a caveat that surfaced ten turns
-before you ticked the phase still gets a baton written for it.
+**A missing or empty baton blocks the stop.** The tracker's Stop hook (settings →
+"HANDOFF guard at session end") checks two things when a session touched a plan's
+phase files, and blocks the stop once if either fails:
+
+- **fresh** — the handoff must be newer than the phase work. It goes by file
+  mtimes, not by how the session looked, so a caveat that surfaced ten turns
+  before you ticked the phase still gets a baton written for it.
+- **a baton, not a receipt** — the text must be long enough to say something,
+  point FORWARD (a next step), name something concrete (a file, a `symbol`, a
+  task `t#N`, a locator like `2.3`), and not merely restate the phase's own title
+  (the next session reads `Phase-N.md` anyway).
+
+Neither check can tell whether the baton is *true* — that's on you. They only stop
+`handoff "phase 2 done"` from passing for a handoff.

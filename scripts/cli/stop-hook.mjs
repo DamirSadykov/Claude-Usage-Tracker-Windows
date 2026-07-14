@@ -6,11 +6,17 @@
 // END. So a session ticks phases, ends, and the baton it should have left is
 // simply missing; the next session picks the phase up blind.
 //
-// This guard closes that leak. On Stop it compares FILE FACTS, not a digest of
-// the turn: if the session touched a plan's Phase-*.md and HANDOFF.md is older
-// than that mutation, the stop is BLOCKED with a nudge to write the baton. Going
-// by mtime (rather than "did the last few turns look like a phase closing") is
-// what catches a caveat that surfaced N turns before the phase was ticked done.
+// This guard closes that leak, on two levels:
+//   • FRESHNESS — file facts, not a digest of the turn: if the session touched a
+//     plan's Phase-*.md and HANDOFF.md is older than that mutation, block. Going
+//     by mtime (rather than "did the last few turns look like a phase closing")
+//     catches a caveat that surfaced N turns before the phase was ticked done.
+//   • SUBSTANCE — freshness alone only proves SOMETHING was written, and the agent
+//     writing the baton is the one being disciplined: `handoff "phase 2 done"`
+//     would clear an mtime check while carrying nothing. So a fresh baton must
+//     also look like a baton — long enough, pointing forward, naming something
+//     concrete, and not just parroting the phase's own title (batonComplaints).
+//     Whether it's TRUE is beyond any cheap check; a receipt is not.
 //
 // Blocking = exit 2 with the reason on stderr (Claude reads it and continues).
 // It fires at most ONCE per stop cycle: when Claude is already continuing because
@@ -27,6 +33,7 @@
 import { readFileSync, readdirSync, statSync, openSync, readSync, closeSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { readPlansForHook } from "./phases.mjs";
 
 const CLI = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "cli.mjs");
 
@@ -96,17 +103,88 @@ function mtimeMs(file) {
   }
 }
 
-// The plans this session TOUCHED whose baton is STALE. A plan qualifies when a
-// Phase-*.md was written after the session started and HANDOFF.md is older than
-// that write (missing HANDOFF.md = mtime 0 = always stale).
+// --- is this text a baton, or just a receipt? --------------------------------
+//
+// mtime alone only proves SOMETHING was written — and the agent that writes the
+// baton is the same one the guard is disciplining, so `handoff "phase 2 done"`
+// would satisfy a freshness-only check while carrying nothing. These checks are
+// the cheap, deterministic half of "is it a baton": they can't tell whether the
+// content is TRUE (nothing cheap can), but they do catch a receipt, a restatement
+// of the phase's own title, and a note with nothing concrete in it.
+//
+// Deliberately NOT checked: "is this byte-for-byte the previous baton". The only
+// cheap source for the old text is git HEAD — and the normal flow (close phase →
+// write handoff → commit → stop) leaves the file identical to HEAD, so such a
+// check would fire on exactly the honest case.
+
+// A minimum that no one-word receipt clears, but a real one-line baton does.
+const MIN_CHARS = 40;
+
+// Does it point FORWARD? A baton's job is the next session's first move.
+const NEXT_RE = /(\bnext\b|след(ующ|.\s*шаг)|дальше|далее|остал(о|ся|ись)|продолж|\bTODO\b)/i;
+
+// Does it name anything CONCRETE — a file, a `symbol`, a task, a phase locator?
+// Without one, "made progress, some issues remain" passes every other check.
+const ANCHOR_RE = new RegExp(
+  [
+    "[\\w./-]+\\.(mjs|cjs|js|ts|tsx|vue|rs|json|md|py|toml|ya?ml|sh|ps1)\\b", // a file
+    "`[^`]+`", // an inline-code span
+    "\\bt#\\d+\\b", // a tracker task
+    "#\\d+\\b", // a PR/issue
+    "\\b\\d+\\.\\d+\\b", // a phase/subphase locator (2.3)
+    "\\w+\\(\\)", // a function
+  ].join("|"),
+);
+
+const squash = (s) => String(s || "").replace(/\s+/g, " ").trim();
+// Letters/digits only, lowercased — for comparing a baton against the phase text
+// it might just be parroting.
+const norm = (s) =>
+  String(s || "")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim();
+
+// What's WRONG with this baton, as a list of complaints (empty = it's a baton).
+// `phase` is the plan's current phase (title/desc) or null when the plan just
+// finished — there's then nothing to parrot, so that check is skipped.
+// Exported for the unit tests.
+export function batonComplaints(body, phase) {
+  const text = squash(body);
+  const out = [];
+  if (!text) return ["it is empty"];
+  if (text.length < MIN_CHARS)
+    out.push(`it is ${text.length} chars — a receipt, not a baton (min ${MIN_CHARS})`);
+  if (!NEXT_RE.test(text))
+    out.push("no next step — say what the next session should DO first");
+  if (!ANCHOR_RE.test(text))
+    out.push(
+      "nothing concrete — name a file, a `symbol`, a task (t#N) or a phase locator (2.3)",
+    );
+  if (phase) {
+    const phaseText = norm(`${phase.title} ${phase.desc || ""}`);
+    const baton = norm(text);
+    if (baton && (baton === norm(phase.title) || phaseText.includes(baton)))
+      out.push(
+        "it restates the phase's own title/description — the next session already reads that from Phase-N.md",
+      );
+  }
+  return out;
+}
+
+// The plans this session TOUCHED whose baton is missing the mark, as findings:
+//   kind "stale" — a Phase-*.md was written after the session started and
+//                  HANDOFF.md is older than that write (no HANDOFF.md = always stale).
+//   kind "weak"  — the baton IS fresh, but it doesn't carry anything (see above).
 //
 // `isTaskDone(n)` skips plans whose tracker task is done: that work is finished
 // (no next session to hand off to), AND the SessionStart hook itself rewrites
 // such a plan's phase files (markPlanDoneForDoneTasks) — without this, the hook's
 // own write would look like session work and demand a baton for closed work.
 //
-// Exported for the unit tests; pure read, throws nothing the caller must handle.
-export function stalePlans(cwd, sinceMs, isTaskDone = () => false) {
+// `phaseOf(slug)` yields the plan's current phase (title/desc) for the parroting
+// check; the caller wires it to phases.mjs. Pure read; exported for the tests.
+export function auditPlans(cwd, sinceMs, isTaskDone = () => false, phaseOf = () => null) {
   const phasesDir = path.join(cwd, ".claude", "phases");
   let dirents;
   try {
@@ -146,15 +224,29 @@ export function stalePlans(cwd, sinceMs, isTaskDone = () => false) {
 
     const lastMut = touched[0];
     const handoffMs = mtimeMs(path.join(dir, "HANDOFF.md"));
-    if (handoffMs >= lastMut.ms) continue; // baton is newer than the work → fresh
-
-    out.push({
+    const base = {
       slug: ent.name,
       task,
       file: lastMut.file,
       mutatedAt: lastMut.ms,
       handoffAt: handoffMs || null,
-    });
+    };
+    if (handoffMs < lastMut.ms) {
+      out.push({ ...base, kind: "stale", complaints: [] });
+      continue;
+    }
+    // Fresh — now: does it actually carry anything?
+    let body = "";
+    try {
+      // Stored as "# Handoff (date)\n\n<baton>" — drop the heading, keep the body.
+      body = readFileSync(path.join(dir, "HANDOFF.md"), "utf8").replace(/^#[^\n]*\n?/, "");
+    } catch {
+      // unreadable right after we statted it → treat as stale rather than guess
+      out.push({ ...base, kind: "stale", complaints: [] });
+      continue;
+    }
+    const complaints = batonComplaints(body, phaseOf(ent.name));
+    if (complaints.length) out.push({ ...base, kind: "weak", complaints });
   }
   return out;
 }
@@ -187,25 +279,31 @@ const hhmm = (ms) => {
   return `${z(d.getHours())}:${z(d.getMinutes())}`;
 };
 
-function reason(stale) {
+function reason(findings) {
   const lines = [
-    `STOP blocked — this session worked a phase plan, but its HANDOFF baton is stale.`,
+    `STOP blocked — this session worked a phase plan, but the HANDOFF baton it leaves behind doesn't do its job.`,
+    ``,
   ];
-  for (const p of stale) {
-    const when = p.handoffAt
-      ? `HANDOFF.md last written ${hhmm(p.handoffAt)}`
-      : `HANDOFF.md does not exist`;
-    lines.push(
-      `  · plan "${p.slug}": ${p.file} written ${hhmm(p.mutatedAt)}, ${when}.`,
-    );
+  for (const p of findings) {
+    if (p.kind === "stale") {
+      const when = p.handoffAt
+        ? `HANDOFF.md last written ${hhmm(p.handoffAt)} — BEFORE that`
+        : `HANDOFF.md does not exist`;
+      lines.push(`  · plan "${p.slug}": ${p.file} written ${hhmm(p.mutatedAt)}, ${when}.`);
+    } else {
+      lines.push(`  · plan "${p.slug}": the handoff is fresh, but it isn't a baton —`);
+      for (const c of p.complaints) lines.push(`      – ${c}`);
+    }
   }
   lines.push(
     ``,
     `The handoff is the ONLY thing the next session inherits about this plan (the`,
-    `SessionStart hook surfaces it). Write it before you stop — what's done, any`,
-    `decision or gotcha, the concrete next step:`,
+    `SessionStart hook surfaces it, and nothing else about this session survives).`,
+    `Write it for the person picking up the NEXT phase: what's done that they build`,
+    `on, the decision or gotcha they'd otherwise re-discover, and the concrete first`,
+    `move — not a summary of the phase they can already read in Phase-N.md.`,
     ``,
-    ...stale.map(
+    ...findings.map(
       (p) =>
         `  node "${CLI}" phases handoff "<what's done; decision/gotcha; next step>" --plan ${p.slug}`,
     ),
@@ -236,11 +334,22 @@ function main() {
   const since = sessionStartMs(input.transcript_path);
   if (since == null) return; // unknown session window → stand down
 
-  const stale = stalePlans(cwd, since, doneTaskLookup(appData));
-  if (!stale.length) return;
+  // The plan's CURRENT phase (title/desc) — a baton that merely parrots it carries
+  // nothing the next session can't already read. readPlansForHook is the same
+  // reader the SessionStart hook uses, so both see one grammar.
+  let currentPhase = () => null;
+  try {
+    const byPlan = new Map(readPlansForHook(cwd).map((p) => [p.slug, p.current]));
+    currentPhase = (slug) => byPlan.get(slug) || null;
+  } catch {
+    // unreadable plans → skip the parroting check, keep the rest
+  }
+
+  const findings = auditPlans(cwd, since, doneTaskLookup(appData), currentPhase);
+  if (!findings.length) return;
 
   // Exit 2 is the Stop hook's "block": stderr goes back to Claude as the reason.
-  process.stderr.write(reason(stale) + "\n");
+  process.stderr.write(reason(findings) + "\n");
   process.exit(2);
 }
 
