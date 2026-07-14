@@ -84,6 +84,13 @@ pub struct Todo {
     /// the graph without a transitive walk. Empty → omitted from the file.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub handoff: String,
+    /// When `handoff` was last WRITTEN, RFC3339; None = never. Distinct from
+    /// `updated_at`, which any edit bumps: the Stop-hook guard (#59) needs to tell
+    /// a baton written for THIS session's work from one a previous session left —
+    /// with only `updated_at`, a year-old handoff on a task touched today reads as
+    /// fresh. Set by whoever writes the field (the cc-todos CLI and [`upsert`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_at: Option<String>,
     /// When this todo arrived via an import (#181), RFC3339; None = created here.
     /// Set by [`merge_import`] on every task it brings in, so the board can mark
     /// them and the user can tell an imported row from a local one — in particular
@@ -225,10 +232,23 @@ pub fn upsert(file: &mut TodoFile, mut todo: Todo, now: &str) {
         if todo.from.is_none() {
             todo.from = existing.from.clone();
         }
+        // Stamp the baton only when its TEXT actually changed — an unrelated edit
+        // (priority, a comment) must not make an old handoff look freshly written
+        // to the Stop guard. Carry the old stamp otherwise; drop it when cleared.
+        todo.handoff_at = if todo.handoff.trim().is_empty() {
+            None
+        } else if todo.handoff != existing.handoff {
+            Some(now.to_string())
+        } else {
+            existing.handoff_at.clone()
+        };
         *existing = todo;
     } else {
         if todo.created_at.is_empty() {
             todo.created_at = now.to_string();
+        }
+        if !todo.handoff.trim().is_empty() && todo.handoff_at.is_none() {
+            todo.handoff_at = Some(now.to_string());
         }
         if todo.number == 0 {
             todo.number = max_number(file) + 1;
@@ -885,6 +905,7 @@ mod tests {
             links: Vec::new(),
             depends_on: Vec::new(),
             handoff: String::new(),
+            handoff_at: None,
             imported_at: None,
             created_by: String::new(),
             created_at: String::new(),
@@ -993,6 +1014,38 @@ mod tests {
         assert_eq!(f.todos[0].subject, "changed");
         assert_eq!(f.todos[0].created_at, "T1"); // preserved
         assert_eq!(f.todos[0].updated_at, "T2"); // bumped
+    }
+
+    /// `handoff_at` is what the Stop guard (#59) reads to tell a baton written for
+    /// THIS session from one an earlier session left. It must move only when the
+    /// baton's TEXT does — an unrelated edit bumps `updated_at`, and if it bumped
+    /// the stamp too, a stale handoff would pass the guard as freshly written.
+    #[test]
+    fn upsert_stamps_handoff_only_when_its_text_changes() {
+        let mut f = TodoFile::default();
+        let mut t = todo("a", "in_progress");
+        t.handoff = "phase 1 done; next: wire the guard".into();
+        upsert(&mut f, t, "T1");
+        assert_eq!(f.todos[0].handoff_at.as_deref(), Some("T1"));
+
+        // An unrelated edit (priority) with the SAME baton → stamp stands still.
+        let mut same = f.todos[0].clone();
+        same.priority = "high".into();
+        upsert(&mut f, same, "T2");
+        assert_eq!(f.todos[0].updated_at, "T2");
+        assert_eq!(f.todos[0].handoff_at.as_deref(), Some("T1"));
+
+        // Rewriting the baton → stamped now.
+        let mut rewritten = f.todos[0].clone();
+        rewritten.handoff = "phase 2 done; next: the task guard".into();
+        upsert(&mut f, rewritten, "T3");
+        assert_eq!(f.todos[0].handoff_at.as_deref(), Some("T3"));
+
+        // Clearing it drops the stamp — there's no baton to date.
+        let mut cleared = f.todos[0].clone();
+        cleared.handoff = String::new();
+        upsert(&mut f, cleared, "T4");
+        assert_eq!(f.todos[0].handoff_at, None);
     }
 
     #[test]

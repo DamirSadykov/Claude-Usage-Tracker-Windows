@@ -185,6 +185,16 @@ const messages = {
     phasesSetting: "Phases in tasks",
     phasesSettingDesc:
       "Show phase checkboxes on task cards.",
+    handoffGuardSetting: "HANDOFF guard at session end (plans)",
+    handoffGuardSettingDesc:
+      "If a session worked a phase plan but left its handoff older than that work — or wrote an empty one — block the stop once and ask Claude for a real baton (Stop hook). Off: a session can end with no handoff.",
+    taskGuardSetting: "HANDOFF guard for tasks",
+    taskGuardDesc:
+      "Which tasks must leave a handoff before the session ends. A task's baton is what a dependent task inherits — without it, the next task starts blind.",
+    taskGuardBoth: "Submitted and unfinished",
+    taskGuardSubmitted: "Only moved to review/done",
+    taskGuardUnfinished: "Only left in progress",
+    taskGuardOff: "Off",
     todoEstimate: "Estimate (min)",
     todoScheduledFor: "When",
     todoPriority: "Priority",
@@ -623,9 +633,11 @@ const messages = {
     ioImported: "Imported: {added} added, {forked} filed as new. {total} task(s) on the board.",
     installCcHook: "Claude Code CLI + hook",
     installCcHookDesc:
-      "Wire the SessionStart hook into ~/.claude/settings.json so every Claude Code session sees this project's tasks and edits them via the cc-todos CLI.",
+      "Wire the SessionStart and Stop hooks into ~/.claude/settings.json so every Claude Code session sees this project's tasks, edits them via the cc-todos CLI, and can't end a phase session without leaving a handoff.",
     installCcHookOn: "Installed",
     installCcHookOff: "Not installed",
+    installCcHookStopMissing:
+      "The Stop hook (HANDOFF guard) isn't wired yet — reinstall to add it.",
     installCcHookBtn: "Install",
     installCcHookReinstall: "Reinstall / update path",
     installCcHookDone: "Done — wired {path}",
@@ -828,6 +840,16 @@ const messages = {
     phasesSetting: "Фазы в задачах",
     phasesSettingDesc:
       "Показывать чекбоксы фаз на карточках задач.",
+    handoffGuardSetting: "Guard HANDOFF в конце сессии (планы)",
+    handoffGuardSettingDesc:
+      "Если сессия работала с планом фаз, но handoff остался старше этой работы — или записан пустым — один раз заблокировать выход и попросить Claude оставить настоящий батон (хук Stop). Выкл.: сессия может завершиться без handoff.",
+    taskGuardSetting: "Guard HANDOFF для задач",
+    taskGuardDesc:
+      "Какие задачи обязаны оставить handoff до конца сессии. Батон задачи — это то, что наследует зависимая задача; без него следующая задача стартует вслепую.",
+    taskGuardBoth: "Сданные и недоделанные",
+    taskGuardSubmitted: "Только переведённые в review/done",
+    taskGuardUnfinished: "Только оставленные в работе",
+    taskGuardOff: "Выключен",
     todoEstimate: "Оценка (мин)",
     todoScheduledFor: "Когда",
     todoPriority: "Приоритет",
@@ -1266,9 +1288,11 @@ const messages = {
     ioImported: "Импортировано: добавлено {added}, заведено новыми {forked}. Задач на доске: {total}.",
     installCcHook: "CLI + хук Claude Code",
     installCcHookDesc:
-      "Прописать SessionStart-хук в ~/.claude/settings.json, чтобы каждая сессия Claude Code видела задачи этого проекта и меняла их через CLI cc-todos.",
+      "Прописать хуки SessionStart и Stop в ~/.claude/settings.json, чтобы каждая сессия Claude Code видела задачи этого проекта, меняла их через CLI cc-todos и не завершала фазовую сессию без handoff.",
     installCcHookOn: "Установлено",
     installCcHookOff: "Не установлено",
+    installCcHookStopMissing:
+      "Хук Stop (guard HANDOFF) ещё не прописан — переустановите, чтобы добавить его.",
     installCcHookBtn: "Установить",
     installCcHookReinstall: "Переустановить / обновить путь",
     installCcHookDone: "Готово — прописан {path}",

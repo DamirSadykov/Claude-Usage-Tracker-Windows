@@ -1703,13 +1703,16 @@ fn save_project_groups(
     Ok(())
 }
 
-// --- CLI + SessionStart hook installer ---
+// --- CLI + Claude Code hook installer ---
 //
 // The unified `cli.mjs` (todos / phases / hook areas) ships as bundled Node
-// scripts (resources). "Install" = wire the hook into the user's
-// ~/.claude/settings.json so Claude Code runs `cli.mjs hook` on every session
-// start. The CLI areas need no separate wiring — the hook hands Claude the
-// cli.mjs path and Claude calls `cli.mjs todos …` itself.
+// scripts (resources). "Install" = wire the hooks into the user's
+// ~/.claude/settings.json so Claude Code runs them around every session:
+//   • SessionStart → `cli.mjs hook`       — inject the task board / current phase.
+//   • Stop         → `cli.mjs stop-hook`  — block a stop that leaves a phase plan
+//                                           with a stale HANDOFF baton (issue #59).
+// The CLI areas need no separate wiring — the hook hands Claude the cli.mjs path
+// and Claude calls `cli.mjs todos …` itself.
 
 /// Absolute path to the unified `cli.mjs`, forward-slashed for a clean
 /// settings.json command on Windows. In a packaged build it's the bundled
@@ -1773,10 +1776,10 @@ fn claude_settings_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(home.join(".claude").join("settings.json"))
 }
 
-/// True if any SessionStart hook command references cc-todos-hook.mjs.
-fn settings_has_cc_hook(v: &serde_json::Value) -> bool {
+/// True if any hook command under `event` (SessionStart / Stop) is ours.
+fn settings_has_cc_hook(v: &serde_json::Value, event: &str) -> bool {
     v.get("hooks")
-        .and_then(|h| h.get("SessionStart"))
+        .and_then(|h| h.get(event))
         .and_then(|s| s.as_array())
         .is_some_and(|groups| {
             groups.iter().any(|g| {
@@ -1794,62 +1797,58 @@ fn settings_has_cc_hook(v: &serde_json::Value) -> bool {
 #[derive(Serialize)]
 struct CcHookStatus {
     installed: bool,
+    /// The Stop hook (HANDOFF guard) specifically — an install from before it
+    /// existed has `installed: true` but no Stop entry, so the UI can offer a
+    /// re-install rather than silently running without the guard.
+    stop_installed: bool,
     script_path: String,
     settings_path: String,
 }
 
-/// Whether the SessionStart hook is already wired, plus the paths involved.
+/// Whether our hooks are already wired, plus the paths involved.
 #[tauri::command]
 fn cc_hook_status(app: AppHandle) -> Result<CcHookStatus, String> {
     let settings = claude_settings_path(&app)?;
-    let installed = std::fs::read_to_string(&settings)
+    let root = std::fs::read_to_string(&settings)
         .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .map(|v| settings_has_cc_hook(&v))
-        .unwrap_or(false);
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
     Ok(CcHookStatus {
-        installed,
+        installed: root
+            .as_ref()
+            .map(|v| settings_has_cc_hook(v, "SessionStart"))
+            .unwrap_or(false),
+        stop_installed: root
+            .as_ref()
+            .map(|v| settings_has_cc_hook(v, "Stop"))
+            .unwrap_or(false),
         script_path: cc_hook_script_path(&app).unwrap_or_default(),
         settings_path: settings.to_string_lossy().replace('\\', "/"),
     })
 }
 
-/// Wire the SessionStart hook into ~/.claude/settings.json. Idempotent: updates an
-/// existing cc-todos entry's path in place, or appends a new group; preserves all
-/// other hooks and keys. Atomic write (temp → rename). Returns the wired path.
-#[tauri::command]
-fn install_cc_hook(app: AppHandle) -> Result<String, String> {
-    let script = cc_hook_script_path(&app)?;
-    let command = format!("node \"{script}\" hook");
-    let settings_path = claude_settings_path(&app)?;
-
-    let mut root: serde_json::Value = std::fs::read_to_string(&settings_path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-    if !root.is_object() {
-        root = serde_json::json!({});
-    }
-
-    let obj = root.as_object_mut().unwrap();
+/// Wire one hook event (SessionStart / Stop) to `command` inside a settings root.
+///
+/// Idempotent: rewrites OUR entry under that event in place (a moved install dir,
+/// or an upgrade from the legacy standalone script), otherwise appends a group.
+/// Every foreign hook is left untouched — the user's own Stop hooks keep running
+/// alongside ours. Returns the dirs of any legacy `cc-todos-hook.mjs` entries it
+/// replaced, so the caller can clean up the orphaned scripts.
+fn wire_hook_event(root: &mut serde_json::Value, event: &str, command: &str) -> Vec<PathBuf> {
+    let obj = root.as_object_mut().expect("settings root is an object");
     let hooks = obj.entry("hooks").or_insert_with(|| serde_json::json!({}));
     if !hooks.is_object() {
         *hooks = serde_json::json!({});
     }
-    let ss = hooks
+    let ev = hooks
         .as_object_mut()
         .unwrap()
-        .entry("SessionStart")
+        .entry(event)
         .or_insert_with(|| serde_json::json!([]));
-    if !ss.is_array() {
-        *ss = serde_json::json!([]);
+    if !ev.is_array() {
+        *ev = serde_json::json!([]);
     }
-    let groups = ss.as_array_mut().unwrap();
+    let groups = ev.as_array_mut().unwrap();
 
-    // Update our command in place if already present (re-install / moved path).
-    // While doing so, note the dir of any LEGACY (cc-todos-hook.mjs) entry so its
-    // now-orphan cc-*.mjs scripts can be deleted after the write — migrating to
-    // cli.mjs shouldn't leave the old standalone scripts piling up on disk.
     let mut updated = false;
     let mut legacy_dirs: Vec<PathBuf> = Vec::new();
     for g in groups.iter_mut() {
@@ -1867,7 +1866,7 @@ fn install_cc_hook(app: AppHandle) -> Result<String, String> {
                             }
                         }
                     }
-                    hook["command"] = serde_json::Value::String(command.clone());
+                    hook["command"] = serde_json::Value::String(command.to_string());
                     updated = true;
                 }
             }
@@ -1878,6 +1877,39 @@ fn install_cc_hook(app: AppHandle) -> Result<String, String> {
             "hooks": [ { "type": "command", "command": command } ]
         }));
     }
+    legacy_dirs
+}
+
+/// Wire BOTH our hooks into ~/.claude/settings.json — SessionStart (task/phase
+/// context) and Stop (the HANDOFF freshness guard, issue #59). Idempotent: updates
+/// an existing entry's path in place, or appends a new group; preserves all other
+/// hooks and keys. Atomic write (temp → rename). Returns the wired script path.
+#[tauri::command]
+fn install_cc_hook(app: AppHandle) -> Result<String, String> {
+    let script = cc_hook_script_path(&app)?;
+    let settings_path = claude_settings_path(&app)?;
+
+    let mut root: serde_json::Value = std::fs::read_to_string(&settings_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !root.is_object() {
+        root = serde_json::json!({});
+    }
+
+    // The dirs of any LEGACY (cc-todos-hook.mjs) entries we rewired — their
+    // now-orphan cc-*.mjs scripts get deleted after the write, so migrating to
+    // cli.mjs doesn't leave the old standalone scripts piling up on disk.
+    let mut legacy_dirs = wire_hook_event(
+        &mut root,
+        "SessionStart",
+        &format!("node \"{script}\" hook"),
+    );
+    legacy_dirs.extend(wire_hook_event(
+        &mut root,
+        "Stop",
+        &format!("node \"{script}\" stop-hook"),
+    ));
 
     if let Some(dir) = settings_path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
@@ -2595,5 +2627,90 @@ mod hook_install_tests {
         // A second run over the now-clean dir must not error.
         remove_legacy_scripts(&dir);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The commands `install_cc_hook` wires, so the tests read like the real thing.
+    const SS_CMD: &str = r#"node "C:/app/scripts/cli.mjs" hook"#;
+    const STOP_CMD: &str = r#"node "C:/app/scripts/cli.mjs" stop-hook"#;
+
+    /// Every command wired under one hook event, in order.
+    fn commands_for(root: &serde_json::Value, event: &str) -> Vec<String> {
+        root["hooks"][event]
+            .as_array()
+            .map(|groups| {
+                groups
+                    .iter()
+                    .filter_map(|g| g["hooks"].as_array())
+                    .flatten()
+                    .filter_map(|h| h["command"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn wires_both_events_into_empty_settings() {
+        let mut root = serde_json::json!({});
+        wire_hook_event(&mut root, "SessionStart", SS_CMD);
+        wire_hook_event(&mut root, "Stop", STOP_CMD);
+        assert_eq!(commands_for(&root, "SessionStart"), vec![SS_CMD]);
+        assert_eq!(commands_for(&root, "Stop"), vec![STOP_CMD]);
+        assert!(settings_has_cc_hook(&root, "SessionStart"));
+        assert!(settings_has_cc_hook(&root, "Stop"));
+    }
+
+    #[test]
+    fn rewires_a_moved_install_in_place_without_duplicating() {
+        // An older install under a different path: re-installing must UPDATE it,
+        // not append a second entry that would run the hook twice.
+        let mut root = serde_json::json!({
+            "hooks": {
+                "SessionStart": [ { "hooks": [ { "type": "command", "command": r#"node "D:/old/cli.mjs" hook"# } ] } ],
+                "Stop": [ { "hooks": [ { "type": "command", "command": r#"node "D:/old/cli.mjs" stop-hook"# } ] } ]
+            }
+        });
+        wire_hook_event(&mut root, "SessionStart", SS_CMD);
+        wire_hook_event(&mut root, "Stop", STOP_CMD);
+        assert_eq!(commands_for(&root, "SessionStart"), vec![SS_CMD]);
+        assert_eq!(commands_for(&root, "Stop"), vec![STOP_CMD]);
+    }
+
+    #[test]
+    fn adds_the_stop_guard_to_an_install_that_predates_it() {
+        // The upgrade path: SessionStart was wired before the guard existed, and
+        // the user has their OWN Stop hook — ours is appended, theirs survives.
+        let foreign = r#"node "$HOME/knowledge/invariant-review.mjs""#;
+        let mut root = serde_json::json!({
+            "hooks": {
+                "SessionStart": [ { "hooks": [ { "type": "command", "command": SS_CMD } ] } ],
+                "Stop": [ { "hooks": [ { "type": "command", "command": foreign } ] } ]
+            }
+        });
+        assert!(!settings_has_cc_hook(&root, "Stop"));
+        wire_hook_event(&mut root, "SessionStart", SS_CMD);
+        wire_hook_event(&mut root, "Stop", STOP_CMD);
+        assert_eq!(commands_for(&root, "Stop"), vec![foreign, STOP_CMD]);
+        assert!(settings_has_cc_hook(&root, "Stop"));
+    }
+
+    #[test]
+    fn migrating_from_the_legacy_script_reports_its_dir_for_cleanup() {
+        let mut root = serde_json::json!({
+            "hooks": {
+                "SessionStart": [ { "hooks": [ { "type": "command", "command": r#"node "D:/x/scripts/cc-todos-hook.mjs""# } ] } ]
+            }
+        });
+        let legacy = wire_hook_event(&mut root, "SessionStart", SS_CMD);
+        assert_eq!(legacy, vec![PathBuf::from("D:/x/scripts")]);
+        assert_eq!(commands_for(&root, "SessionStart"), vec![SS_CMD]);
+    }
+
+    #[test]
+    fn a_malformed_event_value_is_replaced_not_trusted() {
+        // Someone hand-wrote `"Stop": {}` (an object, not an array) — we reset it
+        // to a valid array rather than panicking or silently doing nothing.
+        let mut root = serde_json::json!({ "hooks": { "Stop": {} } });
+        wire_hook_event(&mut root, "Stop", STOP_CMD);
+        assert_eq!(commands_for(&root, "Stop"), vec![STOP_CMD]);
     }
 }
