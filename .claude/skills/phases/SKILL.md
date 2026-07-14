@@ -77,6 +77,25 @@ project has exactly one plan. `done`/`reopen` on a phase cover its subphases.
 4. When the phase is complete: `done 1`, run `verify`, and **STOP**. Don't roll
    into the next phase — one phase per session is what keeps context small.
 
+**Size the ritual to the phase.** "One phase per session" exists to keep context
+small, not as a rule for its own sake. Several *small* phases (a rename, a config
+flip, a one-file edit) can share one session — batch them, then hand off once.
+Hold the rule strictly for a phase big enough to bloat context on its own: that's
+exactly the case where rolling into the next one costs you the plan.
+
+## Check the plan is still the right plan — once, mid-plan
+Around the middle of a plan (the phase that lands at ~half of them), spend the
+start of that session on the plan itself before touching the phase:
+
+- re-read the Vision and **every** handoff so far (`README.md` + `HANDOFF.md`),
+- ask the one question the per-phase isolation can't: **does this plan still serve
+  the goal?** — not "is this phase going well".
+
+Drift accumulates quietly and only becomes obvious at the last phase, where it's
+expensive: a plan can spend five phases perfecting something the Vision never
+asked for. If the answer is no, say so and re-plan (`add --at`, `move`, `delete`)
+instead of finishing a plan that's aimed at the wrong target.
+
 ## Hand off to the next session
 Before you stop, leave a short baton for whoever picks up the next phase — what's
 done, any decision or gotcha, the concrete next step. The CLI stores it in the
@@ -85,5 +104,20 @@ with the current phase:
 
     node <cli> phases handoff "phase 1 done; <finding>; next: <step>"
 
-Keep it short — a baton, not a log. (You can also drop a longer note in the plan's
-`README.md`, or post it on the tracker task with `cli.mjs todos comment add`.)
+Keep it short — a baton, not a log.
+
+**The handoff is the record — don't write it three times.** On closing a phase it's
+tempting to write the same thing into the handoff, a tracker comment, AND a
+`PHASE-N-PROGRESS.md`. Write it **once**, in the handoff:
+
+- **tracker comment** — a pointer, not a copy: "phase 2 done — baton in
+  `.claude/phases/<Plan>/HANDOFF.md`" (`cli.mjs todos comment add`).
+- **`PHASE-N-PROGRESS.md`** — only for a phase big enough to span several sessions,
+  where an in-phase log is genuinely orthogonal to the baton. A normal phase
+  doesn't need one.
+
+**A stale baton blocks the stop.** If the session touched a plan's phase files and
+the handoff is older than that work, the tracker's Stop hook blocks the stop once
+and asks for the baton (settings → "HANDOFF guard at session end"). It goes by
+file mtimes, not by how the session looked, so a caveat that surfaced ten turns
+before you ticked the phase still gets a baton written for it.

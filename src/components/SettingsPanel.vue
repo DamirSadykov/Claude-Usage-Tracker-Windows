@@ -288,9 +288,13 @@ function toggleRuntime(kind: string) {
 
 onMounted(loadIgnoredInsights);
 
-// --- cc-todos CLI + SessionStart hook installer ---
+// --- cc-todos CLI + Claude Code hook installer ---
+// The installer wires two hooks: SessionStart (task/phase context) and Stop (the
+// HANDOFF freshness guard). `stop_installed` is false for an install made before
+// the guard existed — the UI then nudges a re-install instead of leaving it off.
 interface CcHookStatus {
   installed: boolean;
+  stop_installed: boolean;
   script_path: string;
   settings_path: string;
 }
@@ -442,6 +446,33 @@ async function toggleHookContext() {
 }
 
 onMounted(loadHookContext);
+
+// --- HANDOFF freshness guard (issue #59) ---
+// A UI-only flag in settings.json read by the Stop hook: when ON, a session that
+// worked a phase plan can't end while the plan's HANDOFF baton is older than the
+// work — the stop is blocked once, with a nudge to write it. Default ON.
+const phaseHandoffGuard = ref(true);
+
+async function loadHandoffGuard() {
+  try {
+    const { load: loadStore } = await import("@tauri-apps/plugin-store");
+    const store = await loadStore("settings.json");
+    const v = await store.get<boolean>("phaseHandoffGuard");
+    if (typeof v === "boolean") phaseHandoffGuard.value = v;
+  } catch {}
+}
+
+async function toggleHandoffGuard() {
+  phaseHandoffGuard.value = !phaseHandoffGuard.value;
+  try {
+    const { load: loadStore } = await import("@tauri-apps/plugin-store");
+    const store = await loadStore("settings.json");
+    await store.set("phaseHandoffGuard", phaseHandoffGuard.value);
+    await store.save();
+  } catch {}
+}
+
+onMounted(loadHandoffGuard);
 
 // --- Task audit schedule (#35) ---
 // Moved here from the tasks window. The in-app scheduler runs a headless
@@ -1444,13 +1475,22 @@ function handleSave() {
 
       <!-- ===== Tasks ===== -->
       <template v-if="tab === 'tasks'">
-      <!-- Install the cc-todos CLI + SessionStart hook into ~/.claude/settings.json -->
+      <!-- Install the cc-todos CLI + the SessionStart/Stop hooks into ~/.claude/settings.json -->
       <div class="card" style="display: flex; align-items: center; gap: 12px">
         <div style="flex: 1; min-width: 0">
           <div class="card-title" style="font-size: 13px">{{ t('installCcHook') }}</div>
           <div class="card-sub">{{ t('installCcHookDesc') }}</div>
           <div v-if="ccHookStatus" class="card-sub" style="margin-top: 6px">
             {{ ccHookStatus.installed ? t('installCcHookOn') : t('installCcHookOff') }}
+          </div>
+          <!-- Installed before the Stop guard existed: the SessionStart hook runs,
+               but nothing checks the handoff at session end until a re-install. -->
+          <div
+            v-if="ccHookStatus && ccHookStatus.installed && !ccHookStatus.stop_installed"
+            class="field-hint"
+            style="margin-top: 4px; color: #fbbf24"
+          >
+            {{ t('installCcHookStopMissing') }}
           </div>
           <div v-if="installCcMsg" class="field-hint" style="margin-top: 4px">{{ installCcMsg }}</div>
         </div>
@@ -1477,6 +1517,18 @@ function handleSave() {
           <div class="card-sub">{{ t('phasesSettingDesc') }}</div>
         </div>
         <div class="toggle" :class="{ on: phasesEnabled }">
+          <div class="toggle-knob"></div>
+        </div>
+      </div>
+
+      <!-- HANDOFF freshness guard (issue #59) — UI-only flag in settings.json,
+           read by the Stop hook to block a session that leaves a stale baton. -->
+      <div class="card toggle-card" @click="toggleHandoffGuard">
+        <div style="flex: 1; min-width: 0">
+          <div class="card-title" style="font-size: 13px">{{ t('handoffGuardSetting') }}</div>
+          <div class="card-sub">{{ t('handoffGuardSettingDesc') }}</div>
+        </div>
+        <div class="toggle" :class="{ on: phaseHandoffGuard }">
           <div class="toggle-knob"></div>
         </div>
       </div>
