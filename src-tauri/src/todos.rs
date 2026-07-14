@@ -77,6 +77,13 @@ pub struct Todo {
     /// graph draws as a second, dashed edge. Empty → omitted from the file.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
+    /// Handoff note carried FORWARD along dependency edges (#141): what this task
+    /// produced and where it left off, written by the LLM (like a phases handoff).
+    /// A session working on a task that DEPENDS ON this one pulls it in via
+    /// `cc-todos todos handoff <task>`, so naturally-cumulative context flows down
+    /// the graph without a transitive walk. Empty → omitted from the file.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub handoff: String,
     /// Who composed this todo: `"user"` (hand-written in the UI) or `"claude"`
     /// (the cc-todos CLI). Empty (legacy rows) renders as a user task — no AI
     /// badge — so existing files need no migration.
@@ -549,6 +556,7 @@ mod tests {
             comments: Vec::new(),
             links: Vec::new(),
             depends_on: Vec::new(),
+            handoff: String::new(),
             created_by: String::new(),
             created_at: String::new(),
             updated_at: String::new(),
@@ -860,6 +868,29 @@ mod tests {
         assert_eq!(raw.matches("\"depends_on\"").count(), 1);
         let back = load(&path);
         assert_eq!(back.todos.iter().find(|t| t.id == "a").unwrap().depends_on, vec!["b".to_string()]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn handoff_round_trips_and_empty_is_omitted() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("cut_todos_handoff_test.json");
+        let _ = std::fs::remove_file(&path);
+        let mut f = TodoFile::default();
+        let mut a = board_todo("a", Some("p"));
+        a.handoff = "produced X; next step Y (see t#12)".to_string();
+        f.todos = vec![a, board_todo("b", Some("p"))];
+        save(&path, &f).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        // The tracker preserves a CLI-written handoff (#141) across a rewrite; the
+        // empty one (b) is omitted so untouched rows stay clean.
+        assert_eq!(raw.matches("\"handoff\"").count(), 1);
+        let back = load(&path);
+        assert_eq!(
+            back.todos.iter().find(|t| t.id == "a").unwrap().handoff,
+            "produced X; next step Y (see t#12)"
+        );
+        assert!(back.todos.iter().find(|t| t.id == "b").unwrap().handoff.is_empty());
         let _ = std::fs::remove_file(&path);
     }
 

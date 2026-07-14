@@ -209,7 +209,12 @@ function clear() {
   position: absolute;
   top: 100%;
   left: 0;
-  right: 0;
+  /* Grow to fit the longest suggestion (like the native <select> this replaced
+     in #70), but never narrower than the input. Cap so a very long name can't
+     run off the window; only past the cap does the item ellipsis kick in. */
+  min-width: 100%;
+  width: max-content;
+  max-width: min(480px, 90vw);
   z-index: 50;
   margin: 2px 0 0;
   padding: 4px;

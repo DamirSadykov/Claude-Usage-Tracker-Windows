@@ -71,6 +71,7 @@ export interface Todo {
   comments?: Comment[];
   links?: string[];
   depends_on?: string[]; // ids of tasks this one depends on — task-graph edges (#88)
+  handoff?: string; // what this task hands forward to its dependents (#141)
   created_by?: string; // "user" | "claude" ("" / absent = user, no AI badge)
   created_at: string;
   updated_at: string;
@@ -373,6 +374,7 @@ interface Draft {
   subject: string;
   description: string;
   plan: string;
+  handoff: string;
   project: string;
   estimate_minutes: number | null;
   scheduled_for: string;
@@ -383,6 +385,7 @@ const draft = ref<Draft>({
   subject: "",
   description: "",
   plan: "",
+  handoff: "",
   project: "",
   estimate_minutes: null,
   scheduled_for: "",
@@ -404,12 +407,32 @@ const detailSiblings = computed(() => {
     .sort((a, b) => rankStatus(a.status) - rankStatus(b.status));
 });
 
+// Handoff the open task INHERITS from its direct prerequisites (#141): the same
+// view `cc-todos todos handoff <task>` gives an agent, surfaced read-only in the
+// card. Only direct `depends_on` — cumulative context rides authored handoff text.
+const inheritedHandoff = computed(() => {
+  const cur = detail.value;
+  if (!cur || !Array.isArray(cur.depends_on) || !cur.depends_on.length) return [];
+  const byId = new Map(todos.value.map((t) => [t.id, t]));
+  return cur.depends_on
+    .map((id) => byId.get(id))
+    .filter((p): p is Todo => !!p)
+    .map((p) => ({
+      id: p.id,
+      number: p.number,
+      subject: p.subject,
+      status: p.status,
+      handoff: (p.handoff ?? "").trim(),
+    }));
+});
+
 function openDetail(todo: Todo) {
   detailId.value = todo.id;
   draft.value = {
     subject: todo.subject,
     description: todo.description ?? "",
     plan: todo.plan ?? "",
+    handoff: todo.handoff ?? "",
     project: todo.project ?? "",
     estimate_minutes: todo.estimate_minutes ?? null,
     scheduled_for: todo.scheduled_for ?? "",
@@ -437,6 +460,7 @@ async function saveDetail() {
     subject: d.subject.trim(),
     description: d.description.trim(),
     plan: d.plan.trim(),
+    handoff: d.handoff.trim(),
     project: d.project.trim() || null,
     estimate_minutes:
       d.estimate_minutes === null || Number.isNaN(d.estimate_minutes)
@@ -1771,6 +1795,24 @@ onUnmounted(() => {
             <textarea v-model="draft.plan" class="tw-input tw-area" rows="5"></textarea>
           </label>
 
+          <!-- Handoff (#141): what this task hands forward to whatever depends on it.
+               Written here or by the cc-todos CLI; a session on a dependent task reads it. -->
+          <label class="tw-field">
+            <span>{{ t("todoHandoff") }} <em class="tw-hint">{{ t("todoHandoffHint") }}</em></span>
+            <textarea v-model="draft.handoff" class="tw-input tw-area" rows="4"></textarea>
+          </label>
+
+          <!-- Inherited handoff: read-only, what the tasks THIS one depends on left
+               off. Mirrors `cc-todos todos handoff <task>`. -->
+          <div v-if="inheritedHandoff.length" class="tw-field tw-handoff-in">
+            <span class="tw-handoff-in-hd">{{ t("todoHandoffInherited") }}</span>
+            <div v-for="p in inheritedHandoff" :key="p.id" class="tw-handoff-item">
+              <div class="tw-handoff-item-hd">t#{{ p.number }} · {{ p.subject }}</div>
+              <p v-if="p.handoff" class="tw-handoff-item-body">{{ p.handoff }}</p>
+              <p v-else class="tw-handoff-item-empty">{{ t("todoHandoffItemEmpty") }}</p>
+            </div>
+          </div>
+
           <!-- Phase plan (issue #16): read-only checkboxes; done → struck through.
                The cc-phases CLI is the only writer; here it's display-only. -->
           <div v-if="phasesEnabled && phasesFor(detail)" class="tw-field tw-phases">
@@ -2727,6 +2769,44 @@ onUnmounted(() => {
   line-height: 1.45;
   color: var(--text-2);
   white-space: pre-wrap;
+}
+/* Inherited handoff (#141): read-only summary of what upstream deps left off. */
+.tw-handoff-in {
+  gap: 6px;
+}
+.tw-handoff-in-hd {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-3, #7a808a);
+}
+.tw-handoff-item {
+  border-left: 2px solid var(--stroke-strong, rgba(255, 255, 255, 0.12));
+  background: var(--card-bg);
+  border-radius: 4px;
+  padding: 6px 9px;
+}
+.tw-handoff-item + .tw-handoff-item {
+  margin-top: 4px;
+}
+.tw-handoff-item-hd {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+.tw-handoff-item-body {
+  margin: 3px 0 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-2);
+  white-space: pre-wrap;
+}
+.tw-handoff-item-empty {
+  margin: 3px 0 0;
+  font-size: 12px;
+  font-style: italic;
+  color: var(--text-3, #7a808a);
 }
 .tw-phase-list,
 .tw-sub-list {
