@@ -84,6 +84,13 @@ pub struct Todo {
     /// the graph without a transitive walk. Empty → omitted from the file.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub handoff: String,
+    /// When this todo arrived via an import (#181), RFC3339; None = created here.
+    /// Set by [`merge_import`] on every task it brings in, so the board can mark
+    /// them and the user can tell an imported row from a local one — in particular
+    /// a FORK, the copy made when an incoming task's id already existed locally.
+    /// Never cleared: it is provenance, not transient state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imported_at: Option<String>,
     /// Who composed this todo: `"user"` (hand-written in the UI) or `"claude"`
     /// (the cc-todos CLI). Empty (legacy rows) renders as a user task — no AI
     /// badge — so existing files need no migration.
@@ -536,6 +543,327 @@ pub fn canonical_status(status: &str) -> &str {
     }
 }
 
+// --- Import / export (#181) ---------------------------------------------------
+//
+// Moving a board between machines used to mean copying `todos.json` over, which
+// silently DESTROYS whatever the target machine added meanwhile. Import here is a
+// MERGE that never overwrites and never drops:
+//
+//   * identity is `id`, not `number` — two machines both doing `max+1` hand out
+//     the SAME number to DIFFERENT tasks, so a number collision is expected and
+//     is resolved by renumbering the incoming task;
+//   * an incoming task whose `id` ALREADY EXISTS locally is the same task edited
+//     on both machines. We do not pick a winner: the local row is left untouched
+//     and the incoming version is filed as a NEW task (fresh id + number), marked
+//     `imported_at`. Both versions survive; the user reconciles them by hand.
+//
+// Because a fork mints a fresh id, the incoming subgraph must be rewired onto the
+// new ids, and inline `t#N` prose must follow the new numbers — otherwise imported
+// tasks would point at the LOCAL rows they were forked from.
+
+/// A fresh opaque task id. `id` is documented as an opaque string (the frontend
+/// uses `crypto.randomUUID`), so we mint the same v4 shape from the OS RNG rather
+/// than pull in a uuid crate — the dependency surface here is deliberately small.
+fn new_id() -> String {
+    let mut b = [0u8; 16];
+    // A failing OS RNG is not recoverable here; fall back to a time-seeded value
+    // so an import can still complete rather than aborting the user's merge.
+    if getrandom::getrandom(&mut b).is_err() {
+        let ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        for (i, byte) in b.iter_mut().enumerate() {
+            *byte = (ns >> (i * 4)) as u8;
+        }
+    }
+    b[6] = (b[6] & 0x0f) | 0x40; // version 4
+    b[8] = (b[8] & 0x3f) | 0x80; // variant 1
+    let h = |r: &[u8]| r.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    format!(
+        "{}-{}-{}-{}-{}",
+        h(&b[0..4]),
+        h(&b[4..6]),
+        h(&b[6..8]),
+        h(&b[8..10]),
+        h(&b[10..16])
+    )
+}
+
+/// Rewrite inline task references `t#N` → `t#M` for every renumbered task in `map`.
+///
+/// This is the INVERSE direction of [`rewrite_inline_refs`], which promotes a bare
+/// `#N` to `t#N`. Here the form is already explicit and only the NUMBER moves, so
+/// the recognizer mirrors the UI/CLI tokenizer exactly (`(?<![A-Za-z0-9])[tT]#\d+`):
+/// a `t`/`T` not glued to a preceding word, then `#`, then digits. A bare `#N` is
+/// deliberately left alone — it means a GitHub PR/issue, not a task (#63).
+/// Returns the rewritten text and how many references moved.
+pub fn remap_inline_refs(text: &str, map: &std::collections::HashMap<u32, u32>) -> (String, usize) {
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut count = 0usize;
+    let mut k = 0usize;
+    while k < chars.len() {
+        let c = chars[k].1;
+        if (c == 't' || c == 'T')
+            && k + 2 < chars.len()
+            && chars[k + 1].1 == '#'
+            && chars[k + 2].1.is_ascii_digit()
+            // not glued to a preceding word (`part#5`, `xt#5`)
+            && (k == 0 || !chars[k - 1].1.is_alphanumeric())
+        {
+            let mut m = k + 2;
+            while m < chars.len() && chars[m].1.is_ascii_digit() {
+                m += 1;
+            }
+            let digits: String = chars[k + 2..m].iter().map(|(_, ch)| *ch).collect();
+            if let Ok(n) = digits.parse::<u32>() {
+                if let Some(&to) = map.get(&n) {
+                    out.push(c); // keep the author's `t` / `T`
+                    out.push('#');
+                    out.push_str(&to.to_string());
+                    count += 1;
+                    k = m;
+                    continue;
+                }
+            }
+        }
+        out.push(c);
+        k += 1;
+    }
+    (out, count)
+}
+
+/// What one incoming task became. `kind` is `added` (arrived as-is), `renumbered`
+/// (its number was taken locally) or `forked` (its id was taken locally, so it was
+/// filed as a brand-new task and the local row was left alone).
+#[derive(Debug, Clone, Serialize)]
+pub struct ImportItem {
+    pub subject: String,
+    pub kind: String,
+    pub from_number: u32,
+    pub to_number: u32,
+}
+
+/// Outcome of an import — returned by both the preview (nothing written) and the
+/// apply (store rewritten), so the UI can show the same summary before and after.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct ImportReport {
+    /// Incoming tasks that kept their id and number.
+    pub added: usize,
+    /// Incoming tasks whose number collided locally and was reassigned.
+    pub renumbered: usize,
+    /// Incoming tasks whose id existed locally → filed as new tasks (local kept).
+    pub forked: usize,
+    /// Incoming tasks already on the board, unchanged since — skipped. Without this,
+    /// re-importing the SAME file would fork every task and duplicate the board.
+    pub unchanged: usize,
+    /// Edges (`depends_on` / `links`) dropped: dangling, cross-board, or cyclic.
+    pub dropped_edges: usize,
+    /// Inline `t#N` references rewritten to follow a renumbered task.
+    pub rewritten_refs: usize,
+    /// Backup taken before the store was rewritten (apply only; None on preview).
+    pub backup: Option<String>,
+    /// Total tasks on the board after the merge.
+    pub total_after: usize,
+    pub items: Vec<ImportItem>,
+}
+
+/// Parse an exported board. Accepts both the canonical `{version, todos}` envelope
+/// and a bare `[...]` array — the latter is what `cc-todos todos list --json` (and
+/// the nightly triage export) emit, so a file the user already has on disk imports
+/// without them having to know which shape it is.
+pub fn parse_import(content: &str) -> Result<TodoFile, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(content).map_err(|e| format!("not valid JSON: {e}"))?;
+    let mut file: TodoFile = if value.is_array() {
+        let todos: Vec<Todo> = serde_json::from_value(value)
+            .map_err(|e| format!("not a list of tasks: {e}"))?;
+        TodoFile { version: default_version(), todos }
+    } else {
+        serde_json::from_value(value).map_err(|e| format!("not a task file: {e}"))?
+    };
+    for t in &mut file.todos {
+        t.status = canonical_status(&t.status).to_string();
+    }
+    Ok(file)
+}
+
+/// Merge an imported board into the local one. Pure: takes both stores, returns the
+/// merged store plus a report. Never mutates or removes a local task.
+///
+/// Order of operations matters. Ids are resolved FIRST (a taken id ⇒ fork ⇒ fresh
+/// id), because the id map is what the incoming `depends_on` / `links` are rewired
+/// through; numbers are resolved next, because the number map is what inline `t#N`
+/// prose is rewritten through. Dependency edges are then replayed one by one via
+/// [`add_dep`], which is the single place the board's invariants live (same board,
+/// acyclic, both endpoints present) — an edge it rejects is dropped and counted
+/// rather than silently corrupting the graph.
+pub fn merge_import(local: &TodoFile, incoming: &TodoFile, now: &str) -> (TodoFile, ImportReport) {
+    use std::collections::HashMap;
+
+    let mut merged = local.clone();
+    let mut report = ImportReport::default();
+
+    let local_ids: HashSet<String> = local.todos.iter().map(|t| t.id.clone()).collect();
+    let mut taken_numbers: HashSet<u32> =
+        local.todos.iter().map(|t| t.number).filter(|n| *n > 0).collect();
+    let mut next_number = max_number(local) + 1;
+
+    // Deterministic order so a re-import of the same file lands the same way.
+    let mut sorted: Vec<&Todo> = incoming.todos.iter().collect();
+    sorted.sort_by(|a, b| a.number.cmp(&b.number).then_with(|| a.id.cmp(&b.id)));
+
+    // Pass 1 — resolve identity and numbering, building the maps the rewires need.
+    let mut id_map: HashMap<String, String> = HashMap::new();
+    let mut number_map: HashMap<u32, u32> = HashMap::new();
+    let mut plan: Vec<(&Todo, String, u32, &'static str)> = Vec::new();
+
+    // Same id AND same `updated_at` = the same version of the task, already here.
+    // Skipping it is what makes an import IDEMPOTENT: without this, re-importing the
+    // same file would see every id as "taken", fork all of them, and duplicate the
+    // whole board. A real edit on the other machine bumps `updated_at`, so genuine
+    // divergence still forks.
+    let local_by_id: HashMap<&str, &Todo> =
+        local.todos.iter().map(|t| (t.id.as_str(), t)).collect();
+
+    for t in sorted {
+        if let Some(existing) = local_by_id.get(t.id.as_str()) {
+            if existing.updated_at == t.updated_at {
+                report.unchanged += 1;
+                // Other incoming tasks may reference this one by id (deps/links) or by
+                // number (inline `t#N`). Point both at the LOCAL row: its number can
+                // differ from the file's if an earlier import renumbered it.
+                id_map.insert(t.id.clone(), t.id.clone());
+                if t.number > 0 && existing.number != t.number {
+                    number_map.insert(t.number, existing.number);
+                }
+                continue;
+            }
+        }
+
+        let forked = local_ids.contains(&t.id);
+        let final_id = if forked { new_id() } else { t.id.clone() };
+
+        let collides = t.number == 0 || taken_numbers.contains(&t.number);
+        let final_number = if collides {
+            let n = next_number;
+            next_number += 1;
+            n
+        } else {
+            t.number
+        };
+        taken_numbers.insert(final_number);
+
+        let kind = if forked {
+            "forked"
+        } else if collides {
+            "renumbered"
+        } else {
+            "added"
+        };
+
+        id_map.insert(t.id.clone(), final_id.clone());
+        if t.number > 0 && final_number != t.number {
+            number_map.insert(t.number, final_number);
+        }
+        plan.push((t, final_id, final_number, kind));
+    }
+
+    // Pass 2 — materialize the tasks: new identity, rewired refs, deps held back.
+    let final_ids: HashSet<String> = plan.iter().map(|(_, id, _, _)| id.clone()).collect();
+    let mut deferred_deps: Vec<(String, Vec<String>)> = Vec::new();
+
+    for (src, final_id, final_number, kind) in plan {
+        let mut t = src.clone();
+        t.id = final_id.clone();
+        t.number = final_number;
+        t.imported_at = Some(now.to_string());
+
+        // Inline `t#N` in prose must follow the tasks that moved. `migrate_refs`
+        // walks description/plan/comments only; handoff is prose that carries
+        // `t#N` too (it is written FOR a dependent task), so it is included here.
+        let mut moved = 0usize;
+        let (desc, n) = remap_inline_refs(&t.description, &number_map);
+        t.description = desc;
+        moved += n;
+        let (p, n) = remap_inline_refs(&t.plan, &number_map);
+        t.plan = p;
+        moved += n;
+        let (h, n) = remap_inline_refs(&t.handoff, &number_map);
+        t.handoff = h;
+        moved += n;
+        for c in &mut t.comments {
+            let (body, n) = remap_inline_refs(&c.body, &number_map);
+            c.body = body;
+            moved += n;
+        }
+        report.rewritten_refs += moved;
+
+        // `links` are free-form (no board/cycle rule): rewire onto the final ids and
+        // drop any target that isn't on the merged board.
+        let before = t.links.len();
+        t.links = t
+            .links
+            .iter()
+            .map(|id| id_map.get(id).cloned().unwrap_or_else(|| id.clone()))
+            .filter(|id| final_ids.contains(id) || local_ids.contains(id))
+            .collect();
+        t.links.dedup();
+        report.dropped_edges += before - t.links.len();
+
+        // Deps are replayed through `add_dep` AFTER every task exists, so its
+        // endpoint/board/cycle checks can actually see the whole merged board.
+        let wanted: Vec<String> = t
+            .depends_on
+            .iter()
+            .map(|id| id_map.get(id).cloned().unwrap_or_else(|| id.clone()))
+            .collect();
+        t.depends_on.clear();
+        deferred_deps.push((final_id, wanted));
+
+        match kind {
+            "forked" => report.forked += 1,
+            "renumbered" => report.renumbered += 1,
+            _ => report.added += 1,
+        }
+        report.items.push(ImportItem {
+            subject: t.subject.clone(),
+            kind: kind.to_string(),
+            from_number: src.number,
+            to_number: final_number,
+        });
+        merged.todos.push(t);
+    }
+
+    // Pass 3 — replay dependency edges under the board's real invariants.
+    for (from_id, wanted) in deferred_deps {
+        for on_id in wanted {
+            if add_dep(&mut merged, &from_id, &on_id, now).is_err() {
+                report.dropped_edges += 1;
+            }
+        }
+    }
+
+    // `add_dep` stamps `updated_at` on the dependent; an import is not a user edit,
+    // so restore each imported task's own timestamp (its arrival is `imported_at`).
+    let original: HashMap<String, String> = incoming
+        .todos
+        .iter()
+        .filter_map(|t| id_map.get(&t.id).map(|fid| (fid.clone(), t.updated_at.clone())))
+        .collect();
+    for t in &mut merged.todos {
+        if let Some(ts) = original.get(&t.id) {
+            if !ts.is_empty() {
+                t.updated_at = ts.clone();
+            }
+        }
+    }
+
+    report.total_after = merged.todos.len();
+    (merged, report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -557,6 +885,7 @@ mod tests {
             links: Vec::new(),
             depends_on: Vec::new(),
             handoff: String::new(),
+            imported_at: None,
             created_by: String::new(),
             created_at: String::new(),
             updated_at: String::new(),
@@ -949,5 +1278,213 @@ mod tests {
         assert_eq!(back.todos[0].estimate_minutes, Some(30));
         assert_eq!(back.todos[0].project.as_deref(), Some("my-proj"));
         let _ = std::fs::remove_file(&path);
+    }
+
+    // --- import / export (#181) ------------------------------------------------
+
+    /// Build a store from (id, number) pairs, all on the same board.
+    fn board(rows: &[(&str, u32)]) -> TodoFile {
+        let mut f = TodoFile::default();
+        for (id, number) in rows {
+            let mut t = todo(id, "backlog");
+            t.number = *number;
+            t.updated_at = "T0".into();
+            f.todos.push(t);
+        }
+        f
+    }
+
+    /// THE scenario the feature exists for: two machines each ran `max+1` and handed
+    /// number 12 to DIFFERENT tasks. The incoming one must be renumbered, not merged
+    /// onto the local one, and the local row must be untouched.
+    #[test]
+    fn import_renumbers_a_colliding_number() {
+        let local = board(&[("local-a", 12)]);
+        let incoming = board(&[("remote-b", 12)]);
+
+        let (merged, rep) = merge_import(&local, &incoming, "NOW");
+
+        assert_eq!(rep.renumbered, 1);
+        assert_eq!(rep.forked, 0);
+        assert_eq!(merged.todos.len(), 2);
+        // local kept its identity and number
+        let a = merged.todos.iter().find(|t| t.id == "local-a").unwrap();
+        assert_eq!(a.number, 12);
+        assert!(a.imported_at.is_none());
+        // incoming kept its id but got the next free number
+        let b = merged.todos.iter().find(|t| t.id == "remote-b").unwrap();
+        assert_eq!(b.number, 13);
+        assert_eq!(b.imported_at.as_deref(), Some("NOW"));
+    }
+
+    /// Same id on both sides = the same task edited on both machines. We do NOT pick
+    /// a winner: the local row survives verbatim and the incoming version is filed as
+    /// a brand-new task with a fresh id and number.
+    #[test]
+    fn import_forks_a_task_edited_on_both_machines() {
+        let mut local = board(&[("same-id", 12)]);
+        local.todos[0].subject = "Купить хлеб".into();
+
+        let mut incoming = board(&[("same-id", 12)]);
+        incoming.todos[0].subject = "Купить хлеб и молоко".into();
+        incoming.todos[0].updated_at = "T9".into(); // it diverged over there
+
+        let (merged, rep) = merge_import(&local, &incoming, "NOW");
+
+        assert_eq!(rep.forked, 1);
+        assert_eq!(merged.todos.len(), 2, "nothing is overwritten");
+
+        let local_row = merged.todos.iter().find(|t| t.id == "same-id").unwrap();
+        assert_eq!(local_row.subject, "Купить хлеб", "local must not be touched");
+        assert_eq!(local_row.number, 12);
+        assert!(local_row.imported_at.is_none());
+
+        let fork = merged.todos.iter().find(|t| t.id != "same-id").unwrap();
+        assert_eq!(fork.subject, "Купить хлеб и молоко");
+        assert_eq!(fork.number, 13, "fork gets the next free number");
+        assert_eq!(fork.imported_at.as_deref(), Some("NOW"));
+    }
+
+    /// A renumbered task must drag its inline `t#N` mentions with it — including the
+    /// ones in `handoff`, which the older `migrate_refs` pass does not walk.
+    #[test]
+    fn import_rewrites_inline_refs_to_the_new_numbers() {
+        let local = board(&[("local-a", 12), ("local-b", 13)]);
+
+        let mut incoming = board(&[("r1", 12), ("r2", 13)]);
+        incoming.todos[0].description = "зависит от t#13".into();
+        incoming.todos[0].plan = "после t#13".into();
+        incoming.todos[0].handoff = "передал в t#13".into();
+        incoming.todos[0].comments = vec![Comment {
+            id: "c1".into(),
+            author: "user".into(),
+            body: "см. t#13 и PR #13".into(),
+            created_at: "T0".into(),
+        }];
+
+        let (merged, rep) = merge_import(&local, &incoming, "NOW");
+
+        // 12→14, 13→15 (both numbers were taken locally)
+        let r1 = merged.todos.iter().find(|t| t.id == "r1").unwrap();
+        let r2 = merged.todos.iter().find(|t| t.id == "r2").unwrap();
+        assert_eq!(r1.number, 14);
+        assert_eq!(r2.number, 15);
+
+        assert_eq!(r1.description, "зависит от t#15");
+        assert_eq!(r1.plan, "после t#15");
+        assert_eq!(r1.handoff, "передал в t#15", "handoff prose must follow too");
+        // the bare `#13` is a GitHub PR ref (#63) and must stay put
+        assert_eq!(r1.comments[0].body, "см. t#15 и PR #13");
+        assert_eq!(rep.rewritten_refs, 4);
+    }
+
+    /// A forked task mints a fresh id, so the incoming subgraph must be rewired onto
+    /// the FORK — not left pointing at the local row it was forked from.
+    #[test]
+    fn import_rewires_deps_onto_forked_ids() {
+        let local = board(&[("shared", 1)]);
+
+        let mut incoming = board(&[("shared", 1), ("newcomer", 2)]);
+        incoming.todos[0].updated_at = "T9".into(); // `shared` diverged → it forks
+        // newcomer depends on the task whose id collides → must follow the fork
+        incoming.todos[1].depends_on = vec!["shared".into()];
+
+        let (merged, rep) = merge_import(&local, &incoming, "NOW");
+
+        assert_eq!(rep.forked, 1);
+        let newcomer = merged.todos.iter().find(|t| t.id == "newcomer").unwrap();
+        assert_eq!(newcomer.depends_on.len(), 1);
+        assert_ne!(
+            newcomer.depends_on[0], "shared",
+            "must not point at the LOCAL row"
+        );
+        // it points at the fork, which is an imported task that is not the newcomer
+        let target = merged
+            .todos
+            .iter()
+            .find(|t| t.id == newcomer.depends_on[0])
+            .unwrap();
+        assert!(target.imported_at.is_some());
+        assert_eq!(rep.dropped_edges, 0);
+    }
+
+    /// Edges the board's invariants reject (dangling target, cycle) are dropped and
+    /// counted rather than corrupting the graph.
+    #[test]
+    fn import_drops_dangling_and_cyclic_edges() {
+        let local = TodoFile::default();
+
+        let mut incoming = board(&[("a", 1), ("b", 2)]);
+        incoming.todos[0].depends_on = vec!["b".into(), "ghost".into()]; // ghost is dangling
+        incoming.todos[1].depends_on = vec!["a".into()]; // closes a cycle a→b→a
+
+        let (merged, rep) = merge_import(&local, &incoming, "NOW");
+
+        assert_eq!(merged.todos.len(), 2, "tasks still arrive");
+        assert_eq!(rep.dropped_edges, 2, "the ghost and the cycle-closing edge");
+        // exactly one direction of the a↔b pair survived, so the graph stays acyclic
+        let a = merged.todos.iter().find(|t| t.id == "a").unwrap();
+        let b = merged.todos.iter().find(|t| t.id == "b").unwrap();
+        assert_eq!(a.depends_on.len() + b.depends_on.len(), 1);
+    }
+
+    /// A clean import (no collisions at all) must keep ids and numbers as they were.
+    #[test]
+    fn import_keeps_identity_when_nothing_collides() {
+        let local = board(&[("local-a", 1)]);
+        let incoming = board(&[("remote-x", 7)]);
+
+        let (merged, rep) = merge_import(&local, &incoming, "NOW");
+
+        assert_eq!(rep.added, 1);
+        assert_eq!(rep.renumbered, 0);
+        assert_eq!(rep.forked, 0);
+        let x = merged.todos.iter().find(|t| t.id == "remote-x").unwrap();
+        assert_eq!(x.number, 7, "a free number is kept as-is");
+        assert_eq!(rep.total_after, 2);
+    }
+
+    /// Importing the SAME file twice must be a no-op. Without the unchanged-skip,
+    /// the second run would see every id as taken, fork them all, and duplicate the
+    /// whole board — the exact opposite of what this feature is for.
+    #[test]
+    fn import_is_idempotent_for_an_unchanged_file() {
+        let local = TodoFile::default();
+        let incoming = board(&[("a", 1), ("b", 2)]);
+
+        let (once, _) = merge_import(&local, &incoming, "NOW");
+        assert_eq!(once.todos.len(), 2);
+
+        let (twice, rep) = merge_import(&once, &incoming, "LATER");
+        assert_eq!(twice.todos.len(), 2, "re-import must not duplicate the board");
+        assert_eq!(rep.unchanged, 2);
+        assert_eq!(rep.forked, 0);
+        assert_eq!(rep.added, 0);
+    }
+
+    /// ...but a task genuinely edited on the other machine (its `updated_at` moved)
+    /// still forks, so the divergent version is never silently swallowed.
+    #[test]
+    fn import_still_forks_a_task_that_moved_on_the_other_machine() {
+        let local = board(&[("a", 1)]);
+
+        let mut incoming = board(&[("a", 1)]);
+        incoming.todos[0].updated_at = "T9".into(); // edited over there
+        incoming.todos[0].subject = "changed".into();
+
+        let (merged, rep) = merge_import(&local, &incoming, "NOW");
+        assert_eq!(rep.unchanged, 0);
+        assert_eq!(rep.forked, 1);
+        assert_eq!(merged.todos.len(), 2);
+    }
+
+    /// `cc-todos todos list --json` emits a bare array; that file must import too.
+    #[test]
+    fn parse_import_accepts_both_shapes() {
+        let envelope = r#"{"version":1,"todos":[{"id":"a","subject":"s","status":"backlog"}]}"#;
+        let bare = r#"[{"id":"a","subject":"s","status":"backlog"}]"#;
+        assert_eq!(parse_import(envelope).unwrap().todos.len(), 1);
+        assert_eq!(parse_import(bare).unwrap().todos.len(), 1);
+        assert!(parse_import("not json").is_err());
     }
 }

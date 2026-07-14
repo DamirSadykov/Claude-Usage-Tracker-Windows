@@ -72,6 +72,7 @@ export interface Todo {
   links?: string[];
   depends_on?: string[]; // ids of tasks this one depends on — task-graph edges (#88)
   handoff?: string; // what this task hands forward to its dependents (#141)
+  imported_at?: string | null; // arrived via a board import (#181); absent = created here
   created_by?: string; // "user" | "claude" ("" / absent = user, no AI badge)
   created_at: string;
   updated_at: string;
@@ -1616,6 +1617,11 @@ onUnmounted(() => {
                 class="tw-chip tw-from"
                 :title="t('todoFromHint')"
               >↘ {{ t("todoFrom") }} {{ todo.from }}</span>
+              <span
+                v-if="todo.imported_at"
+                class="tw-chip tw-imported"
+                :title="t('todoImportedHint')"
+              >⤓ {{ t("todoImported") }}</span>
               <span v-if="todo.estimate_minutes != null" class="tw-chip">⏱ {{ fmtEstimate(todo.estimate_minutes) }}</span>
               <span v-if="todo.scheduled_for" class="tw-chip">📅 {{ todo.scheduled_for }}</span>
               <span v-if="todo.plan" class="tw-chip" :title="todo.plan">📝</span>
@@ -2957,6 +2963,14 @@ onUnmounted(() => {
   overflow-wrap: anywhere;
 }
 /* Same provenance, shown read-only in the detail/edit view. */
+/* Task that arrived via a board import (#181) — in particular a fork, whose local
+   twin is still on the board, so the two need to be told apart at a glance. */
+.tw-imported {
+  color: #d29922;
+  background: rgba(210, 153, 34, 0.14);
+  padding: 1px 7px;
+  border-radius: 8px;
+}
 .tw-from-note {
   font-size: 13px;
   color: var(--text-3);
