@@ -250,6 +250,7 @@ const messages = {
     graphTabDeps: "Dependencies",
     graphTabRef: "References",
     graphExternal: "other project",
+    graphGlobalBoard: "Global",
     graphExternalEdge: "Dependencies can't start or end on another project's task",
     graphHintDeps:
       "Left-click a node to highlight its links · drag one node onto another to add a dependency · click the dot on an arrow to remove it · right-click a node to open it",
@@ -865,6 +866,7 @@ const messages = {
     graphTabDeps: "Зависимости",
     graphTabRef: "Ссылки",
     graphExternal: "другой проект",
+    graphGlobalBoard: "Глобальные",
     graphExternalEdge: "Зависимость не может начинаться или кончаться на задаче другого проекта",
     graphHintDeps:
       "ЛКМ по ноде — подсветить связи · перетащите ноду на другую — добавить зависимость · клик по точке на стрелке — удалить · ПКМ по ноде — открыть",
