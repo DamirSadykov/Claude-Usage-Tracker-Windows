@@ -8,7 +8,7 @@
 //
 // The view is a kanban board: one column per status, cards drag between columns
 // (which persists the new status). Columns mirror `todos.rs::STATUSES`.
-import { ref, computed, onMounted, onUnmounted, nextTick } from "vue";
+import { ref, computed, watch, onMounted, onUnmounted, nextTick } from "vue";
 import { useI18n, type Composer } from "vue-i18n";
 import { invoke } from "@tauri-apps/api/core";
 import ProjectAutocomplete from "./ProjectAutocomplete.vue";
@@ -24,6 +24,7 @@ import {
   type ExtBucketId,
 } from "../externalStatus";
 import i18n from "../i18n";
+import { useSettings } from "../settingsStore";
 import type { TriageDigest, DigestItem } from "../App.vue";
 
 const { t, locale } = useI18n();
@@ -37,18 +38,12 @@ function applyLocale(l: string | null | undefined) {
   (i18n.global as Composer).locale.value = l;
 }
 
-// Each Tauri window is a separate WebView; vue-i18n boots from navigator
-// language and doesn't see the popup's saved locale. Read it from the shared
-// store so this window opens in the same language the user picked.
-async function loadLocaleFromStore() {
-  try {
-    const { load: loadStore } = await import("@tauri-apps/plugin-store");
-    const store = await loadStore("settings.json");
-    applyLocale(await store.get<string>("locale"));
-  } catch {
-    // store missing or unreadable → keep detected default
-  }
-}
+// Each Tauri window is a separate WebView; vue-i18n boots from navigator language
+// and doesn't see the popup's saved locale. Follow the shared settings snapshot so
+// this window opens — and stays — in the language the user picked. (The main
+// window also pushes `todos-locale` on open; both paths call applyLocale.)
+const { settings, initSettings } = useSettings();
+watch(() => settings.value.locale, (l) => applyLocale(l));
 
 export interface Comment {
   id: string;
@@ -1334,7 +1329,8 @@ async function refreshKnownProjects() {
 }
 
 onMounted(async () => {
-  await loadLocaleFromStore();
+  await initSettings();
+  applyLocale(settings.value.locale);
   // The main window pushes its current locale here whenever it opens this
   // window — this is a separate WebView that may detect a different navigator
   // language and have no saved locale to read from the store.
