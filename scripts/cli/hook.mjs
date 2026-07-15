@@ -5,14 +5,12 @@
 //     CURRENT phase + handoff baton + the discipline, and DON'T dump the task
 //     board (the session is aimed at the phase; the full list would just bloat
 //     context). A thin pointer keeps the plan's own task and `todos list` reachable.
-//   • TODO MODE — no active phase: surface the ACTIVE todos for the project plus
-//     the short contract for editing them. Two sub-modes:
-//       – DUE MODE (#36): if anything is scheduled for today or earlier, show ONLY
-//         those (today's focus, flagged ⏰, most overdue first) and hold the rest
-//         of the board back.
-//       – PRIORITY MODE (#32): with nothing due, fall back to the project's open
-//         tasks gated by the "task priority in context" setting (settings.json,
-//         default `medium`) — high-priority in full, the rest as one-liners.
+//   • TODO MODE — no active phase: surface the QUEUE — the tasks the user has
+//     lined up (status queue or in_progress) that are a CURRENT ROOT of the
+//     dependency graph (every task in `depends_on` is done; no deps = root). The
+//     backlog, blocked, and review tasks are held back to keep the context lean.
+//     Titles only (clipped), capped at 10. The CLI contract prints FIRST (above
+//     the list) so a truncated injection never loses the how-to-edit instructions.
 // It is strictly read-only and MUST never disrupt a session: a missing/unreadable
 // file, no matching todos, or any error is a silent no-op (exit 0, no output).
 //
@@ -49,9 +47,9 @@ const CLI_NOTE = `<cli> = node "${CLI}"`;
 const PRANK = { high: 3, medium: 2, low: 1 };
 const prank = (t) => (t && PRANK[t.priority]) || 0;
 
-// Settings reads (taskContextPriority → min rank, sessionContext, hookContextEnabled)
-// now live in ./settings.mjs — one place that owns the file path + each forgiving
-// default, shared with the Stop hook. See the imports above.
+// Settings reads (sessionContext, hookContextEnabled) now live in ./settings.mjs —
+// one place that owns the file path + each forgiving default, shared with the Stop
+// hook. See the imports above.
 
 // Local calendar date as YYYY-MM-DD — "today" is the USER's day, not UTC (a
 // scheduled_for date is a plain local date). Used to surface due/overdue tasks.
@@ -153,30 +151,61 @@ function main() {
   }
 
   if (active.length) {
-    const minRank = taskContextMinRank(appData);
+    // NEW SELECTION (startup-context bloat + relevance): surface only the tasks
+    // worth acting on THIS session, in two layers —
+    //   1. DUE (#36): tasks scheduled for today or earlier, surfaced FIRST (they're
+    //      time-sensitive), whatever their column or block state.
+    //   2. QUEUE ROOTS: tasks the user has lined up (status queue or in_progress)
+    //      that are a CURRENT ROOT of the dependency graph — every task in their
+    //      `depends_on` is done (no deps = trivially a root).
+    // The QUEUE-ROOTS layer is gated by the "task priority in context" setting
+    // (default medium); the DUE layer bypasses it — a passed deadline matters
+    // regardless of priority. Blocked, backlog and non-due review tasks are held
+    // back; the full board stays one `<cli> todos list` away. Titles only, capped —
+    // descriptions bloated the context and pushed the CLI contract past the cutoff.
+    const CAP = 10;
+    const SUBJECT_MAX = 100;
+    const WORKABLE = new Set(["queue", "in_progress"]);
+    // Resolve depends_on ids → tasks to test the root condition. A dep id that no
+    // longer resolves (task deleted) can't block, so it counts as satisfied.
+    const byId = new Map(todos.filter((t) => t && t.id).map((t) => [t.id, t]));
+    const isRoot = (t) =>
+      (Array.isArray(t.depends_on) ? t.depends_on : []).every((id) => {
+        const dep = byId.get(id);
+        return !dep || col(dep.status) === "done";
+      });
+
     const today = localToday();
     const isDue = (t) =>
       !!t.scheduled_for && String(t.scheduled_for).slice(0, 10) <= today;
-    // Two modes for the todo context:
-    //  • DUE MODE (issue #36): if anything is scheduled for today or earlier, the
-    //    session focuses on THOSE — today's plan, not the whole board.
-    //  • PRIORITY MODE (issue #32): with nothing due, fall back to the project's
-    //    open tasks gated by the "task priority in context" threshold (default
-    //    medium). This is the original behaviour.
-    const dueMode = active.some(isDue);
-    const shown = dueMode
-      ? active.filter(isDue)
-      : active.filter((t) => prank(t) >= minRank);
-    const hidden = active.length - shown.length;
+    // Priority threshold for the queue-roots layer (settings.json taskContextPriority
+    // → min rank, default medium; `all` shows every priority). Due tasks bypass it.
+    const minRank = taskContextMinRank(appData);
+    const meets = (t) => prank(t) >= minRank;
 
-    if (!shown.length) {
-      // Not in due mode (nothing scheduled) and nothing clears the priority
-      // threshold: don't dump the rest, but say so rather than going silently empty.
+    // Layer 1: everything due today/overdue — any column, any block state, ANY
+    // priority (a passed deadline isn't gated by the threshold).
+    const dueTasks = active.filter(isDue);
+    // Layer 2 (priority-gated): queue tasks that are current roots + every
+    // in_progress task (already being worked, so surface it even if a dep is open),
+    // minus anything already in the due group.
+    const queueRoots = active.filter(
+      (t) =>
+        !isDue(t) &&
+        meets(t) &&
+        WORKABLE.has(col(t.status)) &&
+        (col(t.status) === "in_progress" || isRoot(t)),
+    );
+
+    if (!dueTasks.length && !queueRoots.length) {
+      // Nothing clears the bar — say so (don't dump the backlog), and point at the
+      // levers: queue, priority, the threshold setting, the full board.
       const note = [
-        `The Claude Usage Tracker has ${active.length} open task(s) for project "${project}", but none are due today and all are below the "task priority in context" threshold — none are shown here.`,
-        `See them or re-prioritize via the CLI (${CLI_NOTE}); lower the threshold in the tracker's settings to surface more:`,
-        `· list this project's tasks: <cli> todos list (defaults to this project + global; add --all for every project)`,
-        `· set a priority: <cli> todos set-priority <id> <high|medium|low|none>`,
+        `The Claude Usage Tracker has ${active.length} open task(s) for project "${project}", but none clear the bar this session — none are due today, and no queued/unblocked task meets the "task priority in context" threshold.`,
+        `Line up work, re-prioritize, or lower the threshold in the tracker's settings; via the CLI (${CLI_NOTE}):`,
+        `· move a task into the queue: <cli> todos set-status <id> queue`,
+        `· raise a task's priority:    <cli> todos set-priority <id> <high|medium|low|none>`,
+        `· see the whole board:        <cli> todos list  (backlog | queue | in_progress | review | done)`,
         crossProjectNote,
         `File (don't edit): ${file}`,
       ].join("\n");
@@ -184,75 +213,75 @@ function main() {
       return;
     }
 
-    // Order: the due group first and, within it, the most overdue (earliest
-    // date) first; then everything by priority desc, closest-to-finishing status,
-    // and soonest scheduled.
-    const order = { in_progress: 0, review: 1, queue: 2, backlog: 3 };
-    const rank = (s) => order[col(s)] ?? 3;
-    shown.sort(
+    // Due group: most overdue (earliest date) first, then priority desc.
+    dueTasks.sort(
       (a, b) =>
-        (isDue(a) ? 0 : 1) - (isDue(b) ? 0 : 1) ||
-        (isDue(a) && isDue(b)
-          ? String(a.scheduled_for).localeCompare(String(b.scheduled_for))
-          : 0) ||
+        String(a.scheduled_for).localeCompare(String(b.scheduled_for)) ||
+        prank(b) - prank(a),
+    );
+    // Queue roots: highest priority first, then in_progress before queue (closer to
+    // finishing), then soonest-scheduled as a tiebreaker.
+    const statusOrder = { in_progress: 0, queue: 1 };
+    queueRoots.sort(
+      (a, b) =>
         prank(b) - prank(a) ||
-        rank(a.status) - rank(b.status) ||
+        (statusOrder[col(a.status)] ?? 9) - (statusOrder[col(b.status)] ?? 9) ||
         String(a.scheduled_for || "9999-99-99").localeCompare(
           String(b.scheduled_for || "9999-99-99"),
         ),
     );
 
+    // Due first, then the queue roots.
+    const matched = [...dueTasks, ...queueRoots];
+    const shown = matched.slice(0, CAP);
+    const hidden = matched.length - shown.length;
+
+    // Title only, whitespace-collapsed, clipped to SUBJECT_MAX (ellipsis if cut).
+    const clip = (s) => {
+      const one = String(s || "").replace(/\s+/g, " ").trim();
+      return one.length > SUBJECT_MAX
+        ? one.slice(0, SUBJECT_MAX - 1) + "…"
+        : one;
+    };
     const lines = shown.map((t) => {
       const num = t.number ? `#${t.number} ` : "";
       const prio = t.priority ? ` ‹${t.priority}›` : "";
-      const date = t.scheduled_for ? String(t.scheduled_for).slice(0, 10) : "";
-      const due = isDue(t) ? (date < today ? ` ⏰ overdue (${date})` : ` ⏰ today`) : "";
-      const head = `- ${num}[${col(t.status)}]${prio}${due} ${t.subject}`;
-      // Due or high-priority tasks → LONG form (meta + first description line);
-      // everything else that cleared the threshold stays a compact one-liner.
-      if (isDue(t) || t.priority === "high") {
-        const bits = [];
-        if (t.estimate_minutes != null) bits.push(`~${t.estimate_minutes}min`);
-        // The ⏰ marker already carries a due task's date; only show a future date.
-        if (t.scheduled_for && !isDue(t)) bits.push(`by ${date}`);
-        const meta = bits.length ? ` (${bits.join(", ")})` : "";
-        const desc = t.description
-          ? ` — ${String(t.description).split("\n")[0].slice(0, 140)}`
-          : "";
-        return `${head}${meta}${desc}  ⟨id:${t.id}⟩`;
+      let due = "";
+      if (isDue(t)) {
+        const date = String(t.scheduled_for).slice(0, 10);
+        due = date < today ? ` ⏰ overdue (${date})` : ` ⏰ today`;
       }
-      return `${head}  ⟨id:${t.id}⟩`;
+      return `- ${num}[${col(t.status)}]${prio}${due} ${clip(t.subject)}  ⟨id:${t.id}⟩`;
     });
     if (hidden) {
       lines.push(
-        dueMode
-          ? `  …plus ${hidden} other open task(s) not due today — held back to keep the focus on today; \`<cli> todos list\` shows all.`
-          : `  …plus ${hidden} lower-priority task(s) below the "task priority in context" threshold — \`<cli> todos list\` shows all.`,
+        `  …plus ${hidden} more due/queued task(s) — \`<cli> todos list\` shows all.`,
       );
     }
 
-    const refExample = shown[0] && shown[0].number ? shown[0].number : 12;
-    const headerLine = dueMode
-      ? `User's tasks DUE TODAY / overdue (⏰) (Claude Usage Tracker, project "${project}") — today's focus, shown in full. The rest of the board is held back this session:`
-      : `User's active tasks (Claude Usage Tracker, project "${project}"). High-priority shown in full, the rest as one-liners:`;
-    // Plain stdout on exit 0 is the most robust way to inject SessionStart
-    // context (no additionalContext-nesting ambiguity across CC versions).
+    const refExample = (shown[0] && shown[0].number) || 12;
+    // Section order (the CLI contract must never be the part that gets truncated):
+    // the how-to-edit contract goes FIRST, the task list SECOND, each under its own
+    // banner so the two are unmistakably separate. Plain stdout on exit 0 is the
+    // most robust way to inject SessionStart context (no additionalContext nesting).
     const context = [
-      headerLine,
-      lines.join("\n"),
-      "",
+      `──────── TASK TRACKER · how to edit the USER's todos (CLI) ────────`,
       `These are the USER's todos, not your working task list. The tracker owns todos.json — change it ONLY through the CLI (${CLI_NOTE}, written <cli> below), never by hand (concurrent writes corrupt the shared file).`,
       `Before your FIRST todos command this session, run \`<cli> todos --help\` — it's the authoritative command set; the legend below is only a quick reference. Pick the command by intent:`,
       `  move a task     → <cli> todos set-status <id> <backlog|queue|in_progress|review|done>`,
-      `  set priority    → <cli> todos set-priority <id> <high|medium|low|none>   (gates which tasks reach this context)`,
+      `  set priority    → <cli> todos set-priority <id> <high|medium|low|none>`,
       `  add a follow-up → <cli> todos add "<subject>" [--project <name> | --global] [--priority high|medium|low] [--scheduled YYYY-MM-DD] [--description <text>]`,
       `  note a finding  → <cli> todos comment add <id> --text "<body>"`,
       `  link two tasks  → <cli> todos dep add <task> <depends-on>  (blocking, acyclic, one board)  ·  <cli> todos ref add <task> <target>  (non-blocking, cross-project ok)`,
       `  handoff (context)→ a task's handoff = the notes it passes to whatever depends on it, so a task inherits extra context FROM the tasks in its depends_on. That inherited handoff auto-prints when you move a task to in_progress (\`<cli> todos handoff <task>\` re-reads it); record yours with \`<cli> todos handoff set <task> --text "<body>"\`.`,
       `  see the board   → <cli> todos list  [--all | --status <col>[,<col>]]`,
-      `Rules: <id> is the ⟨id⟩ shown above; add/dep/ref args also accept N|#N. Each command touches only its own field — leave the rest to the user. add/comment ONLY what the user asked to track, not your scratchpad; new tasks land in backlog. Reference a task in prose as t#${refExample} ("blocked by t#${refExample}") — a bare #N means a GitHub PR/issue, NOT a task link. An inline t#N draws only a ref edge, never a blocking dep — use \`dep add\` for that; \`dep rm\`/\`ref rm\`/\`dep list\`/\`ref list\` mirror add.`,
+      `Rules: <id> is the ⟨id⟩ shown next to each task below; add/dep/ref args also accept N|#N. Each command touches only its own field — leave the rest to the user. add/comment ONLY what the user asked to track, not your scratchpad; new tasks land in backlog. Reference a task in prose as t#${refExample} ("blocked by t#${refExample}") — a bare #N means a GitHub PR/issue, NOT a task link. An inline t#N draws only a ref edge, never a blocking dep — use \`dep add\` for that; \`dep rm\`/\`ref rm\`/\`dep list\`/\`ref list\` mirror add.`,
       crossProjectNote,
       `File (don't edit): ${file}`,
+      "",
+      `──────── TASKS · project "${project}" · ⏰ due first, then queued & unblocked, up to ${CAP} ────────`,
+      `⏰ = due today / overdue — surfaced first, whatever the column or priority. Below them (priority-gated by the tracker's "task priority in context" setting): queue tasks whose dependencies are all done — current roots of the graph — plus every in_progress task. Titles only; backlog, blocked queue tasks and non-due/below-threshold tasks are held back (\`<cli> todos list\` shows the whole board).`,
+      lines.join("\n"),
     ].join("\n");
 
     process.stdout.write(context + "\n");
