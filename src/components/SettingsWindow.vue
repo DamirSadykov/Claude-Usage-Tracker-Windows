@@ -83,6 +83,9 @@ const uiFont = ref(DEFAULT_FONT_ID);
 // "apply suggested budget" hint works without threading it through the host.
 const usageSevenDay = ref<{ percent_used: number; reset_at: string | null } | null>(null);
 const suggestedBudget = ref<number | null>(null);
+// Bumped whenever the main window confirms a persisted change (`settings-changed`).
+// Passed to SettingsPanel so its Save button can flash "Saved ✓" on a real write.
+const savedTick = ref(0);
 const budgetUnit = computed<"usd" | "pct">(() => (ccAnalyticsEnabled.value ? "usd" : "pct"));
 const configured = computed(() => sessionKey.value && orgId.value);
 
@@ -215,6 +218,7 @@ onMounted(async () => {
         // Main persisted a change (possibly ours) → reload the form so it reflects
         // the canonical on-disk state (and re-apply font/locale).
         await listen("settings-changed", () => {
+            savedTick.value++;
             void loadSettings();
         }),
     );
@@ -260,6 +264,7 @@ onUnmounted(() => {
             :runtime-insight-kinds="runtimeInsightKinds"
             :locale="locale"
             :ui-font="uiFont"
+            :saved-tick="savedTick"
             @save="handleSave"
             @runtime-change="handleRuntimeChange"
         />
