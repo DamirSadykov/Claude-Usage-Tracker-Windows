@@ -17,6 +17,7 @@ import { useProjectGroups, type ProjectGroup } from "../projectGroups";
 import { getInsightHelpHtml, hasInsightHelp } from "../insightHelp";
 import { renderInsightHelp } from "../insightHelp/render";
 import { fmtDateTime, fmtDay } from "../dateFormat";
+import { useSettings } from "../settingsStore";
 import {
   Chart,
   BarController,
@@ -46,19 +47,18 @@ Chart.register(
 
 const { t, locale } = useI18n();
 
-// Each Tauri window is a separate WebView; vue-i18n boots from navigator
-// language and doesn't see the popup's saved locale. Read it from the shared
-// store so the analytics window opens in the same language the user picked.
-async function loadLocaleFromStore() {
-  try {
-    const { load: loadStore } = await import("@tauri-apps/plugin-store");
-    const store = await loadStore("settings.json");
-    const saved = await store.get<string>("locale");
-    if (saved) locale.value = saved;
-  } catch {
-    // store missing or unreadable → keep detected default
-  }
+// All settings.json reads go through the shared read-only layer (one schema, one
+// set of defaults, auto-refreshed on the main window's `settings-changed`).
+const { settings, initSettings } = useSettings();
+
+// Each Tauri window is a separate WebView; vue-i18n boots from navigator language
+// and doesn't see the popup's saved locale. Follow the shared snapshot so the
+// analytics window opens — and stays — in the language the user picked.
+function applyLocaleFromSettings() {
+  const saved = settings.value.locale;
+  if (saved) locale.value = saved;
 }
+watch(() => settings.value.locale, applyLocaleFromSettings);
 
 interface Totals {
   input: number;
@@ -214,17 +214,8 @@ const compare = ref<PeriodCompare | null>(null);
 const corrections = ref<CorrectionsMetrics | null>(null);
 // Whether the outcome metric is enabled (settings toggle, off by default). The
 // Outcome card is hidden entirely when off, even if a stale metrics file exists.
-const correctionsEnabled = ref(false);
-
-async function loadCorrectionsEnabled() {
-  try {
-    const { load: loadStore } = await import("@tauri-apps/plugin-store");
-    const store = await loadStore("settings.json");
-    correctionsEnabled.value = (await store.get<boolean>("correctionsEnabled")) ?? false;
-  } catch {
-    correctionsEnabled.value = false;
-  }
-}
+// Reactive off the shared snapshot — flips live when the toggle is saved.
+const correctionsEnabled = computed(() => settings.value.correctionsEnabled);
 
 async function loadCorrections() {
   try {
@@ -332,11 +323,12 @@ const corrCpsTrend = computed(() =>
   ),
 );
 
-// Efficiency goals, read from the shared store (SettingsPanel writes them).
-// goalCostPerHourMax is USD/hour; goalErrorRateMax is a FRACTION 0..1. null =
-// goal disabled (no indicator shown).
-const goalCostPerHourMax = ref<number | null>(null);
-const goalErrorRateMax = ref<number | null>(null);
+// Efficiency goals, from the shared snapshot (SettingsPanel writes them via the
+// main window). goalCostPerHourMax is USD/hour; goalErrorRateMax is a FRACTION
+// 0..1. null = goal disabled (no indicator shown). Reactive — a goal edited in
+// settings updates the tiles live.
+const goalCostPerHourMax = computed(() => settings.value.goalCostPerHourMax);
+const goalErrorRateMax = computed(() => settings.value.goalErrorRateMax);
 
 const fromIso = computed(() => new Date(dateFrom.value + "T00:00:00").toISOString());
 const toIso = computed(() => new Date(dateTo.value + "T23:59:59.999").toISOString());
@@ -606,18 +598,6 @@ const costPerHourGoalState = computed<GoalState>(() => {
   if (goal === null || metric === null || metric === undefined) return null;
   return metric <= goal ? "ok" : "exceeded";
 });
-
-async function loadGoals() {
-  try {
-    const { load: loadStore } = await import("@tauri-apps/plugin-store");
-    const store = await loadStore("settings.json");
-    goalCostPerHourMax.value = (await store.get<number | null>("goalCostPerHourMax")) ?? null;
-    goalErrorRateMax.value = (await store.get<number | null>("goalErrorRateMax")) ?? null;
-  } catch {
-    goalCostPerHourMax.value = null;
-    goalErrorRateMax.value = null;
-  }
-}
 
 // --- presets ---
 function setRange(days: number) {
@@ -1230,11 +1210,10 @@ onMounted(async () => {
   window.addEventListener("scroll", onTilePopoverDismissScroll, true);
   window.addEventListener("resize", onTilePopoverDismissScroll);
 
-  await loadLocaleFromStore();
+  await initSettings();
+  applyLocaleFromSettings();
   await loadIgnored();
-  await loadGoals();
   await load();
-  await loadCorrectionsEnabled();
   void loadCorrections();
 
   // Refresh if a merge happens (here or in another window) — keeps the breakdown,
@@ -1244,9 +1223,9 @@ onMounted(async () => {
     if (activeTab.value === "projects") void loadProjectMgmt();
   });
   // The background publisher (or the manual refresh) republished the metric →
-  // re-read the file and the toggle so an open window updates live.
+  // re-read the file so an open window updates live. The enabled toggle is now
+  // reactive off the shared snapshot, so it no longer needs re-reading here.
   unlistenCorr = await listen("corrections-updated", () => {
-    void loadCorrectionsEnabled();
     void loadCorrections();
   });
 });
