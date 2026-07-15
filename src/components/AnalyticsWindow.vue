@@ -13,6 +13,7 @@ import ProjectAutocomplete from "./ProjectAutocomplete.vue";
 import ProjectLabel from "./ProjectLabel.vue";
 import type { CorrectionsMetrics } from "../App.vue";
 import { useProjectLinks } from "../projectLinks";
+import { useHotkeys } from "../hotkeys";
 import { useProjectGroups, type ProjectGroup } from "../projectGroups";
 import { getInsightHelpHtml, hasInsightHelp } from "../insightHelp";
 import { renderInsightHelp } from "../insightHelp/render";
@@ -199,6 +200,14 @@ function daysAgo(d: number): string {
 const dateFrom = ref(daysAgo(30));
 const dateTo = ref(today());
 const projectFilter = ref<string>(""); // empty = all
+// Keyboard shortcuts (registry in ../hotkeys): Ctrl+F → the tool search, Ctrl+P →
+// the project filter.
+const projectAcRef = ref<InstanceType<typeof ProjectAutocomplete> | null>(null);
+const toolSearchRef = ref<HTMLInputElement | null>(null);
+useHotkeys({
+  search: () => toolSearchRef.value?.focus(),
+  project: () => projectAcRef.value?.focus(),
+});
 const loading = ref(false);
 const error = ref("");
 const data = ref<AnalyticsExt | null>(null);
@@ -1261,6 +1270,7 @@ onUnmounted(() => {
         <label>
           {{ t("analyticsByProject") }}
           <ProjectAutocomplete
+            ref="projectAcRef"
             v-model="projectFilter"
             :options="data?.projects ?? []"
             :placeholder="t('allProjects')"
@@ -1675,6 +1685,7 @@ onUnmounted(() => {
               {{ t("toolBreakdown") }}
               <span class="aw-sub">{{ t("toolBreakdownHint") }}</span>
               <input
+                ref="toolSearchRef"
                 v-model="toolSearch"
                 class="aw-search"
                 type="search"

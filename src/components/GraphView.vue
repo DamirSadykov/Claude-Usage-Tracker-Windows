@@ -24,6 +24,9 @@ const props = defineProps<{
   todos: Todo[];
   // The active board. "" means the kanban's "All projects" — show every task.
   project: string;
+  // The shared search box in the Tasks header. In graph view it HIGHLIGHTS matches
+  // (in board view the same field filters). Empty = no search active.
+  query?: string;
 }>();
 const emit = defineEmits<{
   (e: "update", todos: Todo[]): void;
@@ -707,12 +710,51 @@ const nodeById = computed(() => {
 
 // --- Selection highlight (LEFT-click a node) -------------------------------
 const selected = ref<string | null>(null);
-// The WHOLE chain through the selected node, not just its direct neighbours: in
-// Deps that's every transitive prerequisite (upstream) AND everything it blocks
-// (downstream) — so selecting #98 lights the pipeline all the way back to #93.
-// In Ref (undirected) it's the entire connected component reachable from it.
+
+// --- Find (the shared header search box, via the `query` prop) --------------
+// When the graph is the active view the ONE search field highlights here instead
+// of filtering the board. A #number / number query matches the task NUMBER, any
+// query matches the subject text. Every match gets a ring; the CURRENT hit
+// (Enter-cycled) additionally lights its transitive chain the usual way.
+const query = computed(() => props.query ?? "");
+const hitIdx = ref(0); // which hit Enter has cycled to (index into hitList)
+const queryActive = computed(() => query.value.trim().length > 0);
+const searchHits = computed<Set<string>>(() => {
+  const set = new Set<string>();
+  const q = query.value.trim().toLowerCase();
+  if (!q) return set;
+  const qNum = q.replace(/^#/, "");
+  const numeric = /^\d+$/.test(qNum); // a bare number / #N query targets the task number
+  for (const n of model.value.nodes) {
+    if (n.subject.toLowerCase().includes(q) || (numeric && String(n.number ?? "").includes(qNum)))
+      set.add(n.id);
+  }
+  return set;
+});
+// Hits in a stable order (by number) for Enter-cycling; currentHitId is the one
+// centered right now (a stronger ring than the other matches).
+const hitList = computed<string[]>(() =>
+  model.value.nodes
+    .filter((n) => searchHits.value.has(n.id))
+    .sort((a, b) => (a.number ?? 0) - (b.number ?? 0))
+    .map((n) => n.id),
+);
+const currentHitId = computed(() =>
+  queryActive.value ? hitList.value[hitIdx.value] ?? null : null,
+);
+
+// The node whose transitive chain is lit: while searching, the current hit; else
+// the clicked node. So a FOUND node shows its connections exactly like a click.
+const activeNode = computed<string | null>(() =>
+  queryActive.value ? currentHitId.value : selected.value,
+);
+
+// The WHOLE chain through the active node, not just its direct neighbours: in Deps
+// that's every transitive prerequisite (upstream) AND everything it blocks
+// (downstream) — so #98 lights the pipeline all the way back to #93. In Ref
+// (undirected) it's the entire connected component reachable from it.
 const highlighted = computed(() => {
-  const sel = selected.value;
+  const sel = activeNode.value;
   const set = new Set<string>();
   if (!sel) return set;
   const fwd = new Map<string, string[]>(); // prerequisite → dependent
@@ -744,10 +786,18 @@ const highlighted = computed(() => {
   }
   return set;
 });
-const nodeDimmed = (id: string) => selected.value !== null && !highlighted.value.has(id);
-// An edge is on the chain when BOTH its ends are highlighted.
+
+// Dimming. While searching (with hits) a node stays lit if it is a match OR on the
+// current hit's transitive chain; everything else fades. With no query it's the
+// plain click-selection dim.
+const nodeDimmed = (id: string) => {
+  if (queryActive.value && hitList.value.length)
+    return !(searchHits.value.has(id) || highlighted.value.has(id));
+  return selected.value !== null && !highlighted.value.has(id);
+};
+// An edge is on the chain when BOTH ends are highlighted (the active node's chain).
 const edgeActive = (e: EdgeGeom) =>
-  selected.value !== null && highlighted.value.has(e.fromId) && highlighted.value.has(e.toId);
+  activeNode.value !== null && highlighted.value.has(e.fromId) && highlighted.value.has(e.toId);
 
 function clipToBox(sx: number, sy: number, cx: number, cy: number, halfH: number) {
   const halfW = NODE_W / 2;
@@ -842,6 +892,7 @@ function resetView() {
 watch(tab, () => {
   resetView();
   selected.value = null;
+  hitIdx.value = 0; // hits are per-tab; restart the Enter-cycle
 });
 function toWorld(clientX: number, clientY: number) {
   const rect = svgEl.value?.getBoundingClientRect();
@@ -862,6 +913,34 @@ function onWheel(e: WheelEvent) {
   ty.value = py - wy * next;
   scale.value = next;
 }
+
+// Pan (keeping the current zoom) so a node sits in the middle of the canvas — used
+// to jump the viewport to a search hit that may be far off in the layout.
+function centerOnNode(id: string) {
+  const n = nodeById.value.get(id);
+  const rect = svgEl.value?.getBoundingClientRect();
+  if (!n || !rect) return;
+  const wx = n.x + NODE_W / 2;
+  const wy = n.y + n.h / 2;
+  tx.value = rect.width / 2 - wx * scale.value;
+  ty.value = rect.height / 2 - wy * scale.value;
+}
+// Retype → restart the cycle and pan to the first (lowest-numbered) hit, so a match
+// is on-screen even when it sits far away in the graph.
+watch(query, () => {
+  hitIdx.value = 0;
+  if (hitList.value.length) centerOnNode(hitList.value[0]);
+});
+// Enter (from the shared search box) advances to the next hit and centres it.
+// Exposed so the header input in TodoWindow can drive the cycle while the graph
+// is the active view.
+function cycleNext() {
+  const hits = hitList.value;
+  if (!hits.length) return;
+  hitIdx.value = (hitIdx.value + 1) % hits.length;
+  centerOnNode(hits[hitIdx.value]);
+}
+defineExpose({ cycleNext });
 
 // --- Pointer: pan / select / connect ---------------------------------------
 const panning = ref(false);
@@ -1102,6 +1181,9 @@ onUnmounted(() => {
         </button>
       </div>
       <span class="gv-spacer"></span>
+      <span v-if="queryActive" class="gv-find-status" :title="t('graphSearchHint')">
+        {{ hitList.length ? `${hitIdx + 1}/${hitList.length}` : t("graphSearchNoMatch") }}
+      </span>
       <button class="gv-btn" @click="resetView">{{ t("graphResetView") }}</button>
     </div>
     <p class="gv-hint">{{ tab === "deps" ? t("graphHintDeps") : t("graphHintRef") }}</p>
@@ -1155,7 +1237,7 @@ onUnmounted(() => {
         </marker>
       </defs>
 
-      <g :transform="`translate(${tx},${ty}) scale(${scale})`" :class="{ 'has-sel': selected }">
+      <g :transform="`translate(${tx},${ty}) scale(${scale})`" :class="{ 'has-sel': activeNode }">
         <!-- Project frames (Deps, multi-board): a labelled box around each board's
              pipeline so the projects read as separate graphs, not one grid. -->
         <g class="bands">
@@ -1218,7 +1300,7 @@ onUnmounted(() => {
           v-for="n in model.nodes"
           :key="n.id"
           class="node"
-          :class="{ external: n.external, context: n.context, dimmed: nodeDimmed(n.id), sel: selected === n.id, target: hoverNode === n.id && dragging }"
+          :class="{ external: n.external, context: n.context, dimmed: nodeDimmed(n.id), sel: selected === n.id, target: hoverNode === n.id && dragging, match: queryActive && searchHits.has(n.id), current: currentHitId === n.id }"
           :transform="`translate(${n.x},${n.y})`"
           @mousedown="onNodeDown($event, n.id)"
           @mouseenter="hoverNode = n.id"
@@ -1366,6 +1448,13 @@ onUnmounted(() => {
 }
 .gv-btn:hover {
   background: #2c2f36;
+}
+/* Match-position indicator (e.g. "2/5") for the shared header search; the input
+   itself lives in the Tasks header, this bar only reports where you are. */
+.gv-find-status {
+  font-size: 11px;
+  color: #9aa0aa;
+  white-space: nowrap;
 }
 .gv-hint {
   margin: 0;
@@ -1593,6 +1682,22 @@ onUnmounted(() => {
 .node.sel .box {
   stroke: #4cc2ff;
   stroke-width: 2.6;
+}
+/* Search match — a gold ring + glow marks every hit; the currently-cycled hit
+   (Enter) gets a brighter, thicker ring so you can tell it apart. A match always
+   reads at full opacity, even over the context/external dimming above. */
+.node.match {
+  opacity: 1;
+}
+.node.match .box {
+  stroke: #ffd54a;
+  stroke-width: 2.6;
+  filter: drop-shadow(0 0 5px rgba(255, 213, 74, 0.55));
+}
+.node.current .box {
+  stroke: #ffe27a;
+  stroke-width: 3;
+  filter: drop-shadow(0 0 9px rgba(255, 213, 74, 0.9));
 }
 .node.target .box {
   stroke: #4cc2ff;
