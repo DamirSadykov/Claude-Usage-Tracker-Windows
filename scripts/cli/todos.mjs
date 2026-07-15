@@ -45,6 +45,19 @@ const col = (s) => (STATUSES.includes(s) ? s : "backlog");
 // order and a settings threshold picks the minimum level that enters context.
 const PRIORITIES = ["high", "medium", "low"];
 
+// Task-graph node type (#88), in lockstep with todos.rs::Todo.kind and GraphView.
+// `auto` = a node a headless runner may execute unattended; `manual` (the default,
+// stored as an empty/absent field) = a human/review gate. Normalize returns the
+// canonical value ("auto" | ""), or undefined for anything else. `manual`/`none`/""
+// all clear the field, so the file stays clean and the default is conservative.
+function normalizeKind(v) {
+  if (v == null) return undefined;
+  const s = String(v).trim().toLowerCase();
+  if (s === "auto") return "auto";
+  if (s === "manual" || s === "none" || s === "") return "";
+  return undefined;
+}
+
 // Normalize a --priority / set-priority value to a real bucket or "" (unset).
 // "none"/"clear"/"" explicitly clear it. Returns undefined for anything invalid,
 // so the caller can fail with a helpful message instead of writing garbage.
@@ -127,16 +140,19 @@ function cmdSetStatus(id, status) {
     fail(`invalid status "${status}". valid: ${STATUSES.join(" | ")}`);
   const file = todosPath();
   const data = load(file);
-  const todo = data.todos.find((t) => t && t.id === id);
+  // Accept id | N | #N (resolveTask), same as set-kind/dep/ref — the pipeline flow
+  // (`set-status <id> done`) and the hook train `#N`, so a raw-id-only lookup here
+  // was an inconsistency that broke step 4 of `todos pipeline`.
+  const todo = resolveTask(data, id);
   if (!todo) fail(`no todo with id ${id}`);
   if (todo.status === status) {
-    process.stdout.write(`ok: ${id} already ${status}\n`);
+    process.stdout.write(`ok: #${todo.number} already ${status}\n`);
     return;
   }
   todo.status = status;
   todo.updated_at = new Date().toISOString();
   save(file, data);
-  process.stdout.write(`ok: ${id} -> ${status}\n`);
+  process.stdout.write(`ok: #${todo.number} -> ${status}\n`);
   // Anchor for the handoff mechanism (#141): moving a task INTO in_progress is the
   // "starting this task" moment, so surface what it inherits from its prerequisites
   // right here — the agent gets the baton without being told to ask for it. Only
@@ -161,17 +177,43 @@ function cmdSetPriority(id, level) {
     fail(`invalid priority "${level}". valid: ${PRIORITIES.join(" | ")} | none`);
   const file = todosPath();
   const data = load(file);
-  const todo = data.todos.find((t) => t && t.id === id);
+  const todo = resolveTask(data, id); // id | N | #N, consistent with set-kind/status
   if (!todo) fail(`no todo with id ${id}`);
   if ((todo.priority || "") === priority) {
-    process.stdout.write(`ok: ${id} already ${priority || "unset"}\n`);
+    process.stdout.write(`ok: #${todo.number} already ${priority || "unset"}\n`);
     return;
   }
   if (priority) todo.priority = priority;
   else delete todo.priority;
   todo.updated_at = new Date().toISOString();
   save(file, data);
-  process.stdout.write(`ok: ${id} priority -> ${priority || "unset"}\n`);
+  process.stdout.write(`ok: #${todo.number} priority -> ${priority || "unset"}\n`);
+}
+
+// Set (or clear) a todo's task-graph node type (#88): `auto` marks a node a
+// headless runner may execute unattended; `manual` (the default) is a human/review
+// gate. Mirrors cmdSetPriority — validate, locate, write atomically, clear to keep
+// the file clean. Accepts an id, a bare number, or #N (via resolveTask), unlike the
+// older set-status/set-priority which still want a raw id.
+function cmdSetKind(id, value) {
+  if (!id || value == null)
+    fail("usage: cli todos set-kind <id> <auto|manual>");
+  const kind = normalizeKind(value);
+  if (kind === undefined)
+    fail(`invalid kind "${value}". valid: auto | manual`);
+  const file = todosPath();
+  const data = load(file);
+  const todo = resolveTask(data, id);
+  if (!todo) fail(`no todo with id ${id}`);
+  if ((todo.kind || "") === kind) {
+    process.stdout.write(`ok: ${todo.id} already ${kind || "manual"}\n`);
+    return;
+  }
+  if (kind) todo.kind = kind;
+  else delete todo.kind;
+  todo.updated_at = new Date().toISOString();
+  save(file, data);
+  process.stdout.write(`ok: #${todo.number} kind -> ${kind || "manual"}\n`);
 }
 
 // Set (or clear) a todo's project (issue #54: a task filed with the wrong/empty
@@ -250,6 +292,12 @@ function cmdAdd(args) {
       fail(`invalid --priority "${flags.priority}". valid: ${PRIORITIES.join(" | ")} | none`);
     priority = p;
   }
+  let kind = "";
+  if (flags.kind != null && flags.kind !== true) {
+    const k = normalizeKind(flags.kind);
+    if (k === undefined) fail(`invalid --kind "${flags.kind}". valid: auto | manual`);
+    kind = k;
+  }
   const now = new Date().toISOString();
   const file = todosPath();
   const data = load(file);
@@ -286,6 +334,7 @@ function cmdAdd(args) {
     status,
     // Omit the field entirely when unset, mirroring todos.rs (skip_serializing_if).
     ...(priority ? { priority } : {}),
+    ...(kind ? { kind } : {}),
     estimate_minutes: estimate,
     scheduled_for: typeof flags.scheduled === "string" ? flags.scheduled : null,
     plan: typeof flags.plan === "string" ? flags.plan : "",
@@ -823,11 +872,105 @@ function cmdGroups(args) {
   }
 }
 
+// `todos ready` — the pipeline frontier: tasks whose every dependency is `done`
+// (so they can be worked NOW) and that aren't done themselves. This is the Beads-
+// style "what's ready" query #88 references. `review` is NOT `done`, so a task
+// waiting on a prerequisite in review stays OUT of the list — mirroring the graph's
+// blocked/ready derivation and docs/task-pipeline.md. A dependency-free task counts
+// as ready (nothing blocks it). Scope mirrors `list` (cwd project + global by
+// default; --project <name> / --all). Filter with --auto | --manual; --json for raw.
+function cmdReady(args) {
+  const { flags } = parseArgs(args);
+  const all = load(todosPath()).todos.filter(Boolean);
+  const byId = new Map(all.map((t) => [t.id, t]));
+  const isDone = (t) => t && col(t.status) === "done";
+
+  let scope;
+  if (flags.all) {
+    scope = all;
+  } else if (typeof flags.project === "string") {
+    const p = flags.project.trim();
+    scope = all.filter((t) => (t.project || "") === p);
+  } else {
+    const cwdProject = path.basename(process.cwd().replace(/[\\/]+$/, ""));
+    scope = all.filter((t) => !t.project || t.project === cwdProject);
+  }
+
+  let ready = scope.filter(
+    (t) =>
+      !isDone(t) &&
+      (t.depends_on ?? []).every((d) => {
+        const dep = byId.get(d);
+        return !dep || isDone(dep); // a missing (deleted) prereq can't block
+      }),
+  );
+  // --auto / --manual narrow to a kind (the runnable frontier vs the human gates).
+  if (flags.auto) ready = ready.filter((t) => t.kind === "auto");
+  if (flags.manual) ready = ready.filter((t) => t.kind !== "auto");
+  ready.sort((a, b) => (a.number || 0) - (b.number || 0));
+
+  if (flags.json) {
+    process.stdout.write(JSON.stringify(ready, null, 2) + "\n");
+    return;
+  }
+  if (!ready.length) {
+    process.stdout.write("(no ready tasks)\n");
+    return;
+  }
+  for (const t of ready) {
+    const kind = t.kind === "auto" ? "auto" : "manual";
+    const proj = t.project || "global";
+    process.stdout.write(
+      `#${t.number} [${col(t.status)}/${kind}] ${proj} — ${t.subject}\n`,
+    );
+  }
+}
+
+// `todos pipeline` — print the task-graph workflow so a Claude Code session knows
+// HOW to drive the board as a DAG (#88): create → deps → set-kind → run. Kept
+// self-contained (no file dependency) so it works from any project; the fuller
+// version with rationale lives in the tracker repo at docs/task-pipeline.md.
+function cmdPipeline() {
+  process.stdout.write(
+    "Task pipeline (#88) — drive the board as a dependency graph (DAG).\n" +
+      "A task = a node; an edge A->B means A depends on B (B must be done first).\n" +
+      "Two orthogonal axes: STATUS (kanban column) vs PIPELINE STATE (blocked/ready,\n" +
+      "derived from deps). KIND (auto|manual) decides WHO closes a node.\n\n" +
+      "1. Create tasks\n" +
+      '     todos add "<subject>" [--project <name> | --global] [--kind auto|manual]\n' +
+      "   No --kind => manual (default).\n\n" +
+      "2. Mark dependencies (the edges)\n" +
+      "     todos dep add <task> <depends-on>     # <task> waits for <depends-on>\n" +
+      "     todos dep list <task>                 # inspect deps + dependents\n" +
+      "   Acyclic, within one board. <task>/<depends-on> accept id | N | #N.\n\n" +
+      "3. Set node type — auto | manual\n" +
+      "     todos set-kind <id> auto|manual\n" +
+      "   manual (default) = human/review gate: YOU do it, the USER moves review->done;\n" +
+      "                      dependents stay blocked until then (by design, not a bug).\n" +
+      "   auto            = this session may run it unattended, VERIFY the result, and\n" +
+      "                     close it itself — you have authority after your own check.\n" +
+      "                     Only mark auto what a headless run can verify.\n\n" +
+      "4. Run the pipeline\n" +
+      "   A node is READY when every task in its depends_on is `done` (review is NOT\n" +
+      "   done — still a gate). List the frontier:\n" +
+      "     todos ready [--auto | --manual]       # tasks workable right now\n" +
+      "   Walk ready nodes in dependency order:\n" +
+      "     - auto  node -> do work, VERIFY, then: todos set-status <id> done\n" +
+      '                     and hand off: todos handoff set <id> --text "<...>"\n' +
+      "     - manual node -> STOP: leave review->done to the user, and send a system\n" +
+      "                      notification (PushNotification) that the pipeline parked\n" +
+      "                      and needs their call. It self-skips if they're at the\n" +
+      "                      terminal, so it only pulls back a user who walked away.\n" +
+      "   Only `done` releases downstream. Stop when the next node is manual.\n\n" +
+      "Full guide + rationale: docs/task-pipeline.md (claude-usage-tracker repo).\n",
+  );
+}
+
 function usage(code) {
   process.stdout.write(
     "cli todos - Claude Usage Tracker todo CLI\n\n" +
       '  add "<subject>" [--project <name> | --global] [--from <project>] [--status <status>]\n' +
-      "                  [--description <text>] [--plan <text>] [--estimate <min>] [--scheduled <YYYY-MM-DD>]\n" +
+      "                  [--description <text>] [--plan <text>] [--estimate <min>] [--scheduled <YYYY-MM-DD>] [--kind auto|manual]\n" +
       "                  no --project → the current project (cwd); --global = project-less\n" +
       "  set-status <id> <status>        status ∈ " +
       STATUSES.join(" | ") +
@@ -835,6 +978,7 @@ function usage(code) {
       "  set-priority <id> <level>       level ∈ " +
       PRIORITIES.join(" | ") +
       " | none\n" +
+      "  set-kind <id> <auto|manual>     task-graph node type (#88): auto = runner may run headless; manual (default) = human gate\n" +
       "  set-project <id> <name>         tie to a project; <--global|none> to clear\n" +
       '  comment add <id> --text "<body>" [--by claude|user]\n' +
       "  comment list <id> [--json]\n" +
@@ -853,6 +997,9 @@ function usage(code) {
       '  handoff set <task> --text "…"   set <task>\'s own handoff (carried to tasks that depend on it)\n' +
       "  related <project> [--json]      projects that work with <project>\n" +
       "  groups [--json]                 list association groups\n" +
+      "  ready [--project <name> | --all] [--auto | --manual] [--json]\n" +
+      "                                  pipeline frontier: tasks whose deps are all done (review ≠ done)\n" +
+      "  pipeline                        how to drive the task graph (#88): create → deps → set-kind → run\n" +
       "\n" +
       "  Inline task references (inside a description/comment): write t#N, e.g. \"blocked by t#12\".\n" +
       "  A bare #N is read as a GitHub PR/issue and is NOT linked — always prefix a task reference with t.\n" +
@@ -883,6 +1030,9 @@ export function run(args) {
     case "set-priority":
       cmdSetPriority(rest[0], rest[1]);
       break;
+    case "set-kind":
+      cmdSetKind(rest[0], rest[1]);
+      break;
     case "set-project":
       cmdSetProject(rest[0], rest[1]);
       break;
@@ -906,6 +1056,12 @@ export function run(args) {
       break;
     case "groups":
       cmdGroups(rest);
+      break;
+    case "ready":
+      cmdReady(rest);
+      break;
+    case "pipeline":
+      cmdPipeline();
       break;
     case undefined:
     case "-h":
