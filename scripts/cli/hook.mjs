@@ -25,6 +25,11 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { readPlansForHook, markPlanDoneForDoneTasks } from "./phases.mjs";
+import {
+  taskContextMinRank,
+  sessionContextMode,
+  hookContextEnabled,
+} from "./settings.mjs";
 
 // The unified CLI is this module's grandparent-relative entry (scripts/cli.mjs);
 // resolve its absolute path so the contract below can hand Claude exact,
@@ -44,61 +49,9 @@ const CLI_NOTE = `<cli> = node "${CLI}"`;
 const PRANK = { high: 3, medium: 2, low: 1 };
 const prank = (t) => (t && PRANK[t.priority]) || 0;
 
-// The "task priority in context" setting (settings.json, written by the tracker's
-// SettingsPanel) names the LOWEST priority a task must have to reach a session:
-// all | low | medium | high → a min rank. Default is `medium`, so low/unset tasks
-// stay out of context unless the user opts them in. Read-only and forgiving: a
-// missing file, bad JSON, or unknown value falls back to the default.
-function contextMinRank(appData) {
-  const MIN = { all: 0, low: 1, medium: 2, high: 3 };
-  try {
-    const raw = readFileSync(
-      path.join(appData, "com.claude-usage-tracker.app", "settings.json"),
-      "utf8",
-    );
-    const v = JSON.parse(raw).taskContextPriority;
-    if (typeof v === "string" && v in MIN) return MIN[v];
-  } catch {
-    // no settings file / bad JSON / missing key → default
-  }
-  return MIN.medium;
-}
-
-// The "session context" setting (settings.json, written by SettingsPanel) chooses
-// what a session LEADS WITH when the project is mid-plan: "phase" (default) — the
-// current phase, focused, board held back; or "tasks" — always the task board,
-// even mid-plan. Read-only and forgiving: missing/bad/unknown falls back to "phase".
-function sessionContextMode(appData) {
-  try {
-    const raw = readFileSync(
-      path.join(appData, "com.claude-usage-tracker.app", "settings.json"),
-      "utf8",
-    );
-    const v = JSON.parse(raw).sessionContext;
-    if (v === "tasks" || v === "phase") return v;
-  } catch {
-    // no settings file / bad JSON / missing key → default
-  }
-  return "phase";
-}
-
-// Master switch (settings.json `hookContextEnabled`, written by SettingsPanel):
-// when false, the hook injects NOTHING into the session — no task board and no
-// phase context. Default true (inject). Read-only and forgiving: a missing file,
-// bad JSON, or absent key falls back to on.
-function hookContextEnabled(appData) {
-  try {
-    const raw = readFileSync(
-      path.join(appData, "com.claude-usage-tracker.app", "settings.json"),
-      "utf8",
-    );
-    const v = JSON.parse(raw).hookContextEnabled;
-    if (typeof v === "boolean") return v;
-  } catch {
-    // no settings file / bad JSON / missing key → default on
-  }
-  return true;
-}
+// Settings reads (taskContextPriority → min rank, sessionContext, hookContextEnabled)
+// now live in ./settings.mjs — one place that owns the file path + each forgiving
+// default, shared with the Stop hook. See the imports above.
 
 // Local calendar date as YYYY-MM-DD — "today" is the USER's day, not UTC (a
 // scheduled_for date is a plain local date). Used to surface due/overdue tasks.
@@ -200,7 +153,7 @@ function main() {
   }
 
   if (active.length) {
-    const minRank = contextMinRank(appData);
+    const minRank = taskContextMinRank(appData);
     const today = localToday();
     const isDue = (t) =>
       !!t.scheduled_for && String(t.scheduled_for).slice(0, 10) <= today;

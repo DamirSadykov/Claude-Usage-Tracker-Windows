@@ -39,25 +39,13 @@ import { readFileSync, readdirSync, statSync, openSync, readSync, closeSync } fr
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { readPlansForHook } from "./phases.mjs";
+import { phaseHandoffGuard, taskHandoffGuard } from "./settings.mjs";
 
 const CLI = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "cli.mjs");
 
-// The guard's off-switch (settings.json `phaseHandoffGuard`, written by the
-// tracker's SettingsPanel). Default ON. Read-only and forgiving: a missing file,
-// bad JSON, or absent key falls back to on — same contract as hookContextEnabled.
-function guardEnabled(appData) {
-  try {
-    const raw = readFileSync(
-      path.join(appData, "com.claude-usage-tracker.app", "settings.json"),
-      "utf8",
-    );
-    const v = JSON.parse(raw).phaseHandoffGuard;
-    if (typeof v === "boolean") return v;
-  } catch {
-    // no settings file / bad JSON / missing key → default on
-  }
-  return true;
-}
+// The guard's off-switch (`phaseHandoffGuard`) and the task-guard mode
+// (`taskHandoffGuard`) are read via ./settings.mjs — the shared settings layer
+// that owns the file path + each forgiving default. See the imports above.
 
 // When did THIS session start? The transcript is a JSONL log whose first records
 // carry an ISO `timestamp`; the earliest one is the session's start. We only need
@@ -272,22 +260,8 @@ export function auditPlans(cwd, sinceMs, isTaskDone = () => false, phaseOf = () 
 // "This session worked it" = `updated_at` after the session start. Whether the
 // baton is fresh is `handoff_at`, NOT updated_at — an edit of any kind bumps the
 // latter, so without the dedicated stamp a year-old handoff on a task touched
-// today would read as freshly written.
-const TASK_GUARD_MODES = ["off", "submitted", "unfinished", "both"];
-
-function taskGuardMode(appData) {
-  try {
-    const raw = readFileSync(
-      path.join(appData, "com.claude-usage-tracker.app", "settings.json"),
-      "utf8",
-    );
-    const v = JSON.parse(raw).taskHandoffGuard;
-    if (typeof v === "string" && TASK_GUARD_MODES.includes(v)) return v;
-  } catch {
-    // no settings file / bad JSON / missing key → default
-  }
-  return "both";
-}
+// today would read as freshly written. The mode itself (`taskHandoffGuard`) is
+// read via ./settings.mjs.
 
 const wants = (mode, kind) => mode === "both" || mode === kind;
 
@@ -445,8 +419,8 @@ function main() {
   const appData =
     process.env.APPDATA ||
     path.join(process.env.USERPROFILE || "", "AppData", "Roaming");
-  const phaseGuard = guardEnabled(appData);
-  const taskMode = taskGuardMode(appData);
+  const phaseGuard = phaseHandoffGuard(appData);
+  const taskMode = taskHandoffGuard(appData);
   if (!phaseGuard && taskMode === "off") return; // both halves switched off
 
   const since = sessionStartMs(input.transcript_path);
