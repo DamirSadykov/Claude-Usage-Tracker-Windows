@@ -96,6 +96,69 @@ function mtimeMs(file) {
   }
 }
 
+// --- which tasks did THIS session actually MOVE? (transcript attribution) ------
+//
+// The task guard's hard question is "did THIS session transition this task?", NOT
+// "was it touched in this window" (#219). A timestamp can't tell them apart — a
+// metadata edit, another session's move, or a hand-edit all bump `updated_at`, and
+// two sessions on one project share the same time window. The transcript can: it
+// is THIS session's own record, and every `todos set-status <ref> <status>` it ran
+// is a Bash tool_use whose command string we read back. A task another session
+// moved, or one this session merely mentioned (t#N in prose) or re-prioritized,
+// never appears here — so none of them can be dragged into this session's stop-gate.
+//
+// Returns Map<ref, Set<status>>: the ref (id|number, a leading '#' stripped) the
+// command named → the statuses it was set to. The caller matches a todo by BOTH
+// its id and its number, and only gates it if the session set it to the status it
+// NOW has (we made that transition, not just some earlier one).
+
+// A `set-status <ref> <status>` inside a command already known to invoke the CLI.
+const SET_STATUS_RE =
+  /\bset-status\s+#?([\w-]+)\s+(backlog|queue|in_progress|review|done)\b/g;
+
+// Pure parser over the raw JSONL transcript text — exported for the unit tests.
+export function parseSessionMoves(raw) {
+  const moved = new Map();
+  for (const line of String(raw || "").split("\n")) {
+    if (!line.includes("set-status")) continue; // cheap prefilter before JSON.parse
+    let rec;
+    try {
+      rec = JSON.parse(line);
+    } catch {
+      continue; // header / truncated line
+    }
+    const content = rec && rec.message && rec.message.content;
+    if (!Array.isArray(content)) continue;
+    for (const item of content) {
+      if (!item || item.type !== "tool_use" || item.name !== "Bash") continue;
+      const cmd = item.input && item.input.command;
+      // Require the command to actually invoke the tracker CLI, so a stray echo of
+      // the string "set-status …" can't be read as a real transition.
+      if (typeof cmd !== "string" || !/cli\.mjs|cc-todos/.test(cmd)) continue;
+      SET_STATUS_RE.lastIndex = 0;
+      let m;
+      while ((m = SET_STATUS_RE.exec(cmd))) {
+        let set = moved.get(m[1]);
+        if (!set) moved.set(m[1], (set = new Set()));
+        set.add(m[2]);
+      }
+    }
+  }
+  return moved;
+}
+
+// Read the session's transcript and derive its moves. Empty Map on any trouble
+// (no/unreadable transcript) — the guard then attributes nothing and stands down,
+// which keeps the "never break a session" contract.
+function sessionMovedTasks(transcriptPath) {
+  if (!transcriptPath) return new Map();
+  try {
+    return parseSessionMoves(readFileSync(transcriptPath, "utf8"));
+  } catch {
+    return new Map();
+  }
+}
+
 // --- is this text a baton, or just a receipt? --------------------------------
 //
 // mtime alone only proves SOMETHING was written — and the agent that writes the
@@ -257,24 +320,39 @@ export function auditPlans(cwd, sinceMs, isTaskDone = () => false, phaseOf = () 
 //   "unfinished" — a task this session worked and LEFT in_progress
 //   "both"       — either (default)
 //
-// "This session worked it" = `updated_at` after the session start. Whether the
-// baton is fresh is `handoff_at`, NOT updated_at — an edit of any kind bumps the
-// latter, so without the dedicated stamp a year-old handoff on a task touched
-// today would read as freshly written. The mode itself (`taskHandoffGuard`) is
-// read via ./settings.mjs.
+// "This session moved it" is read from the transcript, NOT `updated_at` (#219):
+// `movedBy` (a Map<ref, Set<status>> from parseSessionMoves) says which tasks this
+// session ran set-status on and into what. A task is in scope only if this session
+// set it to the status it NOW has — so another session's move, or a mere metadata
+// touch/mention, never counts. Whether the baton is fresh is a separate axis,
+// `handoff_at` vs the session start: an edit of any kind bumps updated_at, so
+// without the dedicated stamp a year-old handoff on a task touched today would read
+// as freshly written. The mode itself (`taskHandoffGuard`) is read via ./settings.mjs.
 
 const wants = (mode, kind) => mode === "both" || mode === kind;
 
+// Did THIS session set `t` to the status it currently has? Matches the transcript
+// refs by BOTH id and number — set-status accepts either (id|N|#N, the '#' already
+// stripped in the map).
+function movedIntoCurrentStatus(movedBy, t) {
+  const into =
+    movedBy.get(t.id) || (t.number != null && movedBy.get(String(t.number)));
+  return !!(into && into.has(t.status));
+}
+
 // The tasks of THIS project that owe a baton and haven't left one. Same two-level
 // judgement as for phases: is it there (fresh), and is it a baton at all.
-// `todos` is todos.json's array; `project` the cwd basename. Exported for the tests.
-export function auditTasks(todos, project, sinceMs, mode = "both") {
+// `todos` is todos.json's array; `project` the cwd basename; `movedBy` this
+// session's transcript-derived moves. Exported for the tests.
+export function auditTasks(todos, project, sinceMs, movedBy, mode = "both") {
   if (mode === "off" || !Array.isArray(todos)) return [];
+  const moved = movedBy instanceof Map ? movedBy : new Map();
   const out = [];
   for (const t of todos) {
     if (!t || (t.project && t.project !== project)) continue;
-    const touchedAt = Date.parse(t.updated_at);
-    if (!Number.isFinite(touchedAt) || touchedAt <= sinceMs) continue; // untouched this session
+    // Only tasks THIS session transitioned into their current status — the
+    // authoritative signal that this is the session's own work (#219).
+    if (!movedIntoCurrentStatus(moved, t)) continue;
 
     const kind =
       t.status === "review" || t.status === "done"
@@ -447,7 +525,10 @@ function main() {
 
   const plans = phaseGuard ? auditPlans(cwd, since, doneTask, currentPhase) : [];
   const project = path.basename(String(cwd).replace(/[\\/]+$/, ""));
-  const tasks = auditTasks(todos, project, since, taskMode);
+  // Which tasks THIS session actually moved (its transcript) — the guard scopes to
+  // those, never to another session's or a merely-touched task (#219).
+  const movedBy = taskMode === "off" ? new Map() : sessionMovedTasks(input.transcript_path);
+  const tasks = auditTasks(todos, project, since, movedBy, taskMode);
   if (!plans.length && !tasks.length) return;
 
   // Exit 2 is the Stop hook's "block": stderr goes back to Claude as the reason.

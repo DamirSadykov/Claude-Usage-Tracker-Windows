@@ -11,7 +11,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, mkdirSync, writeFileSync, utimesSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { auditPlans, auditTasks, batonComplaints } from "./stop-hook.mjs";
+import { auditPlans, auditTasks, batonComplaints, parseSessionMoves } from "./stop-hook.mjs";
 
 // A session that started at T; mutations after it are "this session's work".
 const SESSION_START = Date.parse("2026-07-14T12:00:00Z");
@@ -170,7 +170,7 @@ describe("auditPlans — substance of a FRESH baton", () => {
 
 describe("auditTasks", () => {
   const iso = (h) => new Date(at(`2026-07-14T${h}:00Z`)).toISOString();
-  // A task this session touched: `updated_at` after the session start.
+  // A task this session left in review with a fresh, real baton.
   const task = (over = {}) => ({
     id: "id-1",
     number: 59,
@@ -183,77 +183,151 @@ describe("auditTasks", () => {
     handoff_at: iso("14:40"),
     ...over,
   });
+  // The transcript-derived signal "this session set task #59 to <status>".
+  const moved = (status = "review", ref = "59") => new Map([[ref, new Set([status])]]);
 
   it("clears a submitted task that left a real, freshly written baton", () => {
-    expect(auditTasks([task()], "tracker", SESSION_START)).toEqual([]);
+    expect(auditTasks([task()], "tracker", SESSION_START, moved())).toEqual([]);
   });
 
-  it("flags a task moved to review with no handoff", () => {
+  it("flags a task this session moved to review with no handoff", () => {
     const found = auditTasks(
       [task({ handoff: "", handoff_at: undefined })],
       "tracker",
       SESSION_START,
+      moved(),
     );
     expect(found).toHaveLength(1);
     expect(found[0]).toMatchObject({ number: 59, kind: "submitted", stale: true, hadBaton: false });
   });
 
-  it("flags a baton left by an EARLIER session (updated_at is not enough)", () => {
-    // The trap the dedicated handoff_at stamp exists for: any edit bumps
-    // updated_at, so an old baton on a task touched today would look fresh.
+  it("flags a baton left by an EARLIER session (handoff_at is not enough)", () => {
+    // This session made the transition, but the only baton on the task predates
+    // the session — its own findings never made it in.
     const found = auditTasks(
       [task({ handoff_at: iso("09:00") })], // before SESSION_START (12:00)
       "tracker",
       SESSION_START,
+      moved(),
     );
     expect(found).toHaveLength(1);
     expect(found[0]).toMatchObject({ stale: true, hadBaton: true });
   });
 
-  it("flags a task left in_progress as unfinished work owing a baton", () => {
+  it("flags a task this session left in_progress as unfinished work", () => {
     const found = auditTasks(
       [task({ status: "in_progress", handoff: "", handoff_at: undefined })],
       "tracker",
       SESSION_START,
+      moved("in_progress"),
     );
     expect(found[0].kind).toBe("unfinished");
   });
 
-  it("flags a fresh task baton that is only a receipt", () => {
+  it("matches the moved task by id as well as number", () => {
     const found = auditTasks(
-      [task({ handoff: "готово" })],
+      [task({ handoff: "", handoff_at: undefined })],
       "tracker",
       SESSION_START,
+      moved("review", "id-1"),
     );
+    expect(found).toHaveLength(1);
+  });
+
+  it("flags a fresh task baton that is only a receipt", () => {
+    const found = auditTasks([task({ handoff: "готово" })], "tracker", SESSION_START, moved());
     expect(found[0]).toMatchObject({ stale: false, kind: "submitted" });
     expect(found[0].complaints.length).toBeGreaterThan(0);
   });
 
   it("flags a task baton that just parrots the task's own subject", () => {
-    const found = auditTasks([task({ handoff: "Guard свежести HANDOFF" })], "tracker", SESSION_START);
+    const found = auditTasks([task({ handoff: "Guard свежести HANDOFF" })], "tracker", SESSION_START, moved());
     expect(found[0].complaints.join(" ")).toMatch(/restates/);
   });
 
-  it("ignores a task the session never touched, and one it merely re-prioritized", () => {
-    const untouched = task({ id: "old", updated_at: iso("09:00"), handoff: "", handoff_at: undefined });
-    const backlog = task({ id: "b", number: 22, status: "backlog", handoff: "", handoff_at: undefined });
-    expect(auditTasks([untouched, backlog], "tracker", SESSION_START)).toEqual([]);
+  it("ignores a review task this session never moved, even without a baton (#219)", () => {
+    // The core fix: the task is in review with no fresh baton, but THIS session
+    // never ran set-status on it — an earlier/other session did. Absent from the
+    // transcript-derived map → out of the gate.
+    const found = auditTasks(
+      [task({ handoff: "", handoff_at: undefined })],
+      "tracker",
+      SESSION_START,
+      new Map(), // this session moved nothing
+    );
+    expect(found).toEqual([]);
+  });
+
+  it("ignores a task this session moved into a DIFFERENT status than it now has", () => {
+    // Session set it to in_progress; another session then pushed it to review.
+    // We didn't make the review transition, so no baton is owed for it.
+    const found = auditTasks(
+      [task({ status: "review", handoff: "", handoff_at: undefined })],
+      "tracker",
+      SESSION_START,
+      moved("in_progress"),
+    );
+    expect(found).toEqual([]);
   });
 
   it("ignores tasks of another project", () => {
     const other = task({ project: "some-other-app", handoff: "", handoff_at: undefined });
-    expect(auditTasks([other], "tracker", SESSION_START)).toEqual([]);
+    expect(auditTasks([other], "tracker", SESSION_START, moved())).toEqual([]);
   });
 
   it("honours the mode: off / submitted / unfinished / both", () => {
     const submitted = task({ id: "s", number: 1, status: "review", handoff: "", handoff_at: undefined });
     const unfinished = task({ id: "u", number: 2, status: "in_progress", handoff: "", handoff_at: undefined });
     const all = [submitted, unfinished];
-    const nums = (mode) => auditTasks(all, "tracker", SESSION_START, mode).map((t) => t.number);
+    const mv = new Map([
+      ["1", new Set(["review"])],
+      ["2", new Set(["in_progress"])],
+    ]);
+    const nums = (mode) => auditTasks(all, "tracker", SESSION_START, mv, mode).map((t) => t.number);
     expect(nums("off")).toEqual([]);
     expect(nums("submitted")).toEqual([1]);
     expect(nums("unfinished")).toEqual([2]);
     expect(nums("both")).toEqual([1, 2]);
+  });
+});
+
+describe("parseSessionMoves", () => {
+  // One transcript line = a Bash tool_use whose command runs the tracker CLI.
+  const line = (command) =>
+    JSON.stringify({
+      type: "assistant",
+      message: { content: [{ type: "tool_use", name: "Bash", input: { command } }] },
+    });
+
+  it("extracts a set-status transition keyed by the ref the command used", () => {
+    const raw = line(`cd "/x" && node scripts/cli.mjs todos set-status 84 in_progress`);
+    const moved = parseSessionMoves(raw);
+    expect(moved.get("84")).toEqual(new Set(["in_progress"]));
+  });
+
+  it("accumulates every status a task was set to, and strips a leading #", () => {
+    const raw = [
+      line(`node scripts/cli.mjs todos set-status #59 in_progress`),
+      line(`node scripts/cli.mjs todos set-status 59 review`),
+    ].join("\n");
+    const moved = parseSessionMoves(raw);
+    expect(moved.get("59")).toEqual(new Set(["in_progress", "review"]));
+  });
+
+  it("keys a uuid ref too", () => {
+    const raw = line(`node cli.mjs todos set-status aa0d4a5e-0000 done`);
+    expect(parseSessionMoves(raw).get("aa0d4a5e-0000")).toEqual(new Set(["done"]));
+  });
+
+  it("ignores a set-status string not run through the CLI (a stray echo)", () => {
+    const raw = line(`echo "run: todos set-status 5 review"`);
+    expect(parseSessionMoves(raw).size).toBe(0);
+  });
+
+  it("is empty on junk / no moves", () => {
+    expect(parseSessionMoves("").size).toBe(0);
+    expect(parseSessionMoves("not json\n{bad").size).toBe(0);
+    expect(parseSessionMoves(line(`node cli.mjs todos list`)).size).toBe(0);
   });
 });
 
