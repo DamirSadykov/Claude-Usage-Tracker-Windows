@@ -904,6 +904,7 @@ mod tests {
             description: String::new(),
             status: status.to_string(),
             priority: String::new(),
+            kind: String::new(),
             estimate_minutes: None,
             scheduled_for: None,
             plan: String::new(),
