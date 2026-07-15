@@ -15,6 +15,7 @@ import ProjectAutocomplete from "./ProjectAutocomplete.vue";
 import ProjectLabel from "./ProjectLabel.vue";
 import GraphView from "./GraphView.vue";
 import { useProjectLinks } from "../projectLinks";
+import { useHotkeys } from "../hotkeys";
 import {
   EXT_BUCKETS,
   resolveBucket,
@@ -192,11 +193,16 @@ const visible = computed(() => {
   if (!showDone.value) list = list.filter((t) => t.status !== "done");
   const q = search.value.trim().toLowerCase();
   if (q) {
+    // A bare number or `#N` query also matches the task NUMBER (substring, so
+    // "10" surfaces #10/#102/…) — searching by number, not just title/text.
+    const qNum = q.replace(/^#/, "");
+    const numeric = /^\d+$/.test(qNum);
     list = list.filter(
       (t) =>
         t.subject.toLowerCase().includes(q) ||
         t.description.toLowerCase().includes(q) ||
-        (t.project ?? "").toLowerCase().includes(q),
+        (t.project ?? "").toLowerCase().includes(q) ||
+        (numeric && String(t.number ?? "").includes(qNum)),
     );
   }
   return list;
@@ -663,6 +669,20 @@ async function openSettings() {
 // filtered board, toggled in place — not a separate window. It shares this
 // window's `todos` and `projectFilter`.
 const viewMode = ref<"board" | "graph">("board");
+// In graph view the ONE shared search box (below) highlights matching nodes instead
+// of filtering; Enter cycles to the next hit via GraphView's exposed `cycleNext`.
+const graphRef = ref<InstanceType<typeof GraphView> | null>(null);
+function onSearchEnter() {
+  if (viewMode.value === "graph") graphRef.value?.cycleNext();
+}
+
+// Keyboard shortcuts (registry in ../hotkeys): Ctrl+F → search, Ctrl+P → project.
+const searchInputRef = ref<HTMLInputElement | null>(null);
+const projectAcRef = ref<InstanceType<typeof ProjectAutocomplete> | null>(null);
+useHotkeys({
+  search: () => searchInputRef.value?.focus(),
+  project: () => projectAcRef.value?.focus(),
+});
 
 // GraphView mutates dependencies through the backend and hands back the fresh
 // list; adopt it so both views stay in lockstep without a reload round-trip.
@@ -1477,9 +1497,18 @@ onUnmounted(() => {
           <circle cx="7" cy="7" r="4.5" />
           <line x1="10.5" y1="10.5" x2="14" y2="14" stroke-linecap="round" />
         </svg>
-        <input v-model="search" class="tw-search-input" :placeholder="t('todoSearch')" />
+        <input
+          ref="searchInputRef"
+          v-model="search"
+          class="tw-search-input"
+          :placeholder="viewMode === 'graph' ? t('graphSearch') : t('todoSearch')"
+          :title="viewMode === 'graph' ? t('graphSearchHint') : undefined"
+          @keydown.enter="onSearchEnter"
+          @keydown.esc="search = ''"
+        />
       </div>
       <ProjectAutocomplete
+        ref="projectAcRef"
         v-model="projectFilter"
         :options="projects"
         :placeholder="t('todoFilterAll')"
@@ -1546,9 +1575,11 @@ onUnmounted(() => {
 
     <!-- Task graph: an alternative view of the same filtered board (#88) -->
     <GraphView
+      ref="graphRef"
       v-else-if="viewMode === 'graph'"
       :todos="todos"
       :project="projectFilter"
+      :query="search"
       @update="onGraphUpdate"
       @open="onGraphOpen"
     />

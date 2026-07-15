@@ -123,11 +123,20 @@ function clear() {
   focused.value = false;
   sel.value = -1;
 }
+
+// Expose focus() so a parent hotkey (Ctrl+P) can move focus into the picker.
+const inputEl = ref<HTMLInputElement | null>(null);
+function focus() {
+  inputEl.value?.focus();
+  inputEl.value?.select();
+}
+defineExpose({ focus });
 </script>
 
 <template>
   <div class="pa-root" :style="{ width }">
     <input
+      ref="inputEl"
       :value="text"
       class="pa-input"
       :class="{ clearable: clearable && text }"
