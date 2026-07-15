@@ -42,8 +42,12 @@ const {
   currentVersion,
   availableVersion,
   status: updateStatus,
+  progress: updateProgress,
+  errorMessage: updateErrorMessage,
   checkHours: updateCheckHours,
   checkForUpdate,
+  installUpdate,
+  relaunchApp,
   saveUpdaterSettings,
 } = useUpdater();
 
@@ -85,6 +89,9 @@ const props = defineProps<{
   runtimeInsightKinds: string[];
   locale: string;
   uiFont: string;
+  // Bumped by the host each time the main window confirms a persisted save
+  // (the `settings-changed` round-trip). Watched below to flash "Saved ✓".
+  savedTick?: number;
 }>();
 
 const emit = defineEmits<{
@@ -838,8 +845,37 @@ function goalOrNull(v: number | ""): number | null {
   return Number(v);
 }
 
+// Save feedback: the save round-trips through the main window (emit → persist →
+// `settings-changed` back → host bumps `savedTick`). "saving" is set on click and
+// flips to "saved" only when that confirmation arrives, so the tick reflects a real
+// on-disk write, not an optimistic guess. A fallback timer clears a stuck "saving"
+// if the confirmation never comes (e.g. the main window failed to persist).
+const saveState = ref<"idle" | "saving" | "saved">("idle");
+let saveResetTimer: ReturnType<typeof setTimeout> | null = null;
+let saveFailTimer: ReturnType<typeof setTimeout> | null = null;
+
+watch(() => props.savedTick, () => {
+  if (saveState.value !== "saving") return;
+  if (saveFailTimer) { clearTimeout(saveFailTimer); saveFailTimer = null; }
+  saveState.value = "saved";
+  if (saveResetTimer) clearTimeout(saveResetTimer);
+  saveResetTimer = setTimeout(() => (saveState.value = "idle"), 2000);
+});
+
+onUnmounted(() => {
+  if (saveResetTimer) clearTimeout(saveResetTimer);
+  if (saveFailTimer) clearTimeout(saveFailTimer);
+});
+
 function handleSave() {
   const errPct = goalOrNull(localGoalErrorRatePct.value);
+  saveState.value = "saving";
+  if (saveResetTimer) { clearTimeout(saveResetTimer); saveResetTimer = null; }
+  if (saveFailTimer) clearTimeout(saveFailTimer);
+  // No confirmation within 5s → assume it didn't land; drop the "saving" label.
+  saveFailTimer = setTimeout(() => {
+    if (saveState.value === "saving") saveState.value = "idle";
+  }, 5000);
   emit("save", {
     sessionKey: localSessionKey.value.trim(),
     orgId: localOrgId.value.trim(),
@@ -1488,11 +1524,29 @@ function handleSave() {
           {{ updateStatus === 'checking' ? t('checkingUpdates') : t('checkForUpdates') }}
         </button>
         <div v-if="updateStatus === 'uptodate'" class="field-hint">{{ t('upToDate') }}</div>
-        <div v-else-if="updateStatus === 'available'" class="field-hint">
-          {{ t('updateAvailable', { version: availableVersion }) }}
-        </div>
+        <!-- An update was found: offer to install it right here (the main-window
+             banner isn't visible from this standalone window). installUpdate()
+             downloads, then relaunches once ready. -->
+        <template v-else-if="updateStatus === 'available'">
+          <div class="field-hint">{{ t('updateAvailable', { version: availableVersion }) }}</div>
+          <button type="button" class="btn-check" style="margin-top: 8px" @click="installUpdate">
+            {{ t('updateNow') }}
+          </button>
+        </template>
+        <template v-else-if="updateStatus === 'downloading'">
+          <div class="field-hint">{{ t('updateDownloading', { pct: updateProgress }) }}</div>
+          <div class="update-progress-track">
+            <div class="update-progress-bar" :style="{ width: updateProgress + '%' }"></div>
+          </div>
+        </template>
+        <template v-else-if="updateStatus === 'ready'">
+          <div class="field-hint">{{ t('updateReady') }}</div>
+          <button type="button" class="btn-check" style="margin-top: 8px" @click="relaunchApp">
+            {{ t('restartNow') }}
+          </button>
+        </template>
         <div v-else-if="updateStatus === 'error'" class="field-hint" style="color: #f87171">
-          {{ t('updateError') }}
+          {{ t('updateError') }}<template v-if="updateErrorMessage"> — {{ updateErrorMessage }}</template>
         </div>
       </div>
 
@@ -1804,8 +1858,13 @@ function handleSave() {
     </div>
 
     <div class="settings-save-bar">
-      <button type="submit" class="save-btn" :disabled="!localSessionKey || !localOrgId">
-        {{ t('save') }}
+      <button
+        type="submit"
+        class="save-btn"
+        :class="{ saved: saveState === 'saved' }"
+        :disabled="!localSessionKey || !localOrgId || saveState === 'saving'"
+      >
+        {{ saveState === 'saving' ? t('saving') : saveState === 'saved' ? t('saved') : t('save') }}
       </button>
     </div>
     </div>
@@ -2195,6 +2254,33 @@ function handleSave() {
 .save-btn:disabled {
   opacity: 0.35;
   cursor: not-allowed;
+}
+
+/* Persisted confirmation — green fill, and it stays fully opaque even though the
+   button isn't disabled while showing "Saved ✓". */
+.save-btn.saved {
+  background: #16a34a;
+  opacity: 1;
+}
+
+.save-btn.saved:disabled {
+  opacity: 1;
+}
+
+/* Download progress in the Updates tab (mirrors the main-window banner bar). */
+.update-progress-track {
+  margin-top: 8px;
+  height: 5px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.1);
+  overflow: hidden;
+}
+
+.update-progress-bar {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 3px;
+  transition: width 160ms;
 }
 
 .btn-check {
