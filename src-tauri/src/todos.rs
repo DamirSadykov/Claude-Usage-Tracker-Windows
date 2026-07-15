@@ -43,6 +43,14 @@ pub struct Todo {
     /// with [`PRIORITIES`], the cc-todos CLI, and TodoWindow.vue.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub priority: String,
+    /// Task-graph node type (#88): `"auto"` = a node a headless runner may execute
+    /// unattended, `""` (default) = `manual`, a human/review gate. Orthogonal to
+    /// `status` (the kanban column) and to the DERIVED pipeline state (blocked/ready,
+    /// computed from `depends_on`, never stored). Empty is omitted so existing files
+    /// need no migration and the conservative default stays `manual`. Keep in lockstep
+    /// with the cc-todos CLI (`set-kind`) and GraphView.vue.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub kind: String,
     /// LLM/user time estimate in minutes; None = unestimated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimate_minutes: Option<i64>,

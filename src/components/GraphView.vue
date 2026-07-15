@@ -87,6 +87,43 @@ const byId = computed(() => {
   return m;
 });
 
+// --- Task-graph node type + DERIVED pipeline state (#88) --------------------
+// Two axes kept ORTHOGONAL to the kanban `status` (the node fill):
+//   kind  — a STORED marker: "auto" (a runner may run it headless) vs "manual"
+//           (default; a human/review gate). Shown as a ⚡ glyph on the number line.
+//   pstate — DERIVED from the dep-graph, never stored: "blocked" (a prerequisite is
+//           not yet done) / "ready" (no open deps, not done) / "" (done, or nothing
+//           to say). A task can be `in_progress` AND `blocked` — that's why this is a
+//           separate axis, not a sixth status. Shown as a corner dot on the Deps tab.
+const kindOf = (id: string): "auto" | "manual" =>
+  byId.value.get(id)?.kind === "auto" ? "auto" : "manual";
+
+function pstateOf(id: string): "" | "blocked" | "ready" {
+  const x = byId.value.get(id);
+  if (!x || canonStatus(x.status) === "done") return "";
+  for (const d of x.depends_on ?? []) {
+    const dep = byId.value.get(d);
+    if (dep && canonStatus(dep.status) !== "done") return "blocked";
+  }
+  return "ready";
+}
+
+// Colour for the pipeline-state dot. `ready` splits by kind so the graph reads as a
+// pipeline at a glance: green = a runner could advance it, amber = it stops for you.
+function pstateColor(id: string): string {
+  const s = pstateOf(id);
+  if (s === "blocked") return "#e0574a";
+  if (s === "ready") return kindOf(id) === "manual" ? "#ffc107" : "#6ccb5f";
+  return "";
+}
+function pstateTitle(id: string): string {
+  const s = pstateOf(id);
+  if (s === "blocked") return t("graphPipeBlocked");
+  if (s === "ready")
+    return kindOf(id) === "manual" ? t("graphPipeReadyManual") : t("graphPipeReadyAuto");
+  return "";
+}
+
 // --- Geometry constants ----------------------------------------------------
 interface GNode {
   id: string;
@@ -94,6 +131,10 @@ interface GNode {
   subject: string;
   status: string;
   external: boolean;
+  // Pulled into the Deps tab only as a predecessor of a still-open task while the
+  // status filter would otherwise hide it (e.g. a done prerequisite) — rendered
+  // dimmed to read as context, not part of the active filter.
+  context?: boolean;
   extProject?: string;
   lines: string[]; // subject wrapped to fit the node width
   h: number; // node height, grown to fit the wrapped lines
@@ -246,9 +287,43 @@ const raw = computed(() => {
   return { tasks, boardIds, depEdges, refEdges, externalTargets };
 });
 
+// Deps-tab node/edge set. Starts from the shown tasks, then — so a still-open task
+// never floats away when its prerequisites are filtered out (the default filter
+// hides `done`, and a finished chain leaves its open successor edge-less and thus
+// off the graph) — pulls in the TRANSITIVE prerequisites of every shown NOT-done
+// task from the full board, regardless of the status filter. Keeps an open node
+// anchored to its completed lineage; the pulled-in nodes are flagged `context`.
+const depGraph = computed<{ tasks: Todo[]; shownIds: Set<string>; depEdges: GEdge[] }>(() => {
+  const shown = shownTasks.value;
+  const shownIds = new Set(shown.map((x) => x.id));
+  const inSet = new Map<string, Todo>(shown.map((x) => [x.id, x]));
+  // Seed from the prerequisites of every shown OPEN task, then walk up the chain.
+  const stack: string[] = shown
+    .filter((x) => canonStatus(x.status) !== "done")
+    .flatMap((x) => x.depends_on ?? []);
+  while (stack.length) {
+    const id = stack.pop()!;
+    if (inSet.has(id)) continue;
+    const x = byId.value.get(id);
+    if (!x) continue;
+    // Deps are intra-board; when scoped to one project, don't cross the boundary.
+    if (props.project && boardOf(x) !== props.project) continue;
+    inSet.set(id, x);
+    for (const d of x.depends_on ?? []) stack.push(d);
+  }
+  const ids = new Set(inSet.keys());
+  const depEdges: GEdge[] = [];
+  for (const x of inSet.values()) {
+    for (const depId of x.depends_on ?? []) {
+      if (ids.has(depId)) depEdges.push({ fromId: depId, toId: x.id, kind: "dep" });
+    }
+  }
+  return { tasks: [...inSet.values()], shownIds, depEdges };
+});
+
 // --- Deps tab: per-project ALAP pipeline layout ----------------------------
 const depModel = computed<{ nodes: GNode[]; edges: GEdge[]; bands: DepBand[] }>(() => {
-  const { tasks, depEdges } = raw.value;
+  const { tasks, shownIds, depEdges } = depGraph.value;
   const inGraph = new Set<string>();
   for (const e of depEdges) {
     inGraph.add(e.fromId);
@@ -258,7 +333,12 @@ const depModel = computed<{ nodes: GNode[]; edges: GEdge[]; bands: DepBand[] }>(
   const nodes = new Map<string, GNode>();
   for (const id of inGraph) {
     const x = taskById.get(id);
-    if (x) nodes.set(id, baseNode(x));
+    if (x) {
+      const node = baseNode(x);
+      // A prerequisite pulled in past the status filter — dim it as context.
+      if (!shownIds.has(id)) node.context = true;
+      nodes.set(id, node);
+    }
   }
 
   // Upstream (prerequisites) and downstream (dependents) adjacency. Dep edges are
@@ -937,11 +1017,34 @@ async function removeDep(fromId: string, onId: string) {
     flashError(String(err));
   }
 }
+
+// Removing a dependency asks first: the edge dot is a small target that's easy to
+// hit by accident, and once gone it wasn't clear WHICH link vanished. `pendingDep`
+// holds the edge awaiting confirmation (depId depends on onId; null = no dialog).
+const pendingDep = ref<{ depId: string; onId: string } | null>(null);
+function askRemoveDep(depId: string, onId: string) {
+  pendingDep.value = { depId, onId };
+}
+function cancelRemoveDep() {
+  pendingDep.value = null;
+}
+async function confirmRemoveDep() {
+  const p = pendingDep.value;
+  pendingDep.value = null;
+  if (p) await removeDep(p.depId, p.onId);
+}
+// "#N subject" for the confirm text; falls back to the raw id if the task is gone.
+const depLabel = (id: string): string => {
+  const x = byId.value.get(id);
+  if (!x) return id;
+  return x.number ? `#${x.number} ${x.subject}` : x.subject;
+};
+
 // RIGHT-click a solid dep arrow (source→target ⇒ target depends on source).
 function onDepContext(e: MouseEvent, edge: EdgeGeom) {
   e.preventDefault();
   if (edge.kind !== "dep") return;
-  void removeDep(edge.toId, edge.fromId);
+  askRemoveDep(edge.toId, edge.fromId);
 }
 
 // Curved path for a ref edge: a quadratic Bézier bowed perpendicular to the
@@ -1002,6 +1105,13 @@ onUnmounted(() => {
       <button class="gv-btn" @click="resetView">{{ t("graphResetView") }}</button>
     </div>
     <p class="gv-hint">{{ tab === "deps" ? t("graphHintDeps") : t("graphHintRef") }}</p>
+
+    <div v-if="tab === 'deps'" class="gv-legend">
+      <span class="lg"><i class="lg-dot" style="background:#e0574a"></i>{{ t("graphPipeBlocked") }}</span>
+      <span class="lg"><i class="lg-dot" style="background:#6ccb5f"></i>{{ t("graphPipeReadyAuto") }}</span>
+      <span class="lg"><i class="lg-dot" style="background:#ffc107"></i>{{ t("graphPipeReadyManual") }}</span>
+      <span class="lg"><i class="lg-auto">⚡</i>{{ t("graphKindAuto") }}</span>
+    </div>
 
     <div v-if="errorMsg" class="gv-error">{{ errorMsg }}</div>
 
@@ -1087,8 +1197,8 @@ onUnmounted(() => {
                 :cy="e.my"
                 r="5"
                 @mousedown.stop
-                @click.stop="removeDep(e.toId, e.fromId)"
-                @contextmenu.prevent.stop="removeDep(e.toId, e.fromId)"
+                @click.stop="askRemoveDep(e.toId, e.fromId)"
+                @contextmenu.prevent.stop="askRemoveDep(e.toId, e.fromId)"
               >
                 <title>{{ t("graphRemoveDep") }}</title>
               </circle>
@@ -1108,7 +1218,7 @@ onUnmounted(() => {
           v-for="n in model.nodes"
           :key="n.id"
           class="node"
-          :class="{ external: n.external, dimmed: nodeDimmed(n.id), sel: selected === n.id, target: hoverNode === n.id && dragging }"
+          :class="{ external: n.external, context: n.context, dimmed: nodeDimmed(n.id), sel: selected === n.id, target: hoverNode === n.id && dragging }"
           :transform="`translate(${n.x},${n.y})`"
           @mousedown="onNodeDown($event, n.id)"
           @mouseenter="hoverNode = n.id"
@@ -1122,7 +1232,18 @@ onUnmounted(() => {
             rx="9"
             :style="{ '--accent': statusColor(n.status) }"
           />
+          <circle
+            v-if="tab === 'deps' && pstateColor(n.id)"
+            class="pstate"
+            :cx="NODE_W - 13"
+            cy="13"
+            r="4.5"
+            :fill="pstateColor(n.id)"
+          >
+            <title>{{ pstateTitle(n.id) }}</title>
+          </circle>
           <text class="num" x="12" y="18">
+            <tspan v-if="kindOf(n.id) === 'auto'" class="kind-auto">⚡ </tspan>
             <tspan v-if="n.number">#{{ n.number }}</tspan>
             <tspan v-if="n.external" class="ext-proj" :dx="n.number ? 6 : 0">
               {{ extLabel(n) }}
@@ -1140,6 +1261,27 @@ onUnmounted(() => {
         </g>
       </g>
     </svg>
+
+    <!-- Confirm before removing a dependency edge (accidental clicks on the tiny
+         arrow dot were deleting links without it being clear which one). -->
+    <div v-if="pendingDep" class="gv-modal" @click.self="cancelRemoveDep">
+      <div class="gv-confirm">
+        <div class="gv-confirm-title">{{ t("graphRemoveDepTitle") }}</div>
+        <p class="gv-confirm-body">
+          <strong>{{ depLabel(pendingDep.depId) }}</strong>
+          <span class="gv-confirm-rel">{{ t("graphRemoveDepRel") }}</span>
+          <strong>{{ depLabel(pendingDep.onId) }}</strong>
+        </p>
+        <div class="gv-confirm-actions">
+          <button type="button" class="gv-btn ghost" @click="cancelRemoveDep">
+            {{ t("todoCancel") }}
+          </button>
+          <button type="button" class="gv-btn danger" @click="confirmRemoveDep">
+            {{ t("todoDelete") }}
+          </button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -1149,6 +1291,8 @@ onUnmounted(() => {
   flex-direction: column;
   flex: 1;
   min-height: 0;
+  /* Offset parent for the dependency-remove confirm overlay (position: absolute). */
+  position: relative;
 }
 .gv-bar {
   display: flex;
@@ -1229,6 +1373,92 @@ onUnmounted(() => {
   color: #7a808a;
   font-size: 12px;
   border-bottom: 1px solid #2c2f36;
+}
+.gv-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  padding: 6px 14px;
+  border-bottom: 1px solid #2c2f36;
+  font-size: 11px;
+  color: #7a808a;
+}
+.gv-legend .lg {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.gv-legend .lg-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: 1px solid #16181c;
+}
+.gv-legend .lg-auto {
+  color: #6ccb5f;
+  font-weight: 700;
+  font-style: normal;
+}
+.gv-modal {
+  position: absolute;
+  inset: 0;
+  z-index: 60;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+.gv-confirm {
+  width: 100%;
+  max-width: 380px;
+  display: flex;
+  flex-direction: column;
+  gap: 13px;
+  padding: 20px;
+  border: 1px solid #3a3d44;
+  border-radius: 10px;
+  background: #24262b;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
+}
+.gv-confirm-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: #e6e8eb;
+}
+.gv-confirm-body {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.55;
+  color: #b9bec6;
+  word-break: break-word;
+}
+.gv-confirm-body strong {
+  color: #e6e8eb;
+  font-weight: 600;
+}
+.gv-confirm-rel {
+  color: #7a808a;
+  margin: 0 5px;
+}
+.gv-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+/* Modal button variants — extend the base .gv-btn (toolbar) with intent colours. */
+.gv-btn.ghost {
+  background: transparent;
+  color: #b9bec6;
+}
+.gv-btn.danger {
+  background: #e0524a;
+  color: #fff;
+  border-color: #e0524a;
+}
+.gv-btn.danger:hover {
+  background: #d4453a;
+  border-color: #d4453a;
 }
 .gv-error {
   margin: 8px 14px 0;
@@ -1340,6 +1570,14 @@ onUnmounted(() => {
 .node.external {
   opacity: 0.85;
 }
+/* A prerequisite shown only for context (filtered out, pulled in to anchor an open
+   successor) — dimmed and dashed so it reads as background, not active work. */
+.node.context {
+  opacity: 0.5;
+}
+.node.context .box {
+  stroke-dasharray: 4 3;
+}
 .node.dimmed {
   opacity: 0.25;
 }
@@ -1364,6 +1602,14 @@ onUnmounted(() => {
   fill: #e6e8eb;
   font-weight: 600;
   font-size: 12px;
+}
+.node .num .kind-auto {
+  fill: #6ccb5f;
+  font-weight: 700;
+}
+.node .pstate {
+  stroke: #16181c;
+  stroke-width: 1.5;
 }
 .node .num .ext-proj {
   fill: #9aa0aa;

@@ -58,6 +58,7 @@ export interface Todo {
   description: string;
   status: string;
   priority?: string; // "high" | "medium" | "low" | "" (unset) — drives hook context
+  kind?: string; // "auto" | "" (manual, default) — task-graph node type (#88)
   estimate_minutes?: number | null;
   scheduled_for?: string | null;
   plan: string;
