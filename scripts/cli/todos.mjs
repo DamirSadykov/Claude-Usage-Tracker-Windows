@@ -40,6 +40,11 @@ const STATUSES = ["backlog", "queue", "in_progress", "review", "done"];
 // hook does the same — mirror it so `--status` matches what the board shows.
 const col = (s) => (STATUSES.includes(s) ? s : "backlog");
 
+// A task counts as "done" iff its normalized column is `done` (review ≠ done —
+// still a gate). Shared by the ready frontier and the done-gate so both read the
+// dependency graph the same way.
+const isDone = (t) => !!t && col(t.status) === "done";
+
 // Priority buckets, most to least important; "" = unset. Keep in lockstep with
 // todos.rs::PRIORITIES and TodoWindow.vue. The SessionStart hook ranks by this
 // order and a settings threshold picks the minimum level that enters context.
@@ -134,8 +139,10 @@ function fail(msg) {
   process.exit(1);
 }
 
-function cmdSetStatus(id, status) {
-  if (!id || !status) fail("usage: cli todos set-status <id> <status>");
+function cmdSetStatus(args) {
+  const { positional, flags } = parseArgs(args);
+  const [id, status] = positional;
+  if (!id || !status) fail("usage: cli todos set-status <id> <status> [--force]");
   if (!STATUSES.includes(status))
     fail(`invalid status "${status}". valid: ${STATUSES.join(" | ")}`);
   const file = todosPath();
@@ -145,6 +152,23 @@ function cmdSetStatus(id, status) {
   // was an inconsistency that broke step 4 of `todos pipeline`.
   const todo = resolveTask(data, id);
   if (!todo) fail(`no todo with id ${id}`);
+  // Done-gate (#88): `done` is the ONLY status that releases downstream tasks
+  // (`ready` derives the frontier from it), so closing a task while its
+  // prerequisites are unfinished would silently unblock work whose chain never
+  // ran — the graph would show `ready` for links that were never satisfied.
+  // Refuse it unless the caller explicitly overrides with --force. Only direct
+  // depends_on are checked: a satisfied direct prereq transitively vouches for
+  // its own upstream (it couldn't have closed honestly otherwise).
+  if (status === "done" && !flags.force) {
+    const blocking = directPrereqs(data, todo).filter((p) => !isDone(p));
+    if (blocking.length) {
+      fail(
+        `refusing: #${todo.number} depends on unfinished task(s): ` +
+          blocking.map((p) => `#${p.number} [${col(p.status)}]`).join(", ") +
+          "\nfinish those first, or override with --force",
+      );
+    }
+  }
   if (todo.status === status) {
     process.stdout.write(`ok: #${todo.number} already ${status}\n`);
     return;
@@ -883,7 +907,6 @@ function cmdReady(args) {
   const { flags } = parseArgs(args);
   const all = load(todosPath()).todos.filter(Boolean);
   const byId = new Map(all.map((t) => [t.id, t]));
-  const isDone = (t) => t && col(t.status) === "done";
 
   let scope;
   if (flags.all) {
@@ -961,7 +984,9 @@ function cmdPipeline() {
       "                      notification (PushNotification) that the pipeline parked\n" +
       "                      and needs their call. It self-skips if they're at the\n" +
       "                      terminal, so it only pulls back a user who walked away.\n" +
-      "   Only `done` releases downstream. Stop when the next node is manual.\n\n" +
+      "   Only `done` releases downstream. Stop when the next node is manual.\n" +
+      "   `set-status <id> done` is refused while a direct prereq is unfinished\n" +
+      "   (the graph never shows a ready edge that wasn't satisfied); --force overrides.\n\n" +
       "Full guide + rationale: docs/task-pipeline.md (claude-usage-tracker repo).\n",
   );
 }
@@ -972,9 +997,10 @@ function usage(code) {
       '  add "<subject>" [--project <name> | --global] [--from <project>] [--status <status>]\n' +
       "                  [--description <text>] [--plan <text>] [--estimate <min>] [--scheduled <YYYY-MM-DD>] [--kind auto|manual]\n" +
       "                  no --project → the current project (cwd); --global = project-less\n" +
-      "  set-status <id> <status>        status ∈ " +
+      "  set-status <id> <status> [--force]  status ∈ " +
       STATUSES.join(" | ") +
       "\n" +
+      "                                  → done is refused while a prereq is unfinished; --force overrides\n" +
       "  set-priority <id> <level>       level ∈ " +
       PRIORITIES.join(" | ") +
       " | none\n" +
@@ -1025,7 +1051,7 @@ export function run(args) {
       cmdAdd(rest);
       break;
     case "set-status":
-      cmdSetStatus(rest[0], rest[1]);
+      cmdSetStatus(rest);
       break;
     case "set-priority":
       cmdSetPriority(rest[0], rest[1]);
