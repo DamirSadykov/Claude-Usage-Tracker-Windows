@@ -625,6 +625,14 @@ fn flag_anomalies(sessions: &[SessionUsage]) -> Vec<SessionUsage> {
 }
 
 impl StatsDb {
+    /// Every session on record, no time window — the tokens-per-task join
+    /// (task_cost.rs, t#87) attributes arbitrarily old sessions. ISO timestamps
+    /// compare lexicographically, so "0" and "A" bracket them all.
+    pub fn sessions_all(&self) -> Result<Vec<SessionUsage>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        sessions_in(&conn, "0", "A", None)
+    }
+
     /// Total Claude Code cost (USD) recorded in `[from, to)`. Drives the daily
     /// budget when CC analytics is enabled.
     pub fn cost_in(&self, from: &str, to: &str) -> Result<f64, rusqlite::Error> {

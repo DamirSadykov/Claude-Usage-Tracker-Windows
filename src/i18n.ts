@@ -296,6 +296,9 @@ const messages = {
     todoImported: "import",
     todoImportedHint:
       "Arrived via a board import. If a task with the same id already existed here, this is the incoming copy — your original was kept untouched, so reconcile the two and delete one.",
+    todoCostHint: "Claude Code spend attributed to this task",
+    todoCostSessions: "session(s)",
+    todoCostTokens: "tokens",
     statusPending: "Pending",
     statusInProgress: "In progress",
     statusDone: "Done",
@@ -971,6 +974,9 @@ const messages = {
     todoImported: "импорт",
     todoImportedHint:
       "Пришла с импортом доски. Если задача с таким же id тут уже была — это входящая копия, ваш оригинал остался нетронутым: сверьте их и одну удалите.",
+    todoCostHint: "Атрибуцированная стоимость работы Claude Code по этой задаче",
+    todoCostSessions: "сессий",
+    todoCostTokens: "токенов",
     statusPending: "В очереди",
     statusInProgress: "В работе",
     statusDone: "Готово",

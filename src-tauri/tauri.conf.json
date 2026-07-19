@@ -98,6 +98,7 @@
       "../scripts/cli/phases.mjs": "scripts/cli/phases.mjs",
       "../scripts/cli/triage.mjs": "scripts/cli/triage.mjs",
       "../scripts/cli/corrections.mjs": "scripts/cli/corrections.mjs",
+      "../scripts/cli/task-cost.mjs": "scripts/cli/task-cost.mjs",
       "../scripts/cli/hook.mjs": "scripts/cli/hook.mjs",
       "../scripts/cli/stop-hook.mjs": "scripts/cli/stop-hook.mjs",
       "../scripts/cli/settings.mjs": "scripts/cli/settings.mjs"

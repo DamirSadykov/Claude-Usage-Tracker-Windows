@@ -44,7 +44,14 @@ project (cwd).
 ```
 
 Edges are **acyclic** and **within one board** (the CLI rejects a cycle or a
-cross-project dep). `<task>`/`<depends-on>` accept an id, a bare number, or `#N`.
+cross-project dep). `<task>`/`<depends-on>` accept an id, a bare number, `#N`,
+or the inline task-link form `t#N`.
+
+Not every relation is a blocking edge. `ref add <task> <target>` records a
+**non-blocking reference** — "related to", allowed to cross project boards, never
+part of the ready/blocked derivation. An inline `t#N` in a description/plan draws
+the same non-blocking edge from the text. If B must finish before A starts, it's a
+`dep`; if A merely wants B in view, it's a `ref`.
 
 ### 3. Set node type — `auto` | `manual`
 
@@ -98,6 +105,43 @@ blocks it). Walk the frontier in dependency order:
 Only `done` releases downstream. Keep advancing until the next unblocked node is
 `manual` — that's where the pipeline hands back to a human.
 
+### The done-gate
+
+Because `done` is the **only** status that releases downstream tasks, closing a
+node while its own prerequisites are unfinished would silently unblock work whose
+chain never ran — the graph would show `ready` for edges that were never
+satisfied. So the CLI enforces the invariant at the write:
+
+```
+<cli> todos set-status <id> done          # refused while a direct prereq isn't done
+<cli> todos set-status <id> done --force  # explicit override
+```
+
+The refusal names the blocking tasks and their columns. Only **direct**
+`depends_on` are checked — a satisfied direct prerequisite transitively vouches
+for its own upstream (it couldn't have closed honestly otherwise). `--force` is
+for the genuine exceptions (a prereq made obsolete, an out-of-band completion);
+if you reach for it routinely, the graph is wrong — fix the edges instead.
+
+### The handoff baton (#141)
+
+A task's `handoff` is what it **produced** — files/paths, interfaces, decisions,
+gotchas, the suggested next step — written for the task(s) that depend on it:
+
+```
+<cli> todos handoff set <id> --text "<what it produced; next step; gotchas>"
+<cli> todos handoff <id>                  # read what <id> inherits from its prereqs
+```
+
+You don't have to ask for the baton: moving a task to `in_progress` via
+`set-status` **auto-prints** the handoffs of its direct prerequisites. Only
+direct ones are read — cumulative context still chains forward because a handoff
+is authored prose that can itself reference upstream tasks as `t#N`.
+
+Keep it a baton, not a log: the concrete outcome a dependent builds on, not the
+task's own subject restated, not session chatter, not how you got there. Empty is
+fine when there's nothing to pass on.
+
 ### Two channels, one rule
 
 Who signals the auto→manual handback depends on who drove the auto segment:
@@ -111,6 +155,44 @@ Who signals the auto→manual handback depends on who drove the auto segment:
 
 The gate itself is identical either way — a `manual` node the pipeline never crosses
 on its own.
+
+## Worked example
+
+A three-node chain: extract a schema (verifiable → auto), migrate the code on top
+of it (verifiable → auto), then a human review of the result (manual).
+
+```
+<cli> todos add "extract settings schema" --kind auto        # → #10
+<cli> todos add "migrate readers to schema" --kind auto      # → #11
+<cli> todos add "review migration"                           # → #12 (manual by default)
+<cli> todos dep add 11 10        # migration waits for the schema
+<cli> todos dep add 12 11        # review waits for the migration
+```
+
+Driving it:
+
+```
+<cli> todos ready --auto         # → #10 (only node with all deps done)
+# ... do #10, verify (tests green) ...
+<cli> todos set-status 10 done
+<cli> todos handoff set 10 --text "schema in src/settings-schema.ts; readers must go through parseSettings(); gotcha: legacy `pending` status folds to backlog"
+<cli> todos ready --auto         # → #11 (released by #10)
+<cli> todos set-status 11 in_progress    # auto-prints #10's handoff — the baton arrives
+# ... do #11, verify ...
+<cli> todos set-status 11 done
+<cli> todos handoff set 11 --text "..."
+<cli> todos ready --auto         # → (empty) — the frontier is now manual
+<cli> todos ready --manual       # → #12: the human gate
+# park here: move #12 to review, notify (PushNotification), stop.
+```
+
+Trying to jump the chain is refused:
+
+```
+<cli> todos set-status 12 done
+# refusing: #12 depends on unfinished task(s): #11 [in_progress]
+# finish those first, or override with --force
+```
 
 ## Themes — a root task as the aggregator (t#255)
 

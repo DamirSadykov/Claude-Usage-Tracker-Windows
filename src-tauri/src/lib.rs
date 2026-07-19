@@ -12,6 +12,7 @@ pub mod report;
 pub mod stats;
 pub mod status;
 pub mod sysmon;
+pub mod task_cost;
 pub mod todos;
 pub mod triage;
 pub mod triage_schedule;
@@ -914,15 +915,27 @@ fn spawn_corrections_publisher(app: AppHandle) {
                 && last_publish.map_or(true, |t| t.elapsed() >= CORRECTIONS_PUBLISH_INTERVAL);
             if due {
                 if let Ok(cli) = cc_hook_script_path(&app) {
+                    let cli2 = cli.clone();
                     let res = tokio::task::spawn_blocking(move || {
-                        triage_schedule::run_corrections_publish(&cli)
+                        let corr = triage_schedule::run_corrections_publish(&cli);
+                        // Same cadence, same kind of deterministic transcript
+                        // scan: refresh the session→task attribution too (t#87)
+                        // so the board's cost badges stay current without a
+                        // second timer. Failures are independent.
+                        let attr = triage_schedule::run_task_cost_publish(&cli2);
+                        (corr, attr)
                     })
                     .await;
                     // Best-effort: a scan failure just means the card keeps its last
                     // data; log nothing louder than the existing diagnostics.
                     last_publish = Some(Instant::now());
-                    if matches!(res, Ok(Ok(()))) {
-                        let _ = app.emit("corrections-updated", ());
+                    if let Ok((corr, attr)) = res {
+                        if corr.is_ok() {
+                            let _ = app.emit("corrections-updated", ());
+                        }
+                        if attr.is_ok() {
+                            let _ = app.emit("task-costs-updated", ());
+                        }
                     }
                 }
             }
@@ -1547,6 +1560,40 @@ fn get_corrections_metrics(
 async fn refresh_corrections_metrics(app: AppHandle) -> Result<(), String> {
     let cli = cc_hook_script_path(&app)?;
     tokio::task::spawn_blocking(move || triage_schedule::run_corrections_publish(&cli))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Path to the session→task attribution file, a sibling of todos.json (see
+/// task_cost.rs / `cli.mjs task-cost publish`). Read-only here.
+fn task_attribution_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).ok();
+    Ok(dir.join("task-attribution.json"))
+}
+
+/// Tokens/cost per task (t#87): the attribution file joined with per-session
+/// token totals from SQLite, resolved against the live board. None until the
+/// first `task-cost publish` has produced an attribution file.
+#[tauri::command]
+async fn get_task_costs(
+    app: AppHandle,
+    stats: tauri::State<'_, Arc<StatsDb>>,
+) -> Result<Option<task_cost::TaskCosts>, String> {
+    let Some(attr) = task_cost::load(&task_attribution_path(&app)?) else {
+        return Ok(None);
+    };
+    let board = todos::load(&todos_path(&app)?);
+    let usage = stats.sessions_all().map_err(|e| e.to_string())?;
+    Ok(Some(task_cost::compute(&attr, &board, &usage)))
+}
+
+/// Re-derive the attribution now (runs `task-cost publish --all` via node) so
+/// the costs can be refreshed on demand. Mirrors refresh_corrections_metrics.
+#[tauri::command]
+async fn refresh_task_costs(app: AppHandle) -> Result<(), String> {
+    let cli = cc_hook_script_path(&app)?;
+    tokio::task::spawn_blocking(move || triage_schedule::run_task_cost_publish(&cli))
         .await
         .map_err(|e| e.to_string())?
 }
@@ -2629,6 +2676,8 @@ pub fn run() {
             get_todos,
             get_corrections_metrics,
             refresh_corrections_metrics,
+            get_task_costs,
+            refresh_task_costs,
             get_triage_digest,
             get_triage_schedule,
             set_triage_schedule,

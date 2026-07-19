@@ -159,11 +159,17 @@ Everything else (thresholds, alerts, quiet hours, analytics opt-in, daily budget
 
 The task manager can be driven from a Claude Code session via the bundled `cc-todos` CLI (the **Settings → install CLI + hook** button wires it up). Commands include:
 
-- `add "<subject>" [--project <name>] [--description <text>]` — create a task in the backlog
-- `set-status <id> <backlog|queue|in_progress|review|done>` — move a task across columns
+- `add "<subject>" [--project <name>] [--kind auto|manual] [--description <text>]` — create a task in the backlog
+- `set-status <id> <backlog|queue|in_progress|review|done>` — move a task across columns (`done` is refused while a prerequisite is unfinished; `--force` overrides)
 - `comment add <id> --text "<body>"` — leave a note on a task's thread
 - `dep` / `ref` — manage the task graph (blocking dependencies and non-blocking references)
+- `set-kind <id> <auto|manual>` — who may close the node: `auto` = the session, after verifying its own work; `manual` (default) = a human review gate
+- `ready [--auto | --manual]` — the pipeline frontier: tasks whose every dependency is `done`
+- `handoff <task>` / `handoff set <task> --text "…"` — the baton a task passes forward along dependency edges; auto-printed when a dependent moves to `in_progress`
+- `pipeline` — print the task-graph workflow (create → deps → set-kind → run)
 - `list` / `related <project>` / `groups` — inspect tasks and project links
+
+The full pipeline guide — driving the board as a dependency graph, `auto`/`manual` gates, the done-gate, handoffs — lives in [docs/task-pipeline.md](docs/task-pipeline.md).
 
 To reference one task from another's description or comment, write **`t#N`** (e.g. "blocked by `t#12`") — it renders as a live link. A bare `#N` is treated as a GitHub PR/issue and is left as plain text, so task references must be prefixed with `t`.
 

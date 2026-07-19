@@ -36,6 +36,14 @@ pub struct Todo {
     #[serde(default)]
     pub description: String,
     pub status: String,
+    /// Transition log (t#87): one entry per status ENTERED, appended by every
+    /// writer — [`set_status`] (UI drag), [`upsert`] (UI edit) and the cc-todos
+    /// CLI. Token attribution needs "when was this task in_progress", and
+    /// `updated_at` can't answer that (any edit bumps it). Legacy rows have no
+    /// history — readers must treat an empty log as "status held since
+    /// `created_at`". Empty → omitted from the file (no migration).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub status_history: Vec<StatusChange>,
     /// Priority bucket: `high` | `medium` | `low`, or empty = unset. Drives which
     /// tasks the SessionStart hook injects (a min-level threshold) and how verbose
     /// each one is. Empty is omitted from the file so existing todos need no
@@ -124,6 +132,16 @@ pub struct Todo {
     pub created_at: String,
     #[serde(default)]
     pub updated_at: String,
+}
+
+/// One entry of a todo's transition log: the status entered and when (RFC3339).
+/// Written by [`set_status`], [`upsert`] and the cc-todos CLI; keep the shape in
+/// lockstep with `todos.mjs` (`{ status, at }`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusChange {
+    pub status: String,
+    #[serde(default)]
+    pub at: String,
 }
 
 /// One comment in a todo's thread. `author` is `"user"` or `"claude"` (a plain
@@ -249,6 +267,18 @@ pub fn upsert(file: &mut TodoFile, mut todo: Todo, now: &str) {
         if todo.from.is_none() {
             todo.from = existing.from.clone();
         }
+        // The transition log (t#87) has no UI field either: the frontend sends a
+        // Todo without it, which deserializes as empty — carry the existing log,
+        // then append if this edit also changed the status.
+        if todo.status_history.is_empty() {
+            todo.status_history = existing.status_history.clone();
+        }
+        if todo.status != existing.status {
+            todo.status_history.push(StatusChange {
+                status: todo.status.clone(),
+                at: now.to_string(),
+            });
+        }
         // Stamp the baton only when its TEXT actually changed — an unrelated edit
         // (priority, a comment) must not make an old handoff look freshly written
         // to the Stop guard. Carry the old stamp otherwise; drop it when cleared.
@@ -282,6 +312,14 @@ pub fn delete(file: &mut TodoFile, id: &str) {
 /// Set a todo's status and bump `updated_at`. Returns false if no such id.
 pub fn set_status(file: &mut TodoFile, id: &str, status: &str, now: &str) -> bool {
     if let Some(t) = file.todos.iter_mut().find(|t| t.id == id) {
+        // Log the transition (t#87) only on an actual change — a drag onto the
+        // same column must not inflate the history.
+        if t.status != status {
+            t.status_history.push(StatusChange {
+                status: status.to_string(),
+                at: now.to_string(),
+            });
+        }
         t.status = status.to_string();
         t.updated_at = now.to_string();
         true
@@ -912,6 +950,7 @@ mod tests {
             subject: format!("subject {id}"),
             description: String::new(),
             status: status.to_string(),
+            status_history: Vec::new(),
             priority: String::new(),
             kind: String::new(),
             theme: false,
@@ -1130,6 +1169,27 @@ mod tests {
         assert_eq!(f.todos[0].status, "in_progress");
         assert_eq!(f.todos[0].updated_at, "T2");
         assert!(!set_status(&mut f, "missing", "done", "T3"));
+    }
+
+    #[test]
+    fn status_history_logs_transitions_and_survives_ui_edits() {
+        let mut f = TodoFile::default();
+        upsert(&mut f, todo("a", "backlog"), "T1");
+        // set_status logs the transition; a same-status drag logs nothing.
+        assert!(set_status(&mut f, "a", "in_progress", "T2"));
+        assert!(set_status(&mut f, "a", "in_progress", "T3"));
+        let h = &f.todos[0].status_history;
+        assert_eq!(h.len(), 1);
+        assert_eq!((h[0].status.as_str(), h[0].at.as_str()), ("in_progress", "T2"));
+
+        // A UI edit sends a Todo WITHOUT the log (deserializes empty): upsert must
+        // carry the existing history, and append when the edit changes the status.
+        let mut edited = todo("a", "review");
+        edited.subject = "renamed".to_string();
+        upsert(&mut f, edited, "T4");
+        let h = &f.todos[0].status_history;
+        assert_eq!(h.len(), 2);
+        assert_eq!((h[1].status.as_str(), h[1].at.as_str()), ("review", "T4"));
     }
 
     #[test]
