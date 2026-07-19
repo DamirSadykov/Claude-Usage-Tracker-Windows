@@ -216,6 +216,33 @@ function cmdSetKind(id, value) {
   process.stdout.write(`ok: #${todo.number} kind -> ${kind || "manual"}\n`);
 }
 
+// Mark (or unmark) a todo as a THEME root (t#255), in lockstep with
+// todos.rs::Todo.theme and GraphView. A theme = a root task that depends_on all
+// of its children and closes last; its DESCRIPTION carries the theme's vision,
+// surfaced when a child is worked. Purely a marker over the dep graph — order is
+// already enforced by the done-gate. `off` removes the field (matches the Rust
+// skip_serializing_if, so unmarked rows stay clean).
+function cmdSetTheme(id, value) {
+  if (!id || value == null) fail("usage: cli todos set-theme <id> <on|off>");
+  const s = String(value).trim().toLowerCase();
+  if (!["on", "off", "true", "false"].includes(s))
+    fail(`invalid theme "${value}". valid: on | off`);
+  const theme = s === "on" || s === "true";
+  const file = todosPath();
+  const data = load(file);
+  const todo = resolveTask(data, id);
+  if (!todo) fail(`no todo with id ${id}`);
+  if (Boolean(todo.theme) === theme) {
+    process.stdout.write(`ok: #${todo.number} already theme ${theme ? "on" : "off"}\n`);
+    return;
+  }
+  if (theme) todo.theme = true;
+  else delete todo.theme;
+  todo.updated_at = new Date().toISOString();
+  save(file, data);
+  process.stdout.write(`ok: #${todo.number} theme -> ${theme ? "on" : "off"}\n`);
+}
+
 // Set (or clear) a todo's project (issue #54: a task filed with the wrong/empty
 // project couldn't be fixed from the CLI before — only in the app). <name> ties
 // it to that board; `--global`/`none`/`clear` makes it project-less. Clearing
@@ -335,6 +362,9 @@ function cmdAdd(args) {
     // Omit the field entirely when unset, mirroring todos.rs (skip_serializing_if).
     ...(priority ? { priority } : {}),
     ...(kind ? { kind } : {}),
+    // Theme root (t#255): `--theme` marks this task the aggregator of a theme —
+    // it should depend_on all its children and carry the vision in description.
+    ...(flags.theme ? { theme: true } : {}),
     estimate_minutes: estimate,
     scheduled_for: typeof flags.scheduled === "string" ? flags.scheduled : null,
     plan: typeof flags.plan === "string" ? flags.plan : "",
@@ -962,6 +992,14 @@ function cmdPipeline() {
       "                      and needs their call. It self-skips if they're at the\n" +
       "                      terminal, so it only pulls back a user who walked away.\n" +
       "   Only `done` releases downstream. Stop when the next node is manual.\n\n" +
+      "Themes (t#255) — work bigger than one task\n" +
+      "   A THEME = a root task that depends_on ALL of its children; it closes LAST\n" +
+      "   (the done-gate enforces the order). Worth a root from ~4-5 nodes.\n" +
+      "   Mark the root explicitly:  todos set-theme <id> on   (or add --theme).\n" +
+      "   The theme's VISION goes in the ROOT's DESCRIPTION (no separate field).\n" +
+      "   Working a child, read the root's description (follow `dep list` upward —\n" +
+      "   the nearest dependent with theme on) for the north star; the root's\n" +
+      "   handoff stays the usual downstream baton.\n\n" +
       "Full guide + rationale: docs/task-pipeline.md (claude-usage-tracker repo).\n",
   );
 }
@@ -979,6 +1017,8 @@ function usage(code) {
       PRIORITIES.join(" | ") +
       " | none\n" +
       "  set-kind <id> <auto|manual>     task-graph node type (#88): auto = runner may run headless; manual (default) = human gate\n" +
+      "  set-theme <id> <on|off>         theme-root marker (t#255): the task depends_on all its children, closes last,\n" +
+      "                                  its DESCRIPTION carries the theme's vision (also: add --theme)\n" +
       "  set-project <id> <name>         tie to a project; <--global|none> to clear\n" +
       '  comment add <id> --text "<body>" [--by claude|user]\n' +
       "  comment list <id> [--json]\n" +
@@ -1032,6 +1072,9 @@ export function run(args) {
       break;
     case "set-kind":
       cmdSetKind(rest[0], rest[1]);
+      break;
+    case "set-theme":
+      cmdSetTheme(rest[0], rest[1]);
       break;
     case "set-project":
       cmdSetProject(rest[0], rest[1]);
