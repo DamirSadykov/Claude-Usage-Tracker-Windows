@@ -175,6 +175,12 @@ function cmdSetStatus(args) {
   }
   todo.status = status;
   todo.updated_at = new Date().toISOString();
+  // Transition log (t#87): one entry per status ENTERED, so token attribution can
+  // reconstruct "was this task in_progress during that session" — `updated_at`
+  // can't (any edit bumps it). Every writer appends: here, todos.rs::set_status
+  // (UI drag) and todos.rs::upsert (UI edit). Legacy rows have no history —
+  // readers must treat "no entries" as "status held since created_at".
+  (todo.status_history ??= []).push({ status, at: todo.updated_at });
   save(file, data);
   process.stdout.write(`ok: #${todo.number} -> ${status}\n`);
   // Anchor for the handoff mechanism (#141): moving a task INTO in_progress is the
@@ -356,6 +362,9 @@ function cmdAdd(args) {
     subject,
     description: typeof flags.description === "string" ? flags.description : "",
     status,
+    // Seed the transition log (t#87) with the birth status, so intervals can be
+    // derived without special-casing "no history yet" for new rows.
+    status_history: [{ status, at: now }],
     // Omit the field entirely when unset, mirroring todos.rs (skip_serializing_if).
     ...(priority ? { priority } : {}),
     ...(kind ? { kind } : {}),

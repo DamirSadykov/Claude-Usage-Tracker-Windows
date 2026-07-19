@@ -254,6 +254,22 @@ pub fn run_corrections_publish(cli_path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Recompute the session→task attribution (t#87) across all projects and write
+/// `task-attribution.json` — deterministic, LLM-free, just
+/// `node cli.mjs task-cost publish --all`. Same shape as the corrections publish
+/// above; the app joins the file with per-session token totals (task_cost.rs).
+pub fn run_task_cost_publish(cli_path: &str) -> Result<(), String> {
+    let node = resolve_node();
+    let out = run_node(&node, cli_path, &["task-cost", "publish", "--all"])?;
+    if !out.status.success() {
+        return Err(format!(
+            "task-cost publish failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
 /// Don't flash a console window when spawning the headless run.
 #[cfg(windows)]
 fn no_window(cmd: &mut Command) {

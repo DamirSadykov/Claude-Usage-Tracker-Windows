@@ -18,6 +18,7 @@ const AREAS = {
   phases: "./cli/phases.mjs",
   triage: "./cli/triage.mjs",
   corrections: "./cli/corrections.mjs",
+  "task-cost": "./cli/task-cost.mjs",
   hook: "./cli/hook.mjs",
   "stop-hook": "./cli/stop-hook.mjs",
 };
@@ -35,6 +36,7 @@ function usage(code) {
       "  phases  <…>   break a task into ordered phases (create / add / done / list / …)\n" +
       "  triage  <…>   publish/read the nightly-triage digest (publish / show / clear)\n" +
       "  corrections <…> user-corrections outcome metric, layer 1 (scan / label-template / eval)\n" +
+      "  task-cost <…> session->task attribution for tokens-per-task (scan / publish)\n" +
       "  hook          SessionStart hook (wired into ~/.claude/settings.json)\n" +
       "  stop-hook     Stop hook — blocks a stop that leaves a stale phase HANDOFF\n\n" +
       "Run `cli <area> --help` for an area's commands.\n",

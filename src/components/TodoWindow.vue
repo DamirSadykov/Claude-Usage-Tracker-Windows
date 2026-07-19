@@ -1286,6 +1286,7 @@ let unlistenTodos: (() => void) | null = null;
 let unlistenFocus: (() => void) | null = null;
 let unlistenTriage: (() => void) | null = null;
 let unlistenExternal: (() => void) | null = null;
+let unlistenTaskCosts: (() => void) | null = null;
 
 // Refresh the project picker from cc_usage. The todos window is a persisted
 // webview (created once at startup, then shown/hidden), so `onMounted` runs a
@@ -1330,6 +1331,55 @@ function phaseProgress(todo: Todo | null | undefined): string {
   const plan = phasesFor(todo);
   if (!plan) return "";
   return `${plan.phases.filter((p) => p.done).length}/${plan.phases.length}`;
+}
+
+// ── tokens-per-task (t#87) ────────────────────────────────────────────────────
+// The backend joins the transcript-derived session→task attribution with the
+// per-session token totals (get_task_costs). Conservative by design: a session
+// counts toward a task only when the evidence names exactly one task, so a
+// missing chip means "not attributable", not "free".
+interface TaskCostRow {
+  id: string;
+  number: number;
+  sessions: number;
+  direct_sessions: number;
+  interval_sessions: number;
+  total_tokens: number;
+  cost: number;
+}
+interface TaskCostsPayload {
+  generated_at: string;
+  tasks: TaskCostRow[];
+  ambiguous_sessions: number;
+  ambiguous_tokens: number;
+  ambiguous_cost: number;
+}
+const taskCosts = ref<Map<string, TaskCostRow>>(new Map());
+
+async function loadTaskCosts() {
+  try {
+    const res = await invoke<TaskCostsPayload | null>("get_task_costs");
+    const m = new Map<string, TaskCostRow>();
+    for (const r of res?.tasks ?? []) m.set(r.id, r);
+    taskCosts.value = m;
+  } catch {
+    // keep whatever we had — the chip is best-effort decoration
+  }
+}
+
+function costOf(todo: Todo | null | undefined): TaskCostRow | null {
+  if (!todo) return null;
+  return taskCosts.value.get(todo.id) ?? null;
+}
+
+const fmtCost = (c: number) => "$" + (c >= 100 ? String(Math.round(c)) : c.toFixed(2));
+const fmtTok = (n: number) =>
+  n >= 1_000_000 ? (n / 1_000_000).toFixed(1) + "M" : n >= 1_000 ? Math.round(n / 1_000) + "k" : String(n);
+
+function costTitle(todo: Todo): string {
+  const r = costOf(todo);
+  if (!r) return "";
+  return `${t("todoCostHint")}: ${r.sessions} ${t("todoCostSessions")} · ${fmtTok(r.total_tokens)} ${t("todoCostTokens")}`;
 }
 
 async function refreshKnownProjects() {
@@ -1378,7 +1428,13 @@ onMounted(async () => {
   unlistenExternal = await listen<ExternalTasksUpdate>("external-tasks-updated", (e) => {
     applyExternalUpdate(e.payload);
   });
+  // The background publisher re-derived the session→task attribution (t#87);
+  // re-read the joined costs so the ⚡ chips stay current.
+  unlistenTaskCosts = await listen("task-costs-updated", () => {
+    void loadTaskCosts();
+  });
   await loadTodos();
+  void loadTaskCosts();
   // Populate the "External · N" count chip even while in local mode.
   void loadExternalTasks();
   void loadStatusMap();
@@ -1408,6 +1464,7 @@ onUnmounted(() => {
   if (unlistenFocus) unlistenFocus();
   if (unlistenTriage) unlistenTriage();
   if (unlistenExternal) unlistenExternal();
+  if (unlistenTaskCosts) unlistenTaskCosts();
 });
 </script>
 
@@ -1655,6 +1712,7 @@ onUnmounted(() => {
               <span v-if="todo.plan" class="tw-chip" :title="todo.plan">📝</span>
               <span v-if="phasesEnabled && phasesFor(todo)" class="tw-chip" :title="t('phasesLabel')">☑ {{ phaseProgress(todo) }}</span>
               <span v-if="refCount(todo)" class="tw-chip" :title="t('todoRefs')">🔗 {{ refCount(todo) }}</span>
+              <span v-if="costOf(todo)" class="tw-chip" :title="costTitle(todo)">⚡ {{ fmtCost(costOf(todo)!.cost) }}</span>
             </div>
 
             <div class="tw-card-foot">
