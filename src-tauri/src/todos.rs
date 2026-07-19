@@ -59,6 +59,15 @@ pub struct Todo {
     /// with the cc-todos CLI (`set-kind`) and GraphView.vue.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub kind: String,
+    /// Theme-root marker (t#255): `true` = this task is a THEME aggregator — it
+    /// `depends_on` all of its children, closes last (the done-gate enforces the
+    /// order), and its `description` carries the theme's VISION, which the vision
+    /// hook surfaces when a child task is worked. Purely a marker over the dep
+    /// graph — no behavior of its own here. `false` is omitted from the file so
+    /// existing todos need no migration. Keep in lockstep with the cc-todos CLI
+    /// (`set-theme`) and GraphView.vue.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub theme: bool,
     /// LLM/user time estimate in minutes; None = unestimated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimate_minutes: Option<i64>,
@@ -944,6 +953,7 @@ mod tests {
             status_history: Vec::new(),
             priority: String::new(),
             kind: String::new(),
+            theme: false,
             estimate_minutes: None,
             scheduled_for: None,
             plan: String::new(),

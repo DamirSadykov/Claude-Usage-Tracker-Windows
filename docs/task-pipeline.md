@@ -194,6 +194,32 @@ Trying to jump the chain is refused:
 # finish those first, or override with --force
 ```
 
+## Themes — a root task as the aggregator (t#255)
+
+How a piece of work **bigger than one task** lives on the graph — as a **theme**:
+
+- A theme is an ordinary **root task that `depends_on` all of its children.** No
+  new entity: the aggregation *is* the dep edges. The root **closes last** — the
+  done-gate already refuses `done` while a prerequisite is open, so the order is
+  enforced, not just conventional.
+- A root is **worth creating from ~4–5 nodes**; below that the children speak for
+  themselves. Name it so it reads as a container (e.g. `ТЕМА: <what>`), file it on
+  the same board as its children (deps are intra-board).
+- **Mark the root explicitly** — `todos set-theme <id> on` (or `add --theme`).
+  The stored flag is what lets consumers (the vision hook, t#252) find the vision
+  deterministically: walk UP the reverse dep edges to the nearest dependent with
+  `theme` on, instead of guessing which downstream task is "the" aggregator. The
+  fold behaviour in the graph stays universal; the flag only marks intent.
+- **The theme's vision lives in the root task's DESCRIPTION** — deliberately *not*
+  a separate field (t#255): the description already travels everywhere a task
+  shows (card, CLI, hooks), and a second free-text field would split the story.
+  Write it as the north star for anyone working a child: what the whole chain is
+  for and what "done" means for the theme.
+- Direction of reading matters: the **description is read UPWARD** — working a
+  child, follow the reverse edge to the root(s) that depend on it for the vision
+  (the vision hook, t#252, surfaces it automatically). The root's **handoff stays
+  the usual DOWNSTREAM baton** to whatever depends on the root itself.
+
 ## Why the discipline matters
 
 The whole point of `manual` gates is to stop unattended drift: an early wrong
@@ -207,4 +233,8 @@ In the tracker's graph window, **Dependencies** tab:
 - node **fill** = kanban status;
 - **corner dot** = pipeline state — red `blocked`, green `ready` (auto), amber
   `ready` (manual, i.e. waiting for you);
-- **`⚡`** = an auto node.
+- **`⚡`** = an auto node;
+- **`⊖` on a node** folds its exclusive prerequisite subtree (a theme) into the
+  root — the badge shows the fold's `done/total`; click the badge to unfold;
+- with a node selected, the **"Component only"** toolbar button cuts the view to
+  that task's connectivity component (works on both tabs).

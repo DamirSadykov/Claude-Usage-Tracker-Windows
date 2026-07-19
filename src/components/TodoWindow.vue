@@ -60,6 +60,7 @@ export interface Todo {
   status: string;
   priority?: string; // "high" | "medium" | "low" | "" (unset) — drives hook context
   kind?: string; // "auto" | "" (manual, default) — task-graph node type (#88)
+  theme?: boolean; // theme-root marker (t#255): depends_on all children, description = vision
   estimate_minutes?: number | null;
   scheduled_for?: string | null;
   plan: string;

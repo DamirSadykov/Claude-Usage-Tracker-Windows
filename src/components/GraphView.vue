@@ -100,6 +100,10 @@ const byId = computed(() => {
 //           separate axis, not a sixth status. Shown as a corner dot on the Deps tab.
 const kindOf = (id: string): "auto" | "manual" =>
   byId.value.get(id)?.kind === "auto" ? "auto" : "manual";
+// Theme-root marker (t#255): stored flag, set via CLI `set-theme`. On the graph a
+// theme root's fold control is always visible (it's the designed fold target),
+// while ordinary nodes only reveal theirs on hover.
+const themeOf = (id: string): boolean => byId.value.get(id)?.theme === true;
 
 function pstateOf(id: string): "" | "blocked" | "ready" {
   const x = byId.value.get(id);
@@ -290,6 +294,87 @@ const raw = computed(() => {
   return { tasks, boardIds, depEdges, refEdges, externalTargets };
 });
 
+// --- Theme fold + component focus (t#255) ----------------------------------
+// THEME convention (docs/task-pipeline.md): a root task that `depends_on` all of
+// its children and closes last is a theme aggregator; its description carries the
+// vision. Both features below are pure DISPLAY folds over the same data — no new
+// stored entity.
+//
+// `collapsedRoots` — Deps tab: a collapsed root hides the part of its prerequisite
+// subtree that leads ONLY into this root (a prereq also feeding an outside node
+// stays visible, so no edge ever dangles) and shows done/total progress instead.
+// Persisted per machine: which themes you keep folded is a lasting viewing
+// preference, not session state.
+const COLLAPSE_KEY = "gv-collapsed";
+const collapsedRoots = ref<Set<string>>(loadCollapsed());
+function loadCollapsed(): Set<string> {
+  try {
+    const rawSaved = JSON.parse(localStorage.getItem(COLLAPSE_KEY) || "[]");
+    if (Array.isArray(rawSaved))
+      return new Set(rawSaved.filter((x): x is string => typeof x === "string"));
+  } catch {
+    /* corrupted saved state — start unfolded */
+  }
+  return new Set();
+}
+function toggleCollapse(id: string) {
+  const next = new Set(collapsedRoots.value);
+  if (next.has(id)) next.delete(id);
+  else next.add(id);
+  collapsedRoots.value = next;
+  try {
+    localStorage.setItem(COLLAPSE_KEY, JSON.stringify([...next]));
+  } catch {
+    /* private mode etc. — the fold still works for this session */
+  }
+}
+
+// `focusId` — both tabs: show ONLY the connectivity component of the chosen task
+// (weak/undirected reachability over that tab's edges), so one theme can be
+// inspected without the rest of the board around it. Transient by design.
+const focusId = ref<string | null>(null);
+const focusLabel = computed(() => {
+  const x = byId.value.get(focusId.value ?? "");
+  if (!x) return "";
+  return x.number ? `#${x.number}` : x.subject.slice(0, 20);
+});
+function focusOnSelected() {
+  if (!selected.value) return;
+  focusId.value = selected.value;
+  resetView();
+}
+function clearFocus() {
+  focusId.value = null;
+  resetView();
+}
+// Weak component of `focusId` over `edges`, or null when the focused task isn't in
+// this tab's graph (then the caller shows the graph unfiltered rather than empty).
+function focusComponent(edges: GEdge[]): Set<string> | null {
+  const f = focusId.value;
+  if (!f) return null;
+  const adj = new Map<string, string[]>();
+  const link = (a: string, b: string) => (adj.get(a) ?? adj.set(a, []).get(a)!).push(b);
+  let present = false;
+  for (const e of edges) {
+    link(e.fromId, e.toId);
+    link(e.toId, e.fromId);
+    if (e.fromId === f || e.toId === f) present = true;
+  }
+  if (!present) return null;
+  const keep = new Set<string>([f]);
+  const stack = [f];
+  while (stack.length) {
+    const id = stack.pop()!;
+    for (const nb of adj.get(id) ?? []) {
+      if (!keep.has(nb)) {
+        keep.add(nb);
+        stack.push(nb);
+      }
+    }
+  }
+  return keep;
+}
+
 // Deps-tab node/edge set. Starts from the shown tasks, then — so a still-open task
 // never floats away when its prerequisites are filtered out (the default filter
 // hides `done`, and a finished chain leaves its open successor edge-less and thus
@@ -321,18 +406,107 @@ const depGraph = computed<{ tasks: Todo[]; shownIds: Set<string>; depEdges: GEdg
       if (ids.has(depId)) depEdges.push({ fromId: depId, toId: x.id, kind: "dep" });
     }
   }
+  // Component focus: keep only the weak component around the focused task.
+  const keep = focusComponent(depEdges);
+  if (keep) {
+    return {
+      tasks: [...inSet.values()].filter((x) => keep.has(x.id)),
+      shownIds,
+      depEdges: depEdges.filter((e) => keep.has(e.fromId) && keep.has(e.toId)),
+    };
+  }
   return { tasks: [...inSet.values()], shownIds, depEdges };
+});
+
+// Theme fold applied over the (possibly focused) dep graph: for every collapsed
+// root still visible, swallow its EXCLUSIVE prerequisite subtree — nodes whose
+// every downstream path ends in this root. An outside edge into a swallowed node
+// is retargeted to the root (a swallowed node is a transitive prerequisite of the
+// root, so the redirected edge keeps a true order), which is why the picture never
+// shows a dangling arrow. `stats` carries done/total of what each fold hides.
+const collapsedGraph = computed<{
+  tasks: Todo[];
+  shownIds: Set<string>;
+  depEdges: GEdge[];
+  stats: Map<string, { total: number; done: number }>;
+}>(() => {
+  const { tasks, shownIds, depEdges } = depGraph.value;
+  const stats = new Map<string, { total: number; done: number }>();
+  let curTasks = tasks;
+  let curEdges = depEdges;
+  for (const rootId of collapsedRoots.value) {
+    if (!curTasks.some((x) => x.id === rootId)) continue;
+    const back = new Map<string, string[]>();
+    const fwd = new Map<string, string[]>();
+    for (const e of curEdges) {
+      (back.get(e.toId) ?? back.set(e.toId, []).get(e.toId)!).push(e.fromId);
+      (fwd.get(e.fromId) ?? fwd.set(e.fromId, []).get(e.fromId)!).push(e.toId);
+    }
+    // All transitive prerequisites of the root…
+    const cand = new Set<string>();
+    const stack = [...(back.get(rootId) ?? [])];
+    while (stack.length) {
+      const id = stack.pop()!;
+      if (cand.has(id)) continue;
+      cand.add(id);
+      for (const p of back.get(id) ?? []) stack.push(p);
+    }
+    // …minus (to fixpoint) any that also feed a node OUTSIDE the fold.
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const id of [...cand]) {
+        for (const d of fwd.get(id) ?? []) {
+          if (d !== rootId && !cand.has(d)) {
+            cand.delete(id);
+            changed = true;
+            break;
+          }
+        }
+      }
+    }
+    if (!cand.size) continue;
+    let done = 0;
+    for (const id of cand)
+      if (canonStatus(byId.value.get(id)?.status ?? "") === "done") done++;
+    stats.set(rootId, { total: cand.size, done });
+    curTasks = curTasks.filter((x) => !cand.has(x.id));
+    const seen = new Set<string>();
+    const nextEdges: GEdge[] = [];
+    for (const e of curEdges) {
+      if (cand.has(e.fromId)) continue; // internal edge or edge into the root — folded away
+      const toId = cand.has(e.toId) ? rootId : e.toId;
+      if (e.fromId === toId) continue;
+      const key = `${e.fromId} ${toId}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      nextEdges.push({ fromId: e.fromId, toId, kind: "dep" });
+    }
+    curEdges = nextEdges;
+  }
+  return { tasks: curTasks, shownIds, depEdges: curEdges, stats };
+});
+const collapseStats = computed(() => collapsedGraph.value.stats);
+// Nodes that can be folded right now (have prerequisites in the drawn graph) or
+// already are — the ones that render the fold control.
+const collapsible = computed<Set<string>>(() => {
+  const s = new Set<string>();
+  for (const e of collapsedGraph.value.depEdges) s.add(e.toId);
+  for (const id of collapseStats.value.keys()) s.add(id);
+  return s;
 });
 
 // --- Deps tab: per-project ALAP pipeline layout ----------------------------
 const depModel = computed<{ nodes: GNode[]; edges: GEdge[]; bands: DepBand[] }>(() => {
-  const { tasks, shownIds, depEdges } = depGraph.value;
+  const { tasks, shownIds, depEdges } = collapsedGraph.value;
   const inGraph = new Set<string>();
   for (const e of depEdges) {
     inGraph.add(e.fromId);
     inGraph.add(e.toId);
   }
   const taskById = new Map(tasks.map((x) => [x.id, x]));
+  // A fully folded theme may have swallowed its every edge — keep the root drawn.
+  for (const id of collapseStats.value.keys()) if (taskById.has(id)) inGraph.add(id);
   const nodes = new Map<string, GNode>();
   for (const id of inGraph) {
     const x = taskById.get(id);
@@ -617,7 +791,12 @@ function forceLayout(nodeList: GNode[], edges: GEdge[]) {
 
 // --- Ref tab: force-directed layout, packed per connected component ----------
 const refModel = computed<{ nodes: GNode[]; edges: GEdge[] }>(() => {
-  const { tasks, refEdges, externalTargets } = raw.value;
+  const { tasks, refEdges: allRefEdges, externalTargets } = raw.value;
+  // Component focus: keep only the mention-cluster around the focused task.
+  const keep = focusComponent(allRefEdges);
+  const refEdges = keep
+    ? allRefEdges.filter((e) => keep.has(e.fromId) && keep.has(e.toId))
+    : allRefEdges;
   const taskById = new Map(tasks.map((x) => [x.id, x]));
   const inGraph = new Set<string>();
   for (const e of refEdges) {
@@ -710,6 +889,12 @@ const nodeById = computed(() => {
 
 // --- Selection highlight (LEFT-click a node) -------------------------------
 const selected = ref<string | null>(null);
+// A fold or filter can remove the selected node from the drawing — drop a
+// selection that no longer points at a drawn node, else the whole graph dims
+// against a ghost that can't be clicked off.
+watch(nodeById, (m) => {
+  if (selected.value && !m.has(selected.value)) selected.value = null;
+});
 
 // --- Find (the shared header search box, via the `query` prop) --------------
 // When the graph is the active view the ONE search field highlights here instead
@@ -1181,6 +1366,24 @@ onUnmounted(() => {
         </button>
       </div>
       <span class="gv-spacer"></span>
+      <!-- Component focus (t#255): with a node selected, cut the view down to its
+           connectivity component; the chip shows and clears the active focus. -->
+      <button
+        v-if="selected && !focusId"
+        class="gv-btn"
+        :title="t('graphFocusHint')"
+        @click="focusOnSelected"
+      >
+        {{ t("graphFocusComponent") }}
+      </button>
+      <button
+        v-else-if="focusId"
+        class="gv-chip focus-chip"
+        :title="t('graphFocusHint')"
+        @click="clearFocus"
+      >
+        {{ t("graphFocusChip", { task: focusLabel }) }} ✕
+      </button>
       <span v-if="queryActive" class="gv-find-status" :title="t('graphSearchHint')">
         {{ hitList.length ? `${hitIdx + 1}/${hitList.length}` : t("graphSearchNoMatch") }}
       </span>
@@ -1193,6 +1396,7 @@ onUnmounted(() => {
       <span class="lg"><i class="lg-dot" style="background:#6ccb5f"></i>{{ t("graphPipeReadyAuto") }}</span>
       <span class="lg"><i class="lg-dot" style="background:#ffc107"></i>{{ t("graphPipeReadyManual") }}</span>
       <span class="lg"><i class="lg-auto">⚡</i>{{ t("graphKindAuto") }}</span>
+      <span class="lg"><i class="lg-fold">▸ 3/5</i>{{ t("graphLegendTheme") }}</span>
     </div>
 
     <div v-if="errorMsg" class="gv-error">{{ errorMsg }}</div>
@@ -1307,6 +1511,18 @@ onUnmounted(() => {
           @mouseleave="hoverNode = null"
           @contextmenu="onNodeContext($event, n.id)"
         >
+          <!-- Collapsed theme (t#255): a shifted twin rect behind the box makes the
+               root read as a stack of cards holding its folded subtree. -->
+          <rect
+            v-if="tab === 'deps' && collapseStats.has(n.id)"
+            class="box box-stack"
+            x="5"
+            y="5"
+            :width="NODE_W"
+            :height="n.h"
+            rx="9"
+            :style="{ '--accent': statusColor(n.status) }"
+          />
           <rect
             class="box"
             :width="NODE_W"
@@ -1324,6 +1540,32 @@ onUnmounted(() => {
           >
             <title>{{ pstateTitle(n.id) }}</title>
           </circle>
+          <!-- Fold control: ⊖ folds this node's exclusive prerequisite subtree;
+               a folded root shows done/total of what it hides instead. -->
+          <g
+            v-if="tab === 'deps' && collapsible.has(n.id)"
+            class="fold"
+            @mousedown.stop
+            @click.stop="toggleCollapse(n.id)"
+          >
+            <rect class="fold-hit" :x="NODE_W - 66" y="2" width="44" height="20" />
+            <text
+              v-if="collapseStats.has(n.id)"
+              class="fold-text"
+              :x="NODE_W - 24"
+              y="17"
+              text-anchor="end"
+            >▸ {{ collapseStats.get(n.id)!.done }}/{{ collapseStats.get(n.id)!.total }}</text>
+            <text
+              v-else
+              class="fold-glyph"
+              :class="{ theme: themeOf(n.id) }"
+              :x="NODE_W - 24"
+              y="18"
+              text-anchor="end"
+            >⊖</text>
+            <title>{{ collapseStats.has(n.id) ? t("graphExpandTheme") : t("graphCollapseTheme") }}</title>
+          </g>
           <text class="num" x="12" y="18">
             <tspan v-if="kindOf(n.id) === 'auto'" class="kind-auto">⚡ </tspan>
             <tspan v-if="n.number">#{{ n.number }}</tspan>
@@ -1487,6 +1729,17 @@ onUnmounted(() => {
   color: #6ccb5f;
   font-weight: 700;
   font-style: normal;
+}
+.gv-legend .lg-fold {
+  color: #ffc107;
+  font-weight: 700;
+  font-style: normal;
+  font-size: 10px;
+}
+/* Active component-focus chip in the toolbar — accented, since it hides nodes. */
+.gv-chip.focus-chip {
+  border-color: #4cc2ff;
+  color: #4cc2ff;
 }
 .gv-modal {
   position: absolute;
@@ -1715,6 +1968,37 @@ onUnmounted(() => {
 .node .pstate {
   stroke: #16181c;
   stroke-width: 1.5;
+}
+/* Theme fold (t#255): the shifted twin behind a collapsed root ("stack of cards"). */
+.node .box-stack {
+  opacity: 0.55;
+}
+.node .fold {
+  cursor: pointer;
+}
+.node .fold-hit {
+  fill: transparent;
+}
+/* The unfold badge (done/total of the hidden subtree) is always readable… */
+.node .fold-text {
+  fill: #ffc107;
+  font-size: 10px;
+  font-weight: 700;
+}
+/* …while the fold glyph on an expanded node stays quiet until you point at it. */
+.node .fold-glyph {
+  fill: #9aa0aa;
+  font-size: 12px;
+  opacity: 0.25;
+  transition: opacity 120ms;
+}
+.node:hover .fold-glyph {
+  opacity: 1;
+}
+/* A marked theme root is the designed fold target — its control is always on. */
+.node .fold-glyph.theme {
+  opacity: 1;
+  fill: #ffc107;
 }
 .node .num .ext-proj {
   fill: #9aa0aa;
