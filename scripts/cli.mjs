@@ -21,13 +21,14 @@ const AREAS = {
   "task-cost": "./cli/task-cost.mjs",
   hook: "./cli/hook.mjs",
   "stop-hook": "./cli/stop-hook.mjs",
+  "plan-hook": "./cli/plan-hook.mjs",
 };
 
 // Hook areas run inside Claude Code's session lifecycle: a crash there must never
 // break the session, so an unexpected throw exits clean instead of surfacing.
 // (A DELIBERATE block from the Stop guard is process.exit(2) inside the module —
 // exit doesn't throw, so it never reaches the catch below.)
-const HOOK_AREAS = new Set(["hook", "stop-hook"]);
+const HOOK_AREAS = new Set(["hook", "stop-hook", "plan-hook"]);
 
 function usage(code) {
   process.stdout.write(
@@ -38,7 +39,8 @@ function usage(code) {
       "  corrections <…> user-corrections outcome metric, layer 1 (scan / label-template / eval)\n" +
       "  task-cost <…> session->task attribution for tokens-per-task (scan / publish)\n" +
       "  hook          SessionStart hook (wired into ~/.claude/settings.json)\n" +
-      "  stop-hook     Stop hook — blocks a stop that leaves a stale phase HANDOFF\n\n" +
+      "  stop-hook     Stop hook — blocks a stop that leaves a stale phase HANDOFF\n" +
+      "  plan-hook     PostToolUse hooks for plan mode (enter = format, exit = record + match-plan)\n\n" +
       "Run `cli <area> --help` for an area's commands.\n",
   );
   process.exit(code);

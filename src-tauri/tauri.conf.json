@@ -101,6 +101,7 @@
       "../scripts/cli/task-cost.mjs": "scripts/cli/task-cost.mjs",
       "../scripts/cli/hook.mjs": "scripts/cli/hook.mjs",
       "../scripts/cli/stop-hook.mjs": "scripts/cli/stop-hook.mjs",
+      "../scripts/cli/plan-hook.mjs": "scripts/cli/plan-hook.mjs",
       "../scripts/cli/settings.mjs": "scripts/cli/settings.mjs"
     },
     "icon": [
