@@ -180,7 +180,80 @@ pub fn load(path: &Path) -> TodoFile {
     for t in &mut file.todos {
         t.status = canonical_status(&t.status).to_string();
     }
+    migrate_plan_roles(&mut file);
     file
+}
+
+/// v1 → v2: the field-role split (t#253 field review) — `description` carries
+/// WHAT/WHY (a theme root's vision), `plan` carries only HOW (steps + order).
+/// Two v1 shapes violate that and are healed here, conservatively:
+///   (а) a `plan` that is just a pointer to a phases dir (or a stub under 80
+///       chars) — the phases entity is going away (t#254), so the pointer is
+///       archived as a comment and the field cleared;
+///   (б) a ritual-recorded plan on a task with an EMPTY description (the
+///       plan-hook's first iteration wrote the whole markdown, vision included,
+///       into `plan` — e.g. t#257): the intro before the first step section
+///       moves to `description`, the steps stay in `plan`.
+/// Anything unrecognized is left untouched — a migration must never make a task
+/// worse. Guarded by `version`, so it runs once; the next save persists it.
+fn migrate_plan_roles(file: &mut TodoFile) {
+    if file.version >= 2 {
+        return;
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    for t in &mut file.todos {
+        let plan = t.plan.trim().to_string();
+        if plan.is_empty() {
+            continue;
+        }
+        if plan.contains(".claude/phases/") || plan.chars().count() < 80 {
+            t.comments.push(Comment {
+                id: new_id(),
+                author: "claude".to_string(),
+                body: format!("Архив поля plan (миграция v2): {plan}"),
+                created_at: now.clone(),
+            });
+            t.plan = String::new();
+            continue;
+        }
+        if t.description.trim().is_empty() {
+            if let Some((vision, steps)) = split_vision(&plan) {
+                t.description = vision;
+                t.plan = steps;
+            }
+        }
+    }
+    file.version = 2;
+}
+
+/// Split a ritual plan markdown into (intro-before-steps, the-rest). The seam is
+/// the first steps heading (`## Steps` / `## Шаги`) or the first numbered item
+/// at line start — whichever comes first. None when the seam is at the very top
+/// (no intro to move) or absent (structure not recognized).
+fn split_vision(plan: &str) -> Option<(String, String)> {
+    let mut seam: Option<usize> = None;
+    let mut offset = 0;
+    for line in plan.split_inclusive('\n') {
+        let l = line.trim();
+        let heading = l.strip_prefix("## ").map(str::to_lowercase);
+        let is_steps_heading = heading
+            .as_deref()
+            .is_some_and(|h| h.starts_with("steps") || h.starts_with("шаги"));
+        let is_numbered = l.len() > 2
+            && l.chars().next().is_some_and(|c| c.is_ascii_digit())
+            && l.contains(". ");
+        if is_steps_heading || is_numbered {
+            seam = Some(offset);
+            break;
+        }
+        offset += line.len();
+    }
+    let at = seam?;
+    let intro = plan[..at].trim();
+    if intro.is_empty() {
+        return None;
+    }
+    Some((intro.to_string(), plan[at..].trim().to_string()))
 }
 
 /// Persist the store atomically: write a sibling temp file, then rename over the
@@ -1307,6 +1380,64 @@ mod tests {
         assert_eq!(canonical_status("whatever"), "backlog");
     }
 
+    fn migrated(mut file: TodoFile) -> TodoFile {
+        migrate_plan_roles(&mut file);
+        file
+    }
+
+    #[test]
+    fn migration_archives_phase_pointer_plans_as_comments() {
+        let mut t = todo("a", "done");
+        t.plan = ".claude/phases/my-feature".to_string();
+        let f = migrated(TodoFile { version: 1, todos: vec![t] });
+        assert_eq!(f.version, 2);
+        let t = &f.todos[0];
+        assert!(t.plan.is_empty());
+        assert_eq!(t.comments.len(), 1);
+        assert!(t.comments[0].body.contains(".claude/phases/my-feature"));
+        assert!(!t.comments[0].id.is_empty());
+    }
+
+    #[test]
+    fn migration_splits_a_ritual_plan_into_description_and_steps() {
+        // The t#257 shape: whole plan markdown in `plan`, description empty.
+        let mut t = todo("a", "in_progress");
+        t.description = String::new();
+        t.plan = "# План: фича\n\n## Context (зачем)\n\nДолжно X, решили Y, потому что Z — и это вступление достаточно длинное.\n\n## Steps\n\n1. сделать A\n\n## Порядок\n\nПорядок: 1".to_string();
+        let f = migrated(TodoFile { version: 1, todos: vec![t] });
+        let t = &f.todos[0];
+        assert!(t.description.contains("решили Y"));
+        assert!(!t.description.contains("## Steps"));
+        assert!(t.plan.starts_with("## Steps"));
+        assert!(t.plan.contains("Порядок: 1"));
+    }
+
+    #[test]
+    fn migration_leaves_unrecognized_and_described_plans_alone() {
+        // Non-empty description → the plan stays whatever it is (legacy notes).
+        let mut a = todo("a", "backlog");
+        a.description = "своё описание уже есть".to_string();
+        a.plan = "x".repeat(200);
+        // Long plan, empty description, but no steps seam → untouched.
+        let mut b = todo("b", "backlog");
+        b.description = String::new();
+        b.plan = format!("просто прозаический текст без шагов {}", "y".repeat(100));
+        let f = migrated(TodoFile { version: 1, todos: vec![a, b] });
+        assert_eq!(f.todos[0].plan.len(), 200);
+        assert!(f.todos[1].plan.starts_with("просто"));
+        assert!(f.todos[1].description.is_empty());
+        assert_eq!(f.version, 2);
+    }
+
+    #[test]
+    fn migration_is_guarded_by_version() {
+        let mut t = todo("a", "done");
+        t.plan = ".claude/phases/slug".to_string();
+        let f = migrated(TodoFile { version: 2, todos: vec![t] });
+        assert_eq!(f.todos[0].comments.len(), 0); // already v2 → untouched
+        assert!(!f.todos[0].plan.is_empty());
+    }
+
     #[test]
     fn load_migrates_legacy_pending_status() {
         let dir = std::env::temp_dir();
@@ -1326,7 +1457,9 @@ mod tests {
     #[test]
     fn load_missing_file_is_empty_default() {
         let f = load(Path::new("does-not-exist-12345.json"));
-        assert_eq!(f.version, 1);
+        // An empty default passes through the v2 migration on load — trivially,
+        // with nothing to rewrite — so a fresh store starts at the current version.
+        assert_eq!(f.version, 2);
         assert!(f.todos.is_empty());
     }
 

@@ -149,14 +149,32 @@ wired by the installer next to SessionStart/Stop:
   numbered STEPS where **one step = one session**, and a final ORDER line in
   arrow notation (`Порядок: 1 -> 2 -> 3; 2 -> 5`) stating REAL blockers only.
 - **ExitPlanMode** (`cli.mjs plan-hook exit`) instructs the session to record
-  the accepted plan: several steps → a theme root (`add --theme`, vision →
-  description, full markdown → `set-plan`) plus one task per step and `dep add`
-  per ORDER arrow; a one-session plan → `set-plan` on the task itself. The hook
-  also runs the deterministic **match-plan** step: if `matchPlanCli` in the
-  tracker's settings.json names a kb-style CLI, the plan text goes through
+  the accepted plan under the field-role split (below): several steps → a theme
+  root (`add --theme`, the VISION paragraph → its description, STEPS + ORDER →
+  `set-plan` — **never both places**) plus one task per step and `dep add` per
+  ORDER arrow; a one-session plan → vision → `set-description` (only onto an
+  empty description), steps → `set-plan` on the task itself. The hook also runs
+  the deterministic **match-plan** step: if `matchPlanCli` in the tracker's
+  settings.json names a kb-style CLI, the plan text goes through
   `match-plan --json` and any case-warnings are injected (and asked to be
   persisted as a comment) — zero warnings stay silent, and a matcher failure
   never blocks the recording.
+
+### Field roles — one line each (t#253 review)
+
+Four text fields, four roles; the same sentence never lives in two of them:
+
+| Field | Role |
+|---|---|
+| `description` | WHAT & WHY. A theme root's description **is** the theme's VISION. |
+| `plan` | HOW only: the STEPS + ORDER part of the accepted plan; rewritten on re-plan. |
+| `handoff` | The RESULT baton passed down the dep graph (what was produced; next move; gotchas). |
+| `comments` | The journal: decisions, scope changes, gotchas along the way; append-only. |
+
+The v2 load migration in `todos.rs` (`migrate_plan_roles`) heals pre-split data:
+a `plan` that was just a phases-dir pointer is archived as a comment; a
+ritual-recorded plan on an empty description is split (intro → description,
+steps stay).
 
 Plan mode is NOT mandatory — a task created or taken without it works as before;
 the ORDER/vision structure just doesn't get written for free.

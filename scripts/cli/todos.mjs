@@ -243,14 +243,18 @@ function cmdSetTheme(id, value) {
   process.stdout.write(`ok: #${todo.number} theme -> ${theme ? "on" : "off"}\n`);
 }
 
-// Write a todo's `plan` field (t#253). Historically the field was user-only and
-// sat empty; with plan mode as the task-forming ritual, the ExitPlanMode hook
-// instructs the session to store the accepted plan markdown here — on the theme
-// root for a multi-session plan, on the task itself for a one-session plan.
-// `--text ""` clears it (the field is non-optional in the schema, "" = no plan).
+// Field roles after the t#253 review: description = WHAT & WHY (a theme root's
+// description is the theme's VISION), plan = HOW only (steps + order, rewritten
+// on re-plan), handoff = the result baton, comments = the journal. The two
+// setters below are the ritual's writers; the ExitPlanMode hook spells out which
+// text goes where so the same sentence never lands in two fields.
+
+// Write a todo's `plan` field (t#253): the STEPS + ORDER part of an accepted
+// plan — NOT the vision paragraph (that is the description's job). Rewritten on
+// re-plan. `--text ""` clears it ("" = no plan; the field is non-optional).
 function cmdSetPlan(id, flags) {
   if (!id || typeof flags.text !== "string")
-    fail('usage: cli todos set-plan <id> --text "<plan markdown>"');
+    fail('usage: cli todos set-plan <id> --text "<steps + order markdown>"');
   const file = todosPath();
   const data = load(file);
   const todo = resolveTask(data, id);
@@ -260,6 +264,25 @@ function cmdSetPlan(id, flags) {
   save(file, data);
   process.stdout.write(
     `ok: #${todo.number} plan ${flags.text.trim() ? `set (${flags.text.length} chars)` : "cleared"}\n`,
+  );
+}
+
+// Write a todo's `description` (t#253): the WHAT & WHY — for a ritual-recorded
+// one-session plan this is where the VISION paragraph goes when the task was
+// created without one. The exit hook tells sessions to use it only on an empty
+// description; the command itself stays a plain setter (the user may overwrite).
+function cmdSetDescription(id, flags) {
+  if (!id || typeof flags.text !== "string")
+    fail('usage: cli todos set-description <id> --text "<what & why>"');
+  const file = todosPath();
+  const data = load(file);
+  const todo = resolveTask(data, id);
+  if (!todo) fail(`no todo with id ${id}`);
+  todo.description = flags.text;
+  todo.updated_at = new Date().toISOString();
+  save(file, data);
+  process.stdout.write(
+    `ok: #${todo.number} description ${flags.text.trim() ? `set (${flags.text.length} chars)` : "cleared"}\n`,
   );
 }
 
@@ -1012,6 +1035,11 @@ function cmdPipeline() {
       "                      and needs their call. It self-skips if they're at the\n" +
       "                      terminal, so it only pulls back a user who walked away.\n" +
       "   Only `done` releases downstream. Stop when the next node is manual.\n\n" +
+      "Fields — one role each, never the same text in two (t#253 review)\n" +
+      "   description = WHAT & WHY (a theme root's description = the theme's VISION)\n" +
+      "   plan        = HOW only: steps + order; rewritten on re-plan\n" +
+      "   handoff     = the RESULT baton passed down the dep graph\n" +
+      "   comments    = the journal: decisions, scope changes, gotchas\n\n" +
       "Themes (t#255) — work bigger than one task\n" +
       "   A THEME = a root task that depends_on ALL of its children; it closes LAST\n" +
       "   (the done-gate enforces the order). Worth a root from ~4-5 nodes.\n" +
@@ -1039,7 +1067,8 @@ function usage(code) {
       "  set-kind <id> <auto|manual>     task-graph node type (#88): auto = runner may run headless; manual (default) = human gate\n" +
       "  set-theme <id> <on|off>         theme-root marker (t#255): the task depends_on all its children, closes last,\n" +
       "                                  its DESCRIPTION carries the theme's vision (also: add --theme)\n" +
-      '  set-plan <id> --text "<md>"     store the accepted plan-mode plan on a task (t#253); --text "" clears\n' +
+      '  set-plan <id> --text "<md>"     the plan\'s STEPS + ORDER (HOW; no vision — that lives in description); "" clears\n' +
+      '  set-description <id> --text "…" the WHAT & WHY (a theme root\'s = its VISION); plain setter, "" clears\n' +
       "  set-project <id> <name>         tie to a project; <--global|none> to clear\n" +
       '  comment add <id> --text "<body>" [--by claude|user]\n' +
       "  comment list <id> [--json]\n" +
@@ -1100,6 +1129,11 @@ export function run(args) {
     case "set-plan": {
       const { positional, flags } = parseArgs(rest);
       cmdSetPlan(positional[0], flags);
+      break;
+    }
+    case "set-description": {
+      const { positional, flags } = parseArgs(rest);
+      cmdSetDescription(positional[0], flags);
       break;
     }
     case "set-project":
