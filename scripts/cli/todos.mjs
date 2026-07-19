@@ -243,6 +243,26 @@ function cmdSetTheme(id, value) {
   process.stdout.write(`ok: #${todo.number} theme -> ${theme ? "on" : "off"}\n`);
 }
 
+// Write a todo's `plan` field (t#253). Historically the field was user-only and
+// sat empty; with plan mode as the task-forming ritual, the ExitPlanMode hook
+// instructs the session to store the accepted plan markdown here — on the theme
+// root for a multi-session plan, on the task itself for a one-session plan.
+// `--text ""` clears it (the field is non-optional in the schema, "" = no plan).
+function cmdSetPlan(id, flags) {
+  if (!id || typeof flags.text !== "string")
+    fail('usage: cli todos set-plan <id> --text "<plan markdown>"');
+  const file = todosPath();
+  const data = load(file);
+  const todo = resolveTask(data, id);
+  if (!todo) fail(`no todo with id ${id}`);
+  todo.plan = flags.text;
+  todo.updated_at = new Date().toISOString();
+  save(file, data);
+  process.stdout.write(
+    `ok: #${todo.number} plan ${flags.text.trim() ? `set (${flags.text.length} chars)` : "cleared"}\n`,
+  );
+}
+
 // Set (or clear) a todo's project (issue #54: a task filed with the wrong/empty
 // project couldn't be fixed from the CLI before — only in the app). <name> ties
 // it to that board; `--global`/`none`/`clear` makes it project-less. Clearing
@@ -1019,6 +1039,7 @@ function usage(code) {
       "  set-kind <id> <auto|manual>     task-graph node type (#88): auto = runner may run headless; manual (default) = human gate\n" +
       "  set-theme <id> <on|off>         theme-root marker (t#255): the task depends_on all its children, closes last,\n" +
       "                                  its DESCRIPTION carries the theme's vision (also: add --theme)\n" +
+      '  set-plan <id> --text "<md>"     store the accepted plan-mode plan on a task (t#253); --text "" clears\n' +
       "  set-project <id> <name>         tie to a project; <--global|none> to clear\n" +
       '  comment add <id> --text "<body>" [--by claude|user]\n' +
       "  comment list <id> [--json]\n" +
@@ -1076,6 +1097,11 @@ export function run(args) {
     case "set-theme":
       cmdSetTheme(rest[0], rest[1]);
       break;
+    case "set-plan": {
+      const { positional, flags } = parseArgs(rest);
+      cmdSetPlan(positional[0], flags);
+      break;
+    }
     case "set-project":
       cmdSetProject(rest[0], rest[1]);
       break;
