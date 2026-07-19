@@ -31,6 +31,17 @@ describe("buildExitContext", () => {
     expect(ctx).toMatch(/node "[^"]*cli\.mjs"/);
   });
 
+  it("enforces the field-role split: vision to description only, steps to plan", () => {
+    const ctx = buildExitContext("");
+    // The role table is spelled out, and the vision is explicitly kept OUT of
+    // the plan field — the duplication t#257 was born with.
+    expect(ctx).toContain("Field roles");
+    expect(ctx).toContain("do NOT repeat it here");
+    expect(ctx).toContain("STEPS + ORDER sections ONLY");
+    expect(ctx).toContain("todos set-description <id>");
+    expect(ctx).toContain("never overwrite one");
+  });
+
   it("omits the warnings block when the matcher returned nothing", () => {
     expect(buildExitContext("")).not.toContain("KB case-warnings");
     expect(buildExitContext("   \n ")).not.toContain("KB case-warnings");
