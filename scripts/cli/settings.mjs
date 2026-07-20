@@ -77,3 +77,13 @@ export function taskHandoffGuard(appData) {
   const v = readSettings(appData).taskHandoffGuard;
   return typeof v === "string" && TASK_GUARD_MODES.includes(v) ? v : "both";
 }
+
+// `matchPlanCli`: absolute path to a kb-style CLI whose `match-plan --text "<plan>"`
+// turns plan text into case-warnings (t#253). Empty/absent (the default) skips the
+// deterministic match step in the ExitPlanMode hook — the plan-recording
+// instruction is injected either way. Set by hand in settings.json; the UI's
+// plugin-store writes per key, so a hand-added key survives its saves.
+export function matchPlanCli(appData) {
+  const v = readSettings(appData).matchPlanCli;
+  return typeof v === "string" && v.trim() ? v.trim() : "";
+}

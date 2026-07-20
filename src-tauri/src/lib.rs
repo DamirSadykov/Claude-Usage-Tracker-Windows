@@ -1758,6 +1758,8 @@ fn save_project_groups(
 //   • SessionStart → `cli.mjs hook`       — inject the task board / current phase.
 //   • Stop         → `cli.mjs stop-hook`  — block a stop that leaves a phase plan
 //                                           with a stale HANDOFF baton (issue #59).
+//   • PostToolUse  → `cli.mjs plan-hook enter|exit` (matchers EnterPlanMode /
+//                    ExitPlanMode) — plan mode as the task-forming ritual (t#253).
 // The CLI areas need no separate wiring — the hook hands Claude the cli.mjs path
 // and Claude calls `cli.mjs todos …` itself.
 
@@ -1841,6 +1843,83 @@ fn settings_has_cc_hook(v: &serde_json::Value, event: &str) -> bool {
         })
 }
 
+/// True if OUR command is wired under `event` inside the group whose `matcher`
+/// equals `matcher` (PostToolUse groups are matcher-scoped, unlike SessionStart /
+/// Stop where [`settings_has_cc_hook`] checks every group).
+fn settings_has_cc_hook_matched(v: &serde_json::Value, event: &str, matcher: &str) -> bool {
+    v.get("hooks")
+        .and_then(|h| h.get(event))
+        .and_then(|s| s.as_array())
+        .is_some_and(|groups| {
+            groups
+                .iter()
+                .filter(|g| g.get("matcher").and_then(|m| m.as_str()) == Some(matcher))
+                .any(|g| {
+                    g.get("hooks").and_then(|h| h.as_array()).is_some_and(|hs| {
+                        hs.iter().any(|hook| {
+                            hook.get("command")
+                                .and_then(|c| c.as_str())
+                                .is_some_and(is_our_hook_command)
+                        })
+                    })
+                })
+        })
+}
+
+/// Wire one MATCHER-scoped hook (PostToolUse) to `command`. The plain
+/// [`wire_hook_event`] rewrites OUR entry under every group of an event — correct
+/// for SessionStart/Stop with their single entry, wrong for PostToolUse where two
+/// of our entries live under different matchers (EnterPlanMode vs ExitPlanMode)
+/// and would clobber each other. This variant scopes the rewrite to the group
+/// with this exact `matcher`, appending `{matcher, hooks:[…]}` when absent.
+/// Foreign matchers and foreign hooks inside our matcher's group are untouched.
+fn wire_hook_event_matched(
+    root: &mut serde_json::Value,
+    event: &str,
+    matcher: &str,
+    command: &str,
+) {
+    let obj = root.as_object_mut().expect("settings root is an object");
+    let hooks = obj.entry("hooks").or_insert_with(|| serde_json::json!({}));
+    if !hooks.is_object() {
+        *hooks = serde_json::json!({});
+    }
+    let ev = hooks
+        .as_object_mut()
+        .unwrap()
+        .entry(event)
+        .or_insert_with(|| serde_json::json!([]));
+    if !ev.is_array() {
+        *ev = serde_json::json!([]);
+    }
+    let groups = ev.as_array_mut().unwrap();
+
+    let mut updated = false;
+    for g in groups.iter_mut() {
+        if g.get("matcher").and_then(|m| m.as_str()) != Some(matcher) {
+            continue;
+        }
+        if let Some(hs) = g.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+            for hook in hs.iter_mut() {
+                if hook
+                    .get("command")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(is_our_hook_command)
+                {
+                    hook["command"] = serde_json::Value::String(command.to_string());
+                    updated = true;
+                }
+            }
+        }
+    }
+    if !updated {
+        groups.push(serde_json::json!({
+            "matcher": matcher,
+            "hooks": [ { "type": "command", "command": command } ]
+        }));
+    }
+}
+
 /// The script path OUR SessionStart entry actually points at (the first quoted
 /// span of the command), whatever it is — not the path this build would wire.
 /// The two diverge after the app moves (a reinstall elsewhere, a dev checkout
@@ -1869,6 +1948,9 @@ struct CcHookStatus {
     /// existed has `installed: true` but no Stop entry, so the UI can offer a
     /// re-install rather than silently running without the guard.
     stop_installed: bool,
+    /// The plan-mode PostToolUse pair (t#253) — same story: an older install
+    /// lacks them until a re-install wires the EnterPlanMode/ExitPlanMode entries.
+    plan_installed: bool,
     /// What this build WOULD wire (bundled resource, or the repo in dev).
     script_path: String,
     /// What settings.json currently points at, and whether that file is still
@@ -1899,6 +1981,13 @@ fn cc_hook_status(app: AppHandle) -> Result<CcHookStatus, String> {
         stop_installed: root
             .as_ref()
             .map(|v| settings_has_cc_hook(v, "Stop"))
+            .unwrap_or(false),
+        plan_installed: root
+            .as_ref()
+            .map(|v| {
+                settings_has_cc_hook_matched(v, "PostToolUse", "EnterPlanMode")
+                    && settings_has_cc_hook_matched(v, "PostToolUse", "ExitPlanMode")
+            })
             .unwrap_or(false),
         script_path: cc_hook_script_path(&app).unwrap_or_default(),
         wired_path_exists: !wired.is_empty() && Path::new(&wired).exists(),
@@ -1932,6 +2021,18 @@ fn heal_cc_hook(app: &AppHandle) -> Option<String> {
     let script = cc_hook_script_path(app).ok()?;
     wire_hook_event(&mut root, "SessionStart", &format!("node \"{script}\" hook"));
     wire_hook_event(&mut root, "Stop", &format!("node \"{script}\" stop-hook"));
+    wire_hook_event_matched(
+        &mut root,
+        "PostToolUse",
+        "EnterPlanMode",
+        &format!("node \"{script}\" plan-hook enter"),
+    );
+    wire_hook_event_matched(
+        &mut root,
+        "PostToolUse",
+        "ExitPlanMode",
+        &format!("node \"{script}\" plan-hook exit"),
+    );
     let json = serde_json::to_string_pretty(&root).ok()?;
     let tmp = settings_path.with_extension("json.tmp");
     std::fs::write(&tmp, json.as_bytes()).ok()?;
@@ -2023,6 +2124,19 @@ fn install_cc_hook(app: AppHandle) -> Result<String, String> {
         "Stop",
         &format!("node \"{script}\" stop-hook"),
     ));
+    // Plan-mode ritual (t#253): PostToolUse is matcher-scoped, one entry per tool.
+    wire_hook_event_matched(
+        &mut root,
+        "PostToolUse",
+        "EnterPlanMode",
+        &format!("node \"{script}\" plan-hook enter"),
+    );
+    wire_hook_event_matched(
+        &mut root,
+        "PostToolUse",
+        "ExitPlanMode",
+        &format!("node \"{script}\" plan-hook exit"),
+    );
 
     if let Some(dir) = settings_path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
@@ -2872,5 +2986,48 @@ mod hook_install_tests {
         let mut root = serde_json::json!({ "hooks": { "Stop": {} } });
         wire_hook_event(&mut root, "Stop", STOP_CMD);
         assert_eq!(commands_for(&root, "Stop"), vec![STOP_CMD]);
+    }
+
+    /// The plan-mode pair (t#253): PostToolUse entries are matcher-scoped.
+    const ENTER_CMD: &str = r#"node "C:/app/scripts/cli.mjs" plan-hook enter"#;
+    const EXIT_CMD: &str = r#"node "C:/app/scripts/cli.mjs" plan-hook exit"#;
+
+    fn wire_plan_pair(root: &mut serde_json::Value) {
+        wire_hook_event_matched(root, "PostToolUse", "EnterPlanMode", ENTER_CMD);
+        wire_hook_event_matched(root, "PostToolUse", "ExitPlanMode", EXIT_CMD);
+    }
+
+    #[test]
+    fn matched_wiring_keeps_the_two_matchers_apart() {
+        // The exact failure the matched variant exists for: the plain
+        // wire_hook_event would rewrite BOTH our PostToolUse entries to one
+        // command. Wiring the pair — and re-wiring it (an upgrade) — must leave
+        // exactly one entry per matcher, each with its own subcommand.
+        let mut root = serde_json::json!({});
+        wire_plan_pair(&mut root);
+        wire_plan_pair(&mut root); // idempotency: a re-install must not duplicate
+        assert_eq!(commands_for(&root, "PostToolUse"), vec![ENTER_CMD, EXIT_CMD]);
+        assert!(settings_has_cc_hook_matched(&root, "PostToolUse", "EnterPlanMode"));
+        assert!(settings_has_cc_hook_matched(&root, "PostToolUse", "ExitPlanMode"));
+    }
+
+    #[test]
+    fn matched_wiring_updates_a_moved_install_and_spares_foreign_matchers() {
+        // A moved install is re-pointed in place; a foreign PostToolUse hook
+        // (another tool's matcher group) survives untouched.
+        let foreign = r#"node "$HOME/lint/on-edit.mjs""#;
+        let mut root = serde_json::json!({
+            "hooks": { "PostToolUse": [
+                { "matcher": "Edit", "hooks": [ { "type": "command", "command": foreign } ] },
+                { "matcher": "EnterPlanMode", "hooks": [ { "type": "command", "command": r#"node "D:/old/cli.mjs" plan-hook enter"# } ] }
+            ] }
+        });
+        wire_plan_pair(&mut root);
+        assert_eq!(
+            commands_for(&root, "PostToolUse"),
+            vec![foreign, ENTER_CMD, EXIT_CMD],
+        );
+        // The foreign matcher's group is not "ours", even though ours exist now.
+        assert!(!settings_has_cc_hook_matched(&root, "PostToolUse", "Edit"));
     }
 }

@@ -220,6 +220,47 @@ How a piece of work **bigger than one task** lives on the graph — as a **theme
   (the vision hook, t#252, surfaces it automatically). The root's **handoff stays
   the usual DOWNSTREAM baton** to whatever depends on the root itself.
 
+## Plan mode — the task-forming ritual (t#253)
+
+Plan mode is where themes COME FROM: the plan is written for the writer (and the
+sessions after them), then transcribed into the tracker. Two PostToolUse hooks,
+wired by the installer next to SessionStart/Stop:
+
+- **EnterPlanMode** (`cli.mjs plan-hook enter`) injects the format before the
+  plan is written: a VISION paragraph ("должно X, решили Y, потому что Z"),
+  numbered STEPS where **one step = one session**, and a final ORDER line in
+  arrow notation (`Порядок: 1 -> 2 -> 3; 2 -> 5`) stating REAL blockers only.
+- **ExitPlanMode** (`cli.mjs plan-hook exit`) instructs the session to record
+  the accepted plan under the field-role split (below): several steps → a theme
+  root (`add --theme`, the VISION paragraph → its description, STEPS + ORDER →
+  `set-plan` — **never both places**) plus one task per step and `dep add` per
+  ORDER arrow; a one-session plan → vision → `set-description` (only onto an
+  empty description), steps → `set-plan` on the task itself. The hook also runs
+  the deterministic **match-plan** step: if `matchPlanCli` in the tracker's
+  settings.json names a kb-style CLI, the plan text goes through
+  `match-plan --json` and any case-warnings are injected (and asked to be
+  persisted as a comment) — zero warnings stay silent, and a matcher failure
+  never blocks the recording.
+
+### Field roles — one line each (t#253 review)
+
+Four text fields, four roles; the same sentence never lives in two of them:
+
+| Field | Role |
+|---|---|
+| `description` | WHAT & WHY. A theme root's description **is** the theme's VISION. |
+| `plan` | HOW only: the STEPS + ORDER part of the accepted plan; rewritten on re-plan. |
+| `handoff` | The RESULT baton passed down the dep graph (what was produced; next move; gotchas). |
+| `comments` | The journal: decisions, scope changes, gotchas along the way; append-only. |
+
+The v2 load migration in `todos.rs` (`migrate_plan_roles`) heals pre-split data:
+a `plan` that was just a phases-dir pointer is archived as a comment; a
+ritual-recorded plan on an empty description is split (intro → description,
+steps stay).
+
+Plan mode is NOT mandatory — a task created or taken without it works as before;
+the ORDER/vision structure just doesn't get written for free.
+
 ## Why the discipline matters
 
 The whole point of `manual` gates is to stop unattended drift: an early wrong
