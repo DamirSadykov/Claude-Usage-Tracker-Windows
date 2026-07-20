@@ -1402,4 +1402,89 @@ mod tests {
         assert_eq!(f.seven_day, TierForecast::unknown());
         assert!(f.extra_usage.is_none());
     }
+
+    // --- 5h card reacts to a recent spike (recent-темп) ---
+
+    #[test]
+    fn forecast_five_hour_reacts_to_recent_spike_while_week_amortises() {
+        let db = mem_db();
+        let now = now_at("2026-01-08T00:00:00Z");
+        let reset_five = "2026-01-08T05:00:00Z"; // 300 min away
+        let reset_seven = "2026-01-14T00:00:00Z";
+        // A quiet week: both tiers flat at 5% for 168 hourly snapshots…
+        for h in 0..=167 {
+            let ts = (now_at("2026-01-01T00:00:00Z") + chrono::Duration::hours(h)).to_rfc3339();
+            db.insert_full(&ts, 5.0, Some(reset_five), 5.0, Some(reset_seven), None);
+        }
+        // …then a hot final hour: both jump 5%→25% (a 20%/h spike).
+        db.insert_full("2026-01-08T00:00:00Z", 25.0, Some(reset_five), 25.0, Some(reset_seven), None);
+
+        let f = db.forecast(60, now).unwrap();
+        // 5h blends in the recent short-window burn → reacts to the spike.
+        assert!(
+            (f.five_hour.rate_per_hour - 20.0).abs() < 1e-6,
+            "5h should react to spike, got {}",
+            f.five_hour.rate_per_hour
+        );
+        // 25% used, 20%/h → eta 225min < 300min to reset → warn.
+        assert_eq!(f.five_hour.pace, "warn");
+        // 7-day tier still amortises the same spike across the week.
+        let amortised = 20.0 / 168.0;
+        assert!(
+            (f.seven_day.rate_per_hour - amortised).abs() < 1e-6,
+            "7d should amortise, got {}",
+            f.seven_day.rate_per_hour
+        );
+    }
+
+    #[test]
+    fn forecast_five_hour_recent_idle_falls_back_to_weekly_mean() {
+        let db = mem_db();
+        let now = now_at("2026-01-08T00:00:00Z");
+        let reset_five = "2026-01-08T05:00:00Z";
+        // One burst early in the week (5%→25% in hour 1), then flat 25% for the
+        // rest — including the whole recent window, which is idle.
+        db.insert_full("2026-01-01T00:00:00Z", 5.0, Some(reset_five), 0.0, None, None);
+        for h in 1..=168 {
+            let ts = (now_at("2026-01-01T00:00:00Z") + chrono::Duration::hours(h)).to_rfc3339();
+            db.insert_full(&ts, 25.0, Some(reset_five), 0.0, None, None);
+        }
+
+        let fh = db.forecast(60, now).unwrap().five_hour;
+        // Recent window is flat → recent burn 0. The rate must NOT collapse to
+        // 0; it falls back to the weekly mean (one 20% bucket over 168).
+        let mean = 20.0 / 168.0;
+        assert!(
+            (fh.rate_per_hour - mean).abs() < 1e-6,
+            "idle recent must fall back to weekly mean, got {}",
+            fh.rate_per_hour
+        );
+    }
+
+    #[test]
+    fn forecast_five_hour_recent_ignores_reset_crossing() {
+        let db = mem_db();
+        let now = now_at("2026-01-08T00:00:00Z");
+        let reset_a = "2026-01-08T00:00:00Z"; // reset happens at `now`
+        let reset_b = "2026-01-08T05:00:00Z"; // fresh window after the reset
+        // One 20% burn bucket early in the week gives a small positive mean…
+        db.insert_full("2026-01-01T00:00:00Z", 5.0, Some(reset_a), 0.0, None, None);
+        for h in 1..=167 {
+            let ts = (now_at("2026-01-01T00:00:00Z") + chrono::Duration::hours(h)).to_rfc3339();
+            db.insert_full(&ts, 25.0, Some(reset_a), 0.0, None, None);
+        }
+        // Recent window: 25% at 23:00, then a reset drops it to 3% at `now`.
+        db.insert_full("2026-01-08T00:00:00Z", 3.0, Some(reset_b), 0.0, None, None);
+
+        let fh = db.forecast(60, now).unwrap().five_hour;
+        // Recent delta is negative (25→3, a reset) → recent ignored, not a huge
+        // negative rate. Falls back to the weekly mean; rate stays ≥ 0.
+        assert!(fh.rate_per_hour >= 0.0, "rate must not go negative: {}", fh.rate_per_hour);
+        let mean = 20.0 / 167.0;
+        assert!(
+            (fh.rate_per_hour - mean).abs() < 1e-6,
+            "reset-crossing recent must fall back to mean, got {}",
+            fh.rate_per_hour
+        );
+    }
 }
