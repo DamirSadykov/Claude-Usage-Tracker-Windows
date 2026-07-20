@@ -1,16 +1,14 @@
 // `cli.mjs hook` — Claude Code SessionStart hook for the Claude Usage Tracker.
 //
-// Two modes, by whether the current project is mid-PLAN (issue #16):
-//   • PHASE MODE — the project has a plan with an unfinished phase: surface the
-//     CURRENT phase + handoff baton + the discipline, and DON'T dump the task
-//     board (the session is aimed at the phase; the full list would just bloat
-//     context). A thin pointer keeps the plan's own task and `todos list` reachable.
-//   • TODO MODE — no active phase: surface the QUEUE — the tasks the user has
-//     lined up (status queue or in_progress) that are a CURRENT ROOT of the
-//     dependency graph (every task in `depends_on` is done; no deps = root). The
-//     backlog, blocked, and review tasks are held back to keep the context lean.
-//     Titles only (clipped), capped at 10. The CLI contract prints FIRST (above
-//     the list) so a truncated injection never loses the how-to-edit instructions.
+// Surfaces the QUEUE — the tasks the user has lined up (status queue or
+// in_progress) that are a CURRENT ROOT of the dependency graph (every task in
+// `depends_on` is done; no deps = root). The backlog, blocked, and review tasks
+// are held back to keep the context lean. Titles only (clipped), capped at 10.
+// The CLI contract prints FIRST (above the list) so a truncated injection never
+// loses the how-to-edit instructions. An in_progress task also carries its THEME
+// VISION (t#252): the description of the nearest theme root up the dep graph.
+// (Phase mode was removed with the phases entity, t#254 — a big task is a theme
+// on the graph now; see docs/task-pipeline.md.)
 // It is strictly read-only and MUST never disrupt a session: a missing/unreadable
 // file, no matching todos, or any error is a silent no-op (exit 0, no output).
 //
@@ -22,13 +20,8 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { readPlansForHook, markPlanDoneForDoneTasks } from "./phases.mjs";
 import { themeRootsFor } from "./todos.mjs";
-import {
-  taskContextMinRank,
-  sessionContextMode,
-  hookContextEnabled,
-} from "./settings.mjs";
+import { taskContextMinRank, hookContextEnabled } from "./settings.mjs";
 
 // The unified CLI is this module's grandparent-relative entry (scripts/cli.mjs);
 // resolve its absolute path so the contract below can hand Claude exact,
@@ -48,7 +41,7 @@ const CLI_NOTE = `<cli> = node "${CLI}"`;
 const PRANK = { high: 3, medium: 2, low: 1 };
 const prank = (t) => (t && PRANK[t.priority]) || 0;
 
-// Settings reads (sessionContext, hookContextEnabled) now live in ./settings.mjs —
+// Settings reads (taskContextPriority, hookContextEnabled) live in ./settings.mjs —
 // one place that owns the file path + each forgiving default, shared with the Stop
 // hook. See the imports above.
 
@@ -75,7 +68,7 @@ function main() {
   const appData =
     process.env.APPDATA ||
     path.join(process.env.USERPROFILE || "", "AppData", "Roaming");
-  // Master off-switch: the user turned off task/phase context injection entirely.
+  // Master off-switch: the user turned off task-context injection entirely.
   if (!hookContextEnabled(appData)) return;
   const file = path.join(appData, "com.claude-usage-tracker.app", "todos.json");
 
@@ -109,47 +102,6 @@ function main() {
       col(t.status) !== "done" &&
       (!t.project || t.project === project),
   );
-
-  // If this project is mid-PLAN, the session is aimed at the CURRENT phase, not
-  // the task board — surface the phase (focused) and do NOT dump the task list.
-  // Read-only and guarded: any failure falls through to plain todo mode.
-  //
-  // A plan whose linked tracker task is `done` is finished work, even if some
-  // phase boxes were never ticked. We mark such plans done (markPlanDoneForDone-
-  // Tasks below) so they read complete in `phases list` too, not just here — a
-  // done task has no open plan to keep around. The task status (not the phase
-  // files) is the trigger, so this catches a status flip made in the tracker UI
-  // too — the CLI isn't the only path to done.
-  const donePlanTasks = new Set(
-    todos
-      .filter((t) => t && t.number != null && col(t.status) === "done")
-      .map((t) => t.number),
-  );
-  // Best-effort reconcile (guarded — a write failure must never break a session).
-  // After it, a done-task plan has no open phase, so the `p.current` filter drops
-  // it on its own. The extra task-status guard below is the fallback for when the
-  // write couldn't land (e.g. a read-only checkout): hide it from the hook anyway.
-  try {
-    markPlanDoneForDoneTasks(cwd, (n) => donePlanTasks.has(n));
-  } catch {
-    // ignore — fall through to the read-only display filter
-  }
-  let phasePlans = [];
-  try {
-    phasePlans = readPlansForHook(cwd).filter(
-      (p) => p.current && !(p.task != null && donePlanTasks.has(p.task)),
-    );
-  } catch {
-    phasePlans = [];
-  }
-  // Phase mode is the default lead when the project is mid-plan, but the user can
-  // force the task board instead via the "session context" setting.
-  if (phasePlans.length && sessionContextMode(appData) === "phase") {
-    process.stdout.write(
-      phaseModeContext(project, todos, active, file, phasePlans) + "\n",
-    );
-    return;
-  }
 
   if (active.length) {
     // NEW SELECTION (startup-context bloat + relevance): surface only the tasks
@@ -331,11 +283,10 @@ function main() {
 }
 
 // Render a possibly multi-line value as an indented block under a one-line label,
-// KEEPING the author's line breaks (issue #58 #1/#4). Vision and handoff are the
-// only carriers of cross-session intent; flattening a multi-section vision/handoff
-// to one line (the old behaviour) erased its structure, and the 500-char cap on
-// vision sliced off the current phase's own goal. Single-line values stay inline.
-// A generous char ceiling keeps a runaway value from flooding the session context.
+// KEEPING the author's line breaks (issue #58 #1/#4). The theme vision is a
+// carrier of cross-session intent; flattening a multi-section vision to one line
+// would erase its structure. Single-line values stay inline. A generous char
+// ceiling keeps a runaway value from flooding the session context.
 function block(label, text, pad = "    ", cap = 2000) {
   let body = String(text)
     .replace(/\r\n?/g, "\n")
@@ -349,69 +300,6 @@ function block(label, text, pad = "    ", cap = 2000) {
     .map((l) => (l ? pad + l : ""))
     .join("\n");
   return `${label}\n${indented}`;
-}
-
-// PHASE MODE (issue #16): when the current project has a plan with an unfinished
-// phase, the session is aimed at that phase — so we surface the phase INSTEAD of
-// the task board (the full todo list is noise here, and bloats context). We still
-// hand Claude exactly enough to drive the plan's own task: its id + the status/
-// comment commands, plus a count of the other open tasks behind a `todos list`.
-// `plans` are the project's plans with a current phase; `active` is the open todos.
-function phaseModeContext(project, todos, active, file, plans) {
-  const byNumber = new Map(
-    todos.filter((t) => t && t.number != null).map((t) => [t.number, t]),
-  );
-  const linked = [];
-  const lines = [];
-  for (const p of plans) {
-    const todo = p.task != null ? byNumber.get(p.task) : null;
-    if (todo) linked.push(todo);
-    const idPart = todo ? `, id:${todo.id}` : "";
-    const link =
-      p.task != null
-        ? `task #${p.task}${todo ? ` "${todo.subject}"` : ""}${idPart}`
-        : "(not linked to a task)";
-    const next = p.nextSub
-      ? ` — next: ${p.current.num}.${p.nextSub.num} ${p.nextSub.title}`
-      : "";
-    // An empty phase title shows as `phase 2/2 ""` — a missing orientation anchor
-    // (issue #58 #6). Fall back to an actionable nudge instead of a bare "".
-    const titleShown = p.current.title
-      ? `"${p.current.title}"`
-      : `(untitled — set one: <cli> phases edit ${p.current.num} --title "…")`;
-    lines.push(
-      `- plan "${p.slug}" (${link}): phase ${p.current.num}/${p.total} ${titleShown}${next}`,
-    );
-    if (p.vision) {
-      lines.push(
-        block(
-          `  ★ vision (the plan's north star — keep this phase true to it; if it pulls away, stop and flag it):`,
-          p.vision,
-        ),
-      );
-    }
-    if (p.handoff) lines.push(block(`  ↪ handoff from last session:`, p.handoff));
-  }
-
-  const linkedIds = new Set(linked.map((t) => t.id));
-  const otherOpen = active.filter((t) => !linkedIds.has(t.id));
-
-  const out = [
-    `This project is mid-PLAN (skill: phases) — work the CURRENT phase only, one phase per session. The task board is NOT loaded here, to keep the session phase-focused. (${CLI_NOTE})`,
-    lines.join("\n"),
-    "Phase ops — `<cli> phases <cmd>`: done <N.k> (tick a subphase) · done <N> then verify then STOP (next phase = next session) · handoff \"<what's done; the concrete next step>\" · list.",
-  ];
-  if (linked.length) {
-    const ids = linked.map((t) => `#${t.number} (id:${t.id})`).join(", ");
-    out.push(
-      `The plan's own tracker task ${ids} — \`<cli> todos <cmd>\`: set-status <id> <status> (backlog|queue|in_progress|review|done) · comment add <id> --text "<body>". Don't hand-edit todos.json.`,
-    );
-  }
-  out.push(
-    `Other open tasks for "${project}": ${otherOpen.length} (\`<cli> todos list\`).`,
-  );
-  out.push(`File (don't edit): ${file}`);
-  return out.join("\n");
 }
 
 // Entry for the unified dispatcher: `cli.mjs hook`. A todo hook must NEVER break

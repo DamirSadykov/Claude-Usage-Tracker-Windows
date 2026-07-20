@@ -50,23 +50,11 @@ export function taskContextMinRank(appData) {
   return typeof v === "string" && v in MIN ? MIN[v] : MIN.medium;
 }
 
-// `sessionContext`: what a mid-plan session leads with — "phase" (default) or
-// "tasks" (always the board).
-export function sessionContextMode(appData) {
-  const v = readSettings(appData).sessionContext;
-  return v === "tasks" || v === "phase" ? v : "phase";
-}
 
 // `hookContextEnabled`: master switch — when false the SessionStart hook injects
 // nothing. Default true.
 export function hookContextEnabled(appData) {
   const v = readSettings(appData).hookContextEnabled;
-  return typeof v === "boolean" ? v : true;
-}
-
-// `phaseHandoffGuard`: the Stop hook's plan-baton off-switch. Default true (guard on).
-export function phaseHandoffGuard(appData) {
-  const v = readSettings(appData).phaseHandoffGuard;
   return typeof v === "boolean" ? v : true;
 }
 

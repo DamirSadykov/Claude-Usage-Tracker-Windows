@@ -3,19 +3,17 @@
 // LAZILY so adding an area never bloats this file or the startup cost:
 //
 //   node cli.mjs todos  <…>    → ./cli/todos.mjs   (mutate the todo list)
-//   node cli.mjs phases <…>    → ./cli/phases.mjs  (break a task into phases)
 //   node cli.mjs triage <…>    → ./cli/triage.mjs  (publish the nightly digest)
 //   node cli.mjs hook          → ./cli/hook.mjs    (SessionStart hook)
 //   node cli.mjs stop-hook     → ./cli/stop-hook.mjs (Stop hook: HANDOFF guard)
 //
-// Each area module exports `run(args)`. Back-compat shims (cc-todos.mjs,
-// cc-phases.mjs, cc-todos-hook.mjs) forward to the same modules, so existing
-// wirings and muscle memory keep working. The tracker bundles this whole tree
-// and the installer wires both hooks into ~/.claude/settings.json.
+// Each area module exports `run(args)`. The tracker bundles this whole tree
+// and the installer wires the hooks into ~/.claude/settings.json.
+// (The `phases` area was removed with the phases entity, t#254 — a big task is
+// now a THEME on the task graph: root + dep chain; see docs/task-pipeline.md.)
 
 const AREAS = {
   todos: "./cli/todos.mjs",
-  phases: "./cli/phases.mjs",
   triage: "./cli/triage.mjs",
   corrections: "./cli/corrections.mjs",
   "task-cost": "./cli/task-cost.mjs",
@@ -34,12 +32,11 @@ function usage(code) {
   process.stdout.write(
     "cli - Claude Usage Tracker\n\n" +
       "  todos   <…>   mutate the todo list (add / set-status / comment / list / …)\n" +
-      "  phases  <…>   break a task into ordered phases (create / add / done / list / …)\n" +
       "  triage  <…>   publish/read the nightly-triage digest (publish / show / clear)\n" +
       "  corrections <…> user-corrections outcome metric, layer 1 (scan / label-template / eval)\n" +
       "  task-cost <…> session->task attribution for tokens-per-task (scan / publish)\n" +
       "  hook          SessionStart hook (wired into ~/.claude/settings.json)\n" +
-      "  stop-hook     Stop hook — blocks a stop that leaves a stale phase HANDOFF\n" +
+      "  stop-hook     Stop hook — blocks a stop that leaves a worked task without a handoff baton\n" +
       "  plan-hook     PostToolUse hooks for plan mode (enter = format, exit = record + match-plan)\n\n" +
       "Run `cli <area> --help` for an area's commands.\n",
   );
