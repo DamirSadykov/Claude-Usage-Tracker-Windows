@@ -183,14 +183,6 @@ const messages = {
     todoHandoffHint: "what this task hands to the tasks that depend on it",
     todoHandoffInherited: "Inherited from dependencies",
     todoHandoffItemEmpty: "no handoff — nothing carried forward",
-    phasesLabel: "Phases",
-    visionLabel: "Vision",
-    phasesSetting: "Phases in tasks",
-    phasesSettingDesc:
-      "Show phase checkboxes on task cards.",
-    handoffGuardSetting: "HANDOFF guard at session end (plans)",
-    handoffGuardSettingDesc:
-      "If a session worked a phase plan but left its handoff older than that work — or wrote an empty one — block the stop once and ask Claude for a real baton (Stop hook). Off: a session can end with no handoff.",
     taskGuardSetting: "HANDOFF guard for tasks",
     taskGuardDesc:
       "Which tasks must leave a handoff before the session ends. A task's baton is what a dependent task inherits — without it, the next task starts blind.",
@@ -212,14 +204,9 @@ const messages = {
     taskCtxPrioLow: "Low and above",
     taskCtxPrioMedium: "Medium and above",
     taskCtxPrioHigh: "High only",
-    sessionCtxSetting: "Session context",
-    sessionCtxDesc:
-      "What a session leads with when the project has an active phase plan: the current phase (focused) or always the task board.",
-    sessionCtxPhase: "Active phase",
-    sessionCtxTasks: "Always tasks",
     hookContextSetting: "Task context in sessions",
     hookContextSettingDesc:
-      "Inject your active tasks — and, mid-plan, the current phase — into every Claude Code session (SessionStart hook). Off: sessions start with no task/phase context.",
+      "Inject your active tasks into every Claude Code session (SessionStart hook). Off: sessions start with no task context.",
     todoProject: "Project",
     todoProjectPlaceholder: "e.g. my-app (optional)",
     todoShowDone: "Show done",
@@ -654,7 +641,7 @@ const messages = {
     ioImported: "Imported: {added} added, {forked} filed as new. {total} task(s) on the board.",
     installCcHook: "Claude Code CLI + hook",
     installCcHookDesc:
-      "Wire the SessionStart and Stop hooks into ~/.claude/settings.json so every Claude Code session sees this project's tasks, edits them via the cc-todos CLI, and can't end a phase session without leaving a handoff.",
+      "Wire the SessionStart and Stop hooks into ~/.claude/settings.json so every Claude Code session sees this project's tasks, edits them via the cc-todos CLI, and can't end a session that worked a task without leaving a handoff.",
     installCcHookOn: "Installed",
     installCcHookOff: "Not installed",
     installCcHookStopMissing:
@@ -861,14 +848,6 @@ const messages = {
     todoHandoffHint: "что задача передаёт тем, кто от неё зависит",
     todoHandoffInherited: "Наследуется от зависимостей",
     todoHandoffItemEmpty: "нет handoff — переносить нечего",
-    phasesLabel: "Фазы",
-    visionLabel: "Видение",
-    phasesSetting: "Фазы в задачах",
-    phasesSettingDesc:
-      "Показывать чекбоксы фаз на карточках задач.",
-    handoffGuardSetting: "Guard HANDOFF в конце сессии (планы)",
-    handoffGuardSettingDesc:
-      "Если сессия работала с планом фаз, но handoff остался старше этой работы — или записан пустым — один раз заблокировать выход и попросить Claude оставить настоящий батон (хук Stop). Выкл.: сессия может завершиться без handoff.",
     taskGuardSetting: "Guard HANDOFF для задач",
     taskGuardDesc:
       "Какие задачи обязаны оставить handoff до конца сессии. Батон задачи — это то, что наследует зависимая задача; без него следующая задача стартует вслепую.",
@@ -890,14 +869,9 @@ const messages = {
     taskCtxPrioLow: "Низкий и выше",
     taskCtxPrioMedium: "Средний и выше",
     taskCtxPrioHigh: "Только высокий",
-    sessionCtxSetting: "Контекст сессии",
-    sessionCtxDesc:
-      "С чего начинать сессию, когда у проекта есть активный план фаз: с текущей фазы (фокус) или всегда с доски задач.",
-    sessionCtxPhase: "Активная фаза",
-    sessionCtxTasks: "Всегда задачи",
     hookContextSetting: "Контекст задач в сессиях",
     hookContextSettingDesc:
-      "Вставлять ваши активные задачи — а в проекте с планом и текущую фазу — в каждую сессию Claude Code (хук SessionStart). Выкл.: сессии стартуют без контекста задач/фаз.",
+      "Вставлять ваши активные задачи в каждую сессию Claude Code (хук SessionStart). Выкл.: сессии стартуют без контекста задач.",
     todoProject: "Проект",
     todoProjectPlaceholder: "напр. my-app (необязательно)",
     todoShowDone: "Показать готовые",
@@ -1332,7 +1306,7 @@ const messages = {
     ioImported: "Импортировано: добавлено {added}, заведено новыми {forked}. Задач на доске: {total}.",
     installCcHook: "CLI + хук Claude Code",
     installCcHookDesc:
-      "Прописать хуки SessionStart и Stop в ~/.claude/settings.json, чтобы каждая сессия Claude Code видела задачи этого проекта, меняла их через CLI cc-todos и не завершала фазовую сессию без handoff.",
+      "Прописать хуки SessionStart и Stop в ~/.claude/settings.json, чтобы каждая сессия Claude Code видела задачи этого проекта, меняла их через CLI cc-todos и не завершала сессию с рабочей задачей без handoff.",
     installCcHookOn: "Установлено",
     installCcHookOff: "Не установлено",
     installCcHookStopMissing:

@@ -296,7 +296,7 @@ function toggleRuntime(kind: string) {
 onMounted(loadIgnoredInsights);
 
 // --- cc-todos CLI + Claude Code hook installer ---
-// The installer wires two hooks: SessionStart (task/phase context) and Stop (the
+// The installer wires two hooks: SessionStart (task context) and Stop (the
 // HANDOFF freshness guard). `stop_installed` is false for an install made before
 // the guard existed — the UI then nudges a re-install instead of leaving it off.
 interface CcHookStatus {
@@ -337,37 +337,10 @@ async function doInstallCcHook() {
 }
 onMounted(loadCcHookStatus);
 
-// --- Phases in tasks (issue #16) ---
-// Lives in the Tasks tab. A UI-only flag stored straight in settings.json (like
-// ignoredInsights above) — no backend config, so it stays out of the Save flow.
-// Default ON.
-const phasesEnabled = ref(true);
-
-async function loadPhasesEnabled() {
-  try {
-    const { load: loadStore } = await import("@tauri-apps/plugin-store");
-    const store = await loadStore("settings.json");
-    const v = await store.get<boolean>("phasesEnabled");
-    if (typeof v === "boolean") phasesEnabled.value = v;
-  } catch {}
-}
-
-async function togglePhasesEnabled() {
-  phasesEnabled.value = !phasesEnabled.value;
-  try {
-    const { load: loadStore } = await import("@tauri-apps/plugin-store");
-    const store = await loadStore("settings.json");
-    await store.set("phasesEnabled", phasesEnabled.value);
-    await store.save();
-  } catch {}
-}
-
-onMounted(loadPhasesEnabled);
-
 // --- Task priority in context (issue #32) ---
 // The LOWEST task priority the SessionStart hook injects into a Claude Code
 // session: all | low | medium | high. A UI-only flag in settings.json read
-// directly by the hook (like phasesEnabled above) — no backend config. Default
+// directly by the hook (like ignoredInsights above) — no backend config. Default
 // `medium`, so low/unset tasks stay out of context unless the user lowers the bar.
 const TASK_CTX_LEVELS = ["all", "low", "medium", "high"] as const;
 const taskCtxPrio = ref<string>("medium");
@@ -401,42 +374,10 @@ async function setTaskCtxPrio(v: string) {
 
 onMounted(loadTaskCtxPrio);
 
-// What a session LEADS WITH when the project is mid-plan: "phase" (the current
-// phase, focused) or "tasks" (always the task board). UI-only flag in settings.json
-// read by the SessionStart hook (like taskContextPriority). Default "phase".
-const SESSION_CTX_MODES = ["phase", "tasks"] as const;
-const sessionCtx = ref<string>("phase");
-
-function sessionCtxLabel(m: string): string {
-  return m === "tasks" ? t("sessionCtxTasks") : t("sessionCtxPhase");
-}
-
-async function loadSessionCtx() {
-  try {
-    const { load: loadStore } = await import("@tauri-apps/plugin-store");
-    const store = await loadStore("settings.json");
-    const v = await store.get<string>("sessionContext");
-    if (typeof v === "string" && (SESSION_CTX_MODES as readonly string[]).includes(v))
-      sessionCtx.value = v;
-  } catch {}
-}
-
-async function setSessionCtx(v: string) {
-  sessionCtx.value = v;
-  try {
-    const { load: loadStore } = await import("@tauri-apps/plugin-store");
-    const store = await loadStore("settings.json");
-    await store.set("sessionContext", v);
-    await store.save();
-  } catch {}
-}
-
-onMounted(loadSessionCtx);
-
 // --- Task context in sessions (master hook switch) ---
 // A UI-only flag in settings.json read by the SessionStart hook: when OFF, the
-// hook injects nothing into a session (no task board, no phase context). Default
-// ON. Same store-write pattern as phasesEnabled above.
+// hook injects nothing into a session (no task context at all). Default ON.
+// Same store-write pattern as ignoredInsights above.
 const hookContextEnabled = ref(true);
 
 async function loadHookContext() {
@@ -460,36 +401,10 @@ async function toggleHookContext() {
 
 onMounted(loadHookContext);
 
-// --- HANDOFF freshness guard (issue #59) ---
-// A UI-only flag in settings.json read by the Stop hook: when ON, a session that
-// worked a phase plan can't end while the plan's HANDOFF baton is older than the
-// work — the stop is blocked once, with a nudge to write it. Default ON.
-const phaseHandoffGuard = ref(true);
-
-async function loadHandoffGuard() {
-  try {
-    const { load: loadStore } = await import("@tauri-apps/plugin-store");
-    const store = await loadStore("settings.json");
-    const v = await store.get<boolean>("phaseHandoffGuard");
-    if (typeof v === "boolean") phaseHandoffGuard.value = v;
-  } catch {}
-}
-
-async function toggleHandoffGuard() {
-  phaseHandoffGuard.value = !phaseHandoffGuard.value;
-  try {
-    const { load: loadStore } = await import("@tauri-apps/plugin-store");
-    const store = await loadStore("settings.json");
-    await store.set("phaseHandoffGuard", phaseHandoffGuard.value);
-    await store.save();
-  } catch {}
-}
-
-onMounted(loadHandoffGuard);
-
-// The same guard, one level up: which TASKS must leave a handoff before a session
-// ends (read by the Stop hook). "submitted" = moved to review/done this session;
-// "unfinished" = worked and left in_progress; "both" (default); "off".
+// --- HANDOFF guard (issue #59) ---
+// Which TASKS must leave a handoff before a session ends (read by the Stop
+// hook). "submitted" = moved to review/done this session; "unfinished" = worked
+// and left in_progress; "both" (default); "off".
 const TASK_GUARD_MODES = ["both", "submitted", "unfinished", "off"] as const;
 const taskHandoffGuard = ref<string>("both");
 
@@ -1606,7 +1521,7 @@ function handleSave() {
         </button>
       </div>
 
-      <!-- Master switch: does the SessionStart hook inject task/phase context? -->
+      <!-- Master switch: does the SessionStart hook inject task context? -->
       <div class="card toggle-card" @click="toggleHookContext">
         <div style="flex: 1; min-width: 0">
           <div class="card-title" style="font-size: 13px">{{ t('hookContextSetting') }}</div>
@@ -1617,30 +1532,7 @@ function handleSave() {
         </div>
       </div>
 
-      <!-- Phases in tasks (issue #16) — UI-only flag in settings.json. -->
-      <div class="card toggle-card" @click="togglePhasesEnabled">
-        <div style="flex: 1; min-width: 0">
-          <div class="card-title" style="font-size: 13px">{{ t('phasesSetting') }}</div>
-          <div class="card-sub">{{ t('phasesSettingDesc') }}</div>
-        </div>
-        <div class="toggle" :class="{ on: phasesEnabled }">
-          <div class="toggle-knob"></div>
-        </div>
-      </div>
-
-      <!-- HANDOFF guard for PLANS (issue #59) — UI-only flag in settings.json,
-           read by the Stop hook to block a session that leaves a stale baton. -->
-      <div class="card toggle-card" @click="toggleHandoffGuard">
-        <div style="flex: 1; min-width: 0">
-          <div class="card-title" style="font-size: 13px">{{ t('handoffGuardSetting') }}</div>
-          <div class="card-sub">{{ t('handoffGuardSettingDesc') }}</div>
-        </div>
-        <div class="toggle" :class="{ on: phaseHandoffGuard }">
-          <div class="toggle-knob"></div>
-        </div>
-      </div>
-
-      <!-- The same guard for TASKS: which tasks must leave a handoff (Stop hook). -->
+      <!-- HANDOFF guard (issue #59): which tasks must leave a handoff (Stop hook). -->
       <div class="card">
         <div class="field-label">{{ t('taskGuardSetting') }}</div>
         <select
@@ -1665,20 +1557,6 @@ function handleSave() {
           <option v-for="lv in TASK_CTX_LEVELS" :key="lv" :value="lv">{{ taskCtxPrioLabel(lv) }}</option>
         </select>
         <div class="field-hint">{{ t('taskCtxPrioDesc') }}</div>
-      </div>
-
-      <!-- Session context (phase vs tasks) — UI-only flag in settings.json, read by
-           the SessionStart hook to choose what a mid-plan session leads with. -->
-      <div class="card">
-        <div class="field-label">{{ t('sessionCtxSetting') }}</div>
-        <select
-          class="field-input"
-          :value="sessionCtx"
-          @change="setSessionCtx(($event.target as HTMLSelectElement).value)"
-        >
-          <option v-for="m in SESSION_CTX_MODES" :key="m" :value="m">{{ sessionCtxLabel(m) }}</option>
-        </select>
-        <div class="field-hint">{{ t('sessionCtxDesc') }}</div>
       </div>
 
       <!-- Task audit schedule (#35) — daily headless audit of the task board.

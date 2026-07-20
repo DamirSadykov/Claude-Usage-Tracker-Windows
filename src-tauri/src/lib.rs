@@ -6,7 +6,6 @@ pub mod enroll;
 pub mod external;
 pub mod identity;
 pub mod memory;
-pub mod phases;
 pub mod project_groups;
 pub mod report;
 pub mod stats;
@@ -1752,12 +1751,12 @@ fn save_project_groups(
 
 // --- CLI + Claude Code hook installer ---
 //
-// The unified `cli.mjs` (todos / phases / hook areas) ships as bundled Node
+// The unified `cli.mjs` (todos / triage / hook areas) ships as bundled Node
 // scripts (resources). "Install" = wire the hooks into the user's
 // ~/.claude/settings.json so Claude Code runs them around every session:
-//   • SessionStart → `cli.mjs hook`       — inject the task board / current phase.
-//   • Stop         → `cli.mjs stop-hook`  — block a stop that leaves a phase plan
-//                                           with a stale HANDOFF baton (issue #59).
+//   • SessionStart → `cli.mjs hook`       — inject the task board.
+//   • Stop         → `cli.mjs stop-hook`  — block a stop that leaves a worked
+//                                           task without a HANDOFF baton (issue #59).
 //   • PostToolUse  → `cli.mjs plan-hook enter|exit` (matchers EnterPlanMode /
 //                    ExitPlanMode) — plan mode as the task-forming ritual (t#253).
 // The CLI areas need no separate wiring — the hook hands Claude the cli.mjs path
@@ -2094,7 +2093,7 @@ fn wire_hook_event(root: &mut serde_json::Value, event: &str, command: &str) -> 
     legacy_dirs
 }
 
-/// Wire BOTH our hooks into ~/.claude/settings.json — SessionStart (task/phase
+/// Wire BOTH our hooks into ~/.claude/settings.json — SessionStart (task
 /// context) and Stop (the HANDOFF freshness guard, issue #59). Idempotent: updates
 /// an existing entry's path in place, or appends a new group; preserves all other
 /// hooks and keys. Atomic write (temp → rename). Returns the wired script path.
@@ -2370,25 +2369,6 @@ fn apply_todo_import(app: AppHandle, path: String) -> Result<todos::ImportReport
     })?;
     report.backup = Some(backup);
     Ok(report)
-}
-
-/// All phase plans the tracker can find, across every project that has a
-/// `.claude/phases/` dir. Read-only: the plans are authored by the `cc-phases`
-/// CLI and live in each project. The frontend matches a plan to a task card by
-/// (project basename, task_number). The disk walk (resolve project paths, read
-/// each plan) runs off the async runtime so it can't stall the UI.
-#[tauri::command]
-async fn get_phase_plans() -> Result<Vec<phases::Plan>, String> {
-    let claude = cc::claude_dir().ok_or("Cannot resolve Claude config directory")?;
-    tauri::async_runtime::spawn_blocking(move || {
-        let mut out = Vec::new();
-        for (base, path) in phases::project_paths(&claude) {
-            out.extend(phases::read_plans(&base, &path));
-        }
-        out
-    })
-    .await
-    .map_err(|e| e.to_string())
 }
 
 /// Show the standalone Todo window (declared hidden in tauri.conf.json).
@@ -2819,7 +2799,6 @@ pub fn run() {
             export_todos,
             preview_todo_import,
             apply_todo_import,
-            get_phase_plans,
             open_todo_window,
             open_settings_window,
             enrollment_status,

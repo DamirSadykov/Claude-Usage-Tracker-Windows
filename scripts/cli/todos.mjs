@@ -914,7 +914,7 @@ const HANDOFF_USAGE =
   "       <task> is an id, a number, or #N";
 
 // Handoff carried FORWARD along dependency edges (#141). A task's `handoff` is what
-// it produced / where it left off, written by the LLM (like a phases handoff). A
+// it produced / where it left off, written by the LLM. A
 // session working on a task reads the handoffs of the tasks it DEPENDS ON, so the
 // work it builds on is in context. Only DIRECT prerequisites are read — cumulative
 // context still flows because a handoff is authored prose that can itself reference

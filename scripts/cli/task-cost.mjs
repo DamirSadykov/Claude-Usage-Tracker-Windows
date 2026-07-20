@@ -101,7 +101,7 @@ function resolveTranscripts({ project, all }) {
 // ── the parser ────────────────────────────────────────────────────────────────
 // A `set-status <ref> <status>` inside a command that really invokes the tracker
 // CLI. Keep the pattern in lockstep with stop-hook.mjs::SET_STATUS_RE (not
-// imported: pulling stop-hook would drag its settings/phases imports along).
+// imported: pulling stop-hook would drag its settings imports along).
 const SET_STATUS_RE =
   /\bset-status\s+#?([\w-]+)\s+(backlog|queue|in_progress|review|done)\b/g;
 
