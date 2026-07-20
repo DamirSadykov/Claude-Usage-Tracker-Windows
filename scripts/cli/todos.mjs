@@ -192,6 +192,14 @@ function cmdSetStatus(args) {
     if (prereqs.some((p) => p.handoff && p.handoff.trim())) {
       process.stdout.write("\n" + formatInheritedHandoff(todo, prereqs));
     }
+    // Same anchor, other direction (t#252): the vision is read UP the graph —
+    // starting a subtask surfaces the description of the nearest theme root(s),
+    // the way the phases hook used to surface a plan's vision. Only when a theme
+    // actually wraps this task, so theme-less starts stay quiet.
+    const roots = themeRootsFor(data, todo);
+    if (roots.length) {
+      process.stdout.write("\n" + formatThemeVision(todo, roots));
+    }
   }
 }
 
@@ -842,6 +850,49 @@ function directPrereqs(data, t) {
     .filter(Boolean);
 }
 
+// Nearest THEME roots above a task (t#252): walk UP the reverse dep edges (the
+// tasks that depend on `t`, transitively) and collect the first node with
+// `theme` on along each branch — the closest aggregator is the one whose vision
+// frames this subtask, so the walk does not continue past a found root (an outer
+// theme wrapping an inner one stays out of view). Exported for the SessionStart
+// hook (hook.mjs), which surfaces the same vision for in_progress tasks.
+export function themeRootsFor(data, t) {
+  const roots = [];
+  const seen = new Set([t.id]);
+  let frontier = [t.id];
+  while (frontier.length) {
+    const next = [];
+    for (const id of frontier) {
+      for (const d of data.todos) {
+        if (!d || seen.has(d.id)) continue;
+        if (!Array.isArray(d.depends_on) || !d.depends_on.includes(id)) continue;
+        seen.add(d.id);
+        if (d.theme) roots.push(d);
+        else next.push(d.id);
+      }
+    }
+    frontier = next;
+  }
+  return roots;
+}
+
+// Human-readable block of the theme vision a task inherits from its theme
+// root(s) — the counterpart of formatInheritedHandoff for the OTHER direction:
+// handoff flows down the dep edges, the vision is read UP them (t#255 field
+// roles: a theme root's description IS the theme's vision). Shared by
+// `vision <task>` and the in_progress anchor so both read identically.
+export function formatThemeVision(t, roots) {
+  let out = `★ Vision inherited by #${t.number} "${t.subject}" from its theme root(s) — the chain's north star; keep this task true to it (if it pulls away, stop and flag it):\n`;
+  for (const r of roots) {
+    out += `\n── theme t#${r.number} ${r.subject} [${col(r.status)}] ──\n`;
+    out +=
+      r.description && r.description.trim()
+        ? r.description.trim() + "\n"
+        : `(theme root t#${r.number} has no description — its vision is missing; set it: todos set-description ${r.number} --text "…")\n`;
+  }
+  return out;
+}
+
 // Human-readable block of what a task inherits from its prerequisites' handoff.
 // Shared by `handoff <task>` and the in_progress anchor so both read identically.
 function formatInheritedHandoff(t, prereqs) {
@@ -939,6 +990,49 @@ function cmdHandoff(args) {
     return;
   }
   process.stdout.write(formatInheritedHandoff(t, prereqs));
+}
+
+const VISION_USAGE =
+  "usage: cli todos vision <task> [--json]   read the vision <task> inherits from its theme root(s)\n" +
+  "       <task> is an id, a number, or #N. A theme root's description IS its vision (set-description writes it).";
+
+// `todos vision <task>` — the read counterpart of `handoff <task>` for the UP
+// direction (t#252): the description of the nearest theme root(s) above <task>.
+// Auto-printed by `set-status <task> in_progress`; this re-reads it on demand.
+function cmdVision(args) {
+  const { positional, flags } = parseArgs(args);
+  const file = todosPath();
+  const data = load(file);
+  const t = resolveTask(data, positional[0]);
+  if (!t) fail(VISION_USAGE);
+  const roots = themeRootsFor(data, t);
+  if (flags.json) {
+    process.stdout.write(
+      JSON.stringify(
+        {
+          task: { id: t.id, number: t.number, subject: t.subject },
+          theme_roots: roots.map((r) => ({
+            id: r.id,
+            number: r.number,
+            subject: r.subject,
+            status: col(r.status),
+            vision: r.description || "",
+            has_vision: !!(r.description && r.description.trim()),
+          })),
+        },
+        null,
+        2,
+      ) + "\n",
+    );
+    return;
+  }
+  if (!roots.length) {
+    process.stdout.write(
+      `#${t.number} "${t.subject}" has no theme root above it — no theme vision to inherit. (A theme root = a dependent task with \`theme\` on; mark one: todos set-theme <id> on.)\n`,
+    );
+    return;
+  }
+  process.stdout.write(formatThemeVision(t, roots));
 }
 
 // List the projects related to <project> via association groups, so a session in
@@ -1079,9 +1173,10 @@ function cmdPipeline() {
       "   (the done-gate enforces the order). Worth a root from ~4-5 nodes.\n" +
       "   Mark the root explicitly:  todos set-theme <id> on   (or add --theme).\n" +
       "   The theme's VISION goes in the ROOT's DESCRIPTION (no separate field).\n" +
-      "   Working a child, read the root's description (follow `dep list` upward —\n" +
-      "   the nearest dependent with theme on) for the north star; the root's\n" +
-      "   handoff stays the usual downstream baton.\n\n" +
+      "   Working a child, the vision arrives on its own (t#252): moving a task to\n" +
+      "   in_progress auto-prints the nearest theme root's description, and\n" +
+      "   `todos vision <task>` re-reads it; the root's handoff stays the usual\n" +
+      "   downstream baton.\n\n" +
       "Full guide + rationale: docs/task-pipeline.md (claude-usage-tracker repo).\n",
   );
 }
@@ -1120,6 +1215,8 @@ function usage(code) {
       "  ref list <task> [--json]        show a task's references + referenced-by (link + inline t#N)\n" +
       "  handoff <task> [--json]         read the handoff of <task>'s direct prerequisites (deps it inherits)\n" +
       '  handoff set <task> --text "…"   set <task>\'s own handoff (carried to tasks that depend on it)\n' +
+      "  vision <task> [--json]          read the vision <task> inherits from its nearest theme root(s) up the dep graph\n" +
+      "                                  (a theme root's DESCRIPTION is its vision; auto-printed on -> in_progress)\n" +
       "  related <project> [--json]      projects that work with <project>\n" +
       "  groups [--json]                 list association groups\n" +
       "  ready [--project <name> | --all] [--auto | --manual] [--json]\n" +
@@ -1188,6 +1285,9 @@ export function run(args) {
       break;
     case "handoff":
       cmdHandoff(rest);
+      break;
+    case "vision":
+      cmdVision(rest);
       break;
     case "related":
       cmdRelated(rest);

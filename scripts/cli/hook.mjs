@@ -23,6 +23,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { readPlansForHook, markPlanDoneForDoneTasks } from "./phases.mjs";
+import { themeRootsFor } from "./todos.mjs";
 import {
   taskContextMinRank,
   sessionContextMode,
@@ -256,6 +257,30 @@ function main() {
     if (hidden) {
       lines.push(
         `  …plus ${hidden} more due/queued task(s) — \`<cli> todos list\` shows all.`,
+      );
+    }
+
+    // Theme vision (t#252): a task being WORKED (in_progress) inherits its north
+    // star from the nearest theme root up the dep graph — surface that root's
+    // description here so the vision survives the session boundary, the way the
+    // phases hook used to carry a plan's vision into every session. Only for
+    // in_progress tasks (queued ones get it at the set-status anchor), deduped
+    // when several subtasks share a root.
+    const themeRoots = new Map();
+    for (const t of shown) {
+      if (col(t.status) !== "in_progress") continue;
+      for (const r of themeRootsFor({ todos }, t)) {
+        if (r.description && r.description.trim() && !themeRoots.has(r.id)) {
+          themeRoots.set(r.id, r);
+        }
+      }
+    }
+    for (const r of themeRoots.values()) {
+      lines.push(
+        block(
+          `  ★ vision — theme t#${r.number} "${clip(r.subject)}" (north star for the in_progress task(s) above; keep them true to it — if one pulls away, stop and flag it):`,
+          r.description,
+        ),
       );
     }
 

@@ -216,9 +216,14 @@ How a piece of work **bigger than one task** lives on the graph — as a **theme
   Write it as the north star for anyone working a child: what the whole chain is
   for and what "done" means for the theme.
 - Direction of reading matters: the **description is read UPWARD** — working a
-  child, follow the reverse edge to the root(s) that depend on it for the vision
-  (the vision hook, t#252, surfaces it automatically). The root's **handoff stays
-  the usual DOWNSTREAM baton** to whatever depends on the root itself.
+  child, the vision arrives on its own (t#252, the replacement for the phases
+  hook's vision): `set-status <id> in_progress` auto-prints the nearest theme
+  root's description next to the inherited handoff, the SessionStart hook
+  re-surfaces it for every in_progress task it shows (so the north star survives
+  the session boundary), and `todos vision <task>` re-reads it on demand. The
+  walk stops at the **nearest** root along each branch — an outer theme wrapping
+  an inner one stays out of view. The root's **handoff stays the usual
+  DOWNSTREAM baton** to whatever depends on the root itself.
 
 ## Plan mode — the task-forming ritual (t#253)
 
