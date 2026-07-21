@@ -143,6 +143,8 @@ interface GNode {
   // dimmed to read as context, not part of the active filter.
   context?: boolean;
   extProject?: string;
+  // Theme root drawn as the heading card of an EXPANDED accordion section (t#264).
+  sectionHead?: boolean;
   lines: string[]; // subject wrapped to fit the node width
   h: number; // node height, grown to fit the wrapped lines
   x: number;
@@ -164,6 +166,18 @@ interface DepBand {
   w: number;
   h: number;
 }
+// A theme's accordion section on the Deps tab (t#264): the frame around a theme
+// root's exclusive prerequisite subtree. The root card sits inside at the LEFT
+// edge as the section heading; the members lay out as their own pipeline to its
+// right. Collapsing rides the same fold as before (collapsedRoots) — a collapsed
+// theme is just the root card with its ▸ done/total badge, no frame.
+interface ThemeSection {
+  rootId: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
 
 const NODE_W = 190;
 const NODE_H = 46; // height of a single-line node; taller nodes add LINE_H each
@@ -175,6 +189,9 @@ const V_GAP = 26; // vertical gap between stacked nodes (deps pipeline)
 const MARGIN = 40;
 const BAND_HEAD = 30; // vertical room above a project group for its heading (deps)
 const BAND_GAP = 46; // gap between stacked project groups (deps)
+const SECTION_PAD = 14; // frame padding around a theme section's content (deps)
+const SECTION_GAP = 34; // gap between stacked blocks (main flow / sections) in a band
+const SECTION_INNER_GAP = 34; // gap between a section's root card and its members
 
 // Greedy word-wrap of a subject to fit the node: up to MAX_LINES lines of about
 // WRAP_CHARS each, ellipsis if it still overflows. A single over-long word is
@@ -418,6 +435,70 @@ const depGraph = computed<{ tasks: Todo[]; shownIds: Set<string>; depEdges: GEdg
   return { tasks: [...inSet.values()], shownIds, depEdges };
 });
 
+// Theme sections (t#264): an EXPANDED theme renders as an accordion section
+// instead of a terminal node — the root card heads a frame around its exclusive
+// prerequisite subtree, whose member→root edges are implied by containment and
+// not drawn. A COLLAPSED theme keeps riding the fold below (collapsedRoots →
+// collapsedGraph), so this map lists candidates regardless of fold state and
+// depModel skips the collapsed ones. Nested themes: only OUTERMOST roots get a
+// section; an inner root is a member of the outer subtree and renders as a node.
+const themeSections = computed<Map<string, Set<string>>>(() => {
+  const { tasks, depEdges } = depGraph.value;
+  const sections = new Map<string, Set<string>>();
+  for (const x of tasks) {
+    if (x.theme !== true) continue;
+    const members = exclusiveSubtree(x.id, depEdges);
+    if (members.size) sections.set(x.id, members);
+  }
+  for (const rootId of [...sections.keys()]) {
+    for (const [other, members] of sections) {
+      if (other !== rootId && members.has(rootId)) {
+        sections.delete(rootId);
+        break;
+      }
+    }
+  }
+  return sections;
+});
+
+// Exclusive prerequisite subtree of `rootId` over `edges`: every transitive
+// prerequisite whose downstream paths ALL lead into this root — a prereq that
+// also feeds an outside node is excluded (to fixpoint), so hiding or framing the
+// set can never orphan an outside edge. Shared by the fold below and the theme
+// sections (t#255 / t#264).
+function exclusiveSubtree(rootId: string, edges: GEdge[]): Set<string> {
+  const back = new Map<string, string[]>();
+  const fwd = new Map<string, string[]>();
+  for (const e of edges) {
+    (back.get(e.toId) ?? back.set(e.toId, []).get(e.toId)!).push(e.fromId);
+    (fwd.get(e.fromId) ?? fwd.set(e.fromId, []).get(e.fromId)!).push(e.toId);
+  }
+  // All transitive prerequisites of the root…
+  const cand = new Set<string>();
+  const stack = [...(back.get(rootId) ?? [])];
+  while (stack.length) {
+    const id = stack.pop()!;
+    if (cand.has(id)) continue;
+    cand.add(id);
+    for (const p of back.get(id) ?? []) stack.push(p);
+  }
+  // …minus (to fixpoint) any that also feed a node OUTSIDE the set.
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const id of [...cand]) {
+      for (const d of fwd.get(id) ?? []) {
+        if (d !== rootId && !cand.has(d)) {
+          cand.delete(id);
+          changed = true;
+          break;
+        }
+      }
+    }
+  }
+  return cand;
+}
+
 // Theme fold applied over the (possibly focused) dep graph: for every collapsed
 // root still visible, swallow its EXCLUSIVE prerequisite subtree — nodes whose
 // every downstream path ends in this root. An outside edge into a swallowed node
@@ -436,35 +517,7 @@ const collapsedGraph = computed<{
   let curEdges = depEdges;
   for (const rootId of collapsedRoots.value) {
     if (!curTasks.some((x) => x.id === rootId)) continue;
-    const back = new Map<string, string[]>();
-    const fwd = new Map<string, string[]>();
-    for (const e of curEdges) {
-      (back.get(e.toId) ?? back.set(e.toId, []).get(e.toId)!).push(e.fromId);
-      (fwd.get(e.fromId) ?? fwd.set(e.fromId, []).get(e.fromId)!).push(e.toId);
-    }
-    // All transitive prerequisites of the root…
-    const cand = new Set<string>();
-    const stack = [...(back.get(rootId) ?? [])];
-    while (stack.length) {
-      const id = stack.pop()!;
-      if (cand.has(id)) continue;
-      cand.add(id);
-      for (const p of back.get(id) ?? []) stack.push(p);
-    }
-    // …minus (to fixpoint) any that also feed a node OUTSIDE the fold.
-    let changed = true;
-    while (changed) {
-      changed = false;
-      for (const id of [...cand]) {
-        for (const d of fwd.get(id) ?? []) {
-          if (d !== rootId && !cand.has(d)) {
-            cand.delete(id);
-            changed = true;
-            break;
-          }
-        }
-      }
-    }
+    const cand = exclusiveSubtree(rootId, curEdges);
     if (!cand.size) continue;
     let done = 0;
     for (const id of cand)
@@ -488,25 +541,58 @@ const collapsedGraph = computed<{
 });
 const collapseStats = computed(() => collapsedGraph.value.stats);
 // Nodes that can be folded right now (have prerequisites in the drawn graph) or
-// already are — the ones that render the fold control.
+// already are — the ones that render the fold control. Expanded section roots are
+// added explicitly: their member edges are hidden by the section frame (t#264),
+// so the edge scan alone would lose their fold control.
 const collapsible = computed<Set<string>>(() => {
   const s = new Set<string>();
   for (const e of collapsedGraph.value.depEdges) s.add(e.toId);
   for (const id of collapseStats.value.keys()) s.add(id);
+  for (const id of themeSections.value.keys()) s.add(id);
   return s;
 });
 
 // --- Deps tab: per-project ALAP pipeline layout ----------------------------
-const depModel = computed<{ nodes: GNode[]; edges: GEdge[]; bands: DepBand[] }>(() => {
+const depModel = computed<{
+  nodes: GNode[];
+  edges: GEdge[];
+  bands: DepBand[];
+  sections: ThemeSection[];
+}>(() => {
   const { tasks, shownIds, depEdges } = collapsedGraph.value;
+  const taskById = new Map(tasks.map((x) => [x.id, x]));
+
+  // Expanded theme sections present in the current graph: the root still drawn,
+  // members narrowed to tasks that survived focus/filter. Collapsed roots keep
+  // the fold rendering (card + ▸ badge) via collapsedGraph instead.
+  const sections = new Map<string, Set<string>>();
+  const sectionOf = new Map<string, string>(); // member id → its section root
+  for (const [rootId, members] of themeSections.value) {
+    if (collapsedRoots.value.has(rootId)) continue;
+    if (!taskById.has(rootId)) continue;
+    const present = new Set([...members].filter((id) => taskById.has(id)));
+    if (!present.size) continue;
+    sections.set(rootId, present);
+    for (const id of present) sectionOf.set(id, rootId);
+  }
+
+  // A member→root edge is implied by the section frame — drop it from drawing and
+  // from the layout/reduction adjacency, so the root stops reading as the sink
+  // every child arrow flows into.
+  const drawnEdges = depEdges.filter((e) => sectionOf.get(e.fromId) !== e.toId);
+
   const inGraph = new Set<string>();
-  for (const e of depEdges) {
+  for (const e of drawnEdges) {
     inGraph.add(e.fromId);
     inGraph.add(e.toId);
   }
-  const taskById = new Map(tasks.map((x) => [x.id, x]));
   // A fully folded theme may have swallowed its every edge — keep the root drawn.
   for (const id of collapseStats.value.keys()) if (taskById.has(id)) inGraph.add(id);
+  // Section roots (their child edges were just dropped) and members always draw.
+  for (const [rootId, members] of sections) {
+    inGraph.add(rootId);
+    for (const id of members) inGraph.add(id);
+  }
   const nodes = new Map<string, GNode>();
   for (const id of inGraph) {
     const x = taskById.get(id);
@@ -527,7 +613,7 @@ const depModel = computed<{ nodes: GNode[]; edges: GEdge[]; bands: DepBand[] }>(
     prereqOf.set(id, []);
     dependentOf.set(id, []);
   }
-  for (const e of depEdges) {
+  for (const e of drawnEdges) {
     prereqOf.get(e.toId)!.push(e.fromId);
     dependentOf.get(e.fromId)!.push(e.toId);
   }
@@ -563,11 +649,21 @@ const depModel = computed<{ nodes: GNode[]; edges: GEdge[]; bands: DepBand[] }>(
   // and cut crossing arrows; task number seeds the order and breaks ties, so the
   // layout stays stable across rebuilds.
   const layoutGroup = (groupIds: string[]): { w: number; h: number } => {
+    // Blocks (a project's main flow, each theme section) lay out independently:
+    // only edges with BOTH ends inside the block shape its columns — a cross-block
+    // edge is still drawn, but doesn't drag foreign depths into this block's ALAP.
+    const scope = new Set(groupIds);
+    const pre = new Map<string, string[]>();
+    const dep = new Map<string, string[]>();
+    for (const id of groupIds) {
+      pre.set(id, (prereqOf.get(id) ?? []).filter((nb) => scope.has(nb)));
+      dep.set(id, (dependentOf.get(id) ?? []).filter((nb) => scope.has(nb)));
+    }
     const asapMemo = new Map<string, number>();
     let maxLvl = 0;
-    for (const id of groupIds) maxLvl = Math.max(maxLvl, longest(id, prereqOf, asapMemo, new Set()));
+    for (const id of groupIds) maxLvl = Math.max(maxLvl, longest(id, pre, asapMemo, new Set()));
     const sinkMemo = new Map<string, number>();
-    const levelOf = (id: string) => maxLvl - longest(id, dependentOf, sinkMemo, new Set());
+    const levelOf = (id: string) => maxLvl - longest(id, dep, sinkMemo, new Set());
 
     const columns = new Map<number, string[]>();
     for (const id of groupIds) {
@@ -581,7 +677,7 @@ const depModel = computed<{ nodes: GNode[]; edges: GEdge[]; bands: DepBand[] }>(
     for (let sweep = 0; sweep < 6; sweep++) {
       const downward = sweep % 2 === 0; // alternate: align to prereqs, then to dependents
       const walk = downward ? levels : [...levels].reverse();
-      const neighbourOf = downward ? prereqOf : dependentOf;
+      const neighbourOf = downward ? pre : dep;
       for (const lvl of walk) {
         const colIds = columns.get(lvl)!;
         const bary = new Map<string, number>();
@@ -616,7 +712,9 @@ const depModel = computed<{ nodes: GNode[]; edges: GEdge[]; bands: DepBand[] }>(
   // Split the graph by project board, lay each project out on its own, then stack
   // the projects top-to-bottom with a clear gap + heading — so "All projects" reads
   // as separate pipelines, not one interleaved grid. A single board (project filter
-  // set, or only one present) skips the heading and frame.
+  // set, or only one present) skips the heading and frame. Inside a band, the main
+  // flow and each expanded theme section are separate stacked blocks: the section's
+  // root card sits at the left as its heading, the members pipeline to its right.
   const groups = new Map<string, string[]>();
   for (const id of inGraph) {
     const p = boardOf(taskById.get(id)!);
@@ -627,21 +725,63 @@ const depModel = computed<{ nodes: GNode[]; edges: GEdge[]; bands: DepBand[] }>(
     (a, b) => Math.min(...groups.get(a)!.map(numOf)) - Math.min(...groups.get(b)!.map(numOf)),
   );
   const bands: DepBand[] = [];
+  const sectionBoxes: ThemeSection[] = [];
   let curY = MARGIN;
   for (const proj of order) {
     const ids = groups.get(proj)!;
-    const { w, h } = layoutGroup(ids);
+    const idSet = new Set(ids);
+    const projSections = [...sections.entries()].filter(([rootId]) => idSet.has(rootId));
+    const inSection = new Set<string>();
+    for (const [rootId, members] of projSections) {
+      inSection.add(rootId);
+      for (const id of members) inSection.add(id);
+    }
+    const mainIds = ids.filter((id) => !inSection.has(id));
     const headH = showBands ? BAND_HEAD : 0;
-    const offY = curY + headH;
-    for (const id of ids) {
-      const n = nodes.get(id)!;
-      n.x += MARGIN;
-      n.y += offY;
+    const top = curY + headH;
+    let blockY = 0; // vertical cursor for stacked blocks, local to this band
+    let bandW = NODE_W;
+    if (mainIds.length) {
+      const { w, h } = layoutGroup(mainIds);
+      for (const id of mainIds) {
+        const n = nodes.get(id)!;
+        n.x += MARGIN;
+        n.y += top + blockY;
+      }
+      bandW = Math.max(bandW, w);
+      blockY += h + SECTION_GAP;
     }
+    for (const [rootId, members] of projSections) {
+      const { w: mw, h: mh } = layoutGroup([...members]);
+      const root = nodes.get(rootId)!;
+      root.sectionHead = true;
+      const contentH = Math.max(mh, root.h);
+      const membersX = MARGIN + SECTION_PAD + NODE_W + SECTION_INNER_GAP;
+      for (const id of members) {
+        const n = nodes.get(id)!;
+        n.x += membersX;
+        n.y += top + blockY + SECTION_PAD + (contentH - mh) / 2;
+      }
+      root.x = MARGIN + SECTION_PAD;
+      root.y = top + blockY + SECTION_PAD + (contentH - root.h) / 2;
+      const secW = SECTION_PAD * 2 + NODE_W + SECTION_INNER_GAP + mw;
+      const secH = contentH + SECTION_PAD * 2;
+      sectionBoxes.push({ rootId, x: MARGIN, y: top + blockY, w: secW, h: secH });
+      bandW = Math.max(bandW, secW);
+      blockY += secH + SECTION_GAP;
+    }
+    if (blockY > 0) blockY -= SECTION_GAP; // trim the trailing block gap
+    const bandH = Math.max(blockY, NODE_H);
     if (showBands) {
-      bands.push({ project: proj || t("graphGlobalBoard"), x: MARGIN, y: curY, w, h: h + headH });
+      bands.push({
+        project: proj || t("graphGlobalBoard"),
+        x: MARGIN,
+        y: curY,
+        w: bandW,
+        h: bandH + headH,
+      });
     }
-    curY = offY + h + (showBands ? BAND_GAP : V_GAP);
+    curY = top + bandH + (showBands ? BAND_GAP : V_GAP);
   }
 
   // Soft transitive reduction: an edge u→v is REDUNDANT when v is already
@@ -650,7 +790,7 @@ const depModel = computed<{ nodes: GNode[]; edges: GEdge[]; bands: DepBand[] }>(
   // the fact that it exists — we mark it so it's drawn faintly, keeping the
   // pipeline readable without a bold edge shooting across an intermediate column.
   const children = new Map<string, string[]>();
-  for (const e of depEdges) (children.get(e.fromId) ?? children.set(e.fromId, []).get(e.fromId)!).push(e.toId);
+  for (const e of drawnEdges) (children.get(e.fromId) ?? children.set(e.fromId, []).get(e.fromId)!).push(e.toId);
   const reachCache = new Map<string, Set<string>>();
   const reachFrom = (s: string): Set<string> => {
     if (reachCache.has(s)) return reachCache.get(s)!;
@@ -665,13 +805,13 @@ const depModel = computed<{ nodes: GNode[]; edges: GEdge[]; bands: DepBand[] }>(
     reachCache.set(s, seen);
     return seen;
   };
-  const edges: GEdge[] = depEdges.map((e) => {
+  const edges: GEdge[] = drawnEdges.map((e) => {
     const sibs = children.get(e.fromId) ?? [];
     const redundant = sibs.some((w) => w !== e.toId && reachFrom(w).has(e.toId));
     return { ...e, redundant };
   });
 
-  return { nodes: [...nodes.values()], edges, bands };
+  return { nodes: [...nodes.values()], edges, bands, sections: sectionBoxes };
 });
 
 // Deterministic force-directed placement (Obsidian-style): seed nodes on a circle
@@ -881,6 +1021,10 @@ const model = computed<{ nodes: GNode[]; edges: GEdge[] }>(() =>
 );
 // Project frames — only on the Deps tab, and only when more than one board is shown.
 const depBands = computed<DepBand[]>(() => (tab.value === "deps" ? depModel.value.bands : []));
+// Theme section frames (t#264) — Deps tab only.
+const depSections = computed<ThemeSection[]>(() =>
+  tab.value === "deps" ? depModel.value.sections : [],
+);
 const nodeById = computed(() => {
   const m = new Map<string, GNode>();
   for (const n of model.value.nodes) m.set(n.id, n);
@@ -1457,6 +1601,20 @@ onUnmounted(() => {
             <text class="band-label" :x="b.x - 4" :y="b.y + 14">{{ b.project }}</text>
           </g>
         </g>
+        <!-- Theme accordion sections (t#264): a frame around each EXPANDED theme's
+             exclusive subtree; the root card inside at the left is the heading. -->
+        <g class="sections">
+          <rect
+            v-for="s in depSections"
+            :key="s.rootId"
+            class="section-box"
+            :x="s.x"
+            :y="s.y"
+            :width="s.w"
+            :height="s.h"
+            rx="12"
+          />
+        </g>
         <g class="edges">
           <template v-for="e in edgeGeoms" :key="e.key">
             <!-- Ref edges are READ-ONLY (mentions live in the task text; unlink by
@@ -1504,7 +1662,7 @@ onUnmounted(() => {
           v-for="n in model.nodes"
           :key="n.id"
           class="node"
-          :class="{ external: n.external, context: n.context, dimmed: nodeDimmed(n.id), sel: selected === n.id, target: hoverNode === n.id && dragging, match: queryActive && searchHits.has(n.id), current: currentHitId === n.id }"
+          :class="{ external: n.external, context: n.context, shead: n.sectionHead, dimmed: nodeDimmed(n.id), sel: selected === n.id, target: hoverNode === n.id && dragging, match: queryActive && searchHits.has(n.id), current: currentHitId === n.id }"
           :transform="`translate(${n.x},${n.y})`"
           @mousedown="onNodeDown($event, n.id)"
           @mouseenter="hoverNode = n.id"
@@ -1968,6 +2126,20 @@ onUnmounted(() => {
 .node .pstate {
   stroke: #16181c;
   stroke-width: 1.5;
+}
+/* Theme accordion section (t#264): frame around an EXPANDED theme's subtree; the
+   amber accent matches the theme fold glyph. */
+.section-box {
+  fill: rgba(255, 193, 7, 0.025);
+  stroke: rgba(255, 193, 7, 0.28);
+  stroke-width: 1.2;
+  stroke-dasharray: 6 5;
+  pointer-events: none;
+}
+/* The root card heading its section. */
+.node.shead .box {
+  stroke-width: 2.6;
+  filter: drop-shadow(0 0 4px rgba(255, 193, 7, 0.25));
 }
 /* Theme fold (t#255): the shifted twin behind a collapsed root ("stack of cards"). */
 .node .box-stack {
