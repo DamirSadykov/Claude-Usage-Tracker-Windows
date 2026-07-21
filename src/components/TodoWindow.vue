@@ -61,7 +61,6 @@ export interface Todo {
   priority?: string; // "high" | "medium" | "low" | "" (unset) — drives hook context
   kind?: string; // "auto" | "" (manual, default) — task-graph node type (#88)
   theme?: boolean; // theme-root marker (t#255): depends_on all children, description = vision
-  estimate_minutes?: number | null;
   scheduled_for?: string | null;
   plan: string;
   project?: string | null;
@@ -116,7 +115,6 @@ const pendingReload = ref(false);
 const editingId = ref<string | null>(null);
 const fSubject = ref("");
 const fDescription = ref("");
-const fEstimate = ref<number | null>(null);
 const fScheduled = ref("");
 const fPlan = ref("");
 const fProject = ref("");
@@ -229,7 +227,6 @@ function resetForm() {
   editingId.value = null;
   fSubject.value = "";
   fDescription.value = "";
-  fEstimate.value = null;
   fScheduled.value = "";
   fPlan.value = "";
   fProject.value = "";
@@ -260,10 +257,6 @@ async function submitForm() {
     description: fDescription.value.trim(),
     status: existing?.status ?? formStatus.value,
     priority: fPriority.value || "",
-    estimate_minutes:
-      fEstimate.value === null || Number.isNaN(fEstimate.value)
-        ? null
-        : Math.max(0, Math.round(fEstimate.value)),
     scheduled_for: fScheduled.value || null,
     plan: fPlan.value.trim(),
     project: fProject.value.trim() || null,
@@ -347,7 +340,6 @@ interface Draft {
   plan: string;
   handoff: string;
   project: string;
-  estimate_minutes: number | null;
   scheduled_for: string;
   status: string;
   priority: string;
@@ -358,7 +350,6 @@ const draft = ref<Draft>({
   plan: "",
   handoff: "",
   project: "",
-  estimate_minutes: null,
   scheduled_for: "",
   status: "backlog",
   priority: "",
@@ -405,7 +396,6 @@ function openDetail(todo: Todo) {
     plan: todo.plan ?? "",
     handoff: todo.handoff ?? "",
     project: todo.project ?? "",
-    estimate_minutes: todo.estimate_minutes ?? null,
     scheduled_for: todo.scheduled_for ?? "",
     status: todo.status,
     priority: todo.priority ?? "",
@@ -433,10 +423,6 @@ async function saveDetail() {
     plan: d.plan.trim(),
     handoff: d.handoff.trim(),
     project: d.project.trim() || null,
-    estimate_minutes:
-      d.estimate_minutes === null || Number.isNaN(d.estimate_minutes)
-        ? null
-        : Math.max(0, Math.round(d.estimate_minutes)),
     scheduled_for: d.scheduled_for || null,
     status: d.status,
     priority: d.priority || "",
@@ -1005,14 +991,6 @@ function priorityLabel(p: string | null | undefined): string {
   if (p === "medium") return t("todoPriorityMedium");
   if (p === "low") return t("todoPriorityLow");
   return t("todoPriorityNone");
-}
-
-function fmtEstimate(min: number | null | undefined) {
-  if (min === null || min === undefined) return "";
-  if (min < 60) return `${min} ${t("minShort")}`;
-  const h = Math.floor(min / 60);
-  const m = min % 60;
-  return m ? `${h}${t("hourShort")} ${m}${t("minShort")}` : `${h}${t("hourShort")}`;
 }
 
 // --- External tasks (readonly mirror; plan External-integration-public-side, ph6) ---
@@ -1629,7 +1607,6 @@ onUnmounted(() => {
                 class="tw-chip tw-imported"
                 :title="t('todoImportedHint')"
               >⤓ {{ t("todoImported") }}</span>
-              <span v-if="todo.estimate_minutes != null" class="tw-chip">⏱ {{ fmtEstimate(todo.estimate_minutes) }}</span>
               <span v-if="todo.scheduled_for" class="tw-chip">📅 {{ todo.scheduled_for }}</span>
               <span v-if="todo.plan" class="tw-chip" :title="todo.plan">📝</span>
               <span v-if="refCount(todo)" class="tw-chip" :title="t('todoRefs')">🔗 {{ refCount(todo) }}</span>
@@ -1745,10 +1722,6 @@ onUnmounted(() => {
             ↘ {{ t("todoFrom") }} <strong>{{ detail.from }}</strong>
           </div>
           <div class="tw-row">
-            <label class="tw-field">
-              <span>{{ t("todoEstimate") }}</span>
-              <input v-model.number="draft.estimate_minutes" class="tw-input" type="number" min="0" step="5" />
-            </label>
             <label class="tw-field">
               <span>{{ t("todoScheduledFor") }}</span>
               <input v-model="draft.scheduled_for" class="tw-input" type="date" />
@@ -2111,10 +2084,6 @@ onUnmounted(() => {
           </select>
         </label>
         <div class="tw-row">
-          <label class="tw-field">
-            <span>{{ t("todoEstimate") }}</span>
-            <input v-model.number="fEstimate" class="tw-input" type="number" min="0" step="5" />
-          </label>
           <label class="tw-field">
             <span>{{ t("todoScheduledFor") }}</span>
             <input v-model="fScheduled" class="tw-input" type="date" />

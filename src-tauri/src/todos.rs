@@ -68,9 +68,6 @@ pub struct Todo {
     /// (`set-theme`) and GraphView.vue.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub theme: bool,
-    /// LLM/user time estimate in minutes; None = unestimated.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub estimate_minutes: Option<i64>,
     /// ISO date `YYYY-MM-DD` the user plans to do this; None = unscheduled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduled_for: Option<String>,
@@ -1030,7 +1027,6 @@ mod tests {
             priority: String::new(),
             kind: String::new(),
             theme: false,
-            estimate_minutes: None,
             scheduled_for: None,
             plan: String::new(),
             project: None,
@@ -1531,19 +1527,17 @@ mod tests {
 
         let mut f = TodoFile::default();
         let mut t = todo("a", "queue");
-        t.estimate_minutes = Some(30);
         t.project = Some("my-proj".into());
         upsert(&mut f, t, "T1");
         save(&path, &f).unwrap();
 
         // Optional None fields are skipped in the serialized form.
         let raw = std::fs::read_to_string(&path).unwrap();
-        assert!(raw.contains("\"estimate_minutes\": 30"));
+        assert!(raw.contains("\"project\": \"my-proj\""));
         assert!(!raw.contains("scheduled_for"));
 
         let back = load(&path);
         assert_eq!(back.todos.len(), 1);
-        assert_eq!(back.todos[0].estimate_minutes, Some(30));
         assert_eq!(back.todos[0].project.as_deref(), Some("my-proj"));
         let _ = std::fs::remove_file(&path);
     }
