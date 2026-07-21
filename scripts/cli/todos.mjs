@@ -11,7 +11,7 @@
 //
 // Commands (run as `cli.mjs todos <cmd>`):
 //   add "<subject>" [--project <name> | --global] [--status <status>] [--priority <level>]
-//                   [--description <text>] [--plan <text>] [--estimate <min>] [--scheduled <YYYY-MM-DD>]
+//                   [--description <text>] [--plan <text>] [--scheduled <YYYY-MM-DD>]
 //                   no --project defaults to the current project (cwd basename); --global = project-less
 //   set-status <id> <status>        status ∈ backlog|queue|in_progress|review|done
 //   set-priority <id> <level>       level ∈ high|medium|low|none
@@ -375,7 +375,7 @@ function parseArgs(args) {
 
 const ADD_USAGE =
   'usage: cli todos add "<subject>" [--project <name> | --global] [--from <project>] [--status <status>] ' +
-  "[--priority high|medium|low] [--description <text>] [--plan <text>] [--estimate <min>] [--scheduled <YYYY-MM-DD>] [--by user|claude]\n" +
+  "[--priority high|medium|low] [--description <text>] [--plan <text>] [--scheduled <YYYY-MM-DD>] [--by user|claude]\n" +
   "       (no --project → the current project; --global files a project-less task)";
 
 // Create a new todo. Mirrors the field set the tracker writes (todos.rs / the
@@ -388,11 +388,6 @@ function cmdAdd(args) {
   const status = String(flags.status ?? "backlog");
   if (!STATUSES.includes(status))
     fail(`invalid status "${status}". valid: ${STATUSES.join(" | ")}`);
-  let estimate = null;
-  if (flags.estimate != null && flags.estimate !== true) {
-    const n = Number(flags.estimate);
-    if (Number.isFinite(n)) estimate = Math.max(0, Math.round(n));
-  }
   let priority = "";
   if (flags.priority != null && flags.priority !== true) {
     const p = normalizePriority(flags.priority);
@@ -449,7 +444,6 @@ function cmdAdd(args) {
     // Theme root (t#255): `--theme` marks this task the aggregator of a theme —
     // it should depend_on all its children and carry the vision in description.
     ...(flags.theme ? { theme: true } : {}),
-    estimate_minutes: estimate,
     scheduled_for: typeof flags.scheduled === "string" ? flags.scheduled : null,
     plan: typeof flags.plan === "string" ? flags.plan : "",
     // Omit project/from when absent (global / same-project), mirroring the Rust
@@ -1185,7 +1179,7 @@ function usage(code) {
   process.stdout.write(
     "cli todos - Claude Usage Tracker todo CLI\n\n" +
       '  add "<subject>" [--project <name> | --global] [--from <project>] [--status <status>]\n' +
-      "                  [--description <text>] [--plan <text>] [--estimate <min>] [--scheduled <YYYY-MM-DD>] [--kind auto|manual]\n" +
+      "                  [--description <text>] [--plan <text>] [--scheduled <YYYY-MM-DD>] [--kind auto|manual]\n" +
       "                  no --project → the current project (cwd); --global = project-less\n" +
       "  set-status <id> <status> [--force]  status ∈ " +
       STATUSES.join(" | ") +

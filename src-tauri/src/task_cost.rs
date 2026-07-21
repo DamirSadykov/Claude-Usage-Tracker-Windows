@@ -373,7 +373,6 @@ mod tests {
             status_history: Vec::new(),
             priority: String::new(),
             kind: String::new(),
-            estimate_minutes: None,
             scheduled_for: None,
             theme: false,
             plan: String::new(),
