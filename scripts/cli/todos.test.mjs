@@ -5,7 +5,7 @@
 // `vision <task>` and the in_progress anchor print.
 
 import { describe, it, expect } from "vitest";
-import { themeRootsFor, formatThemeVision } from "./todos.mjs";
+import { themeRootsFor, formatThemeVision, resolveTask } from "./todos.mjs";
 
 // Minimal board builder: rows are [id, {theme, depends_on, ...}].
 const board = (...rows) => ({
@@ -99,5 +99,27 @@ describe("formatThemeVision", () => {
     ]);
     expect(out).toContain("vision is missing");
     expect(out).toContain("todos set-description 9");
+  });
+});
+
+// The help promises "add/dep/ref args also accept N|#N" — `comment add`,
+// `comment list` and `set-project` used to look the id up directly and only
+// matched a full UUID.
+describe("resolveTask", () => {
+  const data = board(["aaa-uuid"], ["bbb-uuid"]);
+
+  it("matches a full id", () => {
+    expect(resolveTask(data, "bbb-uuid").number).toBe(2);
+  });
+
+  it("matches the board number in every notation", () => {
+    for (const token of ["2", "#2", "t#2"]) {
+      expect(resolveTask(data, token).id).toBe("bbb-uuid");
+    }
+  });
+
+  it("returns undefined for an unknown number or an empty token", () => {
+    expect(resolveTask(data, "99")).toBeUndefined();
+    expect(resolveTask(data, "")).toBeUndefined();
   });
 });

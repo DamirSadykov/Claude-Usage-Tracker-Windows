@@ -336,10 +336,11 @@ function cmdSetProject(id, value) {
   const next = clear ? null : v;
   const file = todosPath();
   const data = load(file);
-  const todo = data.todos.find((t) => t && t.id === id);
+  const todo = resolveTask(data, id); // id | N | #N, consistent with set-kind/status
   if (!todo) fail(`no todo with id ${id}`);
+  const label = todo.number != null ? `#${todo.number}` : todo.id;
   if ((todo.project ?? null) === next) {
-    process.stdout.write(`ok: ${id} already ${next ? `project "${next}"` : "global"}\n`);
+    process.stdout.write(`ok: ${label} already ${next ? `project "${next}"` : "global"}\n`);
     return;
   }
   if (next) todo.project = next;
@@ -347,7 +348,7 @@ function cmdSetProject(id, value) {
   todo.updated_at = new Date().toISOString();
   save(file, data);
   process.stdout.write(
-    `ok: ${id} project -> ${next ? `"${next}"` : "global (project-less)"}\n`,
+    `ok: ${label} project -> ${next ? `"${next}"` : "global (project-less)"}\n`,
   );
 }
 
@@ -497,7 +498,7 @@ function cmdComment(args) {
     const author = flags.by === "user" ? "user" : "claude";
     const file = todosPath();
     const data = load(file);
-    const todo = data.todos.find((t) => t && t.id === id);
+    const todo = resolveTask(data, id); // id | N | #N, as the help promises
     if (!todo) fail(`no todo with id ${id}`);
     if (!Array.isArray(todo.comments)) todo.comments = [];
     const now = new Date().toISOString();
@@ -505,14 +506,16 @@ function cmdComment(args) {
     todo.comments.push(comment);
     todo.updated_at = now;
     save(file, data);
-    process.stdout.write(`ok: comment ${comment.id} on ${id} by ${author}\n`);
+    process.stdout.write(
+      `ok: comment ${comment.id} on ${todo.number != null ? `#${todo.number}` : todo.id} by ${author}\n`,
+    );
     return;
   }
   if (sub === "list") {
     const id = String(rest.find((a) => !a.startsWith("--")) ?? "").trim();
     if (!id) fail(COMMENT_USAGE);
     const file = todosPath();
-    const todo = load(file).todos.find((t) => t && t.id === id);
+    const todo = resolveTask(load(file), id); // id | N | #N
     if (!todo) fail(`no todo with id ${id}`);
     const comments = Array.isArray(todo.comments) ? todo.comments : [];
     if (rest.includes("--json")) {
@@ -590,7 +593,7 @@ function cmdList(args) {
 // `#N` reference, or the `t#N` task-link form the hook/README train the agent to
 // write — the graph/dep CLI is friendlier with the human-facing notation the
 // board shows. Returns undefined if nothing matches.
-function resolveTask(data, token) {
+export function resolveTask(data, token) {
   const t = String(token ?? "").trim();
   if (!t) return undefined;
   const byId = data.todos.find((x) => x && x.id === t);
