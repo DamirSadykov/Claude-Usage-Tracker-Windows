@@ -98,10 +98,22 @@
       "../scripts/cli/triage.mjs": "scripts/cli/triage.mjs",
       "../scripts/cli/corrections.mjs": "scripts/cli/corrections.mjs",
       "../scripts/cli/task-cost.mjs": "scripts/cli/task-cost.mjs",
+      "../scripts/cli/outcome.mjs": "scripts/cli/outcome.mjs",
+      "../scripts/cli/run-step.mjs": "scripts/cli/run-step.mjs",
+      "../scripts/cli/run.mjs": "scripts/cli/run.mjs",
+      "../scripts/cli/apply.mjs": "scripts/cli/apply.mjs",
+      "../scripts/cli/graph-rules.mjs": "scripts/cli/graph-rules.mjs",
+      "../scripts/cli/lint.mjs": "scripts/cli/lint.mjs",
+      "../scripts/cli/adoption.mjs": "scripts/cli/adoption.mjs",
+      "../scripts/cli/spec.mjs": "scripts/cli/spec.mjs",
+      "../scripts/cli/spec-match.mjs": "scripts/cli/spec-match.mjs",
+      "../scripts/cli/yaml-subset.mjs": "scripts/cli/yaml-subset.mjs",
       "../scripts/cli/hook.mjs": "scripts/cli/hook.mjs",
       "../scripts/cli/stop-hook.mjs": "scripts/cli/stop-hook.mjs",
       "../scripts/cli/plan-hook.mjs": "scripts/cli/plan-hook.mjs",
-      "../scripts/cli/settings.mjs": "scripts/cli/settings.mjs"
+      "../scripts/cli/plan-guard.mjs": "scripts/cli/plan-guard.mjs",
+      "../scripts/cli/settings.mjs": "scripts/cli/settings.mjs",
+      "../docs/plan-format.md": "docs/plan-format.md"
     },
     "icon": [
       "icons/32x32.png",

@@ -23,7 +23,12 @@ use serde::{Deserialize, Serialize};
 /// `review` | `done`. The pre-kanban `pending` status is migrated to `backlog`
 /// on load (see [`canonical_status`]). Optional fields are omitted from the file
 /// when empty to keep hand-edits readable.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Default` mirrors "an empty row as the file would deserialize it" — every
+/// optional field unset — so a caller that cares about three fields can spell
+/// those and leave the rest to `..Default::default()` instead of re-listing the
+/// whole struct every time a field is added.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Todo {
     pub id: String,
     /// Stable, human-facing task number (like a GitHub issue number) for inline
@@ -59,21 +64,22 @@ pub struct Todo {
     /// with the cc-todos CLI (`set-kind`) and GraphView.vue.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub kind: String,
-    /// Theme-root marker (t#255): `true` = this task is a THEME aggregator — it
+    /// Change-root marker (t#255): `true` = this task is a CHANGE aggregator — it
     /// `depends_on` all of its children, closes last (the done-gate enforces the
-    /// order), and its `description` carries the theme's VISION, which the vision
-    /// hook surfaces when a child task is worked. Purely a marker over the dep
-    /// graph — no behavior of its own here. `false` is omitted from the file so
-    /// existing todos need no migration. Keep in lockstep with the cc-todos CLI
-    /// (`set-theme`) and GraphView.vue.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub theme: bool,
+    /// order), and its `description` carries the change's DELTA: what this change
+    /// makes different and why now, surfaced when a child task is worked. Purely a
+    /// marker over the dep graph — no behavior of its own here. `false` is omitted
+    /// from the file so existing todos need no migration. The legacy field name
+    /// `theme` is still read as an alias (t#345) — only `change` is ever written.
+    /// Keep in lockstep with the cc-todos CLI (`set-change`) and GraphView.vue.
+    #[serde(default, alias = "theme", skip_serializing_if = "std::ops::Not::not")]
+    pub change: bool,
     /// ISO date `YYYY-MM-DD` the user plans to do this; None = unscheduled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduled_for: Option<String>,
     /// Raw plan markdown. Originally user-only and mostly empty; since plan mode
     /// became the task-forming ritual (t#253) the accepted plan is stored here by
-    /// the session too (`cli todos set-plan` / `add --plan`) — on the theme root
+    /// the session too (`cli todos set-plan` / `add --plan`) — on the change root
     /// for a multi-session plan, on the task itself for a one-session plan.
     #[serde(default)]
     pub plan: String,
@@ -102,6 +108,87 @@ pub struct Todo {
     /// graph draws as a second, dashed edge. Empty → omitted from the file.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
+    /// What this step COMMITS to produce (t#302): file paths, interfaces, records.
+    /// Declared BEFORE the work — that is what separates it from `handoff`, the
+    /// baton written after it. A runner checks the declaration against what the
+    /// step actually produced; anything touched but never declared stays a side
+    /// effect. Empty → omitted from the file (no migration).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub produces: Vec<String>,
+    /// Addresses of the spec sections this task changes (t#339), each
+    /// `<domain>#<slug>` into `docs/specs/<domain>/spec.md`. Written by the CLI,
+    /// which validates every address against the registry before the write; the
+    /// app only carries the field. It MUST live here even though nothing in the
+    /// app reads it: the app rewrites the whole file, so a field it does not know
+    /// is silently dropped on the next save. Empty → omitted from the file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spec: Vec<String>,
+    /// The closing answer per addressed spec section (t#341, docs/specs/README.md
+    /// §8): `unchanged` = the section still holds after this work, `updated` = it
+    /// moved and was edited. The Stop hook refuses to let a linked task close
+    /// without a fresh entry per address, which is why the record has to be
+    /// structural — a phrase in prose would only teach the next session to reword.
+    /// Same carry-the-field-you-do-not-read rule as `spec` above. Empty → omitted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spec_answers: Vec<SpecAnswer>,
+    /// Fingerprint of each addressed spec section AS IT WAS SHOWN to the session
+    /// at the `in_progress` anchor. The closing answer `updated` is checked
+    /// against it — without a baseline, "the section moved" was a claim that
+    /// cost exactly as much as "it did not". Same carry-the-field-you-do-not-read
+    /// rule as `spec`/`spec_answers`. Empty → omitted.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spec_seen: Vec<SpecSeen>,
+    /// Verification command for this node (t#302). The outcome is its EXIT CODE —
+    /// 0 = ok, anything else = issue — so the predicate stays machine-made and the
+    /// run reproducible. A node with no `verify` is not auto-executable whatever
+    /// its `kind` says. Empty → omitted from the file.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub verify: String,
+    /// Retry cap M of the `N/<=M` record (t#302): how many times this node may be
+    /// re-run after a failed outcome. Only the cap is stored — the attempt count N
+    /// is DERIVED from `status_history` and the usage blocks, never written here.
+    /// None = no cap declared, which FORBIDS the retry rather than allowing an
+    /// endless one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_limit: Option<u32>,
+    /// Id of the task control jumps to when this node's outcome is `issue` (t#302),
+    /// e.g. a review node handing work back to the implementation node. This is NOT
+    /// a dependency: it lives on the RUN layer, is never mirrored into `depends_on`,
+    /// and is deliberately invisible to [`dep_reaches`] / [`add_dep`] — the stored
+    /// dep graph stays acyclic even when the process itself loops. None = no
+    /// transition declared. Empty → omitted from the file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_issue: Option<String>,
+    /// Spend ceiling for this node in USD (t#302); on a change root (`change`) it is
+    /// the ceiling of the whole GROUP. Only the ceiling is stored — actual spend is
+    /// derived from the usage blocks. None = no ceiling declared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_usd: Option<f64>,
+    /// How many steps of the group a runner may carry at once (t#302). Parallelism
+    /// itself is not declared — it is the ABSENCE of an edge; only its limit is,
+    /// and only on a change root. None = no limit declared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_limit: Option<u32>,
+    /// Machine predicate of this node's outcome (t#304): `"ok"` | `"issue"`, empty =
+    /// NO CHECK HAS RUN. The empty case is deliberately not `ok`: a node nobody
+    /// verified must never pass for a verified one, which is why the field is a
+    /// tri-state string rather than a bool. `ok` requires BOTH — `verify` exited 0
+    /// and everything declared in `produces` exists; either one failing makes it
+    /// `issue`. Free judgement is not a predicate here: only a command's exit code
+    /// and the produces check write this field. Empty → omitted from the file.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub outcome: String,
+    /// Short machine reason behind `outcome` (t#304): `"ok"`, `"verify:issue"`,
+    /// `"missing:<path>"`. Written by the same check that writes `outcome` and read
+    /// as a pair with it — a reason left over from an earlier check would describe
+    /// the wrong verdict. Empty → omitted from the file.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub outcome_reason: String,
+    /// When the check that produced `outcome` ran, RFC3339 (t#304). Distinct from
+    /// `updated_at`, which any edit bumps: a runner needs to tell a verdict made for
+    /// the CURRENT state of the node from one made two edits ago. Empty → omitted.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub outcome_at: String,
     /// Handoff note carried FORWARD along dependency edges (#141): what this task
     /// produced and where it left off, written by the LLM (like a phases handoff).
     /// A session working on a task that DEPENDS ON this one pulls it in via
@@ -158,6 +245,56 @@ pub struct Comment {
     pub created_at: String,
 }
 
+/// One task's answer about one addressed spec section at closing time (t#341).
+/// `verdict` is `unchanged` | `updated` (a plain string, same reasoning as
+/// `Comment::author`); `note` is what the session said about THAT section; `at`
+/// is when it was answered — the Stop guard compares it against the session's
+/// own start, so an answer inherited from earlier work does not count as one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpecAnswer {
+    /// Hashes of the section BLOCKS this task moved (t#353) — content-addressed,
+    /// never positional, so an inserted neighbour cannot shift the attribution
+    /// and an edited block loses its old mark by itself.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocks: Vec<String>,
+    /// The section's text as it stood when the delta was claimed — the second
+    /// half of the pair `SpecSeen::text` starts. Frozen here rather than read
+    /// off the live file, which keeps moving after the task closes and would
+    /// answer a different question every week. Only `updated` carries one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub after: String,
+    #[serde(default)]
+    pub address: String,
+    #[serde(default)]
+    pub verdict: String,
+    #[serde(default)]
+    pub note: String,
+    #[serde(default)]
+    pub at: String,
+}
+
+/// One addressed section's fingerprint at the moment it was injected into a
+/// session's context (t#352). `hash` is a short SHA-256 of the section's PROSE
+/// with whitespace normalised — metadata is excluded, since the provenance
+/// stamp itself rewrites those lines.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpecSeen {
+    /// Block hashes as shown, the baseline the closing answer diffs against.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocks: Vec<String>,
+    /// The section's text as shown. Hashes answer "did it move"; showing WHAT
+    /// moved needs the bytes that were there before, and this anchor is the one
+    /// moment they exist. Bounded by the section budget (README §7).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub text: String,
+    #[serde(default)]
+    pub address: String,
+    #[serde(default)]
+    pub hash: String,
+    #[serde(default)]
+    pub at: String,
+}
+
 fn default_version() -> u32 {
     1
 }
@@ -200,7 +337,7 @@ pub fn load(path: &Path) -> TodoFile {
 }
 
 /// v1 → v2: the field-role split (t#253 field review) — `description` carries
-/// WHAT/WHY (a theme root's vision), `plan` carries only HOW (steps + order).
+/// WHAT/WHY (a change root's delta), `plan` carries only HOW (steps + order).
 /// Two v1 shapes violate that and are healed here, conservatively:
 ///   (а) a `plan` that is just a pointer to a phases dir (or a stub under 80
 ///       chars) — the phases entity is going away (t#254), so the pointer is
@@ -339,6 +476,47 @@ pub fn upsert(file: &mut TodoFile, mut todo: Todo, now: &str) {
         // that doesn't carry it must not erase it.
         if todo.from.is_none() {
             todo.from = existing.from.clone();
+        }
+        // The process declarations (t#302) are written by the cc-todos CLI and have
+        // no UI field yet, so a Todo coming back from the frontend carries them as
+        // empty/None. Both sides rewrite the SAME file, so replacing the row wholesale
+        // would silently erase whatever the CLI declared — carry each one over when
+        // the caller didn't bring it.
+        if todo.produces.is_empty() {
+            todo.produces = existing.produces.clone();
+        }
+        if todo.verify.is_empty() {
+            todo.verify = existing.verify.clone();
+        }
+        if todo.retry_limit.is_none() {
+            todo.retry_limit = existing.retry_limit;
+        }
+        if todo.on_issue.is_none() {
+            todo.on_issue = existing.on_issue.clone();
+        }
+        if todo.budget_usd.is_none() {
+            todo.budget_usd = existing.budget_usd;
+        }
+        if todo.parallel_limit.is_none() {
+            todo.parallel_limit = existing.parallel_limit;
+        }
+        if todo.spec.is_empty() {
+            todo.spec = existing.spec.clone();
+        }
+        if todo.spec_answers.is_empty() {
+            todo.spec_answers = existing.spec_answers.clone();
+        }
+        if todo.spec_seen.is_empty() {
+            todo.spec_seen = existing.spec_seen.clone();
+        }
+        // The outcome predicate (t#304) is carried as ONE unit, keyed on `outcome`:
+        // the verdict, its reason and its timestamp are written together by a single
+        // check, so pairing a fresh verdict with a stale reason (or the other way
+        // round) would misreport what was verified and when.
+        if todo.outcome.is_empty() {
+            todo.outcome = existing.outcome.clone();
+            todo.outcome_reason = existing.outcome_reason.clone();
+            todo.outcome_at = existing.outcome_at.clone();
         }
         // The transition log (t#87) has no UI field either: the frontend sends a
         // Todo without it, which deserializes as empty — carry the existing log,
@@ -960,6 +1138,19 @@ pub fn merge_import(local: &TodoFile, incoming: &TodoFile, now: &str) -> (TodoFi
         t.links.dedup();
         report.dropped_edges += before - t.links.len();
 
+        // The `issue` transition (t#302) points at a task by id, so a fork must drag
+        // it along exactly like `links` do — otherwise an imported node would hand
+        // control to the LOCAL row it was forked from. It is NOT replayed through
+        // `add_dep`: it is a run-layer edge and must never enter the dep graph.
+        if let Some(target) = t.on_issue.take() {
+            let mapped = id_map.get(&target).cloned().unwrap_or(target);
+            if final_ids.contains(&mapped) || local_ids.contains(&mapped) {
+                t.on_issue = Some(mapped);
+            } else {
+                report.dropped_edges += 1;
+            }
+        }
+
         // Deps are replayed through `add_dep` AFTER every task exists, so its
         // endpoint/board/cycle checks can actually see the whole merged board.
         let wanted: Vec<String> = t
@@ -1019,27 +1210,9 @@ mod tests {
     fn todo(id: &str, status: &str) -> Todo {
         Todo {
             id: id.to_string(),
-            number: 0,
             subject: format!("subject {id}"),
-            description: String::new(),
             status: status.to_string(),
-            status_history: Vec::new(),
-            priority: String::new(),
-            kind: String::new(),
-            theme: false,
-            scheduled_for: None,
-            plan: String::new(),
-            project: None,
-            from: None,
-            comments: Vec::new(),
-            links: Vec::new(),
-            depends_on: Vec::new(),
-            handoff: String::new(),
-            handoff_at: None,
-            imported_at: None,
-            created_by: String::new(),
-            created_at: String::new(),
-            updated_at: String::new(),
+            ..Default::default()
         }
     }
 
@@ -1427,6 +1600,212 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Both writers own this file: the cc-todos CLI declares the process fields
+    /// (t#302), the app rewrites the whole store on any edit. A declaration must
+    /// survive that rewrite, and an undeclared field must not reach the file at all.
+    #[test]
+    fn dsl_declarations_round_trip_and_are_omitted_when_unset() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("cut_todos_dsl_test.json");
+        let _ = std::fs::remove_file(&path);
+
+        let mut a = board_todo("a", Some("p"));
+        a.produces = vec!["scripts/cli/todos.mjs".into(), "src-tauri/src/todos.rs".into()];
+        a.verify = "npm test".into();
+        a.retry_limit = Some(2);
+        a.on_issue = Some("b".into());
+        a.budget_usd = Some(2.5);
+        a.parallel_limit = Some(3);
+        let f = TodoFile {
+            todos: vec![a, board_todo("b", Some("p"))],
+            ..Default::default()
+        };
+        save(&path, &f).unwrap();
+
+        // Only the declaring row carries the keys; the bare one stays clean, so an
+        // existing todos.json needs no migration.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        for key in [
+            "produces",
+            "verify",
+            "retry_limit",
+            "on_issue",
+            "budget_usd",
+            "parallel_limit",
+        ] {
+            assert_eq!(raw.matches(&format!("\"{key}\"")).count(), 1, "{key}");
+        }
+
+        let back = load(&path);
+        let a = back.todos.iter().find(|t| t.id == "a").unwrap();
+        assert_eq!(
+            a.produces,
+            vec![
+                "scripts/cli/todos.mjs".to_string(),
+                "src-tauri/src/todos.rs".to_string()
+            ]
+        );
+        assert_eq!(a.verify, "npm test");
+        assert_eq!(a.retry_limit, Some(2));
+        assert_eq!(a.on_issue.as_deref(), Some("b"));
+        assert_eq!(a.budget_usd, Some(2.5));
+        assert_eq!(a.parallel_limit, Some(3));
+        let b = back.todos.iter().find(|t| t.id == "b").unwrap();
+        assert!(b.produces.is_empty());
+        assert!(b.verify.is_empty());
+        assert_eq!(b.retry_limit, None);
+        assert_eq!(b.on_issue, None);
+        assert_eq!(b.budget_usd, None);
+        assert_eq!(b.parallel_limit, None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The loss this guards against: the CLI declares the process fields, the user then
+    /// edits the task in the UI — which sends a Todo WITHOUT them — and the app rewrites
+    /// the file. Replacing the row wholesale would erase the declaration.
+    #[test]
+    fn upsert_preserves_dsl_declarations_across_a_ui_edit() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("cut_todos_dsl_cli_test.json");
+        let _ = std::fs::remove_file(&path);
+        let raw = r#"{"version":2,"todos":[{"id":"a","number":7,"subject":"step","status":"queue",
+            "produces":["scripts/cli/todos.mjs"],"verify":"npm test","retry_limit":2,
+            "on_issue":"b","budget_usd":2.0,"parallel_limit":3}]}"#;
+        std::fs::write(&path, raw).unwrap();
+        let mut f = load(&path);
+
+        // What the frontend sends back: the same task, none of the declarations.
+        let mut edited = todo("a", "in_progress");
+        edited.number = 7;
+        edited.subject = "step renamed".into();
+        upsert(&mut f, edited, "T2");
+        save(&path, &f).unwrap();
+
+        let back = load(&path);
+        let a = &back.todos[0];
+        assert_eq!(a.subject, "step renamed");
+        assert_eq!(a.produces, vec!["scripts/cli/todos.mjs".to_string()]);
+        assert_eq!(a.verify, "npm test");
+        assert_eq!(a.retry_limit, Some(2));
+        assert_eq!(a.on_issue.as_deref(), Some("b"));
+        assert_eq!(a.budget_usd, Some(2.0));
+        assert_eq!(a.parallel_limit, Some(3));
+
+        // A caller that DOES carry a declaration overwrites it — carrying the old one
+        // is a fallback for the writer that knows nothing about the field, not a lock.
+        let mut redeclared = back.todos[0].clone();
+        redeclared.verify = "cargo test --lib".into();
+        redeclared.retry_limit = Some(5);
+        upsert(&mut f, redeclared, "T3");
+        assert_eq!(f.todos[0].verify, "cargo test --lib");
+        assert_eq!(f.todos[0].retry_limit, Some(5));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The predicate is written by whoever ran the check (the CLI today, the runner
+    /// later) and must survive the app's rewrite of the store. The row that was never
+    /// checked carries NO key at all — an absent predicate must not read as `ok`.
+    #[test]
+    fn outcome_round_trips_and_is_absent_until_a_check_ran() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("cut_todos_outcome_test.json");
+        let _ = std::fs::remove_file(&path);
+
+        let mut a = board_todo("a", Some("p"));
+        a.outcome = "issue".into();
+        a.outcome_reason = "missing:src-tauri/src/graph.rs".into();
+        a.outcome_at = "2026-07-29T10:00:00Z".into();
+        let f = TodoFile {
+            todos: vec![a, board_todo("b", Some("p"))],
+            ..Default::default()
+        };
+        save(&path, &f).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        for key in ["outcome", "outcome_reason", "outcome_at"] {
+            assert_eq!(raw.matches(&format!("\"{key}\":")).count(), 1, "{key}");
+        }
+
+        let back = load(&path);
+        let a = back.todos.iter().find(|t| t.id == "a").unwrap();
+        assert_eq!(a.outcome, "issue");
+        assert_eq!(a.outcome_reason, "missing:src-tauri/src/graph.rs");
+        assert_eq!(a.outcome_at, "2026-07-29T10:00:00Z");
+        let b = back.todos.iter().find(|t| t.id == "b").unwrap();
+        assert!(b.outcome.is_empty(), "no check ran, so no verdict — not `ok`");
+        assert!(b.outcome_reason.is_empty());
+        assert!(b.outcome_at.is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Same loss as the declarations, one layer later: the check writes the verdict,
+    /// the user then edits the task in the UI (which sends a Todo without it) and the
+    /// app rewrites the file. The verdict must survive, and it moves as ONE unit —
+    /// a fresh verdict never inherits the previous reason or timestamp.
+    #[test]
+    fn upsert_preserves_the_outcome_predicate_across_a_ui_edit() {
+        let path = std::env::temp_dir().join("cut_todos_outcome_upsert_test.json");
+        let _ = std::fs::remove_file(&path);
+        let raw = r#"{"version":2,"todos":[{"id":"a","number":7,"subject":"step","status":"review",
+            "verify":"cargo test --lib","outcome":"issue","outcome_reason":"verify:issue",
+            "outcome_at":"2026-07-29T10:00:00Z"}]}"#;
+        std::fs::write(&path, raw).unwrap();
+        let mut f = load(&path);
+
+        let mut edited = todo("a", "review");
+        edited.number = 7;
+        edited.subject = "step renamed".into();
+        upsert(&mut f, edited, "T2");
+        save(&path, &f).unwrap();
+
+        let back = load(&path);
+        let a = &back.todos[0];
+        assert_eq!(a.subject, "step renamed");
+        assert_eq!(a.outcome, "issue");
+        assert_eq!(a.outcome_reason, "verify:issue");
+        assert_eq!(a.outcome_at, "2026-07-29T10:00:00Z");
+
+        // A re-check overwrites the verdict — and takes its reason and stamp with it,
+        // so `ok` can never be shown next to the reason of the failure before it.
+        let mut rechecked = back.todos[0].clone();
+        rechecked.outcome = "ok".into();
+        rechecked.outcome_reason = "ok".into();
+        rechecked.outcome_at = "2026-07-29T11:00:00Z".into();
+        upsert(&mut f, rechecked, "T3");
+        assert_eq!(f.todos[0].outcome, "ok");
+        assert_eq!(f.todos[0].outcome_reason, "ok");
+        assert_eq!(f.todos[0].outcome_at, "2026-07-29T11:00:00Z");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The `issue` transition is a RUN-layer edge: it may point backwards, and two of
+    /// them may close a loop. The dep graph must neither see it nor be made cyclic by
+    /// it — cycles live on the run layer, `depends_on` stays acyclic.
+    #[test]
+    fn on_issue_is_not_a_dependency_edge() {
+        let mut implementation = board_todo("impl", Some("p"));
+        implementation.on_issue = Some("review".to_string());
+        let mut review = board_todo("review", Some("p"));
+        review.on_issue = Some("impl".to_string());
+        let mut f = TodoFile {
+            todos: vec![implementation, review],
+            ..Default::default()
+        };
+
+        // The reachability walk behind the cycle check follows `depends_on` only.
+        assert!(!dep_reaches(&f, "impl", "review"));
+        assert!(!dep_reaches(&f, "review", "impl"));
+
+        // So the blocking edge review→impl is still accepted despite the run-layer loop,
+        assert!(add_dep(&mut f, "review", "impl", "T").is_ok());
+        let review = f.todos.iter().find(|t| t.id == "review").unwrap();
+        assert_eq!(review.depends_on, vec!["impl".to_string()]);
+        assert_eq!(review.on_issue.as_deref(), Some("impl"), "transition untouched");
+        // ...and a genuine dep cycle is still rejected, transition or not.
+        assert!(add_dep(&mut f, "impl", "review", "T2").is_err());
+        assert!(f.todos.iter().find(|t| t.id == "impl").unwrap().depends_on.is_empty());
+    }
+
     #[test]
     fn canonical_status_migrates_legacy_and_unknown() {
         assert_eq!(canonical_status("in_progress"), "in_progress");
@@ -1668,6 +2047,72 @@ mod tests {
             .unwrap();
         assert!(target.imported_at.is_some());
         assert_eq!(rep.dropped_edges, 0);
+    }
+
+    /// An `issue` transition points at a task by id, so a fork must drag it onto the
+    /// FORK — left alone it would hand control to the local row it was forked from.
+    /// A transition whose target isn't on the merged board is dropped, and it never
+    /// turns into a dependency on the way in.
+    #[test]
+    fn import_rewires_on_issue_onto_forked_ids() {
+        let local = board(&[("shared", 1)]);
+
+        let mut incoming = board(&[("shared", 1), ("newcomer", 2)]);
+        incoming.todos[0].updated_at = "T9".into(); // `shared` diverged → it forks
+        incoming.todos[0].on_issue = Some("ghost".into()); // dangling → dropped
+        incoming.todos[1].on_issue = Some("shared".into());
+        incoming.todos[1].retry_limit = Some(2);
+
+        let (merged, rep) = merge_import(&local, &incoming, "NOW");
+
+        let newcomer = merged.todos.iter().find(|t| t.id == "newcomer").unwrap();
+        let target = newcomer.on_issue.clone().unwrap();
+        assert_ne!(target, "shared", "must not point at the LOCAL row");
+        assert!(
+            merged.todos.iter().find(|t| t.id == target).unwrap().imported_at.is_some(),
+            "it points at the fork"
+        );
+        assert!(newcomer.depends_on.is_empty(), "a transition is not a dependency");
+        assert_eq!(newcomer.retry_limit, Some(2), "declarations arrive with the task");
+        let fork = merged.todos.iter().find(|t| t.id == target).unwrap();
+        assert_eq!(fork.on_issue, None, "dangling transition dropped");
+        assert_eq!(rep.dropped_edges, 1);
+    }
+
+    /// The outcome predicate names no task, so an import must not remap it — but it
+    /// is a property OF the task and has to travel with it, fork included: a verdict
+    /// left behind would make an imported node look unchecked.
+    #[test]
+    fn import_carries_the_outcome_predicate_with_the_task() {
+        let local = board(&[("shared", 1)]);
+
+        let mut incoming = board(&[("shared", 1), ("newcomer", 2)]);
+        incoming.todos[0].updated_at = "T9".into(); // `shared` diverged → it forks
+        incoming.todos[0].outcome = "issue".into();
+        incoming.todos[0].outcome_reason = "missing:scripts/cli/todos.mjs".into();
+        incoming.todos[0].outcome_at = "2026-07-29T10:00:00Z".into();
+        incoming.todos[1].outcome = "ok".into();
+        incoming.todos[1].outcome_reason = "ok".into();
+        incoming.todos[1].outcome_at = "2026-07-29T11:00:00Z".into();
+
+        let (merged, _) = merge_import(&local, &incoming, "NOW");
+
+        let newcomer = merged.todos.iter().find(|t| t.id == "newcomer").unwrap();
+        assert_eq!(newcomer.outcome, "ok");
+        assert_eq!(newcomer.outcome_reason, "ok");
+        assert_eq!(newcomer.outcome_at, "2026-07-29T11:00:00Z");
+
+        let fork = merged
+            .todos
+            .iter()
+            .find(|t| t.id != "shared" && t.id != "newcomer")
+            .expect("the fork of `shared`");
+        assert_eq!(fork.outcome, "issue");
+        assert_eq!(fork.outcome_reason, "missing:scripts/cli/todos.mjs");
+        assert_eq!(fork.outcome_at, "2026-07-29T10:00:00Z");
+        // The local row it forked from was never checked and stays that way.
+        let local_row = merged.todos.iter().find(|t| t.id == "shared").unwrap();
+        assert!(local_row.outcome.is_empty());
     }
 
     /// Edges the board's invariants reject (dangling target, cycle) are dropped and

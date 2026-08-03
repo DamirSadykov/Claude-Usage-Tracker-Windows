@@ -13,16 +13,19 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
-use crate::stats::{CcUsageRow, StatsDb, ToolResultRow, TurnRow};
+use crate::stats::{CcAgentRow, CcUsageRow, StatsDb, ToolResultRow, TurnRow};
 
-/// A whole transcript file parsed into its three concerns: per-message usage
-/// rows (assistant lines), tool-result outcomes (user lines) and turn-duration
-/// rows (system lines). All three are produced in a single pass over the lines.
+/// A whole transcript file parsed into its concerns: per-message usage rows
+/// (assistant lines), tool-result outcomes (user lines), turn-duration rows
+/// (system lines) — all produced in a single pass over the lines — plus the
+/// subagent manifest, which comes from a sibling `.meta.json` rather than the
+/// lines themselves.
 #[derive(Default)]
 pub struct ParsedFile {
     pub usage: Vec<CcUsageRow>,
     pub tool_results: Vec<ToolResultRow>,
     pub turns: Vec<TurnRow>,
+    pub agents: Vec<CcAgentRow>,
 }
 
 /// Per-million-token prices (input, output) in USD. Cache-write is input×1.25,
@@ -121,6 +124,12 @@ pub fn parse_line(line: &str) -> Option<CcUsageRow> {
         .and_then(Value::as_str)
         .or_else(|| v.get("attributionAgent").and_then(Value::as_str))
         .map(str::to_string);
+    // The INSTANCE key (t#300): `agent_name` is only the type, so two concurrent
+    // general-purpose agents are indistinguishable without this.
+    let agent_id = v
+        .get("agentId")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let cost = cost_for(model, input, output, cache_create, cache_read);
     let tool_uses = extract_tool_uses(msg);
     let (git_commits, git_pushes) = extract_git_ops(msg);
@@ -138,6 +147,7 @@ pub fn parse_line(line: &str) -> Option<CcUsageRow> {
         project,
         is_subagent,
         agent_name,
+        agent_id,
         tool_uses,
         service_tier,
         git_commits,
@@ -344,10 +354,74 @@ fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// The manifest Claude Code writes beside a subagent transcript:
+/// `agent-<id>.jsonl` → `agent-<id>.meta.json`, holding `agentType`,
+/// `description` (the work the agent was launched for), `toolUseId` of the
+/// spawning Task() call and `spawnDepth`. The agent id comes from the FILE NAME,
+/// which is the only place it is guaranteed to be — a manifest without one is
+/// unusable and yields nothing. Missing/unreadable/malformed manifest is normal
+/// (older transcripts have none) and is silently skipped, never an error.
+fn parse_agent_meta(path: &Path) -> Option<CcAgentRow> {
+    let stem = path.file_stem().and_then(|n| n.to_str())?;
+    let agent_id = stem.strip_prefix("agent-")?.to_string();
+    if agent_id.is_empty() {
+        return None;
+    }
+    let raw = std::fs::read_to_string(path.with_file_name(format!("{stem}.meta.json"))).ok()?;
+    let v: Value = serde_json::from_str(&raw).ok()?;
+    let text = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+    Some(CcAgentRow {
+        agent_id,
+        // The parent session owns the `subagents/` directory the file sits in.
+        session_id: path
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .map(str::to_string),
+        agent_type: text("agentType"),
+        description: text("description"),
+        tool_use_id: text("toolUseId"),
+        spawn_depth: v.get("spawnDepth").and_then(Value::as_i64),
+    })
+}
+
+/// Locate the transcript of one session under `base/projects`. A caller holding
+/// only a session id doesn't know which project directory it landed in, so the
+/// lookup walks the project directories rather than guessing the slug. With
+/// `agent` set, the subagent file beside the session directory is returned.
+///
+/// Both ids come from the database but reach here through a frontend command, so
+/// anything that could climb out of `projects/` is refused rather than joined.
+pub fn transcript_path(base: &Path, session: &str, agent: Option<&str>) -> Option<PathBuf> {
+    let plain = |s: &str| !s.is_empty() && !s.contains(['/', '\\', '.', ':']);
+    if !plain(session) || !agent.map(plain).unwrap_or(true) {
+        return None;
+    }
+    for entry in std::fs::read_dir(base.join("projects")).ok()?.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let path = match agent {
+            Some(a) => dir
+                .join(session)
+                .join("subagents")
+                .join(format!("agent-{a}.jsonl")),
+            None => dir.join(format!("{session}.jsonl")),
+        };
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    None
+}
+
 /// Parse one transcript file into its three concerns in a single pass: assistant
 /// lines → `CcUsageRow`, user lines → `ToolResultRow`(s), system turn_duration
 /// lines → `TurnRow`. Each line is JSON-parsed once via the typed dispatch
 /// (parse_line / parse_tool_results / parse_turn_line short-circuit on `type`).
+/// A subagent file additionally yields its manifest row (see `parse_agent_meta`).
 fn parse_file(path: &Path) -> ParsedFile {
     let file = match File::open(path) {
         Ok(f) => f,
@@ -363,6 +437,9 @@ fn parse_file(path: &Path) -> ParsedFile {
         .unwrap_or(false);
     let reader = BufReader::new(file);
     let mut parsed = ParsedFile::default();
+    if from_agent_file {
+        parsed.agents.extend(parse_agent_meta(path));
+    }
     for line in reader.lines().map_while(Result::ok) {
         if line.is_empty() {
             continue;
@@ -370,6 +447,16 @@ fn parse_file(path: &Path) -> ParsedFile {
         if let Some(mut row) = parse_line(&line) {
             if from_agent_file {
                 row.is_subagent = true;
+                // Older subagent transcripts carry no per-line `agentId`; the file
+                // name holds it, and the manifest read above already parsed it out.
+                if row.agent_id.is_none() {
+                    row.agent_id = parsed.agents.first().map(|a| a.agent_id.clone()).or_else(|| {
+                        path.file_stem()
+                            .and_then(|n| n.to_str())
+                            .and_then(|n| n.strip_prefix("agent-"))
+                            .map(str::to_string)
+                    });
+                }
             }
             parsed.usage.push(row);
             continue; // an assistant line can't also be a user / system line
@@ -433,6 +520,9 @@ pub fn ingest(base: &Path, db: &StatsDb) -> Result<usize, String> {
         }
         if !parsed.turns.is_empty() {
             db.cc_turn_upsert(&parsed.turns).map_err(|e| e.to_string())?;
+        }
+        if !parsed.agents.is_empty() {
+            db.cc_agent_upsert(&parsed.agents).map_err(|e| e.to_string())?;
         }
         db.cc_set_file_state(&path_str, size, &mtime)
             .map_err(|e| e.to_string())?;
@@ -578,6 +668,103 @@ mod tests {
     fn parse_turn_line_subagent_flag() {
         let line = r#"{"type":"system","subtype":"turn_duration","durationMs":100,"uuid":"u","timestamp":"t","isSidechain":true}"#;
         assert!(parse_turn_line(line).unwrap().is_subagent);
+    }
+
+    // --- agent instance identity (t#300) ---
+
+    #[test]
+    fn parse_line_keeps_the_agent_instance_id() {
+        let line = r#"{"type":"assistant","isSidechain":true,"agentId":"a1ac9d25f19dae595",
+            "timestamp":"2026-07-28T17:52:17.516Z","sessionId":"s-1",
+            "message":{"id":"m-1","model":"claude-opus-5","usage":{"input_tokens":1,"output_tokens":2}}}"#;
+        let row = parse_line(line).unwrap();
+        assert_eq!(row.agent_id.as_deref(), Some("a1ac9d25f19dae595"));
+        assert!(row.is_subagent);
+        // The TYPE is not the instance: a main-loop line has neither.
+        let main = r#"{"type":"assistant","timestamp":"t","sessionId":"s-1",
+            "message":{"id":"m-2","model":"claude-opus-5","usage":{"input_tokens":1,"output_tokens":2}}}"#;
+        let row = parse_line(main).unwrap();
+        assert!(row.agent_id.is_none());
+        assert!(!row.is_subagent);
+    }
+
+    #[test]
+    fn agent_meta_is_read_from_the_sibling_manifest() {
+        let dir = std::env::temp_dir().join("cut_agent_meta/s-42/subagents");
+        std::fs::create_dir_all(&dir).unwrap();
+        let jsonl = dir.join("agent-abc123.jsonl");
+        std::fs::write(&jsonl, b"").unwrap();
+        std::fs::write(
+            dir.join("agent-abc123.meta.json"),
+            r#"{"agentType":"general-purpose","description":"Спека DSL","toolUseId":"toolu_9","spawnDepth":1}"#,
+        )
+        .unwrap();
+
+        let row = parse_agent_meta(&jsonl).unwrap();
+        assert_eq!(row.agent_id, "abc123");
+        // The parent session owns the directory the `subagents/` folder sits in.
+        assert_eq!(row.session_id.as_deref(), Some("s-42"));
+        assert_eq!(row.agent_type.as_deref(), Some("general-purpose"));
+        assert_eq!(row.description.as_deref(), Some("Спека DSL"));
+        assert_eq!(row.tool_use_id.as_deref(), Some("toolu_9"));
+        assert_eq!(row.spawn_depth, Some(1));
+
+        // A manifest that is missing / malformed is normal (older transcripts),
+        // and a file that isn't an agent transcript has no id to key on.
+        let orphan = dir.join("agent-nometa.jsonl");
+        std::fs::write(&orphan, b"").unwrap();
+        assert!(parse_agent_meta(&orphan).is_none());
+        std::fs::write(dir.join("agent-torn.meta.json"), b"{ not json").unwrap();
+        let torn = dir.join("agent-torn.jsonl");
+        std::fs::write(&torn, b"").unwrap();
+        assert!(parse_agent_meta(&torn).is_none());
+        assert!(parse_agent_meta(&dir.join("plain.jsonl")).is_none());
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("cut_agent_meta"));
+    }
+
+    #[test]
+    fn a_transcript_is_found_by_session_id_across_project_dirs() {
+        let base = std::env::temp_dir().join("cut_transcript_path");
+        let _ = std::fs::remove_dir_all(&base);
+        let proj = base.join("projects/D--projects-app");
+        std::fs::create_dir_all(proj.join("s-42/subagents")).unwrap();
+        std::fs::write(proj.join("s-42.jsonl"), b"").unwrap();
+        std::fs::write(proj.join("s-42/subagents/agent-a1.jsonl"), b"").unwrap();
+
+        assert_eq!(
+            transcript_path(&base, "s-42", None).unwrap(),
+            proj.join("s-42.jsonl")
+        );
+        assert_eq!(
+            transcript_path(&base, "s-42", Some("a1")).unwrap(),
+            proj.join("s-42/subagents/agent-a1.jsonl")
+        );
+        assert!(transcript_path(&base, "s-99", None).is_none());
+        assert!(transcript_path(&base, "s-42", Some("nope")).is_none());
+        // Anything that could climb out of `projects/` is refused before joining.
+        for bad in ["", "..", "../s-42", "a/b", "a\\b", "s-42.jsonl"] {
+            assert!(transcript_path(&base, bad, None).is_none(), "{bad}");
+            assert!(transcript_path(&base, "s-42", Some(bad)).is_none(), "{bad}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn an_agent_file_without_per_line_ids_falls_back_to_its_name() {
+        let dir = std::env::temp_dir().join("cut_agent_fallback/s-7/subagents");
+        std::fs::create_dir_all(&dir).unwrap();
+        let jsonl = dir.join("agent-oldstyle.jsonl");
+        // No agentId / isSidechain on the line — the older transcript shape.
+        std::fs::write(
+            &jsonl,
+            br#"{"type":"assistant","timestamp":"t","sessionId":"s-7","message":{"id":"m-9","model":"claude-opus-5","usage":{"input_tokens":1,"output_tokens":1}}}"#,
+        )
+        .unwrap();
+        let parsed = parse_file(&jsonl);
+        assert_eq!(parsed.usage.len(), 1);
+        assert!(parsed.usage[0].is_subagent);
+        assert_eq!(parsed.usage[0].agent_id.as_deref(), Some("oldstyle"));
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("cut_agent_fallback"));
     }
 
     // --- git op detection ---

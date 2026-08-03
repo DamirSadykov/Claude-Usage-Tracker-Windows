@@ -1,6 +1,9 @@
 //! Join side of tokens-per-task (t#87): what did a TASK cost?
 //!
-//! Three sources meet here, none of which this module owns:
+//! Four sources meet here, none of which this module owns:
+//!   • `task-sessions.jsonl` — the append-only binding journal (t#297), read via
+//!     task_sessions.rs and passed in as BLOCKS. It outranks everything below:
+//!     a session that appears in the journal is attributed by the journal ALONE;
 //!   • `task-attribution.json` — which tasks each session MOVED (worked), written
 //!     by `cli.mjs task-cost publish` from the transcripts (this module is
 //!     load-only over it, same split as corrections.rs / the CLI);
@@ -10,6 +13,12 @@
 //!
 //! Attribution is deliberately CONSERVATIVE (t#87's explicit call): a session's
 //! tokens land on a task only when the evidence names exactly ONE task —
+//!   0. journal (t#297) — the session has binding events. Nothing below is even
+//!      consulted for such a session: a recorded binding is ground truth, and a
+//!      heuristic contradicting it would be noise. Per-BLOCK sums (a session
+//!      split across several tasks) live in the `get_task_blocks` command; this
+//!      whole-session view still needs one task, so a session bound to two or
+//!      more is reported ambiguous rather than smeared;
 //!   1. direct, tier 1 — the session itself moved exactly one task into a
 //!      worked status (`set-status`). The strongest signal: it wins even when
 //!      the session also commented on other tasks in passing;
@@ -39,6 +48,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::stats::SessionUsage;
+use crate::task_sessions::{self, TaskBlock};
 use crate::todos::{Todo, TodoFile};
 
 fn default_version() -> u32 {
@@ -95,14 +105,28 @@ pub struct AttributionFile {
     pub sessions: Vec<AttributionSession>,
 }
 
+impl Default for AttributionFile {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            kind: "task.attribution".to_string(),
+            generated_at: String::new(),
+            sessions: Vec::new(),
+        }
+    }
+}
+
 /// Forgiving read, mirroring corrections::load: missing/malformed → None.
 pub fn load(path: &Path) -> Option<AttributionFile> {
     let raw = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&raw).ok()
 }
 
-/// Cost of one task: every attributed session's tokens summed. `direct` vs
-/// `interval` says which evidence attributed them (a task can have both).
+/// Cost of one task: every attributed session's tokens summed. The four
+/// counters say which evidence attributed them and are disjoint — they add up
+/// to `sessions`. `explicit`/`auto` come from the binding journal (a user's
+/// `take`/`set-status` vs the SessionStart hook's guess), `direct`/`interval`
+/// from the transcript heuristics that serve journal-less history.
 #[derive(Debug, Clone, Serialize)]
 pub struct TaskCostRow {
     pub id: String,
@@ -114,6 +138,8 @@ pub struct TaskCostRow {
     pub sessions: u32,
     pub direct_sessions: u32,
     pub interval_sessions: u32,
+    pub explicit_sessions: u32,
+    pub auto_sessions: u32,
     pub total_tokens: i64,
     pub cost: f64,
 }
@@ -202,10 +228,33 @@ fn overlaps(start: &str, end: &str, span: &(String, Option<String>)) -> bool {
 /// consumer can trust the former and treat the latter as an estimate.
 #[derive(Clone, Copy)]
 enum Verdict {
-    Direct(usize),   // index into todos.todos — the session's own CLI evidence
-    Interval(usize), // time-overlap corroborated by a mention
-    Ambiguous,       // ≥2 distinct tasks named within a tier — report, never smear
-    None,            // no evidence — untracked
+    Journal(usize, bool), // recorded binding; the flag is explicit vs auto
+    Direct(usize),        // index into todos.todos — the session's own CLI evidence
+    Interval(usize),      // time-overlap corroborated by a mention
+    Ambiguous,            // ≥2 distinct tasks named within a tier — report, never smear
+    None,                 // no evidence — untracked
+}
+
+/// Tier 0: the binding journal. A session listed there is judged by it alone —
+/// the heuristics below never run for it. Bindings pointing at tasks that left
+/// the board resolve to nothing and leave the session untracked (NOT ambiguous,
+/// and NOT handed back to the heuristics).
+fn judge_journal(todos: &TodoFile, bound: &[(&str, bool)]) -> Verdict {
+    let mut hits: Vec<(usize, bool)> = Vec::new();
+    for (task_id, explicit) in bound {
+        let Some(idx) = todos.todos.iter().position(|t| t.id == *task_id) else {
+            continue;
+        };
+        match hits.iter_mut().find(|(i, _)| *i == idx) {
+            Some(hit) => hit.1 |= *explicit,
+            None => hits.push((idx, *explicit)),
+        }
+    }
+    match hits.len() {
+        1 => Verdict::Journal(hits[0].0, hits[0].1),
+        0 => Verdict::None,
+        _ => Verdict::Ambiguous,
+    }
 }
 
 fn judge(
@@ -278,20 +327,30 @@ fn judge(
     }
 }
 
-/// Join attribution + board + per-session usage into per-task costs.
+/// Join journal + attribution + board + per-session usage into per-task costs.
 /// `usage` must cover all time (the caller queries without a window): a task's
-/// sessions may be arbitrarily old.
-pub fn compute(attr: &AttributionFile, todos: &TodoFile, usage: &[SessionUsage]) -> TaskCosts {
+/// sessions may be arbitrarily old. `blocks` is the binding journal folded into
+/// spans (task_sessions::blocks) — empty for a machine that never used `take`,
+/// in which case this behaves exactly as it did before t#297.
+pub fn compute(
+    attr: &AttributionFile,
+    todos: &TodoFile,
+    usage: &[SessionUsage],
+    blocks: &[TaskBlock],
+) -> TaskCosts {
     let by_session: HashMap<&str, &AttributionSession> = attr
         .sessions
         .iter()
         .map(|s| (s.session.as_str(), s))
         .collect();
+    let bound = task_sessions::tasks_by_session(blocks);
 
     struct Acc {
         sessions: u32,
         direct: u32,
         interval: u32,
+        explicit: u32,
+        auto: u32,
         tokens: i64,
         cost: f64,
     }
@@ -299,23 +358,27 @@ pub fn compute(attr: &AttributionFile, todos: &TodoFile, usage: &[SessionUsage])
     let mut ambiguous = (0u32, 0i64, 0f64);
 
     for u in usage {
-        let attr_sess = by_session.get(u.session_id.as_str()).copied();
-        let verdict = judge(todos, attr_sess, u);
+        let verdict = match bound.get(u.session_id.as_str()) {
+            Some(b) => judge_journal(todos, b),
+            None => judge(todos, by_session.get(u.session_id.as_str()).copied(), u),
+        };
         match verdict {
-            Verdict::Direct(idx) | Verdict::Interval(idx) => {
-                let direct = matches!(verdict, Verdict::Direct(_));
+            Verdict::Journal(idx, _) | Verdict::Direct(idx) | Verdict::Interval(idx) => {
                 let acc = per_task.entry(idx).or_insert(Acc {
                     sessions: 0,
                     direct: 0,
                     interval: 0,
+                    explicit: 0,
+                    auto: 0,
                     tokens: 0,
                     cost: 0.0,
                 });
                 acc.sessions += 1;
-                if direct {
-                    acc.direct += 1;
-                } else {
-                    acc.interval += 1;
+                match verdict {
+                    Verdict::Journal(_, true) => acc.explicit += 1,
+                    Verdict::Journal(_, false) => acc.auto += 1,
+                    Verdict::Direct(_) => acc.direct += 1,
+                    _ => acc.interval += 1,
                 }
                 acc.tokens += u.total_tokens;
                 acc.cost += u.cost;
@@ -342,6 +405,8 @@ pub fn compute(attr: &AttributionFile, todos: &TodoFile, usage: &[SessionUsage])
                 sessions: acc.sessions,
                 direct_sessions: acc.direct,
                 interval_sessions: acc.interval,
+                explicit_sessions: acc.explicit,
+                auto_sessions: acc.auto,
                 total_tokens: acc.tokens,
                 cost: acc.cost,
             }
@@ -368,25 +433,9 @@ mod tests {
             id: id.to_string(),
             number,
             subject: format!("task {number}"),
-            description: String::new(),
             status: "in_progress".to_string(),
-            status_history: Vec::new(),
-            priority: String::new(),
-            kind: String::new(),
-            scheduled_for: None,
-            theme: false,
-            plan: String::new(),
             project: project.map(String::from),
-            from: None,
-            comments: Vec::new(),
-            links: Vec::new(),
-            depends_on: Vec::new(),
-            handoff: String::new(),
-            handoff_at: None,
-            imported_at: None,
-            created_by: String::new(),
-            created_at: String::new(),
-            updated_at: String::new(),
+            ..Default::default()
         }
     }
 
@@ -454,7 +503,7 @@ mod tests {
             sess("s1", None, "T1", "T2", 100, 1.0),
             sess("s2", None, "T3", "T4", 50, 0.5),
         ];
-        let out = compute(&a, &todos, &usage);
+        let out = compute(&a, &todos, &usage, &[]);
         assert_eq!(out.tasks.len(), 1);
         assert_eq!(out.tasks[0].number, 7);
         assert_eq!(out.tasks[0].sessions, 2);
@@ -468,7 +517,7 @@ mod tests {
         let todos = board(vec![todo("a", 1, None), todo("b", 2, None)]);
         let a = attr(vec![moves("s1", &["1", "2"])]);
         let usage = vec![sess("s1", None, "T1", "T2", 100, 1.0)];
-        let out = compute(&a, &todos, &usage);
+        let out = compute(&a, &todos, &usage, &[]);
         assert!(out.tasks.is_empty());
         assert_eq!(out.ambiguous_sessions, 1);
         assert_eq!(out.ambiguous_tokens, 100);
@@ -482,7 +531,7 @@ mod tests {
         let todos = board(vec![todo("a", 1, None)]);
         let a = attr(vec![moves("s1", &["zzz"])]);
         let usage = vec![sess("s1", None, "T1", "T2", 100, 1.0)];
-        let out = compute(&a, &todos, &usage);
+        let out = compute(&a, &todos, &usage, &[]);
         assert!(out.tasks.is_empty());
         assert_eq!(out.ambiguous_sessions, 0);
     }
@@ -494,7 +543,7 @@ mod tests {
         let todos = board(vec![todo("a", 7, None)]);
         let a = attr(vec![evidence("s1", &[], &["7"], &[])]);
         let usage = vec![sess("s1", None, "T1", "T2", 100, 1.0)];
-        let out = compute(&a, &todos, &usage);
+        let out = compute(&a, &todos, &usage, &[]);
         assert_eq!(out.tasks.len(), 1);
         assert_eq!(out.tasks[0].direct_sessions, 1);
         assert_eq!(out.tasks[0].interval_sessions, 0);
@@ -507,7 +556,7 @@ mod tests {
         let todos = board(vec![todo("a", 1, None), todo("b", 2, None)]);
         let a = attr(vec![evidence("s1", &["1"], &["2"], &[])]);
         let usage = vec![sess("s1", None, "T1", "T2", 100, 1.0)];
-        let out = compute(&a, &todos, &usage);
+        let out = compute(&a, &todos, &usage, &[]);
         assert_eq!(out.tasks.len(), 1);
         assert_eq!(out.tasks[0].number, 1);
         assert_eq!(out.ambiguous_sessions, 0);
@@ -520,7 +569,7 @@ mod tests {
         let todos = board(vec![todo("a", 1, Some("other"))]);
         let a = attr(vec![moves("s1", &["1"])]);
         let usage = vec![sess("s1", Some("proj"), "T1", "T2", 100, 1.0)];
-        let out = compute(&a, &todos, &usage);
+        let out = compute(&a, &todos, &usage, &[]);
         assert!(out.tasks.is_empty());
         assert_eq!(out.ambiguous_sessions, 0);
     }
@@ -537,7 +586,7 @@ mod tests {
         ]);
         let a = attr(vec![moves("s1", &["1", "220", "221"])]);
         let usage = vec![sess("s1", Some("proj"), "T1", "T2", 100, 1.0)];
-        let out = compute(&a, &todos, &usage);
+        let out = compute(&a, &todos, &usage, &[]);
         assert_eq!(out.tasks.len(), 1);
         assert_eq!(out.tasks[0].number, 1);
         assert_eq!(out.ambiguous_sessions, 0);
@@ -549,7 +598,7 @@ mod tests {
         let todos = board(vec![todo("u-fixed", 1, Some("other"))]);
         let a = attr(vec![moves("s1", &["u-fixed"])]);
         let usage = vec![sess("s1", Some("proj"), "T1", "T2", 100, 1.0)];
-        let out = compute(&a, &todos, &usage);
+        let out = compute(&a, &todos, &usage, &[]);
         assert_eq!(out.tasks.len(), 1);
         assert_eq!(out.tasks[0].number, 1);
     }
@@ -564,7 +613,7 @@ mod tests {
             sess("s1", None, "T1", "T2", 100, 1.0),
             sess("s2", None, "T1", "T2", 50, 0.5),
         ];
-        let out = compute(&a, &todos, &usage);
+        let out = compute(&a, &todos, &usage, &[]);
         assert_eq!(out.tasks.len(), 1);
         assert_eq!(out.tasks[0].number, 2);
     }
@@ -574,7 +623,7 @@ mod tests {
         let todos = board(vec![todo("a", 1, None), todo("b", 2, None)]);
         let a = attr(vec![evidence("s1", &[], &["1", "2"], &[])]);
         let usage = vec![sess("s1", None, "T1", "T2", 100, 1.0)];
-        let out = compute(&a, &todos, &usage);
+        let out = compute(&a, &todos, &usage, &[]);
         assert!(out.tasks.is_empty());
         assert_eq!(out.ambiguous_sessions, 1);
     }
@@ -603,7 +652,7 @@ mod tests {
             80,
             0.8,
         )];
-        let out = compute(&a, &todos, &usage);
+        let out = compute(&a, &todos, &usage, &[]);
         assert_eq!(out.tasks.len(), 1);
         assert_eq!(out.tasks[0].number, 1);
         assert_eq!(out.tasks[0].interval_sessions, 1);
@@ -630,7 +679,7 @@ mod tests {
         )];
         // No scanner record at all, and a record whose mentions name something else.
         for a in [attr(vec![]), attr(vec![evidence("s1", &[], &[], &["999"])])] {
-            let out = compute(&a, &todos, &usage);
+            let out = compute(&a, &todos, &usage, &[]);
             assert!(out.tasks.is_empty());
             assert_eq!(out.ambiguous_sessions, 0);
         }
@@ -652,7 +701,7 @@ mod tests {
             80,
             0.8,
         )];
-        let out = compute(&attr(vec![evidence("s1", &[], &[], &["1"])]), &todos, &usage);
+        let out = compute(&attr(vec![evidence("s1", &[], &[], &["1"])]), &todos, &usage, &[]);
         assert!(out.tasks.is_empty());
         assert_eq!(out.ambiguous_sessions, 0);
     }
@@ -677,7 +726,7 @@ mod tests {
             0.8,
         )];
         let a = attr(vec![evidence("s1", &[], &[], &["1", "2"])]);
-        let out = compute(&a, &todos, &usage);
+        let out = compute(&a, &todos, &usage, &[]);
         assert!(out.tasks.is_empty());
         assert_eq!(out.ambiguous_sessions, 1);
     }
@@ -705,10 +754,100 @@ mod tests {
             0.8,
         )];
         let a = attr(vec![evidence("s1", &[], &[], &["2"])]);
-        let out = compute(&a, &todos, &usage);
+        let out = compute(&a, &todos, &usage, &[]);
         assert_eq!(out.tasks.len(), 1);
         assert_eq!(out.tasks[0].number, 2);
         assert_eq!(out.tasks[0].interval_sessions, 1);
+    }
+
+    fn block(session: &str, task: &str, explicit: bool) -> TaskBlock {
+        TaskBlock {
+            task: task.to_string(),
+            session: session.to_string(),
+            from: "2026-07-28T10:00:00Z".to_string(),
+            to: "2026-07-28T11:00:00Z".to_string(),
+            explicit,
+            source: if explicit { "take" } else { "auto" }.to_string(),
+            project: None,
+        }
+    }
+
+    #[test]
+    fn a_journal_binding_overrules_every_heuristic() {
+        // The session moved #1 (tier-1 evidence) but is BOUND to #2: the
+        // recorded binding wins outright and #1 gets nothing.
+        let todos = board(vec![todo("a", 1, Some("proj")), todo("b", 2, Some("proj"))]);
+        let a = attr(vec![evidence("s1", &["1"], &["1"], &["1"])]);
+        let usage = vec![sess("s1", Some("proj"), "T1", "T2", 100, 1.0)];
+        let out = compute(&a, &todos, &usage, &[block("s1", "b", true)]);
+        assert_eq!(out.tasks.len(), 1);
+        assert_eq!(out.tasks[0].number, 2);
+        assert_eq!(out.tasks[0].explicit_sessions, 1);
+        assert_eq!(out.tasks[0].direct_sessions, 0);
+        assert_eq!(out.ambiguous_sessions, 0);
+    }
+
+    #[test]
+    fn journal_sessions_split_explicit_from_auto() {
+        let todos = board(vec![todo("a", 1, None)]);
+        let usage = vec![
+            sess("s1", None, "T1", "T2", 100, 1.0),
+            sess("s2", None, "T3", "T4", 50, 0.5),
+            sess("s3", None, "T5", "T6", 10, 0.1),
+        ];
+        let blocks = vec![
+            block("s1", "a", true),
+            block("s2", "a", false),
+            // A second block of the same session, same task: still ONE session,
+            // and its explicit binding upgrades the pair.
+            block("s3", "a", false),
+            block("s3", "a", true),
+        ];
+        let out = compute(&attr(vec![]), &todos, &usage, &blocks);
+        assert_eq!(out.tasks[0].sessions, 3);
+        assert_eq!(out.tasks[0].explicit_sessions, 2);
+        assert_eq!(out.tasks[0].auto_sessions, 1);
+        assert_eq!(out.tasks[0].total_tokens, 160);
+    }
+
+    #[test]
+    fn a_session_bound_to_two_tasks_is_ambiguous_here() {
+        // The whole-session view can't split; per-block sums are get_task_blocks'.
+        let todos = board(vec![todo("a", 1, None), todo("b", 2, None)]);
+        let usage = vec![sess("s1", None, "T1", "T2", 100, 1.0)];
+        let blocks = vec![block("s1", "a", true), block("s1", "b", true)];
+        let out = compute(&attr(vec![]), &todos, &usage, &blocks);
+        assert!(out.tasks.is_empty());
+        assert_eq!(out.ambiguous_sessions, 1);
+        assert_eq!(out.ambiguous_tokens, 100);
+    }
+
+    #[test]
+    fn a_binding_to_a_deleted_task_never_falls_back_to_heuristics() {
+        let todos = board(vec![todo("a", 1, Some("proj"))]);
+        let a = attr(vec![evidence("s1", &["1"], &[], &[])]);
+        let usage = vec![sess("s1", Some("proj"), "T1", "T2", 100, 1.0)];
+        let out = compute(&a, &todos, &usage, &[block("s1", "gone", true)]);
+        assert!(out.tasks.is_empty());
+        assert_eq!(out.ambiguous_sessions, 0);
+    }
+
+    #[test]
+    fn journal_less_sessions_keep_the_old_heuristics() {
+        // Two sessions, only one of them in the journal: the other is still
+        // judged by its transcript evidence.
+        let todos = board(vec![todo("a", 1, None), todo("b", 2, None)]);
+        let a = attr(vec![moves("s1", &["1"]), moves("s2", &["1"])]);
+        let usage = vec![
+            sess("s1", None, "T1", "T2", 100, 1.0),
+            sess("s2", None, "T3", "T4", 40, 0.4),
+        ];
+        let out = compute(&a, &todos, &usage, &[block("s1", "b", false)]);
+        let by_num = |n: u32| out.tasks.iter().find(|t| t.number == n).unwrap();
+        assert_eq!(by_num(2).auto_sessions, 1);
+        assert_eq!(by_num(2).total_tokens, 100);
+        assert_eq!(by_num(1).direct_sessions, 1);
+        assert_eq!(by_num(1).total_tokens, 40);
     }
 
     #[test]

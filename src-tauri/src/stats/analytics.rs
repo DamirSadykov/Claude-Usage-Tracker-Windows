@@ -601,6 +601,106 @@ fn sessions_in(
     Ok(rows)
 }
 
+/// Sums over ONE task block — a `(session, [from, to])` span from the binding
+/// journal (task_sessions.rs, t#297). Both bounds are INCLUSIVE: `to` is either
+/// the next binding event's ts or the session's last message ts, and the closing
+/// message belongs to the block. Tool calls come from `cc_tool_use` joined to
+/// `cc_usage` (the tool table carries no ts/session of its own); tool errors
+/// from `cc_tool_result`, which is session-scoped but has no message link.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct BlockTotals {
+    pub cost: f64,
+    pub total_tokens: i64,
+    pub messages: i64,
+    pub tool_calls: i64,
+    pub tool_errors: i64,
+}
+
+/// One agent's share of a block (t#300). The main loop is reported as a row with
+/// `agent_id = None`, so the rows always sum back to the block's own totals.
+/// `description` is what the agent was launched for — it names the work, which is
+/// what makes a mixed block readable instead of just "$2.16 by general-purpose".
+#[derive(Debug, Clone, Serialize)]
+pub struct BlockAgent {
+    pub agent_id: Option<String>,
+    pub agent_type: Option<String>,
+    pub description: Option<String>,
+    pub cost: f64,
+    pub total_tokens: i64,
+    pub messages: i64,
+    pub from: String,
+    pub to: String,
+}
+
+fn block_agents_in(
+    conn: &Connection,
+    session: &str,
+    from: &str,
+    to: &str,
+) -> Result<Vec<BlockAgent>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT cu.agent_id, a.agent_type, a.description,
+                COALESCE(SUM(cu.cost), 0),
+                COALESCE(SUM(cu.input+cu.output+cu.cache_create+cu.cache_read), 0),
+                COUNT(*), MIN(cu.ts), MAX(cu.ts)
+           FROM cc_usage cu LEFT JOIN cc_agent a ON a.agent_id = cu.agent_id
+          WHERE cu.session_id = ?1 AND cu.ts >= ?2 AND cu.ts <= ?3
+          GROUP BY cu.agent_id
+          ORDER BY 4 DESC",
+    )?;
+    let rows = stmt
+        .query_map(params![session, from, to], |r| {
+            Ok(BlockAgent {
+                agent_id: r.get(0)?,
+                agent_type: r.get(1)?,
+                description: r.get(2)?,
+                cost: r.get(3)?,
+                total_tokens: r.get(4)?,
+                messages: r.get(5)?,
+                from: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                to: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+fn block_totals_in(
+    conn: &Connection,
+    session: &str,
+    from: &str,
+    to: &str,
+) -> Result<BlockTotals, rusqlite::Error> {
+    let (total_tokens, cost, messages): (i64, f64, i64) = conn.query_row(
+        "SELECT COALESCE(SUM(input+output+cache_create+cache_read), 0),
+                COALESCE(SUM(cost), 0), COUNT(*)
+         FROM cc_usage
+         WHERE session_id = ?1 AND ts >= ?2 AND ts <= ?3",
+        params![session, from, to],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    let tool_calls: i64 = conn.query_row(
+        "SELECT COALESCE(SUM(tu.n), 0)
+         FROM cc_tool_use tu JOIN cc_usage cu USING (message_id)
+         WHERE cu.session_id = ?1 AND cu.ts >= ?2 AND cu.ts <= ?3",
+        params![session, from, to],
+        |r| r.get(0),
+    )?;
+    let tool_errors: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM cc_tool_result
+         WHERE session_id = ?1 AND ts >= ?2 AND ts <= ?3 AND is_error = 1",
+        params![session, from, to],
+        |r| r.get(0),
+    )?;
+    Ok(BlockTotals {
+        cost,
+        total_tokens,
+        messages,
+        tool_calls,
+        tool_errors,
+    })
+}
+
 /// Flag sessions whose token usage is a statistical outlier (mean + 2σ) versus
 /// the rest of the window, returned sorted by tokens descending. Needs at least
 /// `MIN_SESSIONS` to have a meaningful baseline; below that, returns empty so a
@@ -631,6 +731,43 @@ impl StatsDb {
     pub fn sessions_all(&self) -> Result<Vec<SessionUsage>, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         sessions_in(&conn, "0", "A", None)
+    }
+
+    /// Sums for one task block (see `BlockTotals`).
+    pub fn block_totals(
+        &self,
+        session: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<BlockTotals, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        block_totals_in(&conn, session, from, to)
+    }
+
+    /// Who spent the block: the main loop plus one row per agent instance that
+    /// billed inside the span (see `BlockAgent`). A block with more than one
+    /// agent row is a block that covers PARALLEL work — the case the plain
+    /// `(task, session, interval)` model cannot separate on its own.
+    pub fn block_agents(
+        &self,
+        session: &str,
+        from: &str,
+        to: &str,
+    ) -> Result<Vec<BlockAgent>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        block_agents_in(&conn, session, from, to)
+    }
+
+    /// Same, for a whole list of blocks under one lock. Order matches the input.
+    pub fn block_totals_many(
+        &self,
+        spans: &[(String, String, String)],
+    ) -> Result<Vec<BlockTotals>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        spans
+            .iter()
+            .map(|(s, f, t)| block_totals_in(&conn, s, f, t))
+            .collect()
     }
 
     /// Total Claude Code cost (USD) recorded in `[from, to)`. Drives the daily

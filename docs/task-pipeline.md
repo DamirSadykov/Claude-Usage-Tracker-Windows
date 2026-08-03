@@ -56,7 +56,7 @@ the same non-blocking edge from the text. If B must finish before A starts, it's
 ### 3. Set node type — `auto` | `manual`
 
 ```
-<cli> todos set-kind <id> auto|manual
+<cli> todos set kind <id> auto|manual
 ```
 
 This is the load-bearing decision — it sets **who has the authority to close the
@@ -71,7 +71,10 @@ node**:
   session, the session **has the authority to set it `done`** after that check.
   Only mark a node `auto` when a headless run can actually *verify* success
   (build/tests green, an invariant holds) — the oracle is your own verification,
-  and a wrong auto-close compounds down the chain to the next manual gate.
+  and a wrong auto-close compounds down the chain to the next manual gate. An
+  `auto` node with no declared `verify` is accepted but only warns — the
+  headless runner then treats it as a gate anyway (`isGate` in `run.mjs`): the
+  authority to close comes from the check itself, not from the flag alone.
 
 ### 4. Run the pipeline
 
@@ -91,7 +94,7 @@ blocks it). Walk the frontier in dependency order:
 
 - **auto node** → do the work, **verify it**, then close and hand off:
   ```
-  <cli> todos set-status <id> done
+  <cli> todos set status <id> done
   <cli> todos handoff set <id> --text "<what it produced; next step; gotchas>"
   ```
   The handoff flows forward along dep edges (#141) to whatever depends on this.
@@ -113,8 +116,8 @@ chain never ran — the graph would show `ready` for edges that were never
 satisfied. So the CLI enforces the invariant at the write:
 
 ```
-<cli> todos set-status <id> done          # refused while a direct prereq isn't done
-<cli> todos set-status <id> done --force  # explicit override
+<cli> todos set status <id> done          # refused while a direct prereq isn't done
+<cli> todos set status <id> done --force  # explicit override
 ```
 
 The refusal names the blocking tasks and their columns. Only **direct**
@@ -134,7 +137,7 @@ gotchas, the suggested next step — written for the task(s) that depend on it:
 ```
 
 You don't have to ask for the baton: moving a task to `in_progress` via
-`set-status` **auto-prints** the handoffs of its direct prerequisites. Only
+`set status` **auto-prints** the handoffs of its direct prerequisites. Only
 direct ones are read — cumulative context still chains forward because a handoff
 is authored prose that can itself reference upstream tasks as `t#N`.
 
@@ -174,12 +177,12 @@ Driving it:
 ```
 <cli> todos ready --auto         # → #10 (only node with all deps done)
 # ... do #10, verify (tests green) ...
-<cli> todos set-status 10 done
+<cli> todos set status 10 done
 <cli> todos handoff set 10 --text "schema in src/settings-schema.ts; readers must go through parseSettings(); gotcha: legacy `pending` status folds to backlog"
 <cli> todos ready --auto         # → #11 (released by #10)
-<cli> todos set-status 11 in_progress    # auto-prints #10's handoff — the baton arrives
+<cli> todos set status 11 in_progress    # auto-prints #10's handoff — the baton arrives
 # ... do #11, verify ...
-<cli> todos set-status 11 done
+<cli> todos set status 11 done
 <cli> todos handoff set 11 --text "..."
 <cli> todos ready --auto         # → (empty) — the frontier is now manual
 <cli> todos ready --manual       # → #12: the human gate
@@ -189,82 +192,167 @@ Driving it:
 Trying to jump the chain is refused:
 
 ```
-<cli> todos set-status 12 done
+<cli> todos set status 12 done
 # refusing: #12 depends on unfinished task(s): #11 [in_progress]
 # finish those first, or override with --force
 ```
 
-## Themes — a root task as the aggregator (t#255)
+## Changes — a root task as the aggregator (t#255, renamed `theme` → `change` at t#345)
 
-How a piece of work **bigger than one task** lives on the graph — as a **theme**:
+How a piece of work **bigger than one task** lives on the graph — as a
+**change**. The entity used to be called a *theme*; the field, the setter and
+every command were renamed to `change` (old data with `theme` still reads
+fine — see below — but write the new name). See `tasks#changes` for the
+invariants behind this; here is how you drive it:
 
-- A theme is an ordinary **root task that `depends_on` all of its children.** No
+- A change is an ordinary **root task that `depends_on` all of its children.** No
   new entity: the aggregation *is* the dep edges. The root **closes last** — the
   done-gate already refuses `done` while a prerequisite is open, so the order is
   enforced, not just conventional.
 - A root is **worth creating from ~4–5 nodes**; below that the children speak for
-  themselves. Name it so it reads as a container (e.g. `ТЕМА: <what>`), file it on
-  the same board as its children (deps are intra-board).
-- **Mark the root explicitly** — `todos set-theme <id> on` (or `add --theme`).
-  The stored flag is what lets consumers (the vision hook, t#252) find the vision
+  themselves. Name it so it reads as a container (e.g. `CHANGE: <what>`), file it
+  on the same board as its children (deps are intra-board).
+- **Mark the root explicitly** — `todos set change <id> on` (or `add --change`;
+  the old `todos set theme … on` / `add --theme` spellings no longer write —
+  only `change` does). The stored flag is what lets consumers find the root
   deterministically: walk UP the reverse dep edges to the nearest dependent with
-  `theme` on, instead of guessing which downstream task is "the" aggregator. The
-  fold behaviour in the graph stays universal; the flag only marks intent.
-- **The theme's vision lives in the root task's DESCRIPTION** — deliberately *not*
-  a separate field (t#255): the description already travels everywhere a task
-  shows (card, CLI, hooks), and a second free-text field would split the story.
-  Write it as the north star for anyone working a child: what the whole chain is
-  for and what "done" means for the theme.
+  `change` on, instead of guessing which downstream task is "the" aggregator.
+  The fold behaviour in the graph stays universal; the flag only marks intent.
+  A file (or a board) written before the rename with `theme: true` still counts
+  as a change root — the reader accepts either field — but nothing is ever
+  written back out under the old name.
+- **The change root's DESCRIPTION carries the change's DELTA — what this round
+  changes and why now** — not the vision. Vision as a concept has moved to the
+  spec the change is about (`docs/specs/README.md` §1): the spec is the
+  long-lived "what should exist and why", a change is a temporary delta against
+  it, and dies with its graph once closed. The description-printing mechanics
+  below are unchanged from before the rename; only what belongs in the text is
+  different — write it as "what this round is doing and why now", not as a
+  north star meant to outlive the change.
 - Direction of reading matters: the **description is read UPWARD** — working a
-  child, the vision arrives on its own (t#252, the replacement for the phases
-  hook's vision): `set-status <id> in_progress` auto-prints the nearest theme
-  root's description next to the inherited handoff, the SessionStart hook
-  re-surfaces it for every in_progress task it shows (so the north star survives
-  the session boundary), and `todos vision <task>` re-reads it on demand. The
-  walk stops at the **nearest** root along each branch — an outer theme wrapping
-  an inner one stays out of view. The root's **handoff stays the usual
-  DOWNSTREAM baton** to whatever depends on the root itself.
+  child, the delta arrives on its own: `set status <id> in_progress` auto-prints
+  the nearest change root's description next to the inherited handoff, the
+  SessionStart hook re-surfaces it for every in_progress task it shows (so it
+  survives the session boundary), and `todos vision <task>` re-reads it on
+  demand (the command name is unchanged). The walk stops at the **nearest** root
+  along each branch — an outer change wrapping an inner one stays out of view.
+  The root's **handoff stays the usual DOWNSTREAM baton** to whatever depends on
+  the root itself.
+- A change can point at the spec section(s) it is a delta of via
+  `todos set spec <task> <domain>#<slug>` — see `tasks#spec-registry`. That link
+  is what carries the vision the description used to serve alone; nothing here
+  forces you to set it.
+- **Setting it puts a gate at the other end.** Moving a linked task to
+  `review`/`done` will not let the session stop until it has answered for each
+  addressed section:
 
-## Plan mode — the task-forming ritual (t#253)
+  ```
+  <cli> spec answer <task> unchanged --text "why the section still holds"
+  <cli> spec answer <task> updated   --text "what moved in it"   # edit the section FIRST
+  ```
 
-Plan mode is where themes COME FROM: the plan is written for the writer (and the
-sessions after them), then transcribed into the tracker. Two PostToolUse hooks,
-wired by the installer next to SessionStart/Stop:
+  The Stop hook prints the section in full and asks about THAT, because the way
+  the genre rotted was spot edits made without rereading (t#338). `updated`
+  stamps the section's `updated`/`change` for you. One answer covering two
+  sections, or a sentence copied from the answer you just gave, is refused.
+- **Never write `t#N` into a spec section.** A spec is the state that outlives
+  the tasks; a task number in it goes stale the moment the task closes, and the
+  section stops being readable without the board open next to it. Say WHAT was
+  decided without the number — who and when is `git blame` plus the section's
+  `change` stamp, which the machine writes. `spec lint` and `spec answer
+  updated` both refuse a section that carries one.
 
-- **EnterPlanMode** (`cli.mjs plan-hook enter`) injects the format before the
-  plan is written: a VISION paragraph ("должно X, решили Y, потому что Z"),
-  numbered STEPS where **one step = one session**, and a final ORDER line in
-  arrow notation (`Порядок: 1 -> 2 -> 3; 2 -> 5`) stating REAL blockers only.
-- **ExitPlanMode** (`cli.mjs plan-hook exit`) instructs the session to record
-  the accepted plan under the field-role split (below): several steps → a theme
-  root (`add --theme`, the VISION paragraph → its description, STEPS + ORDER →
-  `set-plan` — **never both places**) plus one task per step and `dep add` per
-  ORDER arrow; a one-session plan → vision → `set-description` (only onto an
-  empty description), steps → `set-plan` on the task itself. The hook also runs
-  the deterministic **match-plan** step: if `matchPlanCli` in the tracker's
-  settings.json names a kb-style CLI, the plan text goes through
-  `match-plan --json` and any case-warnings are injected (and asked to be
-  persisted as a comment) — zero warnings stay silent, and a matcher failure
-  never blocks the recording.
+## Plan mode — the task-forming ritual (t#253, rebuilt as a file format at t#314/t#321)
 
-### Field roles — one line each (t#253 review)
+Plan mode is where changes COME FROM, but **the plan is not a ritual you
+transcribe by hand any more.** A plan is a YAML file in the tracker's own
+process-graph language — one step per task — documented in full in
+`docs/plan-format.md` (read it once per session, not once per plan; §4 there is
+a complete worked example). This section is the short version of how the hooks
+carry it; the invariants themselves are `tasks#plan-mode`.
+
+The shape, in brief (full rules in `docs/plan-format.md`):
+
+```yaml
+change: "CHANGE: <name>"   # optional; without it the steps land rootless
+vision: |                  # the WHAT & WHY paragraph — becomes the change's description
+parallel: <N>              # steps the runner may drive at once
+budget: <usd>              # the group's ceiling
+steps:
+  <n>:
+    title: <phrase>         # or: task: <N>  — continue a task already on the board
+    why: |                  # what this step rests on, its risk — becomes the task's description
+    needs: [<n>, <n>]       # REAL blockers only — the only place order lives
+    produces: [<path>]
+    verify: <cmd>
+    retry: <M>
+    on-issue: <n>
+    kind: auto|manual
+    budget: <usd>
+```
+
+Three hooks, wired by the installer next to SessionStart/Stop:
+
+- **EnterPlanMode / a prompt sent while in plan mode** (`cli.mjs plan-hook
+  enter|prompt`) points you at `docs/plan-format.md` instead of repeating the
+  format inline — once per session (a marker file dedupes `enter` and `prompt`
+  firing in the same session).
+- **PreToolUse on ExitPlanMode** (`cli.mjs plan-guard`) — **the gate that
+  actually enforces the language.** It checks the plan text **before the user
+  ever sees the confirmation prompt**: a text that isn't readable as the graph
+  language, or that is but breaks a rule (a cycle in `needs`, an `on-issue`
+  with no `retry`, a `needs`/`on-issue` pointing at a step that doesn't exist,
+  a step with neither `title` nor `task`, a `task` naming no task on the board
+  or one already bound to an earlier step, …), is refused with the broken rule
+  named, and the prompt never appears. The one declared
+  way out is a first line `discussion: <what is being settled, and why it opens
+  no task>` — for plan-mode use that only thinks a question through and starts
+  no work; it passes untouched and records nothing. A bare `discussion: true`,
+  a reason too short to name anything, or a plan mixing `discussion:` with real
+  steps is refused. These are the same rules `todos apply`/`todos lint` run, so
+  the wording never drifts between the three.
+- **PostToolUse on ExitPlanMode** (`cli.mjs plan-hook exit`) — **records an
+  approved plan itself; there is no manual step to run.** It reads the plan
+  text and the harness's approved/rejected verdict off the tool payload, runs
+  `applyDocument` (the same engine behind `todos apply <plan>.yaml --go`), and
+  reports back which tasks were created/matched. A plan the user turned down
+  records nothing. It also runs the deterministic **match-plan** step: if
+  `matchPlanCli` in the tracker's settings.json names a kb-style CLI, the plan
+  text goes through `match-plan --json` and any case-warnings are injected
+  (and asked to be persisted as a comment) — zero warnings stay silent, and a
+  matcher failure never blocks the recording. **Currently broken and silent**:
+  this branch reads the plan from `tool_input.plan`, which the harness leaves
+  empty (recording works because it reads `tool_response` instead), so the
+  warnings never arrive and their absence is indistinguishable from "nothing to
+  say" — t#271. Do not read a quiet plan mode as a clean one.
+
+`todos apply <plan>.yaml [--go]` and `todos lint [<change>] [--json]` are what
+is **left over** for a plan the exit hook could not read as a document (prose,
+or a plan written outside plan mode) — that instruction is the fallback path,
+not the normal one — and for checking the recorded graph afterward. Re-applying
+the same file **updates** the graph instead of forking it: a step is matched to
+its task by `task: <N>` first, by title otherwise (children of the change
+first, then the rest of the project's board).
+
+### Field roles — one line each (t#253 review, updated at t#345)
 
 Four text fields, four roles; the same sentence never lives in two of them:
 
 | Field | Role |
 |---|---|
-| `description` | WHAT & WHY. A theme root's description **is** the theme's VISION. |
-| `plan` | HOW only: the STEPS + ORDER part of the accepted plan; rewritten on re-plan. |
+| `description` | WHAT & WHY of the change itself. A change root's description **is the change's DELTA** — what this round changes and why now, not a vision meant to outlive it (vision lives in the spec, `docs/specs/README.md` §1). |
+| `plan` | HOW only: the STEPS/ORDER text, when a plan was recorded onto a single task instead of a change root; rewritten on re-plan. |
 | `handoff` | The RESULT baton passed down the dep graph (what was produced; next move; gotchas). |
 | `comments` | The journal: decisions, scope changes, gotchas along the way; append-only. |
 
-The v2 load migration in `todos.rs` (`migrate_plan_roles`) heals pre-split data:
-a `plan` that was just a phases-dir pointer is archived as a comment; a
-ritual-recorded plan on an empty description is split (intro → description,
-steps stay).
+The v2 load migration in `todos.rs` (`migrate_plan_roles`) heals data recorded
+before this split: a `plan` that was just a phases-dir pointer is archived as a
+comment; a ritual-recorded plan sitting on an empty description is split (intro
+→ description, steps stay in `plan`).
 
 Plan mode is NOT mandatory — a task created or taken without it works as before;
-the ORDER/vision structure just doesn't get written for free.
+the declarations (`produces`/`verify`/…) and dep edges just don't get written
+for free.
 
 ## Why the discipline matters
 
@@ -280,7 +368,15 @@ In the tracker's graph window, **Dependencies** tab:
 - **corner dot** = pipeline state — red `blocked`, green `ready` (auto), amber
   `ready` (manual, i.e. waiting for you);
 - **`⚡`** = an auto node;
-- **`⊖` on a node** folds its exclusive prerequisite subtree (a theme) into the
-  root — the badge shows the fold's `done/total`; click the badge to unfold;
+- **an expanded change draws as an accordion section**, not a plain node: a
+  frame around its exclusive prerequisite subtree, the root as the section's
+  header card on the left, its members laid out as an ordinary pipeline on the
+  right — member→root edges are not drawn (the frame shows membership instead),
+  edges crossing the section's border draw as usual. Click **`⊖`** on the root
+  card to fold the whole section into one card showing `done/total`; click the
+  folded badge to unfold again. A change nested inside another change is drawn
+  as a plain node — only the outermost root gets the section treatment.
 - with a node selected, the **"Component only"** toolbar button cuts the view to
   that task's connectivity component (works on both tabs).
+
+See `tasks#ui` for the rest of the graph window (the Ref tab, search, hotkeys).

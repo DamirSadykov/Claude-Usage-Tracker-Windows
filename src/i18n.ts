@@ -246,6 +246,53 @@ const messages = {
     statusMapEmpty: "Statuses will appear here after the first external-task poll.",
     viewBoard: "Board",
     viewGraph: "Graph",
+    viewSpecs: "Specs",
+    specRefresh: "Re-read the registry",
+    specNoDomains: "No specs in this project — the registry looks for <domain>/spec.md under specRoot",
+    specTryThese: "Projects that do have one:",
+    specBySection: "By section",
+    specByChange: "By change",
+    specConcurrent: "Two or more open changes touch this section — the second stamp overwrites the first's provenance",
+    specFocus: "Show only the bullets this change wrote",
+    specFocusOff: "show all",
+    specDiffLive: "in flight — against the file as it stands now",
+    specDiffFrozen: "recorded when the change closed",
+    todoSpec: "Spec",
+    todoSpecInherited: "inherited from the change root",
+    todoSpecHint: "Open this section on the Specs tab",
+    // --- per-block help for the Specs tab (shared insight-help markdown) ---
+    specHelpRegistry:
+      "## What this list is\n" +
+      "The spec domains of the selected project and the sections inside each. The registry reads `<domain>/spec.md` under `specRoot` (a setting, `docs/specs` by default); the project directory itself comes from the Claude Code transcripts.\n\n" +
+      "- Projects that have a registry are listed first; the rest are marked with a dot.\n" +
+      "- A section's address is `<domain>#<slug>` — the same string a task uses to link to it.\n" +
+      "- `part` is the section's role: requirements (what must exist), design (how it is built), invariants (what must not break).\n" +
+      "- A section marked external is declared here while its text lives in another repository.",
+    specHelpSection:
+      "## The spec section\n" +
+      "The long-lived state of a subsystem — what stays true between tasks. The SECTION, not the file, is the unit of reading: taking a linked task puts exactly this into the session's context.\n\n" +
+      "- The date and `t#N` on the right say when the section last moved and which change moved it.\n" +
+      "- `refs` are the neighbouring sections this one looks at. They are kept as addresses, never as text: follow one only when you actually need it.\n" +
+      "- The size guide is about 120 lines. A section past it is split in two, or injecting one section quietly becomes injecting half the file again.",
+    specHelpChanges:
+      "## Changes on this section\n" +
+      "Tasks whose `spec` field names this address. A change is the DELTA to the spec — what this round changes and why now. Under a change root its task graph is expanded.\n\n" +
+      "- The link is made with `todos set spec <task> <domain>#<slug>`.\n" +
+      "- A step inherits its change root's address when it declares none of its own.\n" +
+      "- Clicking a row opens that task's card.",
+    specHelpAnswers:
+      "## Closing answers\n" +
+      "When a session closes a linked task, the Stop hook shows it this section IN FULL and will not let it stop without an answer: `unchanged` — the section still holds, `updated` — it drifted and was edited.\n\n" +
+      "- The answer is given with `cli spec answer`, not as a phrase in the conversation: the guard looks for a record, because a guard that matches wording only teaches you to reword.\n" +
+      "- `updated` stamps the section's date and change for you.\n" +
+      "- The answers are listed together on purpose: the same boilerplate given to different sections is only visible side by side.",
+
+    specPickSection: "Pick a section on the left",
+    specExternal: "external",
+    specChanges: "Changes on this section",
+    specNoChanges: "No task links to this section (todos set spec <task> <domain>#<slug>)",
+    specAnswers: "Closing answers",
+    specNoAnswers: "No task has answered for this section yet",
     graphTabDeps: "Dependencies",
     graphTabRef: "References",
     graphExternal: "other project",
@@ -273,9 +320,36 @@ const messages = {
     graphFocusComponent: "Component only",
     graphFocusHint: "Show only the tasks connected to the selected one (its connectivity component)",
     graphFocusChip: "only {task}",
-    graphCollapseTheme: "Fold this task's prerequisite subtree (theme) into one node",
-    graphExpandTheme: "Unfold the hidden subtree — the badge is its done/total",
-    graphLegendTheme: "collapsed theme — done/total of the folded subtree",
+    graphCollapseChange: "Fold this task's prerequisite subtree (change) into one node",
+    graphExpandChange: "Unfold the hidden subtree — the badge is its done/total",
+    graphLegendChange: "collapsed change — done/total of the folded subtree",
+    graphRun: "Run layer",
+    graphRunHint:
+      "Overlay what each task actually cost: money, time and agents per node, from the binding journal (t#306). Only tasks inside a change carry it.",
+    graphRunLoading: "reading blocks…",
+    graphRunNoData: "No change on this view carries run data yet",
+    graphRunMeasured: "measured",
+    // Short forms go INSIDE the node (190px wide); the full wording is the
+    // tooltip and the panel.
+    graphRunNoInProgress: "not worked",
+    graphRunNoBlocks: "no journal",
+    graphRunEmptyBlocks: "empty block",
+    graphRunNoInProgressFull: "never taken into work — no block exists",
+    graphRunNoBlocksFull: "the session predates the binding journal",
+    graphRunEmptyBlocksFull: "block is degenerate — the work landed in a neighbour",
+    graphRunCalendar: "span (calendar time of the change, not work)",
+    graphRunPanel: "Run of #{n}",
+    graphRunBlocks: "Blocks",
+    graphRunAgents: "Who worked",
+    graphRunMainLoop: "main loop",
+    graphRunTranscript: "transcript",
+    graphRunTranscriptHint: "Show this block's transcript in the file manager",
+    graphRunAgentTranscriptHint:
+      "Show this agent's transcript. Available while the task has a single block — with several, which session ran the agent is not recorded.",
+    graphRunTaskCost: "whole task",
+    graphRunUnattributed: "outside the blocks",
+    graphRunNoBlockRows: "No blocks — nothing bound this task to a session",
+    graphRunClose: "Close",
     todoFilterAll: "All projects",
     todoFrom: "from",
     todoFromHint: "Filed from this project (a cross-project task)",
@@ -285,6 +359,21 @@ const messages = {
     todoCostHint: "Claude Code spend attributed to this task",
     todoCostSessions: "session(s)",
     todoCostTokens: "tokens",
+    todoBlocks: "Cost by block",
+    todoBlocksHint:
+      "One block = this task worked by one session over one stretch of time. A session binds itself with `todos take <id>`, or implicitly when it moves the task to in_progress.",
+    todoBlocksEmpty:
+      "No blocks yet — no session has bound itself to this task. Older work is attributed per whole session instead.",
+    todoBlocksExplicit: "declared",
+    todoBlocksAuto: "guessed",
+    todoBlocksAutoHint:
+      "Bound automatically by the SessionStart hook because this was the only in_progress task — not declared by the session itself.",
+    todoBlocksCalls: "calls",
+    todoBlocksErrors: "errors",
+    todoBlocksSum: "blocks total",
+    todoBlocksOutside: "outside blocks",
+    todoBlocksOutsideHint:
+      "Attributed to the task but not inside any block: work between blocks, or sessions that predate the binding journal. Not an error — it is the part the block split cannot place.",
     statusPending: "Pending",
     statusInProgress: "In progress",
     statusDone: "Done",
@@ -910,6 +999,53 @@ const messages = {
     statusMapEmpty: "Статусы появятся здесь после первого поллинга внешних задач.",
     viewBoard: "Доска",
     viewGraph: "Граф",
+    viewSpecs: "Спеки",
+    specRefresh: "Перечитать реестр",
+    specNoDomains: "В проекте нет спек — реестр ищет <домен>/spec.md внутри specRoot",
+    specTryThese: "Спеки есть у проектов:",
+    specBySection: "По разделам",
+    specByChange: "По change'ам",
+    specConcurrent: "На раздел открыто больше одного change'а — штамп второго затрёт провенанс первого",
+    specFocus: "Показать только пункты, которые написал этот change",
+    specFocusOff: "показать все",
+    specDiffLive: "в работе — против файла, каким он сейчас",
+    specDiffFrozen: "записан при закрытии change'а",
+    todoSpec: "Спека",
+    todoSpecInherited: "унаследована от change-root'а",
+    todoSpecHint: "Открыть раздел на вкладке «Спеки»",
+    // --- пояснения к блокам вкладки Specs (общий insight-help markdown) ---
+    specHelpRegistry:
+      "## Что это за список\n" +
+      "Домены реестра спек выбранного проекта и разделы внутри каждого. Реестр читает `<домен>/spec.md` внутри `specRoot` (настройка, по умолчанию `docs/specs`), а каталог самого проекта берётся из транскриптов Claude Code.\n\n" +
+      "- Проекты со спеками стоят в списке первыми, остальные помечены точкой.\n" +
+      "- Адрес раздела — `<домен>#<слаг>`, той же строкой задача на него ссылается.\n" +
+      "- `part` — роль раздела: требования (что должно быть), устройство (как сделано), инварианты (что не должно ломаться).\n" +
+      "- Раздел, помеченный как внешний, объявлен здесь, а текст его живёт в другом репозитории.",
+    specHelpSection:
+      "## Раздел спеки\n" +
+      "Долгоживущее состояние подсистемы — то, что остаётся верным между задачами. Единица чтения — РАЗДЕЛ, а не файл: при взятии слинкованной задачи в контекст сессии попадает ровно он.\n\n" +
+      "- Дата и `t#N` справа — когда раздел двигали в последний раз и какой change это сделал.\n" +
+      "- `refs` — соседние разделы, на которые этот смотрит. Хранятся адресами, а не текстом: разворачивать по ссылке стоит только тогда, когда сосед реально понадобился.\n" +
+      "- Ориентир размера — около 120 строк. Переросший раздел делят надвое, иначе впрыск одного раздела снова тихо становится впрыском половины файла.",
+    specHelpChanges:
+      "## Change'и на этом разделе\n" +
+      "Задачи, чьё поле `spec` называет этот адрес. Change — это ДЕЛЬТА к спеке: что меняется в этом заходе и почему сейчас. Под change-root'ом раскрыт его граф задач.\n\n" +
+      "- Связь ставится командой `todos set spec <задача> <домен>#<слаг>`.\n" +
+      "- Шаг наследует адрес своего change-root'а, если не объявил собственного.\n" +
+      "- Клик по строке открывает карточку задачи.",
+    specHelpAnswers:
+      "## Ответы при закрытии\n" +
+      "Когда сессия закрывает слинкованную задачу, Stop-хук показывает ей этот раздел ЦЕЛИКОМ и не отпускает без ответа: `unchanged` — раздел всё ещё верен, `updated` — разошёлся и правлен.\n\n" +
+      "- Ответ даётся командой `cli spec answer`, а не фразой в переписке: гард ищет запись, потому что гард, сверяющий формулировку, учит переформулировать, а не думать.\n" +
+      "- `updated` сам проставляет разделу дату и change.\n" +
+      "- Ответы стоят списком намеренно: одинаковая отписка на разные разделы видна только рядом.",
+
+    specPickSection: "Выберите раздел слева",
+    specExternal: "внешний",
+    specChanges: "Change'ы на этом разделе",
+    specNoChanges: "Ни одна задача не ссылается на раздел (todos set spec <задача> <домен>#<слаг>)",
+    specAnswers: "Ответы при закрытии",
+    specNoAnswers: "По этому разделу ещё никто не отвечал",
     graphTabDeps: "Зависимости",
     graphTabRef: "Ссылки",
     graphExternal: "другой проект",
@@ -937,9 +1073,36 @@ const messages = {
     graphFocusComponent: "Только компонента",
     graphFocusHint: "Показать только задачи, связанные с выбранной (её компоненту связности)",
     graphFocusChip: "только {task}",
-    graphCollapseTheme: "Свернуть поддерево-предпосылки этой задачи (тему) в один узел",
-    graphExpandTheme: "Развернуть скрытое поддерево — бейдж: готово/всего",
-    graphLegendTheme: "свёрнутая тема — готово/всего в свёрнутом поддереве",
+    graphCollapseChange: "Свернуть поддерево-предпосылки этой задачи (change) в один узел",
+    graphExpandChange: "Развернуть скрытое поддерево — бейдж: готово/всего",
+    graphLegendChange: "свёрнутый change — готово/всего в свёрнутом поддереве",
+    graphRun: "Слой прогона",
+    graphRunHint:
+      "Наложить на граф, во что задача обошлась: деньги, время и агенты на узле — из журнала привязок (t#306). Есть только у задач внутри change'а.",
+    graphRunLoading: "читаю блоки…",
+    graphRunNoData: "Ни один change на этом виде пока не несёт данных прогона",
+    graphRunMeasured: "измерено",
+    // Короткие формы — ВНУТРЬ узла (ширина 190px); полная фраза идёт в подсказку
+    // и в панель.
+    graphRunNoInProgress: "не бралась",
+    graphRunNoBlocks: "нет журнала",
+    graphRunEmptyBlocks: "блок пуст",
+    graphRunNoInProgressFull: "не бралась в работу — блока нет",
+    graphRunNoBlocksFull: "сессия старше журнала привязок",
+    graphRunEmptyBlocksFull: "блок вырожден — работа ушла в соседний",
+    graphRunCalendar: "размах (календарное время change'а, не работа)",
+    graphRunPanel: "Прогон #{n}",
+    graphRunBlocks: "Блоки",
+    graphRunAgents: "Кто работал",
+    graphRunMainLoop: "главный цикл",
+    graphRunTranscript: "транскрипт",
+    graphRunTranscriptHint: "Показать транскрипт этого блока в проводнике",
+    graphRunAgentTranscriptHint:
+      "Показать транскрипт агента. Доступно, пока у задачи один блок — при нескольких не записано, в какой сессии агент работал.",
+    graphRunTaskCost: "по задаче целиком",
+    graphRunUnattributed: "вне блоков",
+    graphRunNoBlockRows: "Блоков нет — задачу ни одна сессия к себе не привязала",
+    graphRunClose: "Закрыть",
     todoFilterAll: "Все проекты",
     todoFrom: "из",
     todoFromHint: "Поставлена из этого проекта (кросс-проектная задача)",
@@ -949,6 +1112,21 @@ const messages = {
     todoCostHint: "Атрибуцированная стоимость работы Claude Code по этой задаче",
     todoCostSessions: "сессий",
     todoCostTokens: "токенов",
+    todoBlocks: "Стоимость по блокам",
+    todoBlocksHint:
+      "Блок — это задача, которую одна сессия вела один отрезок времени. Сессия привязывает себя командой `todos take <id>` либо неявно, переводя задачу в in_progress.",
+    todoBlocksEmpty:
+      "Блоков пока нет — ни одна сессия не привязала себя к этой задаче. Прошлая работа считается целыми сессиями.",
+    todoBlocksExplicit: "объявлено",
+    todoBlocksAuto: "угадано",
+    todoBlocksAutoHint:
+      "Привязано автоматически хуком SessionStart, потому что задача была единственной в работе, — сама сессия этого не объявляла.",
+    todoBlocksCalls: "вызовов",
+    todoBlocksErrors: "ошибок",
+    todoBlocksSum: "сумма блоков",
+    todoBlocksOutside: "вне блоков",
+    todoBlocksOutsideHint:
+      "Отнесено к задаче, но не попало ни в один блок: работа между блоками либо сессии старше журнала привязок. Это не ошибка, а та часть, которую разрез на блоки не размещает.",
     statusPending: "В очереди",
     statusInProgress: "В работе",
     statusDone: "Готово",

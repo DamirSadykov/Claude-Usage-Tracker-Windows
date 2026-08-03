@@ -33,7 +33,7 @@
 import { readFileSync, openSync, readSync, closeSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { taskHandoffGuard } from "./settings.mjs";
+import { taskHandoffGuard, specDeltaGuard } from "./settings.mjs";
 
 const CLI = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "cli.mjs");
 
@@ -87,7 +87,7 @@ function sessionStartMs(transcriptPath) {
 // "was it touched in this window" (#219). A timestamp can't tell them apart — a
 // metadata edit, another session's move, or a hand-edit all bump `updated_at`, and
 // two sessions on one project share the same time window. The transcript can: it
-// is THIS session's own record, and every `todos set-status <ref> <status>` it ran
+// is THIS session's own record, and every `todos set status <ref> <status>` it ran
 // is a Bash tool_use whose command string we read back. A task another session
 // moved, or one this session merely mentioned (t#N in prose) or re-prioritized,
 // never appears here — so none of them can be dragged into this session's stop-gate.
@@ -97,15 +97,17 @@ function sessionStartMs(transcriptPath) {
 // its id and its number, and only gates it if the session set it to the status it
 // NOW has (we made that transition, not just some earlier one).
 
-// A `set-status <ref> <status>` inside a command already known to invoke the CLI.
+// A status move inside a command already known to invoke the CLI. BOTH spellings:
+// the command is `todos set status <ref> <status>` since t#310, and transcripts
+// older than that carry the `set-status <ref> <status>` it replaced.
 const SET_STATUS_RE =
-  /\bset-status\s+#?([\w-]+)\s+(backlog|queue|in_progress|review|done)\b/g;
+  /\bset[- ]status\s+#?([\w-]+)\s+(backlog|queue|in_progress|review|done)\b/g;
 
 // Pure parser over the raw JSONL transcript text — exported for the unit tests.
 export function parseSessionMoves(raw) {
   const moved = new Map();
   for (const line of String(raw || "").split("\n")) {
-    if (!line.includes("set-status")) continue; // cheap prefilter before JSON.parse
+    if (!/set[- ]status/.test(line)) continue; // cheap prefilter before JSON.parse
     let rec;
     try {
       rec = JSON.parse(line);
@@ -276,6 +278,7 @@ export function auditTasks(todos, project, sinceMs, movedBy, mode = "both") {
         id: t.id,
         subject: t.subject,
         kind,
+        status: t.status,
         stale: true,
         hadBaton: !!String(t.handoff || "").trim(),
         complaints: [],
@@ -294,12 +297,169 @@ export function auditTasks(todos, project, sinceMs, movedBy, mode = "both") {
         id: t.id,
         subject: t.subject,
         kind,
+        status: t.status,
         stale: false,
         hadBaton: true,
         complaints,
       });
   }
   return out;
+}
+
+// --- the SPEC-DELTA guard (t#341) ---------------------------------------------
+//
+// The genre died of silent drift: code moved, the section stayed put, and
+// nobody noticed for two weeks (t#338). docs/specs/README.md §8 puts the check
+// at the CLOSE of a task rather than at a PR, because over the audited period
+// there were 33 closed tasks and zero PRs — a guard on PRs would never have run.
+//
+// What it demands is an ANSWER, not a file change: `spec answer <task>
+// unchanged|updated --text "…"`. Two reasons it is the answer and not the diff:
+//
+//   • the failure being guarded against was a spot edit made WITHOUT rereading
+//     the section — §9 of the old spec was patched in place while two
+//     neighbouring bullets went on lying. So the guard prints the addressed
+//     section WHOLE and asks about it;
+//   • the answer must be structural. This session watched the sibling handoff
+//     guard block a perfectly good baton because its next step was worded
+//     "ПЕРВЫЙ ХОД" and not one of NEXT_RE's words — a phrase-matching gate
+//     teaches you to reword, not to think. So there is no prose to match: the
+//     record exists only if the command was run.
+//
+// Scope is CLOSING (review/done), same transcript attribution as the baton
+// guard, and the addresses are the same ones the in_progress injection showed
+// (own `spec`, else the change root's) — you are asked about what you were given.
+
+const answersOf = (t) => (Array.isArray(t.spec_answers) ? t.spec_answers.filter(Boolean) : []);
+
+// The floor an answer has to clear: the moment THIS work cycle was shown the
+// section. Anything older was written about a different state of the work, even
+// inside the same session — without a floor the bar is only "some time this
+// session", which lets a session close five tasks and file one batch of answers
+// at the end: the template answer §9 is about, arriving through the timing.
+//
+// The anchor is the BASELINE (`spec_seen[address].at`), recorded at the
+// in_progress injection, because it means exactly the thing being asked —
+// "answered about the text this work saw". The first shape of this measured
+// from the transition into the CURRENT status instead, and that re-armed the
+// guard on every subsequent move: answer, → review, answer again, → done,
+// answer again, all about text that never moved. Three identical answers in one
+// session, which is precisely the rot §9 names — manufactured by the guard.
+//
+// Re-opening a task records a new baseline, so an answer from the previous
+// cycle goes stale by itself, which is the case the strict version was after.
+// Without a baseline: the last entry into in_progress, else the session window.
+function answerFloorMs(t, address, sinceMs) {
+  const seen = (Array.isArray(t.spec_seen) ? t.spec_seen : []).find(
+    (x) => x && x.address === address,
+  );
+  const baseline = seen ? Date.parse(seen.at) : NaN;
+  if (Number.isFinite(baseline)) return baseline;
+  const history = Array.isArray(t.status_history) ? t.status_history : [];
+  for (let i = history.length - 1; i >= 0; i--) {
+    const h = history[i];
+    if (!h || h.status !== "in_progress") continue;
+    const ms = Date.parse(h.at);
+    if (Number.isFinite(ms)) return ms;
+    break;
+  }
+  return sinceMs;
+}
+
+// Which addressed sections of a closing task have no answer from THIS session.
+// `addressesFor(todo)` is injected so this stays a pure function over the board
+// (production passes a closure over todos.mjs's up-walk; the tests pass a stub).
+// An answer from an earlier session is `stale`, not missing: the section was
+// judged against work that is not this session's.
+export function auditSpecAnswers(todos, project, sinceMs, movedBy, addressesFor, mode = "on") {
+  if (mode === "off" || !Array.isArray(todos) || typeof addressesFor !== "function") return [];
+  const moved = movedBy instanceof Map ? movedBy : new Map();
+  const out = [];
+  for (const t of todos) {
+    if (!t || (t.project && t.project !== project)) continue;
+    if (t.status !== "review" && t.status !== "done") continue;
+    if (!movedIntoCurrentStatus(moved, t)) continue;
+    let addresses;
+    try {
+      addresses = addressesFor(t) || [];
+    } catch {
+      continue; // the board's shape surprised us → never block on a guess
+    }
+    if (!addresses.length) continue;
+    const answers = answersOf(t);
+    const owed = [];
+    for (const address of addresses) {
+      // Per address, not per task: two linked sections can be shown at
+      // different moments, and one of them being fresh says nothing about the
+      // other.
+      const after = answerFloorMs(t, address, sinceMs);
+      const a = answers.find((x) => x.address === address);
+      const at = a ? Date.parse(a.at) : NaN;
+      if (!a) owed.push({ address, state: "missing" });
+      else if (!(Number.isFinite(at) && at >= after))
+        owed.push({ address, state: "stale", verdict: a.verdict });
+    }
+    if (owed.length)
+      out.push({ number: t.number, id: t.id, subject: t.subject, status: t.status, owed });
+  }
+  return out;
+}
+
+// The addressed sections printed in full, as §8 requires — but a stop message
+// is read in a terminal, so past a few sections the rest are named by address
+// and the cap is stated rather than applied in silence.
+const SECTION_PRINT_CAP = 3;
+
+function specReason(tasks, { blocks = [], omitted = 0, lint = [] } = {}) {
+  const lines = [
+    `STOP blocked — a task closed on a spec link left the section unanswered.`,
+    ``,
+  ];
+  for (const t of tasks) {
+    lines.push(`  · task #${t.number} "${t.subject}" (${t.status}):`);
+    for (const o of t.owed)
+      lines.push(
+        `      – ${o.address}: ${o.state === "missing" ? "нет ответа" : `ответ "${o.verdict}" записан ДО того, как задача сюда перешла`}`,
+      );
+  }
+  lines.push(
+    ``,
+    `The spec is the long-lived state; the task was the delta. Read the section`,
+    `BELOW IN FULL — not the line you happen to remember — and say which it is:`,
+    ``,
+  );
+  for (const t of tasks) {
+    for (const o of t.owed) {
+      lines.push(
+        `  node "${CLI}" spec answer ${t.number} unchanged --text "<почему раздел всё ещё верен после этой работы>" --address ${o.address}`,
+        `  node "${CLI}" spec answer ${t.number} updated   --text "<что в разделе разошлось и как поправлено>" --address ${o.address}`,
+      );
+    }
+  }
+  lines.push(
+    ``,
+    `\`updated\` expects the section itself to be edited first — the command only`,
+    `stamps its provenance (updated/change). Answering per section is deliberate:`,
+    `one sentence covering two sections is the template answer README §9 calls rot.`,
+    ``,
+  );
+  if (lint.length) {
+    lines.push(
+      `Реестр вдобавок жалуется на эти же разделы — почини заодно, ты уже здесь:`,
+      ``,
+      ...lint.map((f) => `  ✗ ${f.message}`),
+      ``,
+    );
+  }
+  for (const s of blocks) {
+    lines.push(`──────── ${s.address} ────────`, s.text, ``);
+  }
+  if (omitted)
+    lines.push(
+      `(${omitted} more addressed section(s) not printed here — read them with \`spec show <адрес>\`)`,
+      ``,
+    );
+  return lines.join("\n");
 }
 
 // The tracker's todos.json — the same file the SessionStart hook reads. Returns
@@ -333,7 +493,7 @@ function reason(tasks) {
   for (const t of tasks) {
     const what =
       t.kind === "submitted"
-        ? "you moved it to review/done"
+        ? `you moved it to ${t.status || "review/done"}`
         : "you worked it and left it in_progress";
     if (t.stale) {
       lines.push(
@@ -349,11 +509,11 @@ function reason(tasks) {
 
   lines.push(
     ``,
-    `A handoff is the ONLY thing that survives this session: a task's baton is`,
-    `surfaced to whatever DEPENDS ON it. Write for whoever picks the work up next —`,
-    `what's done that they build on, the decision or gotcha they'd otherwise`,
-    `re-discover, and the concrete first move. Not a summary of the task they can`,
-    `already read.`,
+    `A handoff is the one channel a DEPENDENT task gets automatically: it is`,
+    `surfaced the moment that task moves to in_progress, without anyone going`,
+    `looking. Write for whoever picks the work up next — what's done that they`,
+    `build on, the decision or gotcha they'd otherwise re-discover, and the`,
+    `concrete first move. Not a summary of the task they can already read.`,
     ``,
   );
   for (const t of tasks) {
@@ -369,7 +529,49 @@ function reason(tasks) {
   return lines.join("\n");
 }
 
-function main() {
+// The spec side needs the board's up-walk (a task inherits its change root's
+// `spec`) and the registry's reader. Both are heavy relative to a hook that
+// runs on EVERY stop, so they are pulled in only once a closing task is in
+// scope — and a failure to load them stands the spec guard down rather than
+// breaking the session.
+async function specGuardParts(cwd, appData) {
+  try {
+    const [todosMod, specMod] = await Promise.all([
+      import("./todos.mjs"),
+      import("./spec.mjs"),
+    ]);
+    const root = specMod.resolveRoot(cwd, appData);
+    return {
+      addressesFor: (data) => (t) =>
+        todosMod.specAddressesFor(t, todosMod.changeRootsFor(data, t)).addresses,
+      render: (address) => {
+        const res = specMod.showSection(address, root, appData);
+        if (!res.ok) return `— ${address}: ${res.reason}`;
+        if (res.remote && !res.available)
+          return `— ${address}: ${res.unavailable}` + (res.stub ? `\n\n${res.stub}` : "");
+        return res.text || `— ${address}: (раздел пуст)`;
+      },
+      // Registry errors on the sections being asked about. Scoped to those on
+      // purpose: the guard is already interrupting for this task, and a session
+      // told about an unrelated domain's problems learns to skim the whole
+      // message. Run only when the guard fires, so a clean stop pays nothing.
+      lintFor: (addresses) => {
+        try {
+          const wanted = new Set(addresses);
+          return specMod
+            .validateRegistry(root, cwd)
+            .filter((f) => f.severity === "error" && wanted.has(f.address));
+        } catch {
+          return [];
+        }
+      },
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function main() {
   let input = {};
   try {
     input = JSON.parse(readFileSync(0, "utf8")) || {};
@@ -385,7 +587,8 @@ function main() {
     process.env.APPDATA ||
     path.join(process.env.USERPROFILE || "", "AppData", "Roaming");
   const taskMode = taskHandoffGuard(appData);
-  if (taskMode === "off") return; // switched off
+  const specMode = specDeltaGuard(appData);
+  if (taskMode === "off" && specMode === "off") return; // both switched off
 
   const since = sessionStartMs(input.transcript_path);
   if (since == null) return; // unknown session window → stand down
@@ -396,18 +599,53 @@ function main() {
   // those, never to another session's or a merely-touched task (#219).
   const movedBy = sessionMovedTasks(input.transcript_path);
   const tasks = auditTasks(todos, project, since, movedBy, taskMode);
-  if (!tasks.length) return;
+
+  // BOTH guards are judged in one pass and reported together, on purpose: the
+  // hook fires once per stop cycle (`stop_hook_active`), so a session blocked
+  // for a missing baton would sail past a missing spec answer on its next stop.
+  let specTasks = [];
+  let sections = { blocks: [], omitted: 0 };
+  if (specMode !== "off") {
+    const parts = await specGuardParts(cwd, appData);
+    if (parts) {
+      const board = { todos };
+      specTasks = auditSpecAnswers(
+        todos,
+        project,
+        since,
+        movedBy,
+        parts.addressesFor(board),
+        specMode,
+      );
+      const wanted = [];
+      for (const t of specTasks) for (const o of t.owed) if (!wanted.includes(o.address)) wanted.push(o.address);
+      sections = {
+        blocks: wanted.slice(0, SECTION_PRINT_CAP).map((address) => ({
+          address,
+          text: parts.render(address),
+        })),
+        omitted: Math.max(0, wanted.length - SECTION_PRINT_CAP),
+        lint: wanted.length ? parts.lintFor(wanted) : [],
+      };
+    }
+  }
+
+  if (!tasks.length && !specTasks.length) return;
+
+  const parts = [];
+  if (tasks.length) parts.push(reason(tasks));
+  if (specTasks.length) parts.push(specReason(specTasks, sections));
 
   // Exit 2 is the Stop hook's "block": stderr goes back to Claude as the reason.
-  process.stderr.write(reason(tasks) + "\n");
+  process.stderr.write(parts.join("\n") + "\n");
   process.exit(2);
 }
 
 // Entry for the unified dispatcher: `cli.mjs stop-hook`. Any unexpected failure
 // must leave the session alone — exit 0, no output, no block.
-export function run() {
+export async function run() {
   try {
-    main();
+    await main();
   } catch {
     process.exit(0);
   }

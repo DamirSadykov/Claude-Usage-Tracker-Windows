@@ -19,6 +19,13 @@ import { ref, computed, watch, onUnmounted } from "vue";
 import { useI18n } from "vue-i18n";
 import { invoke } from "@tauri-apps/api/core";
 import type { Todo } from "./TodoWindow.vue";
+import {
+  loadRunLayer,
+  loadTaskBlocks,
+  revealTranscript,
+  type RunGraphNode,
+  type RunBlock,
+} from "../graphModel";
 
 const props = defineProps<{
   todos: Todo[];
@@ -100,10 +107,10 @@ const byId = computed(() => {
 //           separate axis, not a sixth status. Shown as a corner dot on the Deps tab.
 const kindOf = (id: string): "auto" | "manual" =>
   byId.value.get(id)?.kind === "auto" ? "auto" : "manual";
-// Theme-root marker (t#255): stored flag, set via CLI `set-theme`. On the graph a
-// theme root's fold control is always visible (it's the designed fold target),
+// Change-root marker (t#255): stored flag, set via CLI `set-change`. On the graph a
+// change root's fold control is always visible (it's the designed fold target),
 // while ordinary nodes only reveal theirs on hover.
-const themeOf = (id: string): boolean => byId.value.get(id)?.theme === true;
+const changeOf = (id: string): boolean => byId.value.get(id)?.change === true;
 
 function pstateOf(id: string): "" | "blocked" | "ready" {
   const x = byId.value.get(id);
@@ -143,7 +150,7 @@ interface GNode {
   // dimmed to read as context, not part of the active filter.
   context?: boolean;
   extProject?: string;
-  // Theme root drawn as the heading card of an EXPANDED accordion section (t#264).
+  // Change root drawn as the heading card of an EXPANDED accordion section (t#264).
   sectionHead?: boolean;
   lines: string[]; // subject wrapped to fit the node width
   h: number; // node height, grown to fit the wrapped lines
@@ -166,12 +173,12 @@ interface DepBand {
   w: number;
   h: number;
 }
-// A theme's accordion section on the Deps tab (t#264): the frame around a theme
+// A change's accordion section on the Deps tab (t#264): the frame around a change
 // root's exclusive prerequisite subtree. The root card sits inside at the LEFT
 // edge as the section heading; the members lay out as their own pipeline to its
 // right. Collapsing rides the same fold as before (collapsedRoots) — a collapsed
-// theme is just the root card with its ▸ done/total badge, no frame.
-interface ThemeSection {
+// change is just the root card with its ▸ done/total badge, no frame.
+interface ChangeSection {
   rootId: string;
   x: number;
   y: number;
@@ -181,6 +188,7 @@ interface ThemeSection {
 
 const NODE_W = 190;
 const NODE_H = 46; // height of a single-line node; taller nodes add LINE_H each
+const RUN_H = 17; // extra height a node takes while the run layer is on (t#307)
 const LINE_H = 15; // subject line height
 const WRAP_CHARS = 26; // approx chars per line at NODE_W
 const MAX_LINES = 3; // subject lines before ellipsis
@@ -189,7 +197,7 @@ const V_GAP = 26; // vertical gap between stacked nodes (deps pipeline)
 const MARGIN = 40;
 const BAND_HEAD = 30; // vertical room above a project group for its heading (deps)
 const BAND_GAP = 46; // gap between stacked project groups (deps)
-const SECTION_PAD = 14; // frame padding around a theme section's content (deps)
+const SECTION_PAD = 14; // frame padding around a change section's content (deps)
 const SECTION_GAP = 34; // gap between stacked blocks (main flow / sections) in a band
 const SECTION_INNER_GAP = 34; // gap between a section's root card and its members
 
@@ -253,6 +261,16 @@ const shownTasks = computed(() =>
 
 // Base node record for a task (fresh object each build so the two tabs never
 // share/clobber coordinates).
+// --- Run layer (t#307) -----------------------------------------------------
+// What each task actually cost, drawn ON the existing graph rather than in a
+// second picture: `get_task_graph` (t#306) per change, keyed by task id. Off by
+// default — it costs a backend round trip per change and only tasks inside a
+// change carry blocks at all.
+const runOn = ref(false);
+const runLoading = ref(false);
+const runLayer = ref<Map<string, RunGraphNode>>(new Map());
+const runOf = (id: string): RunGraphNode | undefined => runLayer.value.get(id);
+
 // Truncate the external-project label so `#N project` fits the node width; the
 // full name is shown as a <title> tooltip. Budget = line width minus "#N ".
 function extLabel(n: GNode): string {
@@ -271,7 +289,9 @@ function baseNode(x: Todo, external = false): GNode {
     external,
     extProject: external ? boardOf(x) || t("graphExternal") : undefined,
     lines,
-    h: NODE_H + (lines.length - 1) * LINE_H,
+    // The run layer adds a line INSIDE the box, so the layout has to know about
+    // it — otherwise the numbers overflow onto the node below.
+    h: NODE_H + (lines.length - 1) * LINE_H + (runOn.value ? RUN_H : 0),
     x: 0,
     y: 0,
   };
@@ -311,16 +331,16 @@ const raw = computed(() => {
   return { tasks, boardIds, depEdges, refEdges, externalTargets };
 });
 
-// --- Theme fold + component focus (t#255) ----------------------------------
-// THEME convention (docs/task-pipeline.md): a root task that `depends_on` all of
-// its children and closes last is a theme aggregator; its description carries the
-// vision. Both features below are pure DISPLAY folds over the same data — no new
+// --- Change fold + component focus (t#255) ----------------------------------
+// CHANGE convention (docs/task-pipeline.md): a root task that `depends_on` all of
+// its children and closes last is a change aggregator; its description carries the
+// delta. Both features below are pure DISPLAY folds over the same data — no new
 // stored entity.
 //
 // `collapsedRoots` — Deps tab: a collapsed root hides the part of its prerequisite
 // subtree that leads ONLY into this root (a prereq also feeding an outside node
 // stays visible, so no edge ever dangles) and shows done/total progress instead.
-// Persisted per machine: which themes you keep folded is a lasting viewing
+// Persisted per machine: which changes you keep folded is a lasting viewing
 // preference, not session state.
 const COLLAPSE_KEY = "gv-collapsed";
 const collapsedRoots = ref<Set<string>>(loadCollapsed());
@@ -347,7 +367,7 @@ function toggleCollapse(id: string) {
 }
 
 // `focusId` — both tabs: show ONLY the connectivity component of the chosen task
-// (weak/undirected reachability over that tab's edges), so one theme can be
+// (weak/undirected reachability over that tab's edges), so one change can be
 // inspected without the rest of the board around it. Transient by design.
 const focusId = ref<string | null>(null);
 const focusLabel = computed(() => {
@@ -435,18 +455,18 @@ const depGraph = computed<{ tasks: Todo[]; shownIds: Set<string>; depEdges: GEdg
   return { tasks: [...inSet.values()], shownIds, depEdges };
 });
 
-// Theme sections (t#264): an EXPANDED theme renders as an accordion section
+// Change sections (t#264): an EXPANDED change renders as an accordion section
 // instead of a terminal node — the root card heads a frame around its exclusive
 // prerequisite subtree, whose member→root edges are implied by containment and
-// not drawn. A COLLAPSED theme keeps riding the fold below (collapsedRoots →
+// not drawn. A COLLAPSED change keeps riding the fold below (collapsedRoots →
 // collapsedGraph), so this map lists candidates regardless of fold state and
-// depModel skips the collapsed ones. Nested themes: only OUTERMOST roots get a
+// depModel skips the collapsed ones. Nested changes: only OUTERMOST roots get a
 // section; an inner root is a member of the outer subtree and renders as a node.
-const themeSections = computed<Map<string, Set<string>>>(() => {
+const changeSections = computed<Map<string, Set<string>>>(() => {
   const { tasks, depEdges } = depGraph.value;
   const sections = new Map<string, Set<string>>();
   for (const x of tasks) {
-    if (x.theme !== true) continue;
+    if (x.change !== true) continue;
     const members = exclusiveSubtree(x.id, depEdges);
     if (members.size) sections.set(x.id, members);
   }
@@ -464,7 +484,7 @@ const themeSections = computed<Map<string, Set<string>>>(() => {
 // Exclusive prerequisite subtree of `rootId` over `edges`: every transitive
 // prerequisite whose downstream paths ALL lead into this root — a prereq that
 // also feeds an outside node is excluded (to fixpoint), so hiding or framing the
-// set can never orphan an outside edge. Shared by the fold below and the theme
+// set can never orphan an outside edge. Shared by the fold below and the change
 // sections (t#255 / t#264).
 function exclusiveSubtree(rootId: string, edges: GEdge[]): Set<string> {
   const back = new Map<string, string[]>();
@@ -499,7 +519,7 @@ function exclusiveSubtree(rootId: string, edges: GEdge[]): Set<string> {
   return cand;
 }
 
-// Theme fold applied over the (possibly focused) dep graph: for every collapsed
+// Change fold applied over the (possibly focused) dep graph: for every collapsed
 // root still visible, swallow its EXCLUSIVE prerequisite subtree — nodes whose
 // every downstream path ends in this root. An outside edge into a swallowed node
 // is retargeted to the root (a swallowed node is a transitive prerequisite of the
@@ -548,7 +568,7 @@ const collapsible = computed<Set<string>>(() => {
   const s = new Set<string>();
   for (const e of collapsedGraph.value.depEdges) s.add(e.toId);
   for (const id of collapseStats.value.keys()) s.add(id);
-  for (const id of themeSections.value.keys()) s.add(id);
+  for (const id of changeSections.value.keys()) s.add(id);
   return s;
 });
 
@@ -557,17 +577,17 @@ const depModel = computed<{
   nodes: GNode[];
   edges: GEdge[];
   bands: DepBand[];
-  sections: ThemeSection[];
+  sections: ChangeSection[];
 }>(() => {
   const { tasks, shownIds, depEdges } = collapsedGraph.value;
   const taskById = new Map(tasks.map((x) => [x.id, x]));
 
-  // Expanded theme sections present in the current graph: the root still drawn,
+  // Expanded change sections present in the current graph: the root still drawn,
   // members narrowed to tasks that survived focus/filter. Collapsed roots keep
   // the fold rendering (card + ▸ badge) via collapsedGraph instead.
   const sections = new Map<string, Set<string>>();
   const sectionOf = new Map<string, string>(); // member id → its section root
-  for (const [rootId, members] of themeSections.value) {
+  for (const [rootId, members] of changeSections.value) {
     if (collapsedRoots.value.has(rootId)) continue;
     if (!taskById.has(rootId)) continue;
     const present = new Set([...members].filter((id) => taskById.has(id)));
@@ -586,7 +606,7 @@ const depModel = computed<{
     inGraph.add(e.fromId);
     inGraph.add(e.toId);
   }
-  // A fully folded theme may have swallowed its every edge — keep the root drawn.
+  // A fully folded change may have swallowed its every edge — keep the root drawn.
   for (const id of collapseStats.value.keys()) if (taskById.has(id)) inGraph.add(id);
   // Section roots (their child edges were just dropped) and members always draw.
   for (const [rootId, members] of sections) {
@@ -649,7 +669,7 @@ const depModel = computed<{
   // and cut crossing arrows; task number seeds the order and breaks ties, so the
   // layout stays stable across rebuilds.
   const layoutGroup = (groupIds: string[]): { w: number; h: number } => {
-    // Blocks (a project's main flow, each theme section) lay out independently:
+    // Blocks (a project's main flow, each change section) lay out independently:
     // only edges with BOTH ends inside the block shape its columns — a cross-block
     // edge is still drawn, but doesn't drag foreign depths into this block's ALAP.
     const scope = new Set(groupIds);
@@ -713,7 +733,7 @@ const depModel = computed<{
   // the projects top-to-bottom with a clear gap + heading — so "All projects" reads
   // as separate pipelines, not one interleaved grid. A single board (project filter
   // set, or only one present) skips the heading and frame. Inside a band, the main
-  // flow and each expanded theme section are separate stacked blocks: the section's
+  // flow and each expanded change section are separate stacked blocks: the section's
   // root card sits at the left as its heading, the members pipeline to its right.
   const groups = new Map<string, string[]>();
   for (const id of inGraph) {
@@ -725,7 +745,7 @@ const depModel = computed<{
     (a, b) => Math.min(...groups.get(a)!.map(numOf)) - Math.min(...groups.get(b)!.map(numOf)),
   );
   const bands: DepBand[] = [];
-  const sectionBoxes: ThemeSection[] = [];
+  const sectionBoxes: ChangeSection[] = [];
   let curY = MARGIN;
   for (const proj of order) {
     const ids = groups.get(proj)!;
@@ -1021,8 +1041,8 @@ const model = computed<{ nodes: GNode[]; edges: GEdge[] }>(() =>
 );
 // Project frames — only on the Deps tab, and only when more than one board is shown.
 const depBands = computed<DepBand[]>(() => (tab.value === "deps" ? depModel.value.bands : []));
-// Theme section frames (t#264) — Deps tab only.
-const depSections = computed<ThemeSection[]>(() =>
+// Change section frames (t#264) — Deps tab only.
+const depSections = computed<ChangeSection[]>(() =>
   tab.value === "deps" ? depModel.value.sections : [],
 );
 const nodeById = computed(() => {
@@ -1039,6 +1059,125 @@ const selected = ref<string | null>(null);
 watch(nodeById, (m) => {
   if (selected.value && !m.has(selected.value)) selected.value = null;
 });
+
+// --- Run layer: loading and the detail panel (t#307) ------------------------
+// The changes drawn right now. A run graph is fetched per change, so the key also
+// decides WHEN to refetch: fold a change away or filter it out and its numbers
+// stop being asked for.
+const runChanges = computed<string[]>(() =>
+  model.value.nodes
+    .filter((n) => !n.external && byId.value.get(n.id)?.change === true && n.number)
+    .map((n) => String(n.number)),
+);
+
+async function reloadRun() {
+  if (!runOn.value) {
+    runLayer.value = new Map();
+    return;
+  }
+  runLoading.value = true;
+  try {
+    runLayer.value = await loadRunLayer(runChanges.value);
+  } finally {
+    runLoading.value = false;
+  }
+}
+watch([runOn, () => runChanges.value.join(",")], () => void reloadRun());
+
+// Blocks of the selected node, loaded on demand: the graph payload carries the
+// per-agent split but not the individual blocks (a task can have several), and
+// only a block knows WHICH session ran it — which is what opens a transcript.
+const runBlocks = ref<RunBlock[]>([]);
+const runPathMsg = ref("");
+const runNode = computed<RunGraphNode | null>(() =>
+  runOn.value && selected.value ? runOf(selected.value) ?? null : null,
+);
+watch([selected, runOn], async ([id, on]) => {
+  runPathMsg.value = "";
+  runBlocks.value = on && id ? await loadTaskBlocks(id) : [];
+});
+
+// A single block means the agents of this task all ran in that one session, so
+// their transcripts are reachable. With several blocks the graph payload doesn't
+// say which session hosted which agent, and guessing would open the wrong file.
+const runAgentSession = computed<string | null>(() =>
+  runBlocks.value.length === 1 ? runBlocks.value[0].session : null,
+);
+
+async function showTranscript(session: string, agent?: string | null) {
+  const res = await revealTranscript(session, agent);
+  runPathMsg.value = res.error ?? res.path ?? "";
+}
+
+// Two wordings per state: the short one fits INSIDE a 190px node, the full one
+// is what the tooltip and the panel say.
+const RUN_REASON: Record<string, string> = {
+  no_in_progress: "graphRunNoInProgress",
+  no_blocks: "graphRunNoBlocks",
+  empty_blocks: "graphRunEmptyBlocks",
+};
+const RUN_REASON_FULL: Record<string, string> = {
+  no_in_progress: "graphRunNoInProgressFull",
+  no_blocks: "graphRunNoBlocksFull",
+  empty_blocks: "graphRunEmptyBlocksFull",
+};
+const runReason = (n: RunGraphNode, full = false): string =>
+  t((full ? RUN_REASON_FULL : RUN_REASON)[n.measurability] ?? "graphRunNoBlocks");
+// Characters that fit on the run line; anything longer is clipped rather than
+// drawn past the box (SVG text neither wraps nor clips on its own). The figures
+// are bold 11px and the reason a lighter 10px, so they fit differently.
+const RUN_CHARS = 24;
+const RUN_CHARS_REASON = 28;
+const clip = (s: string, max: number) => (s.length > max ? s.slice(0, max - 1) + "…" : s);
+const fmtMoney = (v: number) => "$" + v.toFixed(2);
+const fmtTokens = (v: number) =>
+  v >= 1e6 ? (v / 1e6).toFixed(1) + "M" : v >= 1e3 ? Math.round(v / 1e3) + "k" : String(v);
+const fmtMin = (v: number) => (v < 60 ? `${v}м` : `${Math.floor(v / 60)}ч ${v % 60}м`);
+function fmtClock(iso: string): string {
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? "—" : d.toLocaleString();
+}
+function blockMinutes(b: RunBlock): string {
+  const ms = new Date(b.to).getTime() - new Date(b.from).getTime();
+  return Number.isFinite(ms) && ms > 0 ? fmtMin(Math.round(ms / 60000)) : "—";
+}
+
+// The one-line summary drawn inside a node: money and effort when the block is
+// measurable, the REASON when it isn't. A missing measurement is never rendered
+// as $0.00 — that would claim the step was free (graph.rs, four states).
+function runLabel(n: RunGraphNode): string {
+  if (n.measurability !== "measured") return clip(runReason(n), RUN_CHARS_REASON);
+  const parts = [fmtMoney(n.cost ?? 0)];
+  if (n.duration_minutes != null) {
+    parts.push(fmtMin(n.duration_minutes) + (n.duration_calendar ? "*" : ""));
+  }
+  if (n.messages != null) parts.push(`${n.messages}✎`);
+  if (n.tool_errors) parts.push(`${n.tool_errors}⚠`);
+  // Dots for the subagents sit at the right edge — leave them room.
+  const room = RUN_CHARS - (runSubagents(n).length ? 3 : 0);
+  const line = parts.join(" · ");
+  return line.length > room ? clip(parts.slice(0, -1).join(" · "), room) : line;
+}
+const runSubagents = (n: RunGraphNode) => n.agents.filter((a) => a.agent_id);
+
+// The tooltip carries what the clipped line had to drop: the full reason, or the
+// full set of figures plus the calendar caveat on a change's span.
+function runTitle(n: RunGraphNode): string {
+  if (n.measurability !== "measured") return runReason(n, true);
+  const parts = [fmtMoney(n.cost ?? 0)];
+  if (n.duration_minutes != null) {
+    parts.push(fmtMin(n.duration_minutes) + (n.duration_calendar ? ` — ${t("graphRunCalendar")}` : ""));
+  }
+  if (n.tokens != null) parts.push(fmtTokens(n.tokens));
+  if (n.messages != null) parts.push(`${n.messages} ✎`);
+  if (n.tool_calls != null) parts.push(`${n.tool_calls} ${t("todoBlocksCalls")}`);
+  if (n.tool_errors) parts.push(`${n.tool_errors} ${t("todoBlocksErrors")}`);
+  const subs = runSubagents(n);
+  if (subs.length) {
+    parts.push(subs.map((a) => `${a.description || a.agent_type} ${fmtMoney(a.cost)}`).join(", "));
+  }
+  return parts.join(" · ");
+}
 
 // --- Find (the shared header search box, via the `query` prop) --------------
 // When the graph is the active view the ONE search field highlights here instead
@@ -1531,6 +1670,21 @@ onUnmounted(() => {
       <span v-if="queryActive" class="gv-find-status" :title="t('graphSearchHint')">
         {{ hitList.length ? `${hitIdx + 1}/${hitList.length}` : t("graphSearchNoMatch") }}
       </span>
+      <!-- Run layer (t#307): money/time/agents from the blocks, drawn on the
+           existing nodes. Off by default — it costs a fetch per change. -->
+      <button
+        class="gv-chip run-chip"
+        :class="{ off: !runOn }"
+        :title="t('graphRunHint')"
+        @click="runOn = !runOn"
+      >
+        {{ t("graphRun") }}
+        <span v-if="runOn && runLoading" class="gv-run-load">{{ t("graphRunLoading") }}</span>
+        <span
+          v-else-if="runOn && !runLayer.size"
+          class="gv-run-load"
+        >{{ t("graphRunNoData") }}</span>
+      </button>
       <button class="gv-btn" @click="resetView">{{ t("graphResetView") }}</button>
     </div>
     <p class="gv-hint">{{ tab === "deps" ? t("graphHintDeps") : t("graphHintRef") }}</p>
@@ -1540,7 +1694,7 @@ onUnmounted(() => {
       <span class="lg"><i class="lg-dot" style="background:#6ccb5f"></i>{{ t("graphPipeReadyAuto") }}</span>
       <span class="lg"><i class="lg-dot" style="background:#ffc107"></i>{{ t("graphPipeReadyManual") }}</span>
       <span class="lg"><i class="lg-auto">⚡</i>{{ t("graphKindAuto") }}</span>
-      <span class="lg"><i class="lg-fold">▸ 3/5</i>{{ t("graphLegendTheme") }}</span>
+      <span class="lg"><i class="lg-fold">▸ 3/5</i>{{ t("graphLegendChange") }}</span>
     </div>
 
     <div v-if="errorMsg" class="gv-error">{{ errorMsg }}</div>
@@ -1583,6 +1737,13 @@ onUnmounted(() => {
         >
           <path d="M0 0 L10 5 L0 10 z" fill="#6f7681" />
         </marker>
+        <!-- Run line (t#307): SVG text neither wraps nor clips, and character
+             budgets miss with another locale or font. The line is drawn in a
+             group shifted to the bottom of its node, so ONE clip box serves
+             every node whatever its height. -->
+        <clipPath id="run-clip" clipPathUnits="userSpaceOnUse">
+          <rect x="6" y="0" :width="NODE_W - 12" :height="RUN_H" />
+        </clipPath>
       </defs>
 
       <g :transform="`translate(${tx},${ty}) scale(${scale})`" :class="{ 'has-sel': activeNode }">
@@ -1601,7 +1762,7 @@ onUnmounted(() => {
             <text class="band-label" :x="b.x - 4" :y="b.y + 14">{{ b.project }}</text>
           </g>
         </g>
-        <!-- Theme accordion sections (t#264): a frame around each EXPANDED theme's
+        <!-- Change accordion sections (t#264): a frame around each EXPANDED change's
              exclusive subtree; the root card inside at the left is the heading. -->
         <g class="sections">
           <rect
@@ -1669,7 +1830,7 @@ onUnmounted(() => {
           @mouseleave="hoverNode = null"
           @contextmenu="onNodeContext($event, n.id)"
         >
-          <!-- Collapsed theme (t#255): a shifted twin rect behind the box makes the
+          <!-- Collapsed change (t#255): a shifted twin rect behind the box makes the
                root read as a stack of cards holding its folded subtree. -->
           <rect
             v-if="tab === 'deps' && collapseStats.has(n.id)"
@@ -1717,12 +1878,12 @@ onUnmounted(() => {
             <text
               v-else
               class="fold-glyph"
-              :class="{ theme: themeOf(n.id) }"
+              :class="{ change: changeOf(n.id) }"
               :x="NODE_W - 24"
               y="18"
               text-anchor="end"
             >⊖</text>
-            <title>{{ collapseStats.has(n.id) ? t("graphExpandTheme") : t("graphCollapseTheme") }}</title>
+            <title>{{ collapseStats.has(n.id) ? t("graphExpandChange") : t("graphCollapseChange") }}</title>
           </g>
           <text class="num" x="12" y="18">
             <tspan v-if="kindOf(n.id) === 'auto'" class="kind-auto">⚡ </tspan>
@@ -1740,9 +1901,113 @@ onUnmounted(() => {
               :dy="i === 0 ? 0 : LINE_H"
             >{{ ln }}</tspan>
           </text>
+          <!-- Run layer (t#307): one line inside the box. A node with no
+               recoverable block shows the REASON, never a zero. -->
+          <g
+            v-if="runOn && runOf(n.id)"
+            class="run"
+            :transform="`translate(0,${n.h - RUN_H})`"
+            clip-path="url(#run-clip)"
+          >
+            <line class="run-sep" x1="8" y1="0" :x2="NODE_W - 8" y2="0" />
+            <text
+              class="run-text"
+              :class="{ unmeasured: runOf(n.id)!.measurability !== 'measured' }"
+              x="12"
+              :y="RUN_H - 5"
+            >{{ runLabel(runOf(n.id)!) }}
+              <title>{{ runTitle(runOf(n.id)!) }}</title>
+            </text>
+            <!-- One dot per SUBagent of this node's blocks; the main loop is not
+                 a dot, it's the rest of the money. -->
+            <circle
+              v-for="(a, i) in runSubagents(runOf(n.id)!)"
+              :key="a.agent_id ?? i"
+              class="run-agent"
+              :cx="NODE_W - 13 - i * 10"
+              :cy="RUN_H - 9"
+              r="3.5"
+            >
+              <title>{{ a.description || a.agent_type || "agent" }} — {{ fmtMoney(a.cost) }}</title>
+            </circle>
+          </g>
         </g>
       </g>
     </svg>
+
+    <!-- Run panel (t#307): the selected node's blocks and per-agent split. It
+         floats over the canvas rather than splitting it, so the graph keeps its
+         width when the layer is off. -->
+    <div v-if="runOn && runNode" class="gv-run-panel">
+      <div class="gv-run-hd">
+        <b>{{ t("graphRunPanel", { n: runNode.number }) }}</b>
+        <button class="gv-run-x" :title="t('graphRunClose')" @click="selected = null">✕</button>
+      </div>
+      <div class="gv-run-subj">{{ runNode.subject }}</div>
+      <div class="gv-run-sum">
+        <span v-if="runNode.measurability === 'measured'" class="gv-run-money">
+          {{ fmtMoney(runNode.cost ?? 0) }}
+        </span>
+        <span v-else class="gv-run-reason">{{ runReason(runNode, true) }}</span>
+        <span v-if="runNode.duration_minutes != null" :title="runNode.duration_calendar ? t('graphRunCalendar') : ''">
+          {{ fmtMin(runNode.duration_minutes) }}{{ runNode.duration_calendar ? "*" : "" }}
+        </span>
+        <span v-if="runNode.tokens != null">{{ fmtTokens(runNode.tokens) }}</span>
+        <span v-if="runNode.tool_calls != null">
+          {{ runNode.tool_calls }} {{ t("todoBlocksCalls") }}
+        </span>
+        <span v-if="runNode.tool_errors" class="gv-run-err">
+          {{ runNode.tool_errors }} {{ t("todoBlocksErrors") }}
+        </span>
+      </div>
+      <!-- The whole-task figure and the remainder outside the blocks are shown
+           when known: work between blocks belongs to no task, and hiding the
+           gap would misread as "the blocks are the whole spend" (t#298). -->
+      <div v-if="runNode.task_cost != null || runNode.unattributed_cost != null" class="gv-run-sum dim">
+        <span v-if="runNode.task_cost != null">
+          {{ t("graphRunTaskCost") }}: {{ fmtMoney(runNode.task_cost) }}
+        </span>
+        <span v-if="runNode.unattributed_cost != null">
+          {{ t("graphRunUnattributed") }}: {{ fmtMoney(runNode.unattributed_cost) }}
+        </span>
+      </div>
+
+      <div v-if="runNode.agents.length" class="gv-run-sec">{{ t("graphRunAgents") }}</div>
+      <ul v-if="runNode.agents.length" class="gv-run-list">
+        <li v-for="a in runNode.agents" :key="a.agent_id ?? 'main'" class="gv-run-row">
+          <i v-if="a.agent_id" class="gv-run-dot"></i>
+          <span class="gv-run-who">
+            {{ a.agent_id ? a.description || a.agent_type || "agent" : t("graphRunMainLoop") }}
+          </span>
+          <span class="gv-run-num">{{ fmtMoney(a.cost) }}</span>
+          <span class="gv-run-num dim">{{ a.messages }}✎</span>
+          <button
+            v-if="a.agent_id && runAgentSession"
+            class="gv-run-link"
+            :title="t('graphRunAgentTranscriptHint')"
+            @click="showTranscript(runAgentSession, a.agent_id)"
+          >{{ t("graphRunTranscript") }}</button>
+          <span v-else-if="a.agent_id" class="gv-run-num dim" :title="t('graphRunAgentTranscriptHint')">—</span>
+        </li>
+      </ul>
+
+      <div class="gv-run-sec">{{ t("graphRunBlocks") }}</div>
+      <div v-if="!runBlocks.length" class="gv-run-empty">{{ t("graphRunNoBlockRows") }}</div>
+      <ul v-else class="gv-run-list">
+        <li v-for="(b, i) in runBlocks" :key="b.session + b.from + i" class="gv-run-row">
+          <span class="gv-run-who">{{ fmtClock(b.from) }}</span>
+          <span class="gv-run-num dim">{{ blockMinutes(b) }}</span>
+          <span class="gv-run-num">{{ fmtMoney(b.cost) }}</span>
+          <span class="gv-run-num dim">{{ b.tool_calls }} {{ t("todoBlocksCalls") }}</span>
+          <button
+            class="gv-run-link"
+            :title="t('graphRunTranscriptHint')"
+            @click="showTranscript(b.session)"
+          >{{ t("graphRunTranscript") }}</button>
+        </li>
+      </ul>
+      <div v-if="runPathMsg" class="gv-run-path">{{ runPathMsg }}</div>
+    </div>
 
     <!-- Confirm before removing a dependency edge (accidental clicks on the tiny
          arrow dot were deleting links without it being clear which one). -->
@@ -2127,8 +2392,8 @@ onUnmounted(() => {
   stroke: #16181c;
   stroke-width: 1.5;
 }
-/* Theme accordion section (t#264): frame around an EXPANDED theme's subtree; the
-   amber accent matches the theme fold glyph. */
+/* Change accordion section (t#264): frame around an EXPANDED change's subtree; the
+   amber accent matches the change fold glyph. */
 .section-box {
   fill: rgba(255, 193, 7, 0.025);
   stroke: rgba(255, 193, 7, 0.28);
@@ -2141,7 +2406,7 @@ onUnmounted(() => {
   stroke-width: 2.6;
   filter: drop-shadow(0 0 4px rgba(255, 193, 7, 0.25));
 }
-/* Theme fold (t#255): the shifted twin behind a collapsed root ("stack of cards"). */
+/* Change fold (t#255): the shifted twin behind a collapsed root ("stack of cards"). */
 .node .box-stack {
   opacity: 0.55;
 }
@@ -2167,8 +2432,8 @@ onUnmounted(() => {
 .node:hover .fold-glyph {
   opacity: 1;
 }
-/* A marked theme root is the designed fold target — its control is always on. */
-.node .fold-glyph.theme {
+/* A marked change root is the designed fold target — its control is always on. */
+.node .fold-glyph.change {
   opacity: 1;
   fill: #ffc107;
 }
@@ -2179,5 +2444,143 @@ onUnmounted(() => {
 .node .subj {
   fill: #b9bec6;
   font-size: 11px;
+}
+
+/* Run layer (t#307) --------------------------------------------------------- */
+.gv-chip.run-chip {
+  gap: 7px;
+}
+.gv-run-load {
+  color: #9aa0aa;
+  font-size: 11px;
+}
+.node .run-sep {
+  stroke: #3a3d44;
+  stroke-width: 1;
+}
+.node .run-text {
+  fill: #ffd479;
+  font-size: 11px;
+  font-weight: 600;
+}
+/* An unmeasured node states its reason instead of a number, and must not read
+   like a figure — same rule as the block list. */
+.node .run-text.unmeasured {
+  fill: #7d838d;
+  font-size: 10px;
+  font-weight: 400;
+  font-style: italic;
+}
+.node .run-agent {
+  fill: #7fb2ff;
+  stroke: #24262b;
+  stroke-width: 1;
+}
+.gv-run-panel {
+  position: absolute;
+  right: 14px;
+  bottom: 14px;
+  width: 340px;
+  max-height: 62%;
+  overflow: auto;
+  padding: 12px 14px;
+  border: 1px solid #3a3d44;
+  border-radius: 10px;
+  background: #24262b;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
+  font-size: 12px;
+}
+.gv-run-hd {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.gv-run-x {
+  background: transparent;
+  border: 0;
+  color: #9aa0aa;
+  cursor: pointer;
+  font-size: 13px;
+}
+.gv-run-subj {
+  color: #b9bec6;
+  margin: 2px 0 8px;
+}
+.gv-run-sum {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: baseline;
+}
+.gv-run-sum.dim,
+.gv-run-num.dim {
+  color: #8b929c;
+}
+.gv-run-money {
+  color: #ffd479;
+  font-weight: 600;
+  font-size: 13px;
+}
+.gv-run-reason {
+  color: #7d838d;
+  font-style: italic;
+}
+.gv-run-err {
+  color: #e0574a;
+}
+.gv-run-sec {
+  margin: 12px 0 4px;
+  color: #9aa0aa;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.gv-run-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.gv-run-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+  border-bottom: 1px solid #2c2f36;
+}
+.gv-run-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #7fb2ff;
+  flex: none;
+}
+.gv-run-who {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #d5d9df;
+}
+.gv-run-num {
+  font-variant-numeric: tabular-nums;
+  flex: none;
+}
+.gv-run-link {
+  background: transparent;
+  border: 0;
+  color: #7fb2ff;
+  cursor: pointer;
+  padding: 0;
+  font-size: 11px;
+}
+.gv-run-empty {
+  color: #7d838d;
+}
+.gv-run-path {
+  margin-top: 8px;
+  color: #8b929c;
+  font-size: 11px;
+  word-break: break-all;
 }
 </style>

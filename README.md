@@ -160,13 +160,13 @@ Everything else (thresholds, alerts, quiet hours, analytics opt-in, daily budget
 The task manager can be driven from a Claude Code session via the bundled `cc-todos` CLI (the **Settings → install CLI + hook** button wires it up). Commands include:
 
 - `add "<subject>" [--project <name>] [--kind auto|manual] [--description <text>]` — create a task in the backlog
-- `set-status <id> <backlog|queue|in_progress|review|done>` — move a task across columns (`done` is refused while a prerequisite is unfinished; `--force` overrides)
+- `set <field> <task> <value>` — the one setter for every scalar field (`status`, `priority`, `kind`, `theme`, `project`, `verify`, `retry`, `budget`, `parallel`, `on-issue`, `plan`, `description`); run `set` with no field to see each one's values. Whatever can be checked is refused with the reason: `set status <id> done` while a prerequisite is unfinished, a `?issue` transition with no retry limit, a declaration on a closed node
 - `comment add <id> --text "<body>"` — leave a note on a task's thread
 - `dep` / `ref` — manage the task graph (blocking dependencies and non-blocking references)
-- `set-kind <id> <auto|manual>` — who may close the node: `auto` = the session, after verifying its own work; `manual` (default) = a human review gate
+- `set kind <id> <auto|manual>` — who may close the node: `auto` = the session, after verifying its own work; `manual` (default) = a human review gate
 - `ready [--auto | --manual]` — the pipeline frontier: tasks whose every dependency is `done`
 - `handoff <task>` / `handoff set <task> --text "…"` — the baton a task passes forward along dependency edges; auto-printed when a dependent moves to `in_progress`
-- `pipeline` — print the task-graph workflow (create → deps → set-kind → run)
+- `pipeline` — print the task-graph workflow (create → deps → declare → run) and what this board has declared
 - `list` / `related <project>` / `groups` — inspect tasks and project links
 
 The full pipeline guide — driving the board as a dependency graph, `auto`/`manual` gates, the done-gate, handoffs — lives in [docs/task-pipeline.md](docs/task-pipeline.md).

@@ -66,12 +66,50 @@ export function taskHandoffGuard(appData) {
   return typeof v === "string" && TASK_GUARD_MODES.includes(v) ? v : "both";
 }
 
-// `matchPlanCli`: absolute path to a kb-style CLI whose `match-plan --text "<plan>"`
-// turns plan text into case-warnings (t#253). Empty/absent (the default) skips the
-// deterministic match step in the ExitPlanMode hook — the plan-recording
-// instruction is injected either way. Set by hand in settings.json; the UI's
+// `specDeltaGuard`: does closing a task that carries a `spec` link demand an
+// explicit answer per addressed section (docs/specs/README.md §8, t#341) —
+// on|off. Default on: the guard is inert for a board that links no specs, so
+// it costs nothing until the link is made deliberately.
+export function specDeltaGuard(appData) {
+  const v = readSettings(appData).specDeltaGuard;
+  return v === "off" || v === false ? "off" : "on";
+}
+
+// `matchPlanCli`: absolute path to a kb-style CLI that turns task/plan text into
+// case-warnings. Two calls make up the contract, both optional to implement:
+//   match-plan --text "<plan>" --json   — the ExitPlanMode hook (t#253)
+//   match-warn --todo <id> --event <add|queue|in_progress> --tracker-cli <path>
+//                                       — the task-event notify (t#250); the CLI
+//                                         owns matching, dedup and comment posting
+// Empty/absent (the default) disables both — the tracker itself carries no
+// dependency on any knowledge base. Set by hand in settings.json; the UI's
 // plugin-store writes per key, so a hand-added key survives its saves.
 export function matchPlanCli(appData) {
   const v = readSettings(appData).matchPlanCli;
+  return typeof v === "string" && v.trim() ? v.trim() : "";
+}
+
+// `specRoot`: where the spec registry (t#339) looks for `<domain>/spec.md`
+// catalogs, relative to the project the CLI is invoked from unless it is an
+// absolute path. The tracker serves several projects, and each keeps its own
+// spec tree at its own place, so this is a project-side default with a
+// tracker-side override — same shape as `matchPlanCli`. Default `docs/specs`
+// (this project's layout, docs/specs/README.md). Set by hand in settings.json.
+export function specRoot(appData) {
+  const v = readSettings(appData).specRoot;
+  return typeof v === "string" && v.trim() ? v.trim() : "docs/specs";
+}
+
+// `specRepos`: map of `repo` key (as named by a section's `location.repo` in
+// spec.md frontmatter, docs/specs/README.md §4) to that repo's absolute local
+// path, for sections whose text lives outside this repository. An unlisted key
+// or a listed path that does not exist on disk both mean "not available on
+// this machine" — the registry reports that as its own answer (§4/§6), never
+// as a dangling reference. Empty/absent (the default) means no external repo
+// is reachable from here. Set by hand in settings.json.
+export function specRepoPath(repoKey, appData) {
+  const repos = readSettings(appData).specRepos;
+  if (!repos || typeof repos !== "object") return "";
+  const v = repos[repoKey];
   return typeof v === "string" && v.trim() ? v.trim() : "";
 }

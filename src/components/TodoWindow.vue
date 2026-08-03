@@ -14,6 +14,7 @@ import { invoke } from "@tauri-apps/api/core";
 import ProjectAutocomplete from "./ProjectAutocomplete.vue";
 import ProjectLabel from "./ProjectLabel.vue";
 import GraphView from "./GraphView.vue";
+import SpecView from "./SpecView.vue";
 import { useProjectLinks } from "../projectLinks";
 import { useHotkeys } from "../hotkeys";
 import {
@@ -52,6 +53,34 @@ export interface Comment {
   body: string;
   created_at: string;
 }
+// One task's answer about one addressed spec section at closing time (t#341).
+// Written only by `cli spec answer`; the window renders it, never edits it —
+// an answer typed into a form would be a receipt again, not a judgement made
+// against the section the guard put in front of the session.
+export interface SpecAnswer {
+  address: string;
+  verdict: string; // "unchanged" | "updated"
+  note: string;
+  at: string;
+  // Hashes of the section blocks this task moved (t#353) — content-addressed,
+  // so the Specs tab can mark the individual bullet a change is about.
+  blocks?: string[];
+  // The section's text at the moment the delta was claimed. Paired with the
+  // baseline on `spec_seen`, it is what the Specs tab diffs — frozen, because
+  // the live file keeps moving after the task closes.
+  after?: string;
+}
+// One addressed section as it was SHOWN to the session at the `in_progress`
+// anchor (t#352). `text` is the before-side of the diff; while the task is
+// still open there is no `after` yet, so the tab diffs it against the file as
+// it stands — that is the live "what is this change about to do" view.
+export interface SpecSeen {
+  address: string;
+  hash: string;
+  at: string;
+  blocks?: string[];
+  text?: string;
+}
 export interface Todo {
   id: string;
   number?: number; // stable human-facing number for inline t#N references
@@ -60,7 +89,7 @@ export interface Todo {
   status: string;
   priority?: string; // "high" | "medium" | "low" | "" (unset) — drives hook context
   kind?: string; // "auto" | "" (manual, default) — task-graph node type (#88)
-  theme?: boolean; // theme-root marker (t#255): depends_on all children, description = vision
+  change?: boolean; // change-root marker (t#255): depends_on all children, description = delta
   scheduled_for?: string | null;
   plan: string;
   project?: string | null;
@@ -69,6 +98,9 @@ export interface Todo {
   links?: string[];
   depends_on?: string[]; // ids of tasks this one depends on — task-graph edges (#88)
   handoff?: string; // what this task hands forward to its dependents (#141)
+  spec?: string[]; // addressed spec sections, `<domain>#<slug>` (t#339)
+  spec_answers?: SpecAnswer[]; // the closing answer per addressed section (t#341)
+  spec_seen?: SpecSeen[]; // each addressed section as it was shown (t#352)
   imported_at?: string | null; // arrived via a board import (#181); absent = created here
   created_by?: string; // "user" | "claude" ("" / absent = user, no AI badge)
   created_at: string;
@@ -622,7 +654,10 @@ async function openSettings() {
 // Board vs graph view (#88): the graph is an alternative rendering of the SAME
 // filtered board, toggled in place — not a separate window. It shares this
 // window's `todos` and `projectFilter`.
-const viewMode = ref<"board" | "graph">("board");
+// `specs` is the third rendering (t#346): not another view of the board, but
+// the level ABOVE it — the spec section a change points at, with that change's
+// graph under it.
+const viewMode = ref<"board" | "graph" | "specs">("board");
 // In graph view the ONE shared search box (below) highlights matching nodes instead
 // of filtering; Enter cycles to the next hit via GraphView's exposed `cycleNext`.
 const graphRef = ref<InstanceType<typeof GraphView> | null>(null);
@@ -642,6 +677,60 @@ useHotkeys({
 // list; adopt it so both views stay in lockstep without a reload round-trip.
 function onGraphUpdate(list: Todo[]) {
   todos.value = list;
+}
+
+// --- the spec a task is about (t#339/t#346) ----------------------------------
+//
+// A task's `spec` is written by the CLI and, until now, was invisible here: the
+// board showed the delta and never what the delta was TO. That gap is what the
+// whole mechanic exists to close, so the link belongs on the card, not only in
+// the session's injected context.
+//
+// The walk mirrors `todos.mjs::specAddressesFor`: the task's OWN addresses win
+// outright, and only a task without any inherits its nearest change root's.
+// Inheritance is REPLACEMENT, not a merge — otherwise one section would be
+// listed twice for the same task.
+function changeRootsOf(t: Todo): Todo[] {
+  const roots: Todo[] = [];
+  const seen = new Set<string>([t.id]);
+  let frontier = [t.id];
+  while (frontier.length && !roots.length) {
+    const next: string[] = [];
+    for (const parent of todos.value) {
+      if (!(parent.depends_on ?? []).some((d) => frontier.includes(d))) continue;
+      if (seen.has(parent.id)) continue;
+      seen.add(parent.id);
+      if (parent.change) roots.push(parent);
+      else next.push(parent.id);
+    }
+    frontier = next;
+  }
+  return roots;
+}
+
+function specLinkOf(t: Todo): { addresses: string[]; inherited: boolean } {
+  const own = (t.spec ?? []).filter(Boolean);
+  if (own.length) return { addresses: own, inherited: false };
+  const seen = new Set<string>();
+  for (const r of changeRootsOf(t)) for (const a of r.spec ?? []) seen.add(a);
+  return { addresses: [...seen], inherited: true };
+}
+
+const detailSpec = computed(() =>
+  detail.value ? specLinkOf(detail.value) : { addresses: [], inherited: false },
+);
+// The closing answers recorded for THIS task (`cli spec answer`, t#341) — the
+// board's own copy of what the guard was told.
+const detailAnswers = computed(() => detail.value?.spec_answers ?? []);
+
+// Jump from a task to the section it is about. Opening the Specs tab rather
+// than a popup keeps one place where a section is read — the tab also shows the
+// other changes on it, which is the context a reader wants next.
+const specTarget = ref<{ address: string; project: string } | null>(null);
+function openSpecSection(address: string) {
+  specTarget.value = { address, project: detail.value?.project ?? "" };
+  viewMode.value = "specs";
+  closeDetail();
 }
 
 // Clicking a graph node opens that task's card — the same detail panel the board
@@ -1251,6 +1340,8 @@ interface TaskCostRow {
   sessions: number;
   direct_sessions: number;
   interval_sessions: number;
+  explicit_sessions: number;
+  auto_sessions: number;
   total_tokens: number;
   cost: number;
 }
@@ -1287,6 +1378,70 @@ function costTitle(todo: Todo): string {
   const r = costOf(todo);
   if (!r) return "";
   return `${t("todoCostHint")}: ${r.sessions} ${t("todoCostSessions")} · ${fmtTok(r.total_tokens)} ${t("todoCostTokens")}`;
+}
+
+// ── cost by block (t#298) ─────────────────────────────────────────────────────
+// A block = this task worked by ONE session over ONE stretch of time, from the
+// binding journal (`todos take` / a status move). The per-task total above is
+// per-SESSION and older than the journal, so the two disagree by design: work
+// between blocks belongs to no task, and pre-journal sessions have no blocks at
+// all. That difference is shown rather than hidden — see `blocksOutside`.
+interface TaskBlockRow {
+  task: string;
+  number: number;
+  subject: string;
+  session: string;
+  from: string;
+  to: string;
+  explicit: boolean;
+  source: string;
+  project?: string;
+  cost: number;
+  total_tokens: number;
+  messages: number;
+  tool_calls: number;
+  tool_errors: number;
+}
+interface TaskBlocksPayload {
+  blocks: TaskBlockRow[];
+  explicit_blocks: number;
+  auto_blocks: number;
+}
+
+const taskBlocks = ref<TaskBlockRow[]>([]);
+
+async function loadTaskBlocks(id: string | null) {
+  if (!id) {
+    taskBlocks.value = [];
+    return;
+  }
+  try {
+    const res = await invoke<TaskBlocksPayload | null>("get_task_blocks", { task: id });
+    taskBlocks.value = res?.blocks ?? [];
+  } catch {
+    taskBlocks.value = [];
+  }
+}
+
+const blocksSum = computed(() =>
+  taskBlocks.value.reduce((acc, b) => acc + (b.cost || 0), 0),
+);
+
+const blocksOutside = computed(() => {
+  const total = detail.value ? (costOf(detail.value)?.cost ?? 0) : 0;
+  return Math.max(0, total - blocksSum.value);
+});
+
+watch(detailId, (id) => {
+  void loadTaskBlocks(id);
+});
+
+function blockSpan(b: TaskBlockRow): string {
+  const ms = new Date(b.to).getTime() - new Date(b.from).getTime();
+  if (!Number.isFinite(ms) || ms <= 0) return "—";
+  const min = Math.round(ms / 60000);
+  if (min < 60) return `${min}m`;
+  return `${Math.floor(min / 60)}h ${String(min % 60).padStart(2, "0")}m`;
 }
 
 async function refreshKnownProjects() {
@@ -1509,6 +1664,21 @@ onUnmounted(() => {
           </svg>
           {{ t("viewGraph") }}
         </button>
+        <button
+          class="tw-vt"
+          :class="{ active: viewMode === 'specs' }"
+          role="tab"
+          :aria-selected="viewMode === 'specs'"
+          :title="t('viewSpecs')"
+          @click="viewMode = 'specs'"
+        >
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 2.5h7l3 3v8H3z" />
+            <path d="M9.5 2.5v3.5H13" />
+            <path d="M5.5 8.5h5M5.5 11h3" />
+          </svg>
+          {{ t("viewSpecs") }}
+        </button>
       </div>
       <button class="tw-guide" :title="t('todoGuideHint')" @click="openGuide">
         <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
@@ -1538,6 +1708,15 @@ onUnmounted(() => {
       :project="projectFilter"
       :query="search"
       @update="onGraphUpdate"
+      @open="onGraphOpen"
+    />
+
+    <!-- Specs: the level above the board — section, its changes, their graph -->
+    <SpecView
+      v-else-if="viewMode === 'specs'"
+      :todos="todos"
+      :project="projectFilter"
+      :target="specTarget"
       @open="onGraphOpen"
     />
 
@@ -1609,6 +1788,15 @@ onUnmounted(() => {
               >⤓ {{ t("todoImported") }}</span>
               <span v-if="todo.scheduled_for" class="tw-chip">📅 {{ todo.scheduled_for }}</span>
               <span v-if="todo.plan" class="tw-chip" :title="todo.plan">📝</span>
+              <!-- Only the task's OWN link on the card: an inherited one would
+                   repeat the change root's chip on every step under it. -->
+              <span
+                v-for="a in todo.spec ?? []"
+                :key="a"
+                class="tw-chip tw-spec"
+                :title="t('todoSpecHint')"
+                @click.stop="openSpecSection(a)"
+              >📘 {{ a }}</span>
               <span v-if="refCount(todo)" class="tw-chip" :title="t('todoRefs')">🔗 {{ refCount(todo) }}</span>
               <span v-if="costOf(todo)" class="tw-chip" :title="costTitle(todo)">⚡ {{ fmtCost(costOf(todo)!.cost) }}</span>
             </div>
@@ -1798,6 +1986,33 @@ onUnmounted(() => {
             </div>
           </div>
 
+          <!-- The spec this task is about (t#339/t#346): read-only here on
+               purpose — the link is written by `todos set spec`, which validates
+               the address against the registry, and the answers by `spec answer`.
+               A field typed here would accept an address that resolves to
+               nothing, which is the one thing the link must never be. -->
+          <div v-if="detailSpec.addresses.length || detailAnswers.length" class="tw-field tw-spec-box">
+            <span class="tw-handoff-in-hd">
+              {{ t("todoSpec") }}
+              <em v-if="detailSpec.inherited" class="tw-hint">{{ t("todoSpecInherited") }}</em>
+            </span>
+            <div class="tw-spec-links">
+              <button
+                v-for="a in detailSpec.addresses"
+                :key="a"
+                class="tw-spec-link"
+                :title="t('todoSpecHint')"
+                @click.prevent="openSpecSection(a)"
+              >📘 {{ a }}</button>
+            </div>
+            <div v-for="(a, i) in detailAnswers" :key="i" class="tw-spec-answer">
+              <span class="tw-spec-verdict" :class="`v-${a.verdict}`">{{ a.verdict }}</span>
+              <span class="tw-spec-answer-addr">{{ a.address }}</span>
+              <span class="tw-spec-answer-at">{{ (a.at || "").slice(0, 10) }}</span>
+              <p class="tw-spec-answer-note">{{ a.note }}</p>
+            </div>
+          </div>
+
           <div class="tw-form-actions">
             <transition name="tw-fade">
               <span v-if="saved" class="tw-saved">
@@ -1807,6 +2022,37 @@ onUnmounted(() => {
             </transition>
             <button type="button" class="tw-btn ghost" @click="closeDetail">{{ t("todoBack") }}</button>
             <button type="button" class="tw-btn" :disabled="!draft.subject.trim()" @click="saveDetail">{{ t("save") }}</button>
+          </div>
+
+          <!-- Cost by block: the task's spend split by (session x interval) -->
+          <div class="tw-blocks">
+            <div class="tw-blocks-hd" :title="t('todoBlocksHint')">
+              {{ t("todoBlocks") }}
+              <span v-if="taskBlocks.length" class="tw-comments-n">{{ taskBlocks.length }}</span>
+            </div>
+            <div v-if="!taskBlocks.length" class="tw-comments-empty">{{ t("todoBlocksEmpty") }}</div>
+            <template v-else>
+              <ul class="tw-block-list">
+                <li v-for="(b, i) in taskBlocks" :key="b.session + b.from + i" class="tw-block">
+                  <span class="tw-block-when">{{ fmtTime(b.from) }}</span>
+                  <span class="tw-block-span">{{ blockSpan(b) }}</span>
+                  <span class="tw-block-cost">{{ fmtCost(b.cost) }}</span>
+                  <span class="tw-block-msgs">{{ b.tool_calls }} {{ t("todoBlocksCalls") }}</span>
+                  <span v-if="b.tool_errors" class="tw-block-errs">{{ b.tool_errors }} {{ t("todoBlocksErrors") }}</span>
+                  <span
+                    class="tw-block-kind"
+                    :class="{ auto: !b.explicit }"
+                    :title="b.explicit ? b.source : t('todoBlocksAutoHint')"
+                  >{{ b.explicit ? t("todoBlocksExplicit") : t("todoBlocksAuto") }}</span>
+                </li>
+              </ul>
+              <div class="tw-blocks-foot">
+                <span>{{ t("todoBlocksSum") }}: <b>{{ fmtCost(blocksSum) }}</b></span>
+                <span v-if="blocksOutside > 0.005" class="tw-blocks-outside" :title="t('todoBlocksOutsideHint')">
+                  {{ t("todoBlocksOutside") }}: <b>{{ fmtCost(blocksOutside) }}</b>
+                </span>
+              </div>
+            </template>
           </div>
 
           <!-- Comments thread (posted independently of the field draft) -->
@@ -2666,6 +2912,71 @@ onUnmounted(() => {
   word-break: break-word;
 }
 
+/* The spec link (t#339/t#346) — a chip on the card, a read-only block in the
+   detail. Blue, like every other "this opens somewhere else" affordance here. */
+.tw-spec {
+  cursor: pointer;
+  color: #4cc2ff;
+  border-color: color-mix(in srgb, #4cc2ff 40%, transparent);
+}
+.tw-spec:hover {
+  border-color: #4cc2ff;
+}
+.tw-spec-box {
+  display: block;
+}
+.tw-spec-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 4px 0 8px;
+}
+.tw-spec-link {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 11.5px;
+  background: none;
+  border: 1px solid color-mix(in srgb, #4cc2ff 40%, transparent);
+  border-radius: 5px;
+  color: #4cc2ff;
+  cursor: pointer;
+  padding: 2px 7px;
+}
+.tw-spec-link:hover {
+  border-color: #4cc2ff;
+}
+.tw-spec-answer {
+  border-left: 2px solid var(--tw-border, #2a2f3a);
+  padding: 2px 0 2px 9px;
+  margin-bottom: 7px;
+}
+.tw-spec-verdict {
+  font-size: 9.5px;
+  border-radius: 4px;
+  padding: 1px 5px;
+  background: #3a4150;
+}
+.tw-spec-verdict.v-updated {
+  background: #2f5a2a;
+}
+.tw-spec-answer-addr {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 11px;
+  opacity: 0.7;
+  margin-left: 6px;
+}
+.tw-spec-answer-at {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 11px;
+  opacity: 0.45;
+  margin-left: 6px;
+}
+.tw-spec-answer-note {
+  margin: 3px 0 0;
+  font-size: 12px;
+  line-height: 1.45;
+  opacity: 0.85;
+}
+
 /* Inherited handoff (#141): read-only summary of what upstream deps left off. */
 .tw-handoff-in {
   gap: 6px;
@@ -3085,6 +3396,85 @@ onUnmounted(() => {
 }
 
 /* Comments thread */
+.tw-blocks {
+  border-top: 1px solid var(--stroke-strong);
+  padding-top: 14px;
+  margin-top: 2px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.tw-blocks-hd {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-2);
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  cursor: help;
+}
+.tw-block-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.tw-block {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 12.5px;
+  color: var(--text-3);
+  padding: 4px 8px;
+  border-radius: 7px;
+  background: var(--track);
+}
+.tw-block-when {
+  min-width: 108px;
+  color: var(--text-2);
+}
+.tw-block-span {
+  min-width: 46px;
+  font-variant-numeric: tabular-nums;
+}
+.tw-block-cost {
+  min-width: 56px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-1);
+  font-weight: 600;
+}
+.tw-block-msgs {
+  min-width: 76px;
+  font-variant-numeric: tabular-nums;
+}
+.tw-block-errs {
+  color: var(--danger, #d9534f);
+}
+.tw-block-kind {
+  margin-left: auto;
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 9px;
+  background: var(--card-bg);
+  border: 1px solid var(--stroke-strong);
+  color: var(--text-3);
+}
+.tw-block-kind.auto {
+  border-style: dashed;
+  cursor: help;
+}
+.tw-blocks-foot {
+  display: flex;
+  gap: 16px;
+  font-size: 12.5px;
+  color: var(--text-3);
+  padding: 0 8px;
+}
+.tw-blocks-outside {
+  cursor: help;
+}
 .tw-comments {
   border-top: 1px solid var(--stroke-strong);
   padding-top: 14px;

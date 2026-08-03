@@ -4,14 +4,17 @@ pub mod corrections;
 pub mod domain;
 pub mod enroll;
 pub mod external;
+pub mod graph;
 pub mod identity;
 pub mod memory;
 pub mod project_groups;
 pub mod report;
 pub mod stats;
+pub mod spec;
 pub mod status;
 pub mod sysmon;
 pub mod task_cost;
+pub mod task_sessions;
 pub mod todos;
 pub mod triage;
 pub mod triage_schedule;
@@ -1571,20 +1574,152 @@ fn task_attribution_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir.join("task-attribution.json"))
 }
 
-/// Tokens/cost per task (t#87): the attribution file joined with per-session
-/// token totals from SQLite, resolved against the live board. None until the
-/// first `task-cost publish` has produced an attribution file.
+/// Path to the append-only session→task binding journal, a sibling of
+/// todos.json (written by `cli todos take` / `set-status` and the SessionStart
+/// hook — see task_sessions.rs). Read-only here.
+fn task_sessions_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).ok();
+    Ok(dir.join("task-sessions.jsonl"))
+}
+
+/// Session ends (last `cc_usage` ts) keyed by session id — what closes the last
+/// open block of a session.
+fn session_ends(usage: &[stats::SessionUsage]) -> HashMap<String, String> {
+    usage
+        .iter()
+        .map(|u| (u.session_id.clone(), u.end.clone()))
+        .collect()
+}
+
+/// Tokens/cost per task (t#87): the binding journal and the attribution file
+/// joined with per-session token totals from SQLite, resolved against the live
+/// board. None until either source exists.
 #[tauri::command]
 async fn get_task_costs(
     app: AppHandle,
     stats: tauri::State<'_, Arc<StatsDb>>,
 ) -> Result<Option<task_cost::TaskCosts>, String> {
-    let Some(attr) = task_cost::load(&task_attribution_path(&app)?) else {
+    let attr = task_cost::load(&task_attribution_path(&app)?);
+    let events = task_sessions::load(&task_sessions_path(&app)?);
+    if attr.is_none() && events.is_empty() {
         return Ok(None);
-    };
+    }
     let board = todos::load(&todos_path(&app)?);
     let usage = stats.sessions_all().map_err(|e| e.to_string())?;
-    Ok(Some(task_cost::compute(&attr, &board, &usage)))
+    let blocks = task_sessions::blocks(&events, &session_ends(&usage));
+    Ok(Some(task_cost::compute(
+        &attr.unwrap_or_default(),
+        &board,
+        &usage,
+        &blocks,
+    )))
+}
+
+/// The blocks a task is made of (t#297): every `(task, session, [from, to])`
+/// span the binding journal records, each with its own cost, tokens, messages,
+/// tool calls and tool errors. `task` optionally narrows the result to one task
+/// (`<uuid>` | `N` | `#N` | `t#N`); an unresolvable ref yields no blocks.
+#[tauri::command]
+async fn get_task_blocks(
+    app: AppHandle,
+    stats: tauri::State<'_, Arc<StatsDb>>,
+    task: Option<String>,
+) -> Result<task_sessions::TaskBlocks, String> {
+    let board = todos::load(&todos_path(&app)?);
+    let events = task_sessions::load(&task_sessions_path(&app)?);
+    let usage = stats.sessions_all().map_err(|e| e.to_string())?;
+    let mut blocks = task_sessions::blocks(&events, &session_ends(&usage));
+    if let Some(r) = task.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        match task_sessions::resolve_task_ref(&board, r) {
+            Some(id) => blocks.retain(|b| b.task == id),
+            None => blocks.clear(),
+        }
+    }
+    let spans: Vec<(String, String, String)> = blocks
+        .iter()
+        .map(|b| (b.session.clone(), b.from.clone(), b.to.clone()))
+        .collect();
+    let totals = stats.block_totals_many(&spans).map_err(|e| e.to_string())?;
+    Ok(task_sessions::compose(&blocks, &board, &totals))
+}
+
+/// The run graph of a change (t#306): the change's dependency subtree joined with
+/// the blocks of every task in it, returned BOTH as a model (for the UI) and as
+/// a rendered picture — `format` is `mermaid` (canonical, the default) or `d2`.
+/// A task with no recoverable block reports an unknown cost, never zero (see
+/// graph.rs). An unresolvable change yields an empty graph rather than an error,
+/// the same forgiving contract as `get_task_blocks`.
+#[tauri::command]
+async fn get_task_graph(
+    app: AppHandle,
+    stats: tauri::State<'_, Arc<StatsDb>>,
+    change: String,
+    format: Option<String>,
+) -> Result<graph::TaskGraph, String> {
+    let board = todos::load(&todos_path(&app)?);
+    let events = task_sessions::load(&task_sessions_path(&app)?);
+    let usage = stats.sessions_all().map_err(|e| e.to_string())?;
+    // The whole-task yardstick is judged over ALL blocks, then the graph keeps
+    // only the change's own ones.
+    let all = task_sessions::blocks(&events, &session_ends(&usage));
+    let attr = task_cost::load(&task_attribution_path(&app)?).unwrap_or_default();
+    let costs: HashMap<String, f64> = task_cost::compute(&attr, &board, &usage, &all)
+        .tasks
+        .into_iter()
+        .map(|t| (t.id, t.cost))
+        .collect();
+    let ids: HashSet<String> = graph::subtree(&board, &change).into_iter().collect();
+    let blocks: Vec<task_sessions::TaskBlock> =
+        all.into_iter().filter(|b| ids.contains(&b.task)).collect();
+    let spans: Vec<(String, String, String)> = blocks
+        .iter()
+        .map(|b| (b.session.clone(), b.from.clone(), b.to.clone()))
+        .collect();
+    let totals = stats.block_totals_many(&spans).map_err(|e| e.to_string())?;
+    let mut agents: Vec<Vec<graph::GraphAgent>> = Vec::with_capacity(spans.len());
+    for (session, from, to) in &spans {
+        let rows = stats
+            .block_agents(session, from, to)
+            .map_err(|e| e.to_string())?;
+        agents.push(
+            rows.into_iter()
+                .map(|a| graph::GraphAgent {
+                    agent_id: a.agent_id,
+                    agent_type: a.agent_type,
+                    description: a.description,
+                    cost: a.cost,
+                    total_tokens: a.total_tokens,
+                    messages: a.messages,
+                })
+                .collect(),
+        );
+    }
+    let mut out = graph::build(&board, &change, &blocks, &totals, &agents, &costs);
+    graph::render(&mut out, format.as_deref().unwrap_or("mermaid"));
+    Ok(out)
+}
+
+/// Shows a block's transcript in the OS file manager and returns its path
+/// (t#307). The file itself is opened in the manager rather than launched: a
+/// `.jsonl` has no reliable association, and the surrounding directory is what
+/// a reader wants anyway — the subagent files sit next to the session's own.
+#[tauri::command]
+async fn reveal_transcript(session: String, agent: Option<String>) -> Result<String, String> {
+    let base = cc::claude_dir().ok_or("Каталог Claude не найден")?;
+    let agent = agent.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let path = cc::transcript_path(&base, session.trim(), agent)
+        .ok_or("Транскрипт не найден — файл мог быть очищен по сроку хранения")?;
+    #[cfg(windows)]
+    let shown = std::process::Command::new("explorer")
+        .arg(format!("/select,{}", path.display()))
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string());
+    #[cfg(not(windows))]
+    let shown = open::that(path.parent().unwrap_or(&path)).map_err(|e| e.to_string());
+    shown?;
+    Ok(path.to_string_lossy().to_string())
 }
 
 /// Re-derive the attribution now (runs `task-cost publish --all` via node) so
@@ -1766,7 +1901,7 @@ fn save_project_groups(
 /// settings.json command on Windows. In a packaged build it's the bundled
 /// resource; in `tauri dev` it's the repo's `scripts/` (preferred there, since
 /// the resource copy under target/ is wiped on rebuild).
-fn cc_hook_script_path(app: &AppHandle) -> Result<String, String> {
+pub(crate) fn cc_hook_script_path(app: &AppHandle) -> Result<String, String> {
     let resource = app
         .path()
         .resolve("scripts/cli.mjs", tauri::path::BaseDirectory::Resource)
@@ -1947,8 +2082,9 @@ struct CcHookStatus {
     /// existed has `installed: true` but no Stop entry, so the UI can offer a
     /// re-install rather than silently running without the guard.
     stop_installed: bool,
-    /// The plan-mode PostToolUse pair (t#253) — same story: an older install
-    /// lacks them until a re-install wires the EnterPlanMode/ExitPlanMode entries.
+    /// The whole plan-mode wiring (t#253, t#318) — same story: an older install
+    /// lacks it until a re-install wires the EnterPlanMode/ExitPlanMode entries,
+    /// the keyboard-entry path and the PreToolUse format guard.
     plan_installed: bool,
     /// What this build WOULD wire (bundled resource, or the repo in dev).
     script_path: String,
@@ -1986,6 +2122,13 @@ fn cc_hook_status(app: AppHandle) -> Result<CcHookStatus, String> {
             .map(|v| {
                 settings_has_cc_hook_matched(v, "PostToolUse", "EnterPlanMode")
                     && settings_has_cc_hook_matched(v, "PostToolUse", "ExitPlanMode")
+                    // The keyboard-entry path: an install without it delivers the
+                    // format only when the model calls EnterPlanMode itself.
+                    && settings_has_cc_hook(v, "UserPromptSubmit")
+                    // The format GUARD (t#318). Without this entry the plan is
+                    // still only ASKED for, and t#309 measured what asking buys —
+                    // so an install that lacks it is incomplete, not merely older.
+                    && settings_has_cc_hook_matched(v, "PreToolUse", "ExitPlanMode")
             })
             .unwrap_or(false),
         script_path: cc_hook_script_path(&app).unwrap_or_default(),
@@ -2031,6 +2174,23 @@ fn heal_cc_hook(app: &AppHandle) -> Option<String> {
         "PostToolUse",
         "ExitPlanMode",
         &format!("node \"{script}\" plan-hook exit"),
+    );
+    wire_hook_event_matched(
+        &mut root,
+        "PreToolUse",
+        "ExitPlanMode",
+        &format!("node \"{script}\" plan-guard"),
+    );
+    wire_hook_event(
+        &mut root,
+        "UserPromptSubmit",
+        &format!("node \"{script}\" plan-hook prompt"),
+    );
+    wire_hook_event_matched(
+        &mut root,
+        "PostToolUse",
+        "Read|Grep|Glob",
+        &format!("node \"{script}\" plan-hook prompt"),
     );
     let json = serde_json::to_string_pretty(&root).ok()?;
     let tmp = settings_path.with_extension("json.tmp");
@@ -2135,6 +2295,35 @@ fn install_cc_hook(app: AppHandle) -> Result<String, String> {
         "PostToolUse",
         "ExitPlanMode",
         &format!("node \"{script}\" plan-hook exit"),
+    );
+    // The format GUARD (t#318), on the way IN to ExitPlanMode: PostToolUse fires
+    // after the plan has been shown and approved, so a plan that is not a valid
+    // graph file can only be caught before the permission prompt, not after it.
+    wire_hook_event_matched(
+        &mut root,
+        "PreToolUse",
+        "ExitPlanMode",
+        &format!("node \"{script}\" plan-guard"),
+    );
+    // The EnterPlanMode entry above only fires when the MODEL calls that tool; a
+    // user flipping plan mode from the keyboard never triggers it, so the format
+    // never arrived (measured: 9 of 9 real plan-mode sessions entered by mode,
+    // only 3 also called the tool). These entries key off permission_mode in the
+    // payload and cover both ways in; a shared one-shot marker in plan-hook.mjs
+    // keeps them from injecting the format twice.
+    legacy_dirs.extend(wire_hook_event(
+        &mut root,
+        "UserPromptSubmit",
+        &format!("node \"{script}\" plan-hook prompt"),
+    ));
+    // ...and the same on the tools a planning session reaches for first, because
+    // UserPromptSubmit alone misses the mode being flipped AFTER the prompt was
+    // sent (measured: 12 seconds after, and no further prompt to carry it).
+    wire_hook_event_matched(
+        &mut root,
+        "PostToolUse",
+        "Read|Grep|Glob",
+        &format!("node \"{script}\" plan-hook prompt"),
     );
 
     if let Some(dir) = settings_path.parent() {
@@ -2743,6 +2932,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             configure,
+            crate::spec::spec_projects,
+            crate::spec::spec_domains,
+            crate::spec::spec_section,
             refresh_now,
             open_claude,
             ensure_project,
@@ -2771,6 +2963,9 @@ pub fn run() {
             get_corrections_metrics,
             refresh_corrections_metrics,
             get_task_costs,
+            get_task_blocks,
+            get_task_graph,
+            reveal_transcript,
             refresh_task_costs,
             get_triage_digest,
             get_triage_schedule,
@@ -3008,5 +3203,57 @@ mod hook_install_tests {
         );
         // The foreign matcher's group is not "ours", even though ours exist now.
         assert!(!settings_has_cc_hook_matched(&root, "PostToolUse", "Edit"));
+    }
+
+    /// The format guard (t#318) shares the ExitPlanMode matcher with `plan-hook
+    /// exit`, but lives under a different EVENT.
+    const GUARD_CMD: &str = r#"node "C:/app/scripts/cli.mjs" plan-guard"#;
+    const PROMPT_CMD: &str = r#"node "C:/app/scripts/cli.mjs" plan-hook prompt"#;
+
+    #[test]
+    fn the_guard_is_wired_under_pretooluse_without_disturbing_the_posttooluse_pair() {
+        // Same matcher, two events: if the event were ignored anywhere in the
+        // wiring, the guard and `plan-hook exit` would overwrite each other and
+        // the plan would be checked only after the user had approved it.
+        let mut root = serde_json::json!({});
+        wire_plan_pair(&mut root);
+        wire_hook_event_matched(&mut root, "PreToolUse", "ExitPlanMode", GUARD_CMD);
+        wire_hook_event_matched(&mut root, "PreToolUse", "ExitPlanMode", GUARD_CMD); // re-install
+        assert_eq!(commands_for(&root, "PreToolUse"), vec![GUARD_CMD]);
+        assert_eq!(commands_for(&root, "PostToolUse"), vec![ENTER_CMD, EXIT_CMD]);
+        assert!(settings_has_cc_hook_matched(&root, "PreToolUse", "ExitPlanMode"));
+    }
+
+    #[test]
+    fn a_moved_install_re_points_the_guard_and_spares_a_foreign_pretooluse_hook() {
+        let foreign = r#"node "$HOME/audit/before-bash.mjs""#;
+        let mut root = serde_json::json!({
+            "hooks": { "PreToolUse": [
+                { "matcher": "Bash", "hooks": [ { "type": "command", "command": foreign } ] },
+                { "matcher": "ExitPlanMode", "hooks": [ { "type": "command", "command": r#"node "D:/old/cli.mjs" plan-guard"# } ] }
+            ] }
+        });
+        wire_hook_event_matched(&mut root, "PreToolUse", "ExitPlanMode", GUARD_CMD);
+        assert_eq!(commands_for(&root, "PreToolUse"), vec![foreign, GUARD_CMD]);
+        assert!(!settings_has_cc_hook_matched(&root, "PreToolUse", "Bash"));
+    }
+
+    #[test]
+    fn an_install_without_the_guard_does_not_count_as_plan_mode_installed() {
+        // What `plan_installed` reports drives the re-install the UI offers, so an
+        // install made before t#318 has to read as incomplete — otherwise the
+        // panel says "installed" and the plan is never checked.
+        let plan_installed = |v: &serde_json::Value| {
+            settings_has_cc_hook_matched(v, "PostToolUse", "EnterPlanMode")
+                && settings_has_cc_hook_matched(v, "PostToolUse", "ExitPlanMode")
+                && settings_has_cc_hook(v, "UserPromptSubmit")
+                && settings_has_cc_hook_matched(v, "PreToolUse", "ExitPlanMode")
+        };
+        let mut root = serde_json::json!({});
+        wire_plan_pair(&mut root);
+        wire_hook_event(&mut root, "UserPromptSubmit", PROMPT_CMD);
+        assert!(!plan_installed(&root));
+        wire_hook_event_matched(&mut root, "PreToolUse", "ExitPlanMode", GUARD_CMD);
+        assert!(plan_installed(&root));
     }
 }

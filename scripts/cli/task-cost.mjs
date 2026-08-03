@@ -10,16 +10,16 @@
 // Attribution signals, strongest first (the join in task_cost.rs consumes them
 // in this order — deliberately conservative: tokens land on a task only when
 // the evidence names exactly ONE, ambiguity is REPORTED, never smeared):
-//   moves    — `set-status <ref> in_progress|review|done` the session itself
+//   moves    — `set status <ref> in_progress|review|done` the session itself
 //              ran (same transcript-derived evidence as the Stop-hook guard,
 //              #219). Moving a task into a worked status = worked on it.
 //   touched  — `comment add <ref>` / `handoff [set] <ref>`: a session that
 //              records findings or reads/writes a handoff worked the task too —
 //              this is what a post-/clear continuation typically leaves behind
-//              when it never re-runs set-status.
+//              when it never re-runs the status move.
 //   mentions — corroboration only, NEVER attributes by itself: task refs the
 //              session named in USER text (`t#87` / `#87`; bare numbers are
-//              too noisy) or in other tracker-CLI commands (set-priority,
+//              too noisy) or in other tracker-CLI commands (set priority,
 //              dep/ref edges). The interval fallback in the join requires a
 //              mention, so an unrelated same-project session that merely
 //              overlaps a task's in_progress window no longer inherits its
@@ -63,7 +63,7 @@ function fail(msg) {
 }
 
 // Scope resolution: default = current project, --project <name>, --all.
-// Skips `agent-*.jsonl` (subagent transcripts run no set-status of their own
+// Skips `agent-*.jsonl` (subagent transcripts run no status move of their own
 // worth attributing separately — their tokens roll up under the parent session).
 function resolveTranscripts({ project, all }) {
   const root = claudeProjectsDir();
@@ -99,11 +99,13 @@ function resolveTranscripts({ project, all }) {
 }
 
 // ── the parser ────────────────────────────────────────────────────────────────
-// A `set-status <ref> <status>` inside a command that really invokes the tracker
-// CLI. Keep the pattern in lockstep with stop-hook.mjs::SET_STATUS_RE (not
-// imported: pulling stop-hook would drag its settings imports along).
+// A status move inside a command that really invokes the tracker CLI. BOTH
+// spellings: `todos set status <ref> <status>` since t#310, and the `set-status`
+// it replaced, which older transcripts are full of. Keep the pattern in lockstep
+// with stop-hook.mjs::SET_STATUS_RE (not imported: pulling stop-hook would drag
+// its settings imports along).
 const SET_STATUS_RE =
-  /\bset-status\s+#?([\w-]+)\s+(backlog|queue|in_progress|review|done)\b/g;
+  /\bset[- ]status\s+#?([\w-]+)\s+(backlog|queue|in_progress|review|done)\b/g;
 
 // Statuses that mean the session WORKED the task. backlog/queue moves are
 // triage — re-shelving someone else's work carries no cost worth attributing.
@@ -122,11 +124,11 @@ const TOUCH_RES = [
 ];
 
 // mentions from CLI commands: the session at least NAMED the task. Triage-only
-// verbs (priority, graph edges, comment list) — deliberately not `set-status
+// verbs (priority, graph edges, comment list) — deliberately not `set status
 // backlog|queue` refs: re-shelving stays invisible, as for moves. Two capture
 // slots because dep/ref commands name two tasks.
 const CLI_MENTION_RES = [
-  new RegExp(`\\bset-priority\\s+${REF}\\b`, "g"),
+  new RegExp(`\\bset[- ]priority\\s+${REF}\\b`, "g"),
   new RegExp(`\\b(?:dep|ref)\\s+(?:add|rm|list)\\s+${REF}\\b(?:\\s+${REF}\\b)?`, "g"),
   new RegExp(`\\bcomment\\s+list\\s+${REF}\\b`, "g"),
 ];
@@ -141,7 +143,7 @@ const TEXT_MENTION_RE = /(?:\bt)?#(\d{1,4})\b/g;
 // any line that could contain a tracker verb. Everything else is skipped
 // without a JSON.parse.
 const LINE_PREFILTER =
-  /"type":"user"|"is_error":true|set-status|set-priority|comment\s+add|comment\s+list|handoff|\b(?:dep|ref)\s+(?:add|rm|list)/;
+  /"type":"user"|"is_error":true|set[- ]status|set[- ]priority|comment\s+add|comment\s+list|handoff|\b(?:dep|ref)\s+(?:add|rm|list)/;
 
 const collect = (res, text, into) => {
   for (const re of res) {
@@ -155,7 +157,7 @@ const collect = (res, text, into) => {
 
 // Pure parser over the raw JSONL transcript text — exported for the unit tests.
 // Returns { moves, touched, mentions }:
-//   moves    [{ ref, statuses: [..], first_ts, last_ts }] — worked set-status
+//   moves    [{ ref, statuses: [..], first_ts, last_ts }] — worked status
 //            runs; `ref` is the id or number the command named ('#' stripped;
 //            resolution against the board happens in the Rust join, which owns
 //            todos.json), timestamps bracket the moves (null when absent);
@@ -163,7 +165,7 @@ const collect = (res, text, into) => {
 //   mentions [ref] — corroboration refs from user text and triage CLI verbs.
 export function parseSessionEvidence(raw) {
   // CLI evidence is buffered per tool_use id and committed only if the command
-  // did not FAIL: a rejected permission, a CLI error (`set-status 99999`, a
+  // did not FAIL: a rejected permission, a CLI error (`set status 99999`, a
   // bogus status) or any non-zero exit comes back as a tool_result with
   // is_error — counting those would credit moves that never happened (a real
   // case: negative tests run while developing the tracker itself). A command
@@ -217,7 +219,7 @@ export function parseSessionEvidence(raw) {
     for (const item of content) {
       if (!item || item.type !== "tool_use" || item.name !== "Bash") continue;
       const cmd = item.input && item.input.command;
-      // Require a real CLI invocation, so an echo of "set-status …" can't count.
+      // Require a real CLI invocation, so an echo of the command can't count.
       if (typeof cmd !== "string" || !/cli\.mjs|cc-todos/.test(cmd)) continue;
       const buf = { moves: new Map(), touched: new Set(), mentions: new Set() };
       SET_STATUS_RE.lastIndex = 0;
