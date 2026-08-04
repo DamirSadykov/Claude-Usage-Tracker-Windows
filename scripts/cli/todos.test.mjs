@@ -132,12 +132,19 @@ describe("formatChangeVision", () => {
     expect(out).toContain("north star text");
   });
 
+  it("адресует запись как c#N, а немигрированный корень как t#N", () => {
+    const record = formatChangeVision(t, [
+      { number: 4, address: "c#4", subject: "CHANGE: запись", status: "queue", description: "дельта" },
+    ]);
+    expect(record).toContain("── change c#4 CHANGE: запись");
+  });
+
   it("nudges to fill an empty description instead of printing a blank block", () => {
     const out = formatChangeVision(t, [
       { number: 9, subject: "CHANGE: X", status: "queue", description: "  " },
     ]);
     expect(out).toContain("vision is missing");
-    expect(out).toContain("todos set description 9");
+    expect(out).toContain("t#9");
   });
 });
 

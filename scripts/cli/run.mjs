@@ -67,7 +67,15 @@ import { fileURLToPath } from "node:url";
 import { execFile } from "node:child_process";
 import { readFileSync } from "node:fs";
 
-import { resolveTask, isReadyNode, isDone, isChangeRoot, envWithoutSession } from "./todos.mjs";
+import {
+  resolveTask,
+  isReadyNode,
+  isDone,
+  isChangeRoot,
+  changeAsRoot,
+  envWithoutSession,
+} from "./todos.mjs";
+import { findChange } from "./change.mjs";
 
 export const DEFAULT_PARALLEL_LIMIT = 1;
 
@@ -131,6 +139,13 @@ const retryLimitOf = (t) => (typeof t?.retry_limit === "number" ? t.retry_limit 
 export function collectChange(data, ref) {
   const todos = (data?.todos || []).filter(Boolean);
   const byId = new Map(todos.map((t) => [t.id, t]));
+  const record = findChange(data ?? {}, ref);
+  if (record) {
+    const members = todos
+      .filter((t) => t.change_id === record.id)
+      .sort((a, b) => (a.number || 0) - (b.number || 0));
+    return { root: changeAsRoot(record, data), members, byId };
+  }
   const root = resolveTask({ todos }, ref);
   if (!root) return { root: null, members: [], byId };
   const members = [];

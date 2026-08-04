@@ -361,3 +361,50 @@ describe("cli change", () => {
     expect(refuse(["change", "close", "t#3"])).toContain("still a root task");
   });
 });
+
+describe("потребители читают запись, а не корень", () => {
+  const withRecord = () => {
+    const data = { version: 1, todos: [], changes: [] };
+    const change = createChange(data, {
+      title: "CHANGE: потребители",
+      delta: "что меняем в этом заходе",
+      project: "board",
+      parallel_limit: 3,
+    });
+    data.todos.push(
+      task(1, { change_id: change.id, status: "done" }),
+      task(2, { change_id: change.id }),
+    );
+    return { data, change };
+  };
+
+  it("vision наследуется от записи и адресуется c#N", async () => {
+    const { changeRootsFor, formatChangeVision } = await import("./todos.mjs");
+    const { data, change } = withRecord();
+    const roots = changeRootsFor(data, data.todos[1]);
+    expect(roots.map((r) => r.address)).toEqual(["c#1"]);
+    expect(roots[0].subject).toBe(change.title);
+    const out = formatChangeVision(data.todos[1], roots);
+    expect(out).toContain("── change c#1");
+    expect(out).toContain("что меняем в этом заходе");
+  });
+
+  it("раннер собирает группу по ссылке c#N и берёт потолок с записи", async () => {
+    const { collectChange } = await import("./run.mjs");
+    const { data } = withRecord();
+    const { root, members } = collectChange(data, "c#1");
+    expect(root.parallel_limit).toBe(3);
+    expect(members.map((t) => t.number)).toEqual([1, 2]);
+  });
+
+  it("линт видит запись без потолка, пока в ней есть открытая задача", async () => {
+    const { boardGraph } = await import("./lint.mjs");
+    const { checkGraph } = await import("./graph-rules.mjs");
+    const { data } = withRecord();
+    const findings = checkGraph(boardGraph(data, data.todos));
+    expect(findings.map((f) => f.message).join(" ")).toContain("no budget declared");
+    for (const t of data.todos) t.status = "done";
+    const closed = checkGraph(boardGraph(data, data.todos));
+    expect(closed.map((f) => f.message).join(" ")).not.toContain("no budget declared");
+  });
+});

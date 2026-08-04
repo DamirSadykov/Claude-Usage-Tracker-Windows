@@ -1795,7 +1795,31 @@ function directPrereqs(data, t) {
 // (an outer change wrapping an inner one stays out of view). Exported for the
 // SessionStart hook (hook.mjs), which surfaces the same vision for in_progress
 // tasks.
+export function changeAsRoot(record, data) {
+  if (!record) return null;
+  const members = (data?.todos ?? []).filter((x) => x && x.change_id === record.id);
+  const closed = members.length > 0 && members.every((x) => isDone(x));
+  return {
+    id: record.id,
+    number: record.number,
+    address: `c#${record.number}`,
+    subject: record.title,
+    description: record.delta ?? "",
+    plan: record.plan ?? "",
+    spec: Array.isArray(record.spec) ? [...record.spec] : [],
+    status: closed ? "done" : "queue",
+    budget_usd: record.budget_usd,
+    parallel_limit: record.parallel_limit,
+    record: true,
+    depends_on: members.map((x) => x.id),
+  };
+}
+
 export function changeRootsFor(data, t) {
+  if (t?.change_id) {
+    const record = (data?.changes ?? []).find((c) => c && c.id === t.change_id);
+    if (record) return [changeAsRoot(record, data)];
+  }
   const roots = [];
   const seen = new Set([t.id]);
   let frontier = [t.id];
@@ -1823,11 +1847,11 @@ export function changeRootsFor(data, t) {
 export function formatChangeVision(t, roots) {
   let out = `★ Vision inherited by #${t.number} "${t.subject}" from its change root(s) — the chain's north star; keep this task true to it (if it pulls away, stop and flag it):\n`;
   for (const r of roots) {
-    out += `\n── change t#${r.number} ${r.subject} [${col(r.status)}] ──\n`;
+    out += `\n── change ${r.address ?? `t#${r.number}`} ${r.subject} [${col(r.status)}] ──\n`;
     out +=
       r.description && r.description.trim()
         ? r.description.trim() + "\n"
-        : `(change root t#${r.number} has no description — its vision is missing; set it: todos set description ${r.number} --text "…")\n`;
+        : `(change ${r.address ?? `t#${r.number}`} has no delta — its vision is missing; write it on the record)\n`;
   }
   return out;
 }
