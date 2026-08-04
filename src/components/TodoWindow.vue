@@ -15,6 +15,8 @@ import ProjectAutocomplete from "./ProjectAutocomplete.vue";
 import ProjectLabel from "./ProjectLabel.vue";
 import GraphView from "./GraphView.vue";
 import SpecView from "./SpecView.vue";
+import PipelineGraph from "./pipeline/PipelineGraph.vue";
+import type { PipelineMode } from "./pipeline/modes";
 import { useProjectLinks } from "../projectLinks";
 import { useHotkeys } from "../hotkeys";
 import {
@@ -160,6 +162,10 @@ const formOpen = ref(false);
 // plus an empty option. Kept in lockstep with todos.rs / the cc-todos CLI.
 const PRIORITY_LEVELS = ["high", "medium", "low"] as const;
 
+const SUBJECT_LIMIT = 150;
+const fSubjectRemaining = computed(() => SUBJECT_LIMIT - fSubject.value.trim().length);
+const fSubjectOverLimit = computed(() => fSubjectRemaining.value < 0);
+
 // Projects the tracker has seen (from cc_usage), so the picker offers real
 // projects even before any todo uses them.
 const knownProjects = ref<string[]>([]);
@@ -255,6 +261,12 @@ function flushPendingReload() {
   }
 }
 
+function subjectCounterLabel(remaining: number): string {
+  return remaining >= 0
+    ? t("todoSubjectRemaining", { n: remaining })
+    : t("todoSubjectOverLimit", { n: -remaining });
+}
+
 function resetForm() {
   editingId.value = null;
   fSubject.value = "";
@@ -279,7 +291,7 @@ function startNew(colId = "backlog") {
 
 async function submitForm() {
   const subject = fSubject.value.trim();
-  if (!subject) return;
+  if (!subject || subject.length > SUBJECT_LIMIT) return;
   const existing = editingId.value
     ? todos.value.find((x) => x.id === editingId.value)
     : null;
@@ -386,6 +398,8 @@ const draft = ref<Draft>({
   status: "backlog",
   priority: "",
 });
+const draftSubjectRemaining = computed(() => SUBJECT_LIMIT - draft.value.subject.trim().length);
+const draftSubjectOverLimit = computed(() => draftSubjectRemaining.value < 0);
 
 function rankStatus(s: string): number {
   const i = COLUMNS.findIndex((c) => c.id === s);
@@ -447,7 +461,7 @@ async function saveDetail() {
   const cur = detail.value;
   if (!cur) return;
   const d = draft.value;
-  if (!d.subject.trim()) return;
+  if (!d.subject.trim() || d.subject.trim().length > SUBJECT_LIMIT) return;
   const todo: Todo = {
     ...cur, // keep id / comments / links / created_at / updated_at
     subject: d.subject.trim(),
@@ -658,6 +672,14 @@ async function openSettings() {
 // the level ABOVE it — the spec section a change points at, with that change's
 // graph under it.
 const viewMode = ref<"board" | "graph" | "specs">("board");
+// The graph tab has two renderings while the redesign lands: the new lane/wire
+// screens (default) and the classic force layout. The choice is remembered per
+// machine so a session that prefers the old picture keeps it.
+const graphUiNew = ref(localStorage.getItem("graph-ui") !== "classic");
+const specMode = ref<PipelineMode>("reader");
+watch(graphUiNew, (on) =>
+  localStorage.setItem("graph-ui", on ? "next" : "classic"),
+);
 // In graph view the ONE shared search box (below) highlights matching nodes instead
 // of filtering; Enter cycles to the next hit via GraphView's exposed `cycleNext`.
 const graphRef = ref<InstanceType<typeof GraphView> | null>(null);
@@ -735,9 +757,13 @@ function openSpecSection(address: string) {
 
 // Clicking a graph node opens that task's card — the same detail panel the board
 // uses (it overlays the graph and returns to it on close).
-function onGraphOpen(id: string) {
-  const todo = todos.value.find((x) => x.id === id);
-  if (todo) openDetail(todo);
+// The pipeline screens address a task the way a human does — "#345" — while the
+// classic graph passes the uuid. Accept both so either can open the card.
+function onPipelineOpen(ref: string) {
+  const byRef = ref.startsWith("#")
+    ? byNumber.value.get(Number(ref.slice(1)))
+    : todos.value.find((x) => x.id === ref);
+  if (byRef) openDetail(byRef);
 }
 
 // Navigate a t#N reference to that task's detail; a @name reference back to the
@@ -1680,6 +1706,19 @@ onUnmounted(() => {
           {{ t("viewSpecs") }}
         </button>
       </div>
+      <button
+        v-if="viewMode === 'graph' || viewMode === 'specs'"
+        class="tw-guide"
+        :title="graphUiNew ? t('graphUiOld') : t('graphUiNew')"
+        @click="graphUiNew = !graphUiNew"
+      >
+        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M2.5 5.5h11M2.5 10.5h11" />
+          <circle cx="6" cy="5.5" r="1.6" />
+          <circle cx="10" cy="10.5" r="1.6" />
+        </svg>
+        {{ graphUiNew ? t("graphUiOld") : t("graphUiNew") }}
+      </button>
       <button class="tw-guide" :title="t('todoGuideHint')" @click="openGuide">
         <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
           <path d="M2.5 3.2c1.8-.6 3.7-.6 5.5.3 1.8-.9 3.7-.9 5.5-.3v8.6c-1.8-.6-3.7-.6-5.5.3-1.8-.9-3.7-.9-5.5-.3z" />
@@ -1700,6 +1739,12 @@ onUnmounted(() => {
 
     <div v-if="loading" class="tw-empty">{{ t("loading") }}</div>
 
+    <!-- Task graph, new rendering: lanes by theme, artifacts on wires, ref rings -->
+    <PipelineGraph
+      v-else-if="viewMode === 'graph' && graphUiNew"
+      @open="onPipelineOpen"
+    />
+
     <!-- Task graph: an alternative view of the same filtered board (#88) -->
     <GraphView
       ref="graphRef"
@@ -1708,7 +1753,14 @@ onUnmounted(() => {
       :project="projectFilter"
       :query="search"
       @update="onGraphUpdate"
-      @open="onGraphOpen"
+      @open="onPipelineOpen"
+    />
+
+    <!-- Specs, new rendering: reader and review over the same registry -->
+    <PipelineGraph
+      v-else-if="viewMode === 'specs' && graphUiNew"
+      v-model:mode="specMode"
+      @open="onPipelineOpen"
     />
 
     <!-- Specs: the level above the board — section, its changes, their graph -->
@@ -1717,7 +1769,7 @@ onUnmounted(() => {
       :todos="todos"
       :project="projectFilter"
       :target="specTarget"
-      @open="onGraphOpen"
+      @open="onPipelineOpen"
     />
 
     <!-- Kanban board -->
@@ -1852,7 +1904,7 @@ onUnmounted(() => {
             {{ t("todoSaved") }}
           </span>
         </transition>
-        <button class="tw-btn" :disabled="!draft.subject.trim()" @click="saveDetail">{{ t("save") }}</button>
+        <button class="tw-btn" :disabled="!draft.subject.trim() || draftSubjectOverLimit" @click="saveDetail">{{ t("save") }}</button>
       </header>
 
       <div v-if="errorMsg" class="tw-error">{{ errorMsg }}</div>
@@ -1877,6 +1929,11 @@ onUnmounted(() => {
           <label class="tw-field">
             <span>{{ t("todoSubject") }}</span>
             <input v-model="draft.subject" class="tw-input" maxlength="200" />
+            <span
+              v-if="draftSubjectRemaining < 30"
+              class="tw-subject-counter"
+              :class="{ crit: draftSubjectOverLimit }"
+            >{{ subjectCounterLabel(draftSubjectRemaining) }}</span>
           </label>
           <div class="tw-row">
             <label class="tw-field">
@@ -2021,7 +2078,7 @@ onUnmounted(() => {
               </span>
             </transition>
             <button type="button" class="tw-btn ghost" @click="closeDetail">{{ t("todoBack") }}</button>
-            <button type="button" class="tw-btn" :disabled="!draft.subject.trim()" @click="saveDetail">{{ t("save") }}</button>
+            <button type="button" class="tw-btn" :disabled="!draft.subject.trim() || draftSubjectOverLimit" @click="saveDetail">{{ t("save") }}</button>
           </div>
 
           <!-- Cost by block: the task's spend split by (session x interval) -->
@@ -2308,6 +2365,11 @@ onUnmounted(() => {
           maxlength="200"
           autofocus
         />
+        <span
+          v-if="fSubjectRemaining < 30"
+          class="tw-subject-counter"
+          :class="{ crit: fSubjectOverLimit }"
+        >{{ subjectCounterLabel(fSubjectRemaining) }}</span>
         <textarea
           v-model="fDescription"
           class="tw-input tw-area"
@@ -2341,7 +2403,7 @@ onUnmounted(() => {
         </label>
         <div class="tw-form-actions">
           <button type="button" class="tw-btn ghost" @click="resetForm">{{ t("todoCancel") }}</button>
-          <button type="submit" class="tw-btn" :disabled="!fSubject.trim()">{{ t("save") }}</button>
+          <button type="submit" class="tw-btn" :disabled="!fSubject.trim() || fSubjectOverLimit">{{ t("save") }}</button>
         </div>
       </form>
     </div>
@@ -3196,6 +3258,15 @@ onUnmounted(() => {
   color: var(--text-4);
   font-style: italic;
   font-weight: 400;
+}
+.tw-subject-counter {
+  align-self: flex-end;
+  font-size: 11px;
+  color: var(--text-4);
+}
+.tw-subject-counter.crit {
+  color: var(--crit);
+  font-weight: 600;
 }
 .tw-form-actions {
   display: flex;

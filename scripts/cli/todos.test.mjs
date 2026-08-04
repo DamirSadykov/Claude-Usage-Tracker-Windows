@@ -963,6 +963,43 @@ describe("todos set", () => {
     });
   }
 
+  it("set subject changes the title without touching description or other fields", () => {
+    run("set", "description", "1", "--text", "keep me");
+    run("set", "priority", "1", "high");
+    run("set", "subject", "1", "a shorter title");
+    const t = read(1);
+    expect(t.subject).toBe("a shorter title");
+    expect(t.description).toBe("keep me");
+    expect(t.priority).toBe("high");
+  });
+
+  it("set subject accepts a title exactly at the 150-char cap", () => {
+    const title = "x".repeat(150);
+    run("set", "subject", "1", title);
+    expect(read(1).subject).toBe(title);
+    expect(read(1).subject.length).toBe(150);
+  });
+
+  it("set subject refuses a title one char over the cap", () => {
+    const title = "x".repeat(151);
+    const err = refuse("set", "subject", "1", title);
+    expect(err).toContain("151");
+    expect(err).toContain("150");
+    expect(err).toContain("todos set description");
+    expect(read(1).subject).toBe("task 1");
+  });
+
+  it("set subject refuses an empty title", () => {
+    const err = refuse("set", "subject", "1", "");
+    expect(err).toContain("empty");
+    expect(read(1).subject).toBe("task 1");
+  });
+
+  it("set subject trims surrounding whitespace before checking the cap", () => {
+    run("set", "subject", "1", "  padded title  ");
+    expect(read(1).subject).toBe("padded title");
+  });
+
   it("writes the on-issue field once a retry limit is declared", () => {
     run("set", "retry", "1", "2");
     run("set", "on-issue", "1", "#2");
@@ -1048,6 +1085,58 @@ describe("todos set", () => {
     ]) {
       expect(raw).not.toContain(key);
     }
+  });
+});
+
+describe("todos add: subject cap", () => {
+  const cli = path.join(fileURLToPath(new URL(".", import.meta.url)), "..", "cli.mjs");
+  let dir;
+  let file;
+
+  beforeEach(() => {
+    dir = mkdtempSync(path.join(os.tmpdir(), "cut-add-"));
+    const appDir = path.join(dir, "com.claude-usage-tracker.app");
+    mkdirSync(appDir, { recursive: true });
+    file = path.join(appDir, "todos.json");
+    writeFileSync(file, JSON.stringify({ version: 1, todos: [] }, null, 2));
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  const run = (...args) =>
+    execFileSync(process.execPath, [cli, "todos", ...args], {
+      env: { ...process.env, APPDATA: dir },
+      encoding: "utf8",
+    });
+
+  const refuse = (...args) => {
+    try {
+      execFileSync(process.execPath, [cli, "todos", ...args], {
+        env: { ...process.env, APPDATA: dir },
+        encoding: "utf8",
+        stdio: "pipe",
+      });
+      return null;
+    } catch (e) {
+      return String(e.stderr || "");
+    }
+  };
+
+  const todos = () => JSON.parse(readFileSync(file, "utf8")).todos;
+
+  it("accepts a subject exactly at the 150-char cap", () => {
+    const subject = "x".repeat(150);
+    run("add", subject, "--global");
+    expect(todos()).toHaveLength(1);
+    expect(todos()[0].subject).toBe(subject);
+  });
+
+  it("refuses a subject one char over the cap and creates nothing", () => {
+    const subject = "x".repeat(151);
+    const err = refuse("add", subject, "--global");
+    expect(err).toContain("151");
+    expect(err).toContain("150");
+    expect(err).toContain("todos set description");
+    expect(todos()).toHaveLength(0);
   });
 });
 
@@ -1267,7 +1356,7 @@ describe("the text and the CLI agree", () => {
 
   it("lists in --help exactly the fields `set` accepts", () => {
     const help = say("--help");
-    expect(fields).toHaveLength(13);
+    expect(fields).toHaveLength(14);
     for (const f of fields) expect(help).toContain(f);
   });
 
