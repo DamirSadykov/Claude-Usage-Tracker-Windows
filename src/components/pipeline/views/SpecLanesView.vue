@@ -13,7 +13,8 @@ import RefCard from "../../atoms/RefCard.vue";
 import SectionCard from "../../atoms/SectionCard.vue";
 import FileRow from "../../atoms/FileRow.vue";
 import WireLayer from "../../atoms/WireLayer.vue";
-import { specLanes, orphanMiddle, graphStats } from "../mock";
+import { specLanes as mockSpecLanes, orphanMiddle, graphStats as mockGraphStats } from "../mock";
+import { useSpecs } from "../useSpecs";
 import type { SpecLane } from "../types";
 
 const emit = defineEmits<{
@@ -27,11 +28,43 @@ interface LaneWire {
     [key: string]: unknown;
 }
 
+const specs = useSpecs();
+const live = computed(() => specs.live.value);
+
 const layer = ref("links");
 const layout = ref("sections");
 const hideEmpty = ref(false);
 const picked = ref("");
 const bodies = ref<Record<string, HTMLElement | null>>({});
+
+const lanes = computed(() => (live.value ? specs.specLanes.value : mockSpecLanes));
+
+const totalSections = computed(() =>
+    live.value ? specs.sectionCount() : undefined,
+);
+const totalRefs = computed(() =>
+    live.value
+        ? lanes.value.reduce((n, l) => n + l.incoming.length + l.outgoing.length, 0)
+        : undefined,
+);
+const totalOpenChanges = computed(() => {
+    if (!live.value) return undefined;
+    const migratedFrom = new Set(
+        specs.changes.value.map((c) => c.migrated_from).filter((n): n is number => !!n),
+    );
+    const openRecords = specs.changes.value.filter((c) => !c.closed_at).length;
+    const openLegacy = specs.board.value.filter(
+        (t) => t.change && t.status !== "done" && !(t.number && migratedFrom.has(t.number)),
+    ).length;
+    return openRecords + openLegacy;
+});
+const graphStats = computed(() =>
+    live.value
+        ? {
+              refs: `${totalSections.value} раздел(ов) · ${totalRefs.value} ссылок`,
+          }
+        : mockGraphStats,
+);
 
 const legendItems = [
     { text: "сплошная: ссылка из текста задачи", mark: "line" as const },
@@ -45,10 +78,19 @@ const legendItems = [
 ];
 
 const sectionLanes = computed(() =>
-    specLanes.filter((lane) => lane.id !== "orphan"),
+    lanes.value.filter((lane) => lane.id !== "orphan"),
 );
 const orphanLane = computed(() =>
-    specLanes.find((lane) => lane.id === "orphan"),
+    live.value ? undefined : lanes.value.find((lane) => lane.id === "orphan"),
+);
+
+const projectMeta = computed(() =>
+    live.value
+        ? [
+              `${totalSections.value ?? 0} раздел(ов)`,
+              `${totalOpenChanges.value ?? 0} открытых change'а`,
+          ]
+        : ["14 разделов", "4 открытых change'а"],
 );
 
 const orphanWires: LaneWire[] = [
@@ -144,13 +186,20 @@ function reset() {
     <div class="pipe-canvas">
         <ProjectBand
             kicker="домен спеки"
-            name="tasks v5"
-            :meta="['14 разделов', '4 открытых change\'а']"
+            :name="live ? (specs.currentDir.value?.project ?? '') : 'tasks v5'"
+            :meta="projectMeta"
         />
+
+        <div v-if="live && specs.loading.value" class="spec-lanes-empty">
+            Загрузка…
+        </div>
+        <div v-else-if="live && !sectionLanes.length" class="spec-lanes-empty">
+            В проекте нет спек — реестр ищет &lt;домен&gt;/spec.md внутри specRoot
+        </div>
 
         <div class="pipe-section spec-stack">
             <LaneFrame
-                v-for="lane in sectionLanes"
+                v-for="lane in sectionLanes.filter((l) => !hideEmpty || l.incoming.length + l.outgoing.length > 0)"
                 :key="lane.id"
                 :ref="(el) => bindFrame(lane.id, el)"
                 :tone="lane.tone === 'warn' ? 'warn' : 'plain'"
@@ -323,6 +372,12 @@ function reset() {
 </template>
 
 <style scoped>
+.spec-lanes-empty {
+    padding: 12px 28px;
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--text-4);
+}
 .spec-stack {
     display: flex;
     flex-direction: column;
