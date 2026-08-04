@@ -192,7 +192,8 @@ const USAGE =
   "                    [--spec <домен#слаг>[,<…>]] [--budget <usd>] [--parallel <N>]\n" +
   "       cli change list [--project <name> | --all] [--json]\n" +
   "       cli change show <c#N> [--json]\n" +
-  "       cli change close <c#N>\n\n" +
+  "       cli change close <c#N>\n" +
+  "       cli change migrate [--go]        root tasks -> records; dry run by default\n\n" +
   "A change is a RECORD, not a task: it holds the delta, the spec sections and the\n" +
   "group's ceilings, while a task points at it through `todos set change <task> c#N`.\n" +
   "Its status is derived — open while any of its tasks is open — and never stored.\n" +
@@ -369,6 +370,29 @@ function cmdClose(args) {
   process.stdout.write(`ok: ${changeAddress(change)} closed — ${total} task(s) done\n`);
 }
 
+async function cmdMigrate(args) {
+  const { flags } = parseArgs(args);
+  const { describe: describeMigration, migrate } = await import("./change-migrate.mjs");
+  const file = boardPath();
+  const data = loadBoard(file);
+  const lines = describeMigration(data);
+  if (!lines.length) {
+    process.stdout.write("нечего мигрировать: ни одного корня с флагом на доске\n");
+    return;
+  }
+  process.stdout.write(lines.join("\n") + "\n");
+  if (!flags.go) {
+    process.stdout.write("\nсухой прогон, ничего не записано — повтори с --go\n");
+    return;
+  }
+  const result = migrate(data);
+  saveBoard(file, data);
+  for (const note of result.notes) process.stdout.write(`note: ${note}\n`);
+  process.stdout.write(
+    `ok: ${result.created.length} запис(и) заведено, ${result.roots} корней снято с доски\n`,
+  );
+}
+
 export function run(args) {
   const [cmd, ...rest] = args;
   if (!cmd || cmd === "-h" || cmd === "--help" || cmd === "help") {
@@ -379,5 +403,6 @@ export function run(args) {
   if (cmd === "list") return cmdList(rest);
   if (cmd === "show") return cmdShow(rest);
   if (cmd === "close") return cmdClose(rest);
+  if (cmd === "migrate") return cmdMigrate(rest);
   fail(`unknown command: ${cmd}\n\n${USAGE}`);
 }
