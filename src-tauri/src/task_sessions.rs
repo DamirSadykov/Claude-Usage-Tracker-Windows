@@ -411,6 +411,7 @@ mod tests {
         let board = TodoFile {
             version: 1,
             todos: vec![todo("u-a", 7)],
+            changes: Vec::new(),
         };
         for r in ["u-a", "7", "#7", "t#7"] {
             assert_eq!(resolve_task_ref(&board, r).as_deref(), Some("u-a"));
@@ -424,6 +425,7 @@ mod tests {
         let board = TodoFile {
             version: 1,
             todos: vec![todo("u-a", 7)],
+            changes: Vec::new(),
         };
         let evs = vec![
             ev("T1", "s1", "u-a", "start", "take"),
@@ -454,7 +456,7 @@ mod tests {
 
     #[test]
     fn compose_survives_a_short_totals_vec() {
-        let board = TodoFile { version: 1, todos: vec![todo("u-a", 7)] };
+        let board = TodoFile { version: 1, todos: vec![todo("u-a", 7)], changes: Vec::new() };
         let bl = blocks(&[ev("T1", "s1", "u-a", "start", "take")], &ends(&[]));
         let out = compose(&bl, &board, &[]);
         assert_eq!(out.blocks.len(), 1);
