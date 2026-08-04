@@ -549,9 +549,9 @@ function setChange({ data, file, todo, value }) {
   }
   const change = s === "on" || s === "true";
   if (change)
-    process.stdout.write(
-      `warn: \`change on\` marks the OLD root-task form; membership is a record now —\n` +
-        `      cli change new "<title>" then todos set change ${todo.number} <c#N>\n`,
+    fail(
+      `refusing: \`change on\` is the OLD root-task form — a change is a record now.\n` +
+        `  cli change new "<title>"   then   todos set change ${todo.number} <c#N>`,
     );
   if (change && !directPrereqs(data, todo).length) {
     process.stdout.write(
@@ -767,7 +767,7 @@ function setParallel({ data, file, todo, value }) {
   if (limit !== null && !isChangeRoot(todo)) {
     process.stdout.write(
       `warn: #${todo.number} is not a change — a parallel limit only means something on a GROUP,\n` +
-        `      and the runner reads it off the change root. Mark it: todos set change ${todo.number} on\n`,
+        `      and the runner reads it off the change record. Put the task in one: todos set change ${todo.number} <c#N>\n`,
     );
   }
   if ((todo.parallel_limit ?? null) === limit) {
@@ -2071,7 +2071,7 @@ function cmdVision(args) {
   }
   if (!roots.length && !specLink.addresses.length) {
     process.stdout.write(
-      `#${t.number} "${t.subject}" has no change root above it and no spec link of its own — nothing to inherit. (A change root = a dependent task with \`change\` on; mark one: todos set change <id> on. A spec link is \`todos set spec <id> <домен>#<слаг>\`.)\n`,
+      `#${t.number} "${t.subject}" has no change above it and no spec link of its own — nothing to inherit. (A change is a record: \`cli change new "<title>"\`, then \`todos set change <id> <c#N>\`. A spec link is \`todos set spec <id> <домен>#<слаг>\`.)\n`,
     );
     return;
   }

@@ -158,19 +158,20 @@ describe("apply records the graph", () => {
 
   it("records tasks, dep edges and every declaration in one pass", () => {
     say(path.join(dir, "graph.yaml"), "--go");
-    const { todos } = board();
+    const { todos, changes } = board();
     const bySubject = Object.fromEntries(todos.map((t) => [t.subject, t]));
-    const root = bySubject["CHANGE: пробный процесс"];
     const one = bySubject["Собираю каркас"];
     const two = bySubject["Пишу тесты"];
     const three = bySubject["Смотрю глазами"];
+    const change = changes.find((c) => c.title === "CHANGE: пробный процесс");
 
-    expect(root.change).toBe(true);
-    expect(root.description).toMatch(/Проверяю запись графа/);
-    expect(root.parallel_limit).toBe(2);
-    expect(root.budget_usd).toBe(5);
-    // A change root depends on every member, so it closes last.
-    expect(root.depends_on).toEqual(expect.arrayContaining([one.id, two.id, three.id]));
+    // The change is a RECORD now: no task carries it, and membership is a field.
+    expect(bySubject["CHANGE: пробный процесс"]).toBeUndefined();
+    expect(change.number).toBe(1);
+    expect(change.delta).toMatch(/Проверяю запись графа/);
+    expect(change.parallel_limit).toBe(2);
+    expect(change.budget_usd).toBe(5);
+    expect([one, two, three].map((t) => t.change_id)).toEqual([change.id, change.id, change.id]);
 
     expect(one.produces).toEqual(["scripts/cli/apply.mjs"]);
     expect(one.verify).toBe("npm test");
@@ -187,7 +188,7 @@ describe("apply records the graph", () => {
   it("keeps a ?issue target out of depends_on", () => {
     writeFileSync(
       path.join(dir, "loop.yaml"),
-      ["steps:", "  1:", "    title: A", "  2:", "    title: B", "    needs: [1]", "  3:", "    title: C", "    needs: [2]", "    retry: 2", "    on-issue: 1"].join("\n"),
+      ["change: CHANGE: петля прогона", "steps:", "  1:", "    title: A", "  2:", "    title: B", "    needs: [1]", "  3:", "    title: C", "    needs: [2]", "    retry: 2", "    on-issue: 1"].join("\n"),
     );
     say(path.join(dir, "loop.yaml"), "--go");
     const { todos } = board();
@@ -209,10 +210,10 @@ describe("apply records the graph", () => {
     say(path.join(dir, "graph.yaml"), "--go");
     writeFileSync(path.join(dir, "graph.yaml"), GRAPH.replace("Проверяю запись графа из файла.", "Другое видение."));
     const kept = say(path.join(dir, "graph.yaml"), "--go");
-    expect(kept).toMatch(/already carries a vision/);
-    expect(board().todos.find((t) => t.change).description).toMatch(/Проверяю запись графа/);
+    expect(kept).toMatch(/already carries a delta/);
+    expect(board().changes[0].delta).toMatch(/Проверяю запись графа/);
     say(path.join(dir, "graph.yaml"), "--go", "--force");
-    expect(board().todos.find((t) => t.change).description).toBe("Другое видение.");
+    expect(board().changes[0].delta).toBe("Другое видение.");
   });
 
   // t#323: an interrupted run leaves tasks that were created but never linked to
@@ -225,9 +226,9 @@ describe("apply records the graph", () => {
     expect(out).toMatch(/2 new step\(s\), 1 matched/);
     const { todos: rows } = board();
     expect(rows.filter((t) => t.subject === "Пишу тесты")).toHaveLength(1);
-    const root = rows.find((t) => t.change);
+    const change = board().changes[0];
     const adopted = rows.find((t) => t.subject === "Пишу тесты");
-    expect(root.depends_on).toContain(adopted.id);
+    expect(adopted.change_id).toBe(change.id);
   });
 
   // Two steps sharing a phrase must not collapse onto one row: the second one
@@ -235,7 +236,7 @@ describe("apply records the graph", () => {
   it("does not seat two steps on the same task", () => {
     writeFileSync(
       path.join(dir, "twins.yaml"),
-      ["steps:", "  1:", "    title: Одинаковое", "  2:", "    title: Одинаковое"].join("\n"),
+      ["change: CHANGE: близнецы", "steps:", "  1:", "    title: Одинаковое", "  2:", "    title: Одинаковое"].join("\n"),
     );
     say(path.join(dir, "twins.yaml"), "--go");
     expect(board().todos.filter((t) => t.subject === "Одинаковое")).toHaveLength(2);
@@ -404,5 +405,67 @@ describe("a step may name the task it IS", () => {
     expect(() =>
       say(yaml("twins.yaml", "steps:", "  1:", `    task: ${n}`, "  2:", `    task: #${n}`), "--go"),
     ).toThrow(/already bound to an earlier step/);
+  });
+});
+
+describe("apply requires a change for new work", () => {
+  let dir;
+  const savedAppData = process.env.APPDATA;
+  const board = () =>
+    JSON.parse(readFileSync(path.join(dir, "com.claude-usage-tracker.app", "todos.json"), "utf8"));
+  const todos = (...args) =>
+    execFileSync(process.execPath, [cli, "todos", ...args], {
+      encoding: "utf8",
+      env: { ...process.env, APPDATA: dir },
+      windowsHide: true,
+    });
+  const write = (name, ...lines) => {
+    const p = path.join(dir, name);
+    writeFileSync(p, lines.join("\n"));
+    return p;
+  };
+
+  beforeEach(() => {
+    dir = mkdtempSync(path.join(os.tmpdir(), "cut-apply-change-"));
+    mkdirSync(path.join(dir, "com.claude-usage-tracker.app"), { recursive: true });
+  });
+
+  afterEach(() => {
+    if (savedAppData === undefined) delete process.env.APPDATA;
+    else process.env.APPDATA = savedAppData;
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("refuses a plan that opens a new task and names no change", () => {
+    expect(() => todos("apply", write("bare.yaml", "steps:", "  1:", "    title: Один шаг"), "--go")).toThrow(
+      /no change: a step that opens a NEW task/,
+    );
+  });
+
+  it("takes a one-step plan bound to an existing task — it opens nothing", () => {
+    todos("add", "Уже на доске");
+    const n = board().todos[0].number;
+    const out = todos("apply", write("bound.yaml", "steps:", "  1:", `    task: ${n}`, "    verify: npm test"), "--go");
+    expect(out).toMatch(/0 new step/);
+    expect(board().todos[0].verify).toBe("npm test");
+  });
+
+  it("inherits the change from a task the step is bound to", () => {
+    execFileSync(process.execPath, [cli, "change", "new", "CHANGE: уже заведён"], {
+      encoding: "utf8",
+      env: { ...process.env, APPDATA: dir },
+      windowsHide: true,
+    });
+    todos("add", "Уже на доске");
+    const n = board().todos[0].number;
+    todos("set", "change", String(n), "c#1");
+    const out = todos(
+      "apply",
+      write("mixed.yaml", "steps:", "  1:", `    task: ${n}`, "  2:", "    title: Новый шаг", "    needs: [1]"),
+      "--go",
+    );
+    expect(out).toMatch(/1 new step/);
+    const fresh = board().todos.find((t) => t.subject === "Новый шаг");
+    expect(fresh.change_id).toBe(board().changes[0].id);
   });
 });

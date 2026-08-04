@@ -312,9 +312,10 @@ describe("cli change", () => {
     expect(err).toContain("cli change list");
   });
 
-  it("предупреждает про старую булеву форму вместо тихой записи", () => {
-    const out = run(["todos", "set", "change", "1", "on"]);
-    expect(out).toContain("marks the OLD root-task form");
+  it("отказывает старой булевой форме, называя новую", () => {
+    const err = refuse(["todos", "set", "change", "1", "on"]);
+    expect(err).toContain("is the OLD root-task form");
+    expect(err).toContain("cli change new");
   });
 
   it("показывает состав и производный статус", () => {
