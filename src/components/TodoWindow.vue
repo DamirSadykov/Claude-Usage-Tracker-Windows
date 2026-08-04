@@ -92,6 +92,7 @@ export interface Todo {
   priority?: string; // "high" | "medium" | "low" | "" (unset) — drives hook context
   kind?: string; // "auto" | "" (manual, default) — task-graph node type (#88)
   change?: boolean; // change-root marker (t#255): depends_on all children, description = delta
+  change_id?: string;
   scheduled_for?: string | null;
   plan: string;
   project?: string | null;

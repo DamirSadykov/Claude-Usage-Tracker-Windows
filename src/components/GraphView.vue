@@ -15,15 +15,16 @@
 //
 // Pointer model: LEFT-click a node highlights its connections; drag (Deps tab)
 // creates a dependency; RIGHT-click a node opens its card.
-import { ref, computed, watch, onUnmounted } from "vue";
+import { ref, computed, watch, onMounted, onUnmounted } from "vue";
 import { useI18n } from "vue-i18n";
 import { invoke } from "@tauri-apps/api/core";
 import type { Todo } from "./TodoWindow.vue";
 import {
-  loadRunLayer,
+  loadRunGroups,
   loadTaskBlocks,
   revealTranscript,
   type RunGraphNode,
+  type RunGraphGroup,
   type RunBlock,
 } from "../graphModel";
 
@@ -97,6 +98,28 @@ const byId = computed(() => {
   return m;
 });
 
+interface ChangeRecord {
+  id: string;
+  number: number;
+  title: string;
+  project?: string | null;
+}
+const changeRecords = ref<ChangeRecord[]>([]);
+async function reloadChangeRecords() {
+  try {
+    changeRecords.value = await invoke<ChangeRecord[]>("get_changes");
+  } catch {
+    changeRecords.value = [];
+  }
+}
+onMounted(() => void reloadChangeRecords());
+watch(() => props.todos, () => void reloadChangeRecords());
+const recordById = computed(() => {
+  const m = new Map<string, ChangeRecord>();
+  for (const c of changeRecords.value) m.set(c.id, c);
+  return m;
+});
+
 // --- Task-graph node type + DERIVED pipeline state (#88) --------------------
 // Two axes kept ORTHOGONAL to the kanban `status` (the node fill):
 //   kind  — a STORED marker: "auto" (a runner may run it headless) vs "manual"
@@ -152,6 +175,7 @@ interface GNode {
   extProject?: string;
   // Change root drawn as the heading card of an EXPANDED accordion section (t#264).
   sectionHead?: boolean;
+  record?: boolean;
   lines: string[]; // subject wrapped to fit the node width
   h: number; // node height, grown to fit the wrapped lines
   x: number;
@@ -269,7 +293,9 @@ const shownTasks = computed(() =>
 const runOn = ref(false);
 const runLoading = ref(false);
 const runLayer = ref<Map<string, RunGraphNode>>(new Map());
+const groupLayer = ref<Map<string, RunGraphGroup>>(new Map());
 const runOf = (id: string): RunGraphNode | undefined => runLayer.value.get(id);
+const groupOf = (id: string): RunGraphGroup | undefined => groupLayer.value.get(id);
 
 // Truncate the external-project label so `#N project` fits the node width; the
 // full name is shown as a <title> tooltip. Budget = line width minus "#N ".
@@ -291,6 +317,26 @@ function baseNode(x: Todo, external = false): GNode {
     lines,
     // The run layer adds a line INSIDE the box, so the layout has to know about
     // it — otherwise the numbers overflow onto the node below.
+    h: NODE_H + (lines.length - 1) * LINE_H + (runOn.value ? RUN_H : 0),
+    x: 0,
+    y: 0,
+  };
+}
+
+function recordAggStatus(members: Todo[]): string {
+  if (!members.length) return "backlog";
+  return members.every((m) => canonStatus(m.status) === "done") ? "done" : "in_progress";
+}
+function baseNodeFromRecord(record: ChangeRecord, members: Todo[]): GNode {
+  const lines = wrapLines(record.title);
+  return {
+    id: record.id,
+    number: record.number,
+    subject: record.title,
+    status: recordAggStatus(members),
+    external: false,
+    record: true,
+    lines,
     h: NODE_H + (lines.length - 1) * LINE_H + (runOn.value ? RUN_H : 0),
     x: 0,
     y: 0,
@@ -455,16 +501,15 @@ const depGraph = computed<{ tasks: Todo[]; shownIds: Set<string>; depEdges: GEdg
   return { tasks: [...inSet.values()], shownIds, depEdges };
 });
 
-// Change sections (t#264): an EXPANDED change renders as an accordion section
-// instead of a terminal node — the root card heads a frame around its exclusive
-// prerequisite subtree, whose member→root edges are implied by containment and
-// not drawn. A COLLAPSED change keeps riding the fold below (collapsedRoots →
-// collapsedGraph), so this map lists candidates regardless of fold state and
-// depModel skips the collapsed ones. Nested changes: only OUTERMOST roots get a
-// section; an inner root is a member of the outer subtree and renders as a node.
 const changeSections = computed<Map<string, Set<string>>>(() => {
   const { tasks, depEdges } = depGraph.value;
   const sections = new Map<string, Set<string>>();
+  const byRecord = new Map<string, string[]>();
+  for (const x of tasks) {
+    if (!x.change_id || !recordById.value.has(x.change_id)) continue;
+    (byRecord.get(x.change_id) ?? byRecord.set(x.change_id, []).get(x.change_id)!).push(x.id);
+  }
+  for (const [changeId, memberIds] of byRecord) sections.set(changeId, new Set(memberIds));
   for (const x of tasks) {
     if (x.change !== true) continue;
     const members = exclusiveSubtree(x.id, depEdges);
@@ -568,7 +613,7 @@ const collapsible = computed<Set<string>>(() => {
   const s = new Set<string>();
   for (const e of collapsedGraph.value.depEdges) s.add(e.toId);
   for (const id of collapseStats.value.keys()) s.add(id);
-  for (const id of changeSections.value.keys()) s.add(id);
+  for (const id of changeSections.value.keys()) if (!recordById.value.has(id)) s.add(id);
   return s;
 });
 
@@ -587,13 +632,19 @@ const depModel = computed<{
   // the fold rendering (card + ▸ badge) via collapsedGraph instead.
   const sections = new Map<string, Set<string>>();
   const sectionOf = new Map<string, string>(); // member id → its section root
+  const recordProject = new Map<string, string>();
   for (const [rootId, members] of changeSections.value) {
     if (collapsedRoots.value.has(rootId)) continue;
-    if (!taskById.has(rootId)) continue;
+    const record = recordById.value.get(rootId);
+    if (!taskById.has(rootId) && !record) continue;
     const present = new Set([...members].filter((id) => taskById.has(id)));
     if (!present.size) continue;
     sections.set(rootId, present);
     for (const id of present) sectionOf.set(id, rootId);
+    if (record) {
+      const fallback = [...present].map((id) => taskById.get(id)?.project).find(Boolean);
+      recordProject.set(rootId, record.project ?? fallback ?? "");
+    }
   }
 
   // A member→root edge is implied by the section frame — drop it from drawing and
@@ -621,6 +672,14 @@ const depModel = computed<{
       // A prerequisite pulled in past the status filter — dim it as context.
       if (!shownIds.has(id)) node.context = true;
       nodes.set(id, node);
+      continue;
+    }
+    const record = recordById.value.get(id);
+    if (record) {
+      const memberTasks = [...(sections.get(id) ?? [])]
+        .map((mid) => taskById.get(mid))
+        .filter((t): t is Todo => !!t);
+      nodes.set(id, baseNodeFromRecord(record, memberTasks));
     }
   }
 
@@ -737,7 +796,8 @@ const depModel = computed<{
   // root card sits at the left as its heading, the members pipeline to its right.
   const groups = new Map<string, string[]>();
   for (const id of inGraph) {
-    const p = boardOf(taskById.get(id)!);
+    const t = taskById.get(id);
+    const p = t ? boardOf(t) : (recordProject.get(id) ?? "");
     (groups.get(p) ?? groups.set(p, []).get(p)!).push(id);
   }
   const showBands = groups.size > 1;
@@ -1064,20 +1124,30 @@ watch(nodeById, (m) => {
 // The changes drawn right now. A run graph is fetched per change, so the key also
 // decides WHEN to refetch: fold a change away or filter it out and its numbers
 // stop being asked for.
-const runChanges = computed<string[]>(() =>
-  model.value.nodes
-    .filter((n) => !n.external && byId.value.get(n.id)?.change === true && n.number)
-    .map((n) => String(n.number)),
-);
+const runChanges = computed<string[]>(() => {
+  const refs: string[] = [];
+  for (const n of model.value.nodes) {
+    if (n.external || !n.number) continue;
+    if (n.record) {
+      refs.push(n.id);
+      continue;
+    }
+    if (byId.value.get(n.id)?.change === true) refs.push(String(n.number));
+  }
+  return refs;
+});
 
 async function reloadRun() {
   if (!runOn.value) {
     runLayer.value = new Map();
+    groupLayer.value = new Map();
     return;
   }
   runLoading.value = true;
   try {
-    runLayer.value = await loadRunLayer(runChanges.value);
+    const layer = await loadRunGroups(runChanges.value);
+    runLayer.value = layer.nodes;
+    groupLayer.value = layer.groups;
   } finally {
     runLoading.value = false;
   }
@@ -1091,6 +1161,9 @@ const runBlocks = ref<RunBlock[]>([]);
 const runPathMsg = ref("");
 const runNode = computed<RunGraphNode | null>(() =>
   runOn.value && selected.value ? runOf(selected.value) ?? null : null,
+);
+const runGroupNode = computed<RunGraphGroup | null>(() =>
+  runOn.value && selected.value ? groupOf(selected.value) ?? null : null,
 );
 watch([selected, runOn], async ([id, on]) => {
   runPathMsg.value = "";
@@ -1177,6 +1250,15 @@ function runTitle(n: RunGraphNode): string {
     parts.push(subs.map((a) => `${a.description || a.agent_type} ${fmtMoney(a.cost)}`).join(", "));
   }
   return parts.join(" · ");
+}
+
+function groupRunLabel(g: RunGraphGroup): string {
+  return g.duration_minutes != null ? fmtMin(g.duration_minutes) + "*" : "";
+}
+function groupRunTitle(g: RunGraphGroup): string {
+  return g.duration_minutes != null
+    ? fmtMin(g.duration_minutes) + ` — ${t("graphRunCalendar")}`
+    : "";
 }
 
 // --- Find (the shared header search box, via the `query` prop) --------------
@@ -1479,7 +1561,7 @@ async function onUp() {
   if (!target || target === from) return;
   const src = nodeById.value.get(from);
   const dst = nodeById.value.get(target);
-  if (!src || !dst || src.external || dst.external) {
+  if (!src || !dst || src.external || dst.external || src.record || dst.record) {
     flashError(t("graphExternalEdge"));
     return;
   }
@@ -1533,7 +1615,8 @@ function existingDepPath(dependentId: string, prereqId: string): number[] | null
 // RIGHT-click a node → open its card.
 function onNodeContext(e: MouseEvent, id: string) {
   e.preventDefault();
-  if (nodeById.value.get(id)?.external) return; // other-board task: no local card
+  const n = nodeById.value.get(id);
+  if (n?.external || n?.record) return; // other-board task: no local card
   emit("open", id);
 }
 
@@ -1887,7 +1970,7 @@ onUnmounted(() => {
           </g>
           <text class="num" x="12" y="18">
             <tspan v-if="kindOf(n.id) === 'auto'" class="kind-auto">⚡ </tspan>
-            <tspan v-if="n.number">#{{ n.number }}</tspan>
+            <tspan v-if="n.number">{{ n.record ? "c#" : "#" }}{{ n.number }}</tspan>
             <tspan v-if="n.external" class="ext-proj" :dx="n.number ? 6 : 0">
               {{ extLabel(n) }}
             </tspan>
@@ -1904,7 +1987,19 @@ onUnmounted(() => {
           <!-- Run layer (t#307): one line inside the box. A node with no
                recoverable block shows the REASON, never a zero. -->
           <g
-            v-if="runOn && runOf(n.id)"
+            v-if="runOn && n.record && groupOf(n.id)"
+            class="run"
+            :transform="`translate(0,${n.h - RUN_H})`"
+            clip-path="url(#run-clip)"
+          >
+            <line class="run-sep" x1="8" y1="0" :x2="NODE_W - 8" y2="0" />
+            <text class="run-text" x="12" :y="RUN_H - 5"
+            >{{ groupRunLabel(groupOf(n.id)!) }}
+              <title>{{ groupRunTitle(groupOf(n.id)!) }}</title>
+            </text>
+          </g>
+          <g
+            v-else-if="runOn && !n.record && runOf(n.id)"
             class="run"
             :transform="`translate(0,${n.h - RUN_H})`"
             clip-path="url(#run-clip)"
@@ -2007,6 +2102,19 @@ onUnmounted(() => {
         </li>
       </ul>
       <div v-if="runPathMsg" class="gv-run-path">{{ runPathMsg }}</div>
+    </div>
+
+    <div v-else-if="runOn && runGroupNode" class="gv-run-panel">
+      <div class="gv-run-hd">
+        <b>{{ t("graphRunPanel", { n: runGroupNode.number }) }}</b>
+        <button class="gv-run-x" :title="t('graphRunClose')" @click="selected = null">✕</button>
+      </div>
+      <div class="gv-run-subj">{{ runGroupNode.subject }}</div>
+      <div class="gv-run-sum">
+        <span v-if="runGroupNode.duration_minutes != null" :title="t('graphRunCalendar')">
+          {{ fmtMin(runGroupNode.duration_minutes) }}*
+        </span>
+      </div>
     </div>
 
     <!-- Confirm before removing a dependency edge (accidental clicks on the tiny
