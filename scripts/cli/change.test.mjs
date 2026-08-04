@@ -1,4 +1,9 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   parseChangeRef,
   changesOf,
@@ -232,5 +237,126 @@ describe("legacyRootsOf", () => {
   it("returns the root itself for a root", () => {
     const data = legacyBoard();
     expect(legacyRootsOf(data, data.todos[0]).map((r) => r.number)).toEqual([10]);
+  });
+});
+
+describe("cli change", () => {
+  const cli = path.join(fileURLToPath(new URL(".", import.meta.url)), "..", "cli.mjs");
+  let dir;
+  let appDir;
+  let board;
+
+  const run = (args, opts = {}) =>
+    execFileSync(process.execPath, [cli, ...args], {
+      env: { ...process.env, APPDATA: dir },
+      encoding: "utf8",
+      cwd: opts.cwd ?? process.cwd(),
+      stdio: "pipe",
+    });
+
+  const refuse = (args) => {
+    try {
+      run(args);
+      return "";
+    } catch (e) {
+      return String(e.stderr || "");
+    }
+  };
+
+  const read = () => JSON.parse(readFileSync(board, "utf8"));
+
+  beforeEach(() => {
+    dir = mkdtempSync(path.join(os.tmpdir(), "cut-change-"));
+    appDir = path.join(dir, "com.claude-usage-tracker.app");
+    mkdirSync(appDir, { recursive: true });
+    board = path.join(appDir, "todos.json");
+    writeFileSync(
+      board,
+      JSON.stringify({
+        version: 1,
+        todos: [
+          { id: "t-1", number: 1, subject: "первая", status: "backlog", project: "board" },
+          { id: "t-2", number: 2, subject: "вторая", status: "done", project: "board" },
+        ],
+      }),
+    );
+  });
+
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  it("заводит запись со своим номером и потолками группы", () => {
+    const out = run(["change", "new", "Перевод на записи", "--project", "board", "--budget", "12", "--parallel", "2"]);
+    expect(out).toContain("ok: c#1");
+    const rec = read().changes[0];
+    expect(rec.number).toBe(1);
+    expect(rec.budget_usd).toBe(12);
+    expect(rec.parallel_limit).toBe(2);
+  });
+
+  it("отказывает второй записи с тем же заголовком на одной доске", () => {
+    run(["change", "new", "Перевод на записи", "--project", "board"]);
+    expect(refuse(["change", "new", "Перевод на записи", "--project", "board"])).toContain("already carries that title");
+  });
+
+  it("привязывает задачу к записи и снимает привязку", () => {
+    run(["change", "new", "Перевод на записи", "--project", "board"]);
+    expect(run(["todos", "set", "change", "1", "c#1"])).toContain("change -> c#1");
+    expect(read().todos[0].change_id).toBe(read().changes[0].id);
+    expect(run(["todos", "set", "change", "1", "none"])).toContain("change -> none");
+    expect(read().todos[0].change_id).toBeUndefined();
+  });
+
+  it("отказывает привязке к несуществующему change'у, называя новую форму", () => {
+    const err = refuse(["todos", "set", "change", "1", "c#9"]);
+    expect(err).toContain("valid: <c#N> | none");
+    expect(err).toContain("cli change list");
+  });
+
+  it("предупреждает про старую булеву форму вместо тихой записи", () => {
+    const out = run(["todos", "set", "change", "1", "on"]);
+    expect(out).toContain("marks the OLD root-task form");
+  });
+
+  it("показывает состав и производный статус", () => {
+    run(["change", "new", "Перевод на записи", "--project", "board"]);
+    run(["todos", "set", "change", "1", "c#1"]);
+    run(["todos", "set", "change", "2", "c#1"]);
+    const out = run(["change", "show", "c#1"]);
+    expect(out).toContain("c#1 [open]");
+    expect(out).toContain("1/2 готово");
+    expect(out).toContain("#1 [backlog] первая");
+  });
+
+  it("отказывается закрывать change с открытой задачей и закрывает готовый", () => {
+    run(["change", "new", "Перевод на записи", "--project", "board"]);
+    run(["todos", "set", "change", "1", "c#1"]);
+    run(["todos", "set", "change", "2", "c#1"]);
+    expect(refuse(["change", "close", "c#1"])).toContain("still has 1 open task");
+    run(["todos", "set", "status", "1", "done"]);
+    expect(run(["change", "close", "c#1"])).toContain("closed — 2 task(s) done");
+    expect(read().changes[0].closed_at).toBeTruthy();
+  });
+
+  it("отказывается закрывать change без задач", () => {
+    run(["change", "new", "Пустой", "--project", "board"]);
+    expect(refuse(["change", "close", "c#1"])).toContain("has no tasks");
+  });
+
+  it("перечисляет немигрированные корни под адресом t#N", () => {
+    const data = read();
+    data.todos.push({
+      id: "t-3",
+      number: 3,
+      subject: "старый корень",
+      status: "queue",
+      project: "board",
+      change: true,
+      depends_on: ["t-1"],
+    });
+    writeFileSync(board, JSON.stringify(data));
+    const out = run(["change", "list", "--all"]);
+    expect(out).toContain("t#3");
+    expect(out).toContain("не мигрирован");
+    expect(refuse(["change", "close", "t#3"])).toContain("still a root task");
   });
 });

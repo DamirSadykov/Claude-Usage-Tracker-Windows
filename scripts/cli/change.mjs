@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { boardPath, loadBoard, saveBoard } from "./todos.mjs";
 
 export const CHANGE_REF = /^c\s*#?\s*(\d+)$/i;
 
@@ -174,4 +175,209 @@ export function changeStatus(data, change) {
 
 export function isChangeOpen(data, change) {
   return changeStatus(data, change) === "open";
+}
+
+export function legacyChanges(data) {
+  return (data?.todos ?? [])
+    .filter(isLegacyRoot)
+    .map((root) => ({ ...legacyChange(root), created_at: root.created_at }));
+}
+
+export function allChanges(data) {
+  return [...changesOf(data), ...legacyChanges(data)].sort(byRecency);
+}
+
+const USAGE =
+  'usage: cli change new "<title>" [--project <name> | --global] [--delta "<text>"]\n' +
+  "                    [--spec <домен#слаг>[,<…>]] [--budget <usd>] [--parallel <N>]\n" +
+  "       cli change list [--project <name> | --all] [--json]\n" +
+  "       cli change show <c#N> [--json]\n" +
+  "       cli change close <c#N>\n\n" +
+  "A change is a RECORD, not a task: it holds the delta, the spec sections and the\n" +
+  "group's ceilings, while a task points at it through `todos set change <task> c#N`.\n" +
+  "Its status is derived — open while any of its tasks is open — and never stored.\n" +
+  "Roots not migrated yet are listed under their old address t#N.";
+
+function fail(msg) {
+  process.stderr.write(msg + "\n");
+  process.exit(1);
+}
+
+function parseArgs(args) {
+  const flags = {};
+  const positional = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a.startsWith("--")) {
+      const next = args[i + 1];
+      if (next === undefined || next.startsWith("--")) flags[a.slice(2)] = true;
+      else {
+        flags[a.slice(2)] = next;
+        i++;
+      }
+    } else positional.push(a);
+  }
+  return { positional, flags };
+}
+
+const currentProject = () => process.cwd().split(/[\\/]/).filter(Boolean).pop() ?? null;
+
+function numberFlag(value, name) {
+  if (value === undefined) return undefined;
+  const n = Number(String(value).replace(/^\$/, ""));
+  if (!Number.isFinite(n) || n <= 0) fail(`refusing: --${name} takes a positive number`);
+  return n;
+}
+
+export function formatChangeLine(data, change) {
+  const { done, total } = changeProgress(data, change);
+  const status = changeStatus(data, change);
+  const caps = [
+    change.budget_usd === undefined ? "" : `$${change.budget_usd}`,
+    change.parallel_limit === undefined ? "" : `параллельно ${change.parallel_limit}`,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  return (
+    `${changeAddress(change)} [${status}] ${change.title}` +
+    ` — ${done}/${total} готово` +
+    (change.project ? ` · ${change.project}` : "") +
+    (caps ? ` · ${caps}` : "") +
+    (change.legacy ? " · не мигрирован" : "")
+  );
+}
+
+function cmdNew(args) {
+  const { positional, flags } = parseArgs(args);
+  const title = String(positional[0] ?? flags.title ?? "").trim();
+  if (!title) fail(USAGE);
+  const file = boardPath();
+  const data = loadBoard(file);
+  const project = flags.global ? null : String(flags.project ?? currentProject());
+  const twin = findChangeByTitle(data, title, project);
+  if (twin)
+    fail(
+      `refusing: ${changeAddress(twin)} on this board already carries that title.\n` +
+        `  point the task at it instead: todos set change <task> ${changeAddress(twin)}`,
+    );
+  const change = createChange(data, {
+    title,
+    delta: flags.delta === true ? "" : (flags.delta ?? ""),
+    project,
+    spec: flags.spec && flags.spec !== true ? String(flags.spec).split(",").map((s) => s.trim()).filter(Boolean) : [],
+    budget_usd: numberFlag(flags.budget, "budget"),
+    parallel_limit: numberFlag(flags.parallel, "parallel"),
+  });
+  saveBoard(file, data);
+  process.stdout.write(`ok: ${changeAddress(change)} "${change.title}"\n`);
+}
+
+function cmdList(args) {
+  const { flags } = parseArgs(args);
+  const data = loadBoard(boardPath());
+  const project = flags.all ? null : String(flags.project ?? currentProject());
+  const list = allChanges(data).filter(
+    (c) => flags.all || (c.project ?? null) === project || c.project == null,
+  );
+  if (flags.json) {
+    process.stdout.write(
+      JSON.stringify(
+        list.map((c) => ({
+          address: changeAddress(c),
+          ...c,
+          status: changeStatus(data, c),
+          progress: changeProgress(data, c),
+        })),
+        null,
+        2,
+      ) + "\n",
+    );
+    return;
+  }
+  if (!list.length) {
+    process.stdout.write("нет ни одного change'а на этой доске\n");
+    return;
+  }
+  for (const c of list) process.stdout.write(formatChangeLine(data, c) + "\n");
+}
+
+function resolveOrFail(data, ref) {
+  const hit = findChange(data, ref) ?? allChanges(data).find((c) => changeAddress(c) === String(ref).trim());
+  if (!hit) fail(`refusing: no change ${ref} — see them all: cli change list --all`);
+  return hit;
+}
+
+function cmdShow(args) {
+  const { positional, flags } = parseArgs(args);
+  if (!positional[0]) fail(USAGE);
+  const data = loadBoard(boardPath());
+  const change = resolveOrFail(data, positional[0]);
+  const members = membersOf(data, change);
+  if (flags.json) {
+    process.stdout.write(
+      JSON.stringify(
+        {
+          address: changeAddress(change),
+          ...change,
+          status: changeStatus(data, change),
+          progress: changeProgress(data, change),
+          tasks: members.map((t) => ({ number: t.number, subject: t.subject, status: t.status })),
+        },
+        null,
+        2,
+      ) + "\n",
+    );
+    return;
+  }
+  process.stdout.write(formatChangeLine(data, change) + "\n");
+  if (change.delta) process.stdout.write(`\n${change.delta}\n`);
+  if (change.spec?.length) process.stdout.write(`\nразделы спеки: ${change.spec.join(", ")}\n`);
+  if (!members.length) {
+    process.stdout.write("\nни одной задачи не смотрит на этот change\n");
+    return;
+  }
+  process.stdout.write("\nзадачи:\n");
+  for (const t of members)
+    process.stdout.write(`  #${t.number} [${t.status}] ${t.subject}\n`);
+}
+
+function cmdClose(args) {
+  const { positional } = parseArgs(args);
+  if (!positional[0]) fail(USAGE);
+  const file = boardPath();
+  const data = loadBoard(file);
+  const change = resolveOrFail(data, positional[0]);
+  if (change.legacy)
+    fail(
+      `refusing: ${changeAddress(change)} is still a root task — close it as a task, or migrate the board first.`,
+    );
+  const { done, total } = changeProgress(data, change);
+  if (total === 0)
+    fail(`refusing: ${changeAddress(change)} has no tasks — nothing it could have finished.`);
+  if (done < total)
+    fail(
+      `refusing: ${changeAddress(change)} still has ${total - done} open task(s).\n` +
+        `  its status is derived, so closing it means closing them: cli change show ${changeAddress(change)}`,
+    );
+  if (change.closed_at) {
+    process.stdout.write(`ok: ${changeAddress(change)} already closed at ${change.closed_at}\n`);
+    return;
+  }
+  change.closed_at = new Date().toISOString();
+  change.updated_at = change.closed_at;
+  saveBoard(file, data);
+  process.stdout.write(`ok: ${changeAddress(change)} closed — ${total} task(s) done\n`);
+}
+
+export function run(args) {
+  const [cmd, ...rest] = args;
+  if (!cmd || cmd === "-h" || cmd === "--help" || cmd === "help") {
+    process.stdout.write(USAGE + "\n");
+    process.exit(cmd ? 0 : 1);
+  }
+  if (cmd === "new") return cmdNew(rest);
+  if (cmd === "list") return cmdList(rest);
+  if (cmd === "show") return cmdShow(rest);
+  if (cmd === "close") return cmdClose(rest);
+  fail(`unknown command: ${cmd}\n\n${USAGE}`);
 }

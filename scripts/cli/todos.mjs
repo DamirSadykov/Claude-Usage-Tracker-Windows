@@ -46,6 +46,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { matchPlanCli } from "./settings.mjs";
 import { resolveAddress, showSection, sectionFingerprint, blocksOf } from "./spec.mjs";
+import { findChange, changeAddress } from "./change.mjs";
 
 // Kanban columns, in board order. Keep in lockstep with todos.rs::STATUSES.
 export const STATUSES = ["backlog", "queue", "in_progress", "review", "done"];
@@ -519,9 +520,39 @@ function setKind({ data, file, todo, value }) {
 // root that depends on nothing is not yet a group, so marking one says so.
 function setChange({ data, file, todo, value }) {
   const s = String(value).trim().toLowerCase();
-  if (!["on", "off", "true", "false"].includes(s))
-    fail(`invalid change "${value}". valid: on | off`);
+  const clearing = ["off", "false", "none", "clear"].includes(s);
+  if (!["on", "true"].includes(s) && !clearing) {
+    const change = findChange(data, value);
+    if (!change)
+      fail(
+        `invalid change "${value}". valid: <c#N> | none\n` +
+          `  a change is a record now, not a flag — see them: cli change list --all`,
+      );
+    if (todo.change_id === change.id) {
+      process.stdout.write(`ok: #${todo.number} already in ${changeAddress(change)}\n`);
+      return;
+    }
+    todo.change_id = change.id;
+    todo.updated_at = new Date().toISOString();
+    save(file, data);
+    process.stdout.write(
+      `ok: #${todo.number} change -> ${changeAddress(change)} "${change.title}"\n`,
+    );
+    return;
+  }
+  if (clearing && todo.change_id) {
+    delete todo.change_id;
+    todo.updated_at = new Date().toISOString();
+    save(file, data);
+    process.stdout.write(`ok: #${todo.number} change -> none\n`);
+    return;
+  }
   const change = s === "on" || s === "true";
+  if (change)
+    process.stdout.write(
+      `warn: \`change on\` marks the OLD root-task form; membership is a record now —\n` +
+        `      cli change new "<title>" then todos set change ${todo.number} <c#N>\n`,
+    );
   if (change && !directPrereqs(data, todo).length) {
     process.stdout.write(
       `warn: #${todo.number} depends on nothing yet — a change root depends_on ALL of its children\n` +
@@ -980,7 +1011,7 @@ const SET_FIELDS = {
     set: setKind,
   },
   change: {
-    values: "on | off   (a change root depends_on all its children and closes last)",
+    values: "<c#N> | none   (a change is a record: cli change list --all)",
     set: setChange,
   },
   project: { values: "<name> | none   (none = global, project-less)", set: setProject },

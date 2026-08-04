@@ -20,6 +20,7 @@ import path from "node:path";
 
 const AREAS = {
   todos: "./cli/todos.mjs",
+  change: "./cli/change.mjs",
   triage: "./cli/triage.mjs",
   corrections: "./cli/corrections.mjs",
   "task-cost": "./cli/task-cost.mjs",
@@ -66,6 +67,7 @@ function usage(code) {
   process.stdout.write(
     "cli - Claude Usage Tracker\n\n" +
       "  todos   <…>   mutate the todo list (add / set / comment / list / …)\n" +
+      "  change  <…>   changes as records (new / list / show / close); a task points at one\n" +
       "  triage  <…>   publish/read the nightly-triage digest (publish / show / clear)\n" +
       "  corrections <…> user-corrections outcome metric, layer 1 (scan / label-template / eval)\n" +
       "  task-cost <…> session->task attribution for tokens-per-task (scan / publish)\n" +
