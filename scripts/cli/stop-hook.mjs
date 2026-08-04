@@ -464,6 +464,19 @@ function specReason(tasks, { blocks = [], omitted = 0, lint = [] } = {}) {
 
 // The tracker's todos.json — the same file the SessionStart hook reads. Returns
 // the array, or [] when it's missing/unreadable (the guard then only sees plans).
+function readChanges(appData) {
+  try {
+    const raw = readFileSync(
+      path.join(appData, "com.claude-usage-tracker.app", "todos.json"),
+      "utf8",
+    );
+    const changes = JSON.parse(raw).changes;
+    return Array.isArray(changes) ? changes : [];
+  } catch {
+    return [];
+  }
+}
+
 function readTodos(appData) {
   try {
     const raw = readFileSync(
@@ -608,7 +621,7 @@ async function main() {
   if (specMode !== "off") {
     const parts = await specGuardParts(cwd, appData);
     if (parts) {
-      const board = { todos };
+      const board = { todos, changes: readChanges(appData) };
       specTasks = auditSpecAnswers(
         todos,
         project,

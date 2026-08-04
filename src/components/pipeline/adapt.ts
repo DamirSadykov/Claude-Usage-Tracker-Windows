@@ -81,6 +81,8 @@ export function isGate(todo: BoardTodo): boolean {
 
 export function nodeStatus(todo: BoardTodo, byId: Map<string, BoardTodo>): NodeStatus {
     if (isDone(todo.status)) return "done";
+    if (todo.status === "review") return "review";
+    if (todo.status === "in_progress") return "ready";
     for (const dep of todo.depends_on ?? []) {
         const prev = byId.get(dep);
         if (prev && !isDone(prev.status)) return "blocked";

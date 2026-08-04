@@ -637,7 +637,7 @@ export async function runChange({
     dry,
     change: {
       ...brief(root),
-      is_change: isChangeRoot(root),
+      is_change: Boolean(root.record) || isChangeRoot(root),
       parallel_limit: limit,
       parallel_declared: typeof root.parallel_limit === "number" ? root.parallel_limit : null,
       budget_usd: groupBudget,
@@ -805,9 +805,11 @@ export async function run(args) {
   if (!root) fail(`no such task: ${ref}`);
   if (!dry && typeof root.budget_usd !== "number") {
     fail(
-      `refusing to run #${root.number} unattended: no budget is declared on the change.\n` +
+      `refusing to run ${root.address ?? `#${root.number}`} unattended: no budget is declared on the change.\n` +
         "an autonomous run needs a ceiling it can stop itself at — declare one first:\n" +
-        `  todos set budget ${root.number} <usd>`,
+        (root.record
+          ? `  cli change set budget ${root.address} <usd>`
+          : `  todos set budget ${root.number} <usd>`),
     );
   }
 

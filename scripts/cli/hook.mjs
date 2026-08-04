@@ -161,6 +161,7 @@ function main() {
     // first write), so don't bail here — always tell the session it's available.
   }
   const todos = Array.isArray(data && data.todos) ? data.todos : [];
+  const changes = Array.isArray(data && data.changes) ? data.changes : [];
 
   const project = path.basename(String(cwd).replace(/[\\/]+$/, ""));
   // General cross-project note (issue #13): tasks aren't limited to the current
@@ -297,7 +298,7 @@ function main() {
     const changeRoots = new Map();
     for (const t of shown) {
       if (col(t.status) !== "in_progress") continue;
-      for (const r of changeRootsFor({ todos }, t)) {
+      for (const r of changeRootsFor({ todos, changes }, t)) {
         if (r.description && r.description.trim() && !changeRoots.has(r.id)) {
           changeRoots.set(r.id, r);
         }
@@ -306,7 +307,7 @@ function main() {
     for (const r of changeRoots.values()) {
       lines.push(
         block(
-          `  ★ vision — change t#${r.number} "${clip(r.subject)}" (north star for the in_progress task(s) above; keep them true to it — if one pulls away, stop and flag it):`,
+          `  ★ vision — change ${r.address ?? `t#${r.number}`} "${clip(r.subject)}" (north star for the in_progress task(s) above; keep them true to it — if one pulls away, stop and flag it):`,
           r.description,
         ),
       );
@@ -322,7 +323,7 @@ function main() {
     const specSeen = new Set();
     for (const t of shown) {
       if (col(t.status) !== "in_progress") continue;
-      const specLink = specAddressesFor(t, changeRootsFor({ todos }, t));
+      const specLink = specAddressesFor(t, changeRootsFor({ todos, changes }, t));
       const fresh = specLink.addresses.filter((a) => !specSeen.has(a));
       fresh.forEach((a) => specSeen.add(a));
       if (fresh.length) {

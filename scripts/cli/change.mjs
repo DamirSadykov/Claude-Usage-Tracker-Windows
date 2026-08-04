@@ -193,6 +193,7 @@ const USAGE =
   "       cli change list [--project <name> | --all] [--json]\n" +
   "       cli change show <c#N> [--json]\n" +
   "       cli change close <c#N>\n" +
+  "       cli change set title|delta|spec|budget|parallel <c#N> <value>\n" +
   "       cli change migrate [--go]        root tasks -> records; dry run by default\n\n" +
   "A change is a RECORD, not a task: it holds the delta, the spec sections and the\n" +
   "group's ceilings, while a task points at it through `todos set change <task> c#N`.\n" +
@@ -370,6 +371,67 @@ function cmdClose(args) {
   process.stdout.write(`ok: ${changeAddress(change)} closed — ${total} task(s) done\n`);
 }
 
+const SET_FIELDS = {
+  title: (change, value) => {
+    const title = String(value).trim();
+    if (!title) fail("refusing: a change needs a title");
+    change.title = title;
+    return title;
+  },
+  delta: (change, value) => {
+    change.delta = String(value);
+    return change.delta.split("\n")[0];
+  },
+  spec: (change, value) => {
+    const list = String(value)
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    if (!list.length || list[0] === "none") {
+      delete change.spec;
+      return "none";
+    }
+    change.spec = list;
+    return list.join(", ");
+  },
+  budget: (change, value) => {
+    if (String(value).trim() === "none") {
+      delete change.budget_usd;
+      return "none";
+    }
+    change.budget_usd = numberFlag(value, "budget");
+    return `$${change.budget_usd}`;
+  },
+  parallel: (change, value) => {
+    if (String(value).trim() === "none") {
+      delete change.parallel_limit;
+      return "none";
+    }
+    change.parallel_limit = numberFlag(value, "parallel");
+    return String(change.parallel_limit);
+  },
+};
+
+function cmdSet(args) {
+  const { positional, flags } = parseArgs(args);
+  const [field, ref] = positional;
+  const value = flags.text !== undefined ? flags.text : positional.slice(2).join(" ");
+  if (!field || !SET_FIELDS[field])
+    fail(`usage: cli change set <${Object.keys(SET_FIELDS).join("|")}> <c#N> <value>`);
+  if (!ref) fail(`usage: cli change set ${field} <c#N> <value>`);
+  const file = boardPath();
+  const data = loadBoard(file);
+  const change = resolveOrFail(data, ref);
+  if (change.legacy)
+    fail(
+      `refusing: ${changeAddress(change)} is still a root task — set the field on the task, or migrate the board first.`,
+    );
+  const shown = SET_FIELDS[field](change, value);
+  change.updated_at = new Date().toISOString();
+  saveBoard(file, data);
+  process.stdout.write(`ok: ${changeAddress(change)} ${field} -> ${shown}\n`);
+}
+
 async function cmdMigrate(args) {
   const { flags } = parseArgs(args);
   const { describe: describeMigration, migrate } = await import("./change-migrate.mjs");
@@ -403,6 +465,7 @@ export function run(args) {
   if (cmd === "list") return cmdList(rest);
   if (cmd === "show") return cmdShow(rest);
   if (cmd === "close") return cmdClose(rest);
+  if (cmd === "set") return cmdSet(rest);
   if (cmd === "migrate") return cmdMigrate(rest);
   fail(`unknown command: ${cmd}\n\n${USAGE}`);
 }

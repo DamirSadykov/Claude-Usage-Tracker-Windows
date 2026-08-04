@@ -1,4 +1,4 @@
-export type NodeStatus = "blocked" | "ready" | "waiting" | "done";
+export type NodeStatus = "blocked" | "ready" | "waiting" | "review" | "done";
 
 export type ArtifactKind = "spec" | "file" | "handoff" | "after";
 

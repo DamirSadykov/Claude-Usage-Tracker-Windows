@@ -457,3 +457,21 @@ describe("дорожки из записей change'а", () => {
         expect(index.laneOf.get("leaf")).toBe("root");
     });
 });
+
+describe("статус карточки различает колонки доски", () => {
+    const board = [
+        todo({ id: "prev", number: 1, status: "done" }),
+        todo({ id: "review", number: 2, status: "review", depends_on: ["prev"] }),
+        todo({ id: "work", number: 3, status: "in_progress", depends_on: ["open"] }),
+        todo({ id: "open", number: 4, status: "queue" }),
+    ];
+    const byId = new Map(board.map((t) => [t.id, t]));
+
+    it("задача на приёмке — свой статус, не «ждёт тебя»", () => {
+        expect(nodeStatus(byId.get("review")!, byId)).toBe("review");
+    });
+
+    it("взятая в работу не выглядит заблокированной", () => {
+        expect(nodeStatus(byId.get("work")!, byId)).toBe("ready");
+    });
+});
