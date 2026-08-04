@@ -34,6 +34,20 @@ export interface BoardTodo {
     spec_seen?: { address: string }[];
 }
 
+export interface BoardChange {
+    id: string;
+    number: number;
+    title: string;
+    delta?: string;
+    project?: string | null;
+    spec?: string[];
+    budget_usd?: number;
+    parallel_limit?: number;
+    created_at?: string;
+    updated_at?: string;
+    closed_at?: string;
+}
+
 export interface TaskCostRow {
     id: string;
     project?: string | null;
@@ -101,6 +115,7 @@ export function wavesOf<T>(ids: T[], edges: { from: T; to: T }[]): Map<T, number
 
 export interface LaneIndex {
     roots: BoardTodo[];
+    records: BoardChange[];
     laneOf: Map<string, string>;
     members: Map<string, string[]>;
 }
@@ -122,13 +137,21 @@ export function isFreeLane(id: string): boolean {
     return id.startsWith("free:");
 }
 
-export function laneIndex(board: BoardTodo[]): LaneIndex {
+export function laneIndex(board: BoardTodo[], changes: BoardChange[] = []): LaneIndex {
     const byId = new Map(board.map((t) => [t.id, t]));
     const roots = board
         .filter((t) => t.change === true)
         .sort((a, b) => (a.number ?? 0) - (b.number ?? 0));
     const laneOf = new Map<string, string>();
     const members = new Map<string, string[]>();
+    const records = changes.filter(Boolean);
+    const byRecord = new Map(records.map((c) => [c.id, c]));
+    for (const c of records) members.set(c.id, []);
+    for (const t of board) {
+        if (!t.change_id || !byRecord.has(t.change_id)) continue;
+        laneOf.set(t.id, t.change_id);
+        members.get(t.change_id)!.push(t.id);
+    }
     for (const root of roots) {
         const seen: string[] = [];
         const stack = [...(root.depends_on ?? [])];
@@ -153,7 +176,7 @@ export function laneIndex(board: BoardTodo[]): LaneIndex {
         laneOf.set(t.id, lane);
         members.set(lane, [...(members.get(lane) ?? []), t.id]);
     }
-    return { roots, laneOf, members };
+    return { roots, records, laneOf, members };
 }
 
 export interface Money {
@@ -344,6 +367,31 @@ export function toLanes(
     waves: Map<string, number>,
 ): Lane[] {
     const byId = new Map(board.map((t) => [t.id, t]));
+    const fromRecords: Lane[] = [...index.records]
+        .sort((a, b) => newerFirst(a as unknown as BoardTodo, b as unknown as BoardTodo))
+        .map((record) => {
+            const ids = index.members.get(record.id) ?? [];
+            const nodes = ids.map((id) => run.get(id)).filter(Boolean) as RunGraphNode[];
+            const totals = laneTotals(nodes);
+            const done = ids.filter((id) => isDone(byId.get(id)?.status ?? "")).length;
+            const levels = ids.map((id) => waves.get(id) ?? 1);
+            const span = levels.length
+                ? `волны ${Math.min(...levels)}–${Math.max(...levels)}`
+                : "";
+            const unknownNote = totals.unknown ? ` · ${totals.unknown} без замера` : "";
+            return {
+                id: record.id,
+                kicker: `тема · change c#${record.number}`,
+                title: record.title,
+                note: (record.delta ?? "").split("\n")[0] || undefined,
+                progress: ids.length ? done / ids.length : 0,
+                progressLabel: `${done} / ${ids.length} готово · ${span}${unknownNote}`,
+                cost: formatMoney(totals.cost),
+                duration: totals.minutes ? formatDuration(totals.minutes) : undefined,
+                tone: "theme" as const,
+                done: ids.length > 0 && done === ids.length,
+            };
+        });
     const lanes: Lane[] = [...index.roots].sort(newerFirst).map((root) => {
         const ids = [root.id, ...(index.members.get(root.id) ?? [])];
         const nodes = ids.map((id) => run.get(id)).filter(Boolean) as RunGraphNode[];
@@ -367,6 +415,7 @@ export function toLanes(
             done: ids.length > 0 && done === ids.length,
         };
     });
+    lanes.unshift(...fromRecords);
     for (const [id, ids] of index.members) {
         if (!isFreeLane(id) || !ids.length) continue;
         lanes.push({

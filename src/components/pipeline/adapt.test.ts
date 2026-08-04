@@ -395,3 +395,65 @@ describe("specTree", () => {
         expect(commonAncestor(tree, "a", "loose")).toBeNull();
     });
 });
+
+describe("дорожки из записей change'а", () => {
+    const changes = [
+        {
+            id: "ch-1",
+            number: 4,
+            title: "CHANGE: записи вместо корней",
+            delta: "что меняем в этом заходе\nвторая строка",
+            project: "board",
+            created_at: "2026-08-01T10:00:00Z",
+        },
+        {
+            id: "ch-2",
+            number: 2,
+            title: "CHANGE: прошлый заход",
+            project: "board",
+            created_at: "2026-06-01T10:00:00Z",
+        },
+    ];
+    const board = [
+        todo({ id: "a", number: 1, change_id: "ch-1", status: "done" }),
+        todo({ id: "b", number: 2, change_id: "ch-1" }),
+        todo({ id: "c", number: 3, change_id: "ch-2", status: "done" }),
+        todo({ id: "d", number: 4 }),
+    ];
+
+    it("принадлежность читается полем, а не обходом рёбер", () => {
+        const index = laneIndex(board, changes);
+        expect(index.laneOf.get("a")).toBe("ch-1");
+        expect(index.laneOf.get("d")).toBe("free:");
+        expect(index.members.get("ch-1")).toEqual(["a", "b"]);
+    });
+
+    it("дорожка собирается из записи, свежая сверху, свободные под ними", () => {
+        const index = laneIndex(board, changes);
+        const lanes = toLanes(board, new Map(), index, new Map());
+        expect(lanes.map((l) => l.id)).toEqual(["ch-1", "ch-2", "free:"]);
+        expect(lanes[0].kicker).toBe("тема · change c#4");
+        expect(lanes[0].title).toBe("CHANGE: записи вместо корней");
+        expect(lanes[0].note).toBe("что меняем в этом заходе");
+        expect(lanes[0].progressLabel).toContain("1 / 2 готово");
+    });
+
+    it("закрытая запись помечается закрытой дорожкой", () => {
+        const index = laneIndex(board, changes);
+        const lanes = toLanes(board, new Map(), index, new Map());
+        expect(lanes.find((l) => l.id === "ch-2")?.done).toBe(true);
+        expect(lanes.find((l) => l.id === "ch-1")?.done).toBe(false);
+    });
+
+    it("немигрированный корень и запись живут на одной доске", () => {
+        const mixed = [
+            ...board,
+            todo({ id: "root", number: 9, change: true, depends_on: ["leaf"], subject: "Старая тема" }),
+            todo({ id: "leaf", number: 10 }),
+        ];
+        const index = laneIndex(mixed, changes);
+        const lanes = toLanes(mixed, new Map(), index, new Map());
+        expect(lanes.map((l) => l.id)).toEqual(["ch-1", "ch-2", "root", "free:"]);
+        expect(index.laneOf.get("leaf")).toBe("root");
+    });
+});
