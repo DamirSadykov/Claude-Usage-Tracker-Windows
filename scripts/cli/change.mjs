@@ -52,6 +52,17 @@ export function createChange(data, fields = {}) {
   return change;
 }
 
+export function byRecency(a, b) {
+  const ta = Date.parse(a?.created_at ?? "");
+  const tb = Date.parse(b?.created_at ?? "");
+  if (!Number.isNaN(ta) && !Number.isNaN(tb) && ta !== tb) return tb - ta;
+  return (b?.number ?? 0) - (a?.number ?? 0);
+}
+
+export function sortedChanges(data) {
+  return [...changesOf(data)].sort(byRecency);
+}
+
 export function findChange(data, ref) {
   const parsed = parseChangeRef(ref);
   if (!parsed) return null;

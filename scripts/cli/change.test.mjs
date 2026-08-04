@@ -13,6 +13,7 @@ import {
   membersOf,
   changeProgress,
   changeStatus,
+  sortedChanges,
 } from "./change.mjs";
 
 const task = (number, fields = {}) => ({
@@ -102,6 +103,29 @@ describe("createChange", () => {
     const data = { version: 1, todos: [] };
     createChange(data, { title: "первый" });
     expect(changesOf(data)).toHaveLength(1);
+  });
+});
+
+describe("sortedChanges", () => {
+  it("ставит свежие вверх по времени, а без него по номеру", () => {
+    const data = { version: 1, todos: [], changes: [] };
+    const first = createChange(data, { title: "первый" });
+    const second = createChange(data, { title: "второй" });
+    const third = createChange(data, { title: "третий" });
+    first.created_at = "2026-06-01T10:00:00Z";
+    second.created_at = "2026-08-01T10:00:00Z";
+    third.created_at = "2026-07-01T10:00:00Z";
+    expect(sortedChanges(data).map((c) => c.title)).toEqual(["второй", "третий", "первый"]);
+    for (const c of data.changes) delete c.created_at;
+    expect(sortedChanges(data).map((c) => c.number)).toEqual([3, 2, 1]);
+  });
+
+  it("не трогает исходный порядок записи", () => {
+    const data = { version: 1, todos: [], changes: [] };
+    createChange(data, { title: "первый" });
+    createChange(data, { title: "второй" });
+    sortedChanges(data);
+    expect(data.changes.map((c) => c.number)).toEqual([1, 2]);
   });
 });
 

@@ -22,6 +22,8 @@ export interface BoardTodo {
     status: string;
     kind?: string;
     change?: boolean;
+    change_id?: string;
+    created_at?: string;
     project?: string | null;
     depends_on?: string[];
     links?: string[];
@@ -328,6 +330,13 @@ function idOfLabel(board: BoardTodo[], label: string): string | undefined {
     return hit?.id;
 }
 
+export function newerFirst(a: BoardTodo, b: BoardTodo): number {
+    const ta = Date.parse(a.created_at ?? "");
+    const tb = Date.parse(b.created_at ?? "");
+    if (!Number.isNaN(ta) && !Number.isNaN(tb) && ta !== tb) return tb - ta;
+    return (b.number ?? 0) - (a.number ?? 0);
+}
+
 export function toLanes(
     board: BoardTodo[],
     run: Map<string, RunGraphNode>,
@@ -335,7 +344,7 @@ export function toLanes(
     waves: Map<string, number>,
 ): Lane[] {
     const byId = new Map(board.map((t) => [t.id, t]));
-    const lanes: Lane[] = index.roots.map((root) => {
+    const lanes: Lane[] = [...index.roots].sort(newerFirst).map((root) => {
         const ids = [root.id, ...(index.members.get(root.id) ?? [])];
         const nodes = ids.map((id) => run.get(id)).filter(Boolean) as RunGraphNode[];
         const totals = laneTotals(nodes);

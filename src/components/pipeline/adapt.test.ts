@@ -276,6 +276,45 @@ describe("вью-модель дорожек", () => {
         expect(lanes.map((l) => l.id).sort()).toEqual(["free:alpha", "free:beta"]);
     });
 
+    it("свежий change идёт первым, свободные задачи остаются под темами", () => {
+        const many = [
+            todo({
+                id: "old",
+                number: 10,
+                change: true,
+                depends_on: ["o1"],
+                subject: "Старая",
+                created_at: "2026-06-01T10:00:00Z",
+            }),
+            todo({ id: "o1", number: 11 }),
+            todo({
+                id: "new",
+                number: 12,
+                change: true,
+                depends_on: ["n1"],
+                subject: "Свежая",
+                created_at: "2026-08-01T10:00:00Z",
+            }),
+            todo({ id: "n1", number: 13 }),
+            todo({ id: "free", number: 14 }),
+        ];
+        const index = laneIndex(many);
+        const lanes = toLanes(many, new Map(), index, new Map());
+        expect(lanes.map((l) => l.id)).toEqual(["new", "old", "free:"]);
+    });
+
+    it("без даты порядок задаёт номер, свежий сверху", () => {
+        const many = [
+            todo({ id: "old", number: 10, change: true, depends_on: ["o1"], subject: "Старая" }),
+            todo({ id: "o1", number: 11 }),
+            todo({ id: "new", number: 20, change: true, depends_on: ["n1"], subject: "Свежая" }),
+            todo({ id: "n1", number: 21 }),
+        ];
+        const index = laneIndex(many);
+        const lanes = toLanes(many, new Map(), index, new Map());
+        expect(lanes.map((l) => l.id)).toEqual(["new", "old"]);
+    });
+
     it("прогресс и суммы собираются из графа прогона", () => {
         const index = laneIndex(board);
         const waves = wavesOf(
