@@ -9,12 +9,14 @@ import {
     refEdges,
     specPorts,
     toLanes,
+    toSpecLanes,
     toTaskLinks,
     toTaskNodes,
     wavesOf,
     specTree,
     commonAncestor,
     type BoardTodo,
+    type BoardChange,
 } from "./adapt";
 import type { RunGraphNode } from "../../graphModel";
 
@@ -455,6 +457,64 @@ describe("дорожки из записей change'а", () => {
         const lanes = toLanes(mixed, new Map(), index, new Map());
         expect(lanes.map((l) => l.id)).toEqual(["ch-1", "ch-2", "root", "free:"]);
         expect(index.laneOf.get("leaf")).toBe("root");
+    });
+});
+
+describe("specTree читает записи change'ей наравне со старыми корнями", () => {
+    const changes: BoardChange[] = [
+        {
+            id: "ch-1",
+            number: 4,
+            title: "CHANGE: записи вместо корней",
+            project: "tracker",
+            spec: ["tasks#registry"],
+        },
+    ];
+    const board: BoardTodo[] = [
+        todo({ id: "a", number: 1, change_id: "ch-1", project: "tracker" }),
+        todo({ id: "b", number: 2, change_id: "ch-1", project: "tracker", spec: ["tasks#gate"] }),
+        todo({ id: "loose", number: 3, project: "tracker" }),
+    ];
+
+    it("тема записи висит под её собственным разделом", () => {
+        const tree = specTree(board, changes);
+        expect(tree.byId.get("ch-1")?.kind).toBe("theme");
+        expect(tree.byId.get("ch-1")?.parent).toBe("tasks#registry");
+        expect(tree.byId.get("ch-1")?.label).toBe("c#4");
+    });
+
+    it("задача с change_id висит под темой записи, а не в свободных", () => {
+        const tree = specTree(board, changes);
+        expect(tree.byId.get("a")?.parent).toBe("ch-1");
+        expect(tree.byId.get("loose")?.parent).toBe("project:tracker");
+    });
+
+    it("собственный spec задачи внутри записи остаётся кросс-связью", () => {
+        const tree = specTree(board, changes);
+        expect(tree.cross).toContainEqual({ from: "b", to: "tasks#gate", kind: "spec" });
+    });
+});
+
+describe("toSpecLanes считает и записи, и старые корни", () => {
+    const board: BoardTodo[] = [
+        todo({ id: "root", number: 9, change: true, spec: ["tasks#registry"] }),
+    ];
+    const changes: BoardChange[] = [
+        { id: "ch-1", number: 4, title: "CHANGE", spec: ["tasks#registry"] },
+    ];
+    const section = {
+        address: "tasks#registry",
+        entry: { title: "Реестр" },
+    };
+
+    it("счётчик change'ей берёт и записи, и немигрированные корни", () => {
+        const lanes = toSpecLanes([section], board, changes);
+        expect(lanes[0].metrics).toContain("2 change'а");
+    });
+
+    it("без записей считает только старые корни", () => {
+        const lanes = toSpecLanes([section], board);
+        expect(lanes[0].metrics).toContain("1 change'а");
     });
 });
 

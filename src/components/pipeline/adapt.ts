@@ -590,6 +590,7 @@ export function focusRows(
 export function toSpecLanes(
     sections: SpecSectionPayload[],
     board: BoardTodo[],
+    changes: BoardChange[] = [],
 ): SpecLane[] {
     const stateOf = (status: string) =>
         status === "in_progress" ? "в работе" : status === "queue" ? "очередь" : status;
@@ -610,9 +611,13 @@ export function toSpecLanes(
             section.lineCount !== undefined &&
             section.lineCeiling !== undefined &&
             section.lineCount > section.lineCeiling;
-        const changes = board.filter(
-            (t) => t.change === true && (t.spec ?? []).includes(section.address),
-        ).length;
+        const changeIds = new Set<string>();
+        for (const t of board)
+            if (t.change === true && (t.spec ?? []).includes(section.address))
+                changeIds.add(t.id);
+        for (const c of changes)
+            if ((c.spec ?? []).includes(section.address)) changeIds.add(c.id);
+        const changeCount = changeIds.size;
         return {
             id: section.address,
             kicker: overCeiling ? "раздел спеки · внимание" : "раздел спеки",
@@ -633,7 +638,7 @@ export function toSpecLanes(
             lintTone: overCeiling ? "warn" : "ok",
             metrics: [
                 `${incoming.length + outgoing.length} ссылок`,
-                `${changes} change'а`,
+                `${changeCount} change'а`,
             ],
             tone: overCeiling ? "warn" : "spec",
             incoming,
@@ -694,8 +699,8 @@ export function commonAncestor(tree: SpecTree, a: string, b: string): string | n
     return null;
 }
 
-export function specTree(board: BoardTodo[]): SpecTree {
-    const index = laneIndex(board);
+export function specTree(board: BoardTodo[], changes: BoardChange[] = []): SpecTree {
+    const index = laneIndex(board, changes);
     const byId = new Map<string, TreeNode>();
     const children = new Map<string, string[]>();
     const label = (t: BoardTodo) => (t.number ? `#${t.number}` : t.id);
@@ -752,6 +757,36 @@ export function specTree(board: BoardTodo[]): SpecTree {
             parent: home,
             project: root.project ?? null,
             weight: (index.members.get(root.id) ?? []).length,
+        });
+    }
+
+    for (const record of index.records) {
+        const own = record.spec ?? [];
+        const memberIds = index.members.get(record.id) ?? [];
+        const inherited = memberIds
+            .flatMap((id) => addressesOf(board.find((t) => t.id === id) ?? ({} as BoardTodo)))
+            .filter(Boolean);
+        const home = own[0] ?? inherited[0] ?? ORPHAN_SPEC;
+        if (!byId.has(home)) {
+            put({
+                id: home,
+                kind: "spec",
+                label: home === ORPHAN_SPEC ? "без раздела" : home,
+                title: home === ORPHAN_SPEC ? "темы без раздела спеки" : home,
+                parent: null,
+                project: null,
+                weight: 0,
+            });
+        }
+        themeSpec.set(record.id, home);
+        put({
+            id: record.id,
+            kind: "theme",
+            label: `c#${record.number}`,
+            title: record.title,
+            parent: home,
+            project: record.project ?? null,
+            weight: memberIds.length,
         });
     }
 

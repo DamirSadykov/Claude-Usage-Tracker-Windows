@@ -17,6 +17,7 @@ import GraphView from "./GraphView.vue";
 import SpecView from "./SpecView.vue";
 import PipelineGraph from "./pipeline/PipelineGraph.vue";
 import type { PipelineMode } from "./pipeline/modes";
+import type { BoardChange } from "./pipeline/adapt";
 import { useProjectLinks } from "../projectLinks";
 import { useHotkeys } from "../hotkeys";
 import {
@@ -129,6 +130,7 @@ const COL_BY_ID: Record<string, Column> = Object.fromEntries(
 );
 
 const todos = ref<Todo[]>([]);
+const changes = ref<BoardChange[]>([]);
 const loading = ref(true);
 const errorMsg = ref("");
 
@@ -243,6 +245,11 @@ async function loadTodos(silent = false) {
     errorMsg.value = String(e);
   } finally {
     if (!silent) loading.value = false;
+  }
+  try {
+    changes.value = await invoke<BoardChange[]>("get_changes");
+  } catch {
+    changes.value = [];
   }
 }
 
@@ -710,10 +717,14 @@ function onGraphUpdate(list: Todo[]) {
 // the session's injected context.
 //
 // The walk mirrors `todos.mjs::specAddressesFor`: the task's OWN addresses win
-// outright, and only a task without any inherits its nearest change root's.
+// outright, and only a task without any inherits its nearest change's.
 // Inheritance is REPLACEMENT, not a merge — otherwise one section would be
 // listed twice for the same task.
-function changeRootsOf(t: Todo): Todo[] {
+function changeRootsOf(t: Todo): { spec: string[] }[] {
+  if (t.change_id) {
+    const record = changes.value.find((c) => c.id === t.change_id);
+    if (record) return [{ spec: record.spec ?? [] }];
+  }
   const roots: Todo[] = [];
   const seen = new Set<string>([t.id]);
   let frontier = [t.id];
@@ -728,7 +739,7 @@ function changeRootsOf(t: Todo): Todo[] {
     }
     frontier = next;
   }
-  return roots;
+  return roots.map((r) => ({ spec: r.spec ?? [] }));
 }
 
 function specLinkOf(t: Todo): { addresses: string[]; inherited: boolean } {
@@ -1768,6 +1779,7 @@ onUnmounted(() => {
     <SpecView
       v-else-if="viewMode === 'specs'"
       :todos="todos"
+      :changes="changes"
       :project="projectFilter"
       :target="specTarget"
       @open="onPipelineOpen"

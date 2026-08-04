@@ -128,10 +128,11 @@ interface InnerEdge {
     dashed: boolean;
 }
 
-const { board: liveBoard, live } = useBoard();
+const { board: liveBoard, changes: liveChanges, live } = useBoard();
 const board = computed(() => (live.value ? liveBoard.value : mockBoard));
+const changes = computed(() => (live.value ? liveChanges.value : []));
 const byId = computed(() => new Map(board.value.map((t) => [t.id, t])));
-const tree = computed(() => specTree(board.value));
+const tree = computed(() => specTree(board.value, changes.value));
 
 const opened = ref<string[]>([]);
 const picked = ref<string | null>(null);
