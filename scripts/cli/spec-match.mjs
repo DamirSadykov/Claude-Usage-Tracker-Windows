@@ -16,7 +16,11 @@
 // a dependency bought to rank 26 candidates. It is an ADVISOR: it blocks
 // nothing, writes nothing, and its precision is unmeasured (see MIN_SCORE).
 
+import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import path from "node:path";
+
 import { listDomainIds, loadDomain, resolveRoot, resolveAddress } from "./spec.mjs";
+import { roamingBase } from "./settings.mjs";
 
 // Letters and digits only, the same normalisation the handoff guard uses on a
 // baton (`stop-hook.mjs::norm`) — punctuation, markdown and code fences all
@@ -324,6 +328,74 @@ const USAGE =
   "       --task берёт subject + description задачи с доски и отмечает уже\n" +
   "       слинкованные разделы как сверку, а не как находку.";
 
+// --- the seeding meter ------------------------------------------------------
+//
+// Seeding a registry onto an existing codebase is not measured by how many
+// sections exist — it is measured by how often a task still finds NOTHING.
+// The matcher answers that question once per call and then forgets it, so the
+// one number that says whether coverage is growing (`how many asks in a row
+// came back empty`) was impossible to get. Every call appends one line here.
+//
+// Append-only JSONL next to todos.json, one short line per ask, and the query
+// is stored TRUNCATED: this is a meter, not a search history. Never throws —
+// a lost measurement must not cost anyone an answer.
+const QUERY_KEPT = 120;
+
+export function meterFile() {
+  return path.join(roamingBase(), "com.claude-usage-tracker.app", "spec-match.jsonl");
+}
+
+export function noteAsk(fields) {
+  try {
+    const file = meterFile();
+    mkdirSync(path.dirname(file), { recursive: true });
+    appendFileSync(file, JSON.stringify({ ts: new Date().toISOString(), ...fields }) + "\n");
+  } catch {
+    // measuring must never break the thing it measures
+  }
+}
+
+export function readAsks(file = meterFile()) {
+  let raw;
+  try {
+    raw = readFileSync(file, "utf8");
+  } catch {
+    return [];
+  }
+  return raw
+    .split("\n")
+    .filter((l) => l.trim())
+    .map((l) => {
+      try {
+        return JSON.parse(l);
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean);
+}
+
+export function coverageOf(asks, project) {
+  const rows = project ? asks.filter((a) => a.project === project) : asks;
+  const empty = rows.filter((a) => a.zero);
+  let streak = 0;
+  for (let i = rows.length - 1; i >= 0 && rows[i].zero; i--) streak++;
+  const byQuery = new Map();
+  for (const a of empty) {
+    const key = String(a.query ?? "").toLowerCase();
+    byQuery.set(key, (byQuery.get(key) ?? 0) + 1);
+  }
+  return {
+    asks: rows.length,
+    empty: empty.length,
+    hit: rows.length - empty.length,
+    share: rows.length ? Number((empty.length / rows.length).toFixed(2)) : 0,
+    streak,
+    recent: empty.slice(-10).map((a) => ({ at: String(a.ts).slice(0, 10), query: a.query, task: a.task ?? null })),
+    repeated: [...byQuery.entries()].filter(([, n]) => n > 1).sort((a, b) => b[1] - a[1]),
+  };
+}
+
 // Long queries make long hit lists, and a wall of matched words is not evidence
 // a reader can use — the first few are.
 const HITS_SHOWN = 8;
@@ -360,6 +432,15 @@ export async function run(args) {
   if (!Number.isFinite(flags.min) || flags.min < 0) fail("refusing: --min must be a non-negative number");
 
   const res = matchSections(text, { limit: flags.limit, min: flags.min, linked });
+  noteAsk({
+    project: path.basename(process.cwd()),
+    query: String(text).replace(/\s+/g, " ").trim().slice(0, QUERY_KEPT),
+    task: todo ? todo.number : null,
+    zero: !!res.zero,
+    top: res.matches?.[0]?.address ?? res.near?.address ?? null,
+    score: res.matches?.[0]?.score ?? res.near?.score ?? null,
+    linked: linked.length,
+  });
   if (flags.json) {
     process.stdout.write(
       JSON.stringify({ ok: true, task: todo ? todo.number : null, ...res }, null, 2) + "\n",

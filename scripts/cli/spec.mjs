@@ -17,7 +17,7 @@
 // may be unavailable, never its existence.
 
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 import { parseYamlSubset } from "./yaml-subset.mjs";
@@ -943,11 +943,28 @@ function fail(msg) {
 export const MIN_ANSWER_CHARS = 40;
 const VERDICTS = ["unchanged", "updated"];
 
-// The change/task the stamp names. A step of a change points at the change —
-// that is the unit §7 wants to be able to ask "why did this section move".
+// What the stamp names. NOT a number: `t#347`/`c#9` are counters of one local
+// board, so the stamp resolved to nothing the moment the task was migrated
+// into a record (`change: t#337` in this very registry points at a task that
+// no longer exists), and on someone else's clone it never resolved at all.
+// A TITLE outlives both the task and the record, reads without the board open
+// next to it, and is the answer §7 actually wants when asking why a section
+// moved. Sanitised because the metadata line splits on `·`.
+const STAMP_MAX = 80;
+
+export function stampTitle(text) {
+  const clean = String(text ?? "")
+    .replace(/^(CHANGE|ТЕМА)\s*:\s*/i, "")
+    .replace(/[·\r\n]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return clean.length > STAMP_MAX ? `${clean.slice(0, STAMP_MAX - 1).trimEnd()}…` : clean;
+}
+
 export function stampRefFor(roots, todo) {
-  const root = (Array.isArray(roots) ? roots : []).find((r) => r && r.number != null);
-  return `t#${root ? root.number : todo.number}`;
+  const root = (Array.isArray(roots) ? roots : []).find((r) => r && (r.subject || r.title));
+  const title = stampTitle(root ? (root.subject ?? root.title) : todo?.subject);
+  return title || "без названия";
 }
 
 async function cmdAnswer(args) {
@@ -1135,12 +1152,19 @@ const ANSWER_USAGE =
 
 const USAGE =
   "usage: cli spec domains [--json]                перечислить домены и их разделы\n" +
+  "       cli spec new <домен>#<слаг> --part <требования|устройство|инварианты>\n" +
+  "                    --title \"<Название>\" --text \"<текст раздела>\"\n" +
+  "                    [--refs <адрес>[,<…>]] [--new-domain]\n" +
+  "                                                  завести раздел (и, с --new-domain, сам домен)\n" +
   "       cli spec show <домен>#<слаг> [--json]     текст адресованного раздела (или ответ\n" +
   "                                                  «домен объявлен, текст недоступен»)\n" +
   "       cli spec match \"<текст>\" [--task <N>] [--limit N] [--min 0.3] [--json]\n" +
   "                                                  какие разделы задевает этот текст — и\n" +
   "                                                  честное «раздела под это нет»\n" +
   "       cli spec refs <домен>#<слаг> [--json]     обратные ссылки: кто смотрит на этот раздел\n" +
+  "       cli spec coverage [--project <имя>|--all] [--json]\n" +
+  "                                                  как идёт посев: доля запросов, на которые\n" +
+  "                                                  раздела не нашлось, и сколько их подряд\n" +
   "       cli spec lint [--json]                    невалидные/висячие refs, потолок ~120 строк,\n" +
   "                                                  раздел без обязательного part\n" +
   "       cli spec answer <задача> unchanged|updated --text \"…\" [--address <домен>#<слаг>]\n" +
@@ -1204,6 +1228,151 @@ function cmdDomains(args) {
       for (const a of e?.anchors ?? [])
         process.stdout.write(`      /${a.slug}  ${a.title}\n`);
     }
+  }
+}
+
+// --- writing a section --------------------------------------------------
+//
+// Until now a section was born by hand-editing markdown, and its shape was
+// only checked afterwards by lint. That is affordable while a registry has a
+// couple of dozen sections written over months; it is not affordable while
+// SEEDING a registry onto an existing codebase, where sections are written by
+// the dozen and the form has to be recalled every time. So the form moves into
+// a command, and lint goes back to catching what a generator cannot: drift.
+//
+// The command refuses more than it fixes. A section with no text would satisfy
+// the parser and lie to every reader, so text is required rather than stubbed;
+// a slug already taken is refused rather than merged, because a duplicate slug
+// makes the FIRST section unreachable (see parseHeadings).
+const STRICT_SLUG_RE = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+
+export function domainFile(id, root = resolveRoot()) {
+  return path.join(root, id, "spec.md");
+}
+
+export function domainScaffold(id, date = ymd()) {
+  return [`---`, `id: ${id}`, `version: 1`, `updated: ${date}`, `location: local`, `---`, ``, ``].join(
+    "\n",
+  );
+}
+
+export function sectionScaffold({ slug, title, part, refs, text }) {
+  const meta = [`part: ${part}`];
+  if (refs?.length) meta.push(`refs: ${refs.join(", ")}`);
+  const prose = String(text)
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .map((l) => l.replace(/\s+$/, ""));
+  while (prose.length && !prose[0].trim()) prose.shift();
+  while (prose.length && !prose.at(-1).trim()) prose.pop();
+  return [`## ${slug} — ${title}`, ``, meta.join(" · "), ``, ...prose, ``].join("\n");
+}
+
+export function addSection(address, { title, part, refs, text, createDomain, root = resolveRoot() }) {
+  const parsed = parseAddress(address);
+  if (!parsed) return { ok: false, reason: `адрес "${address}" не в форме <домен>#<слаг>` };
+  const { domain: id, slug } = parsed;
+  if (!STRICT_SLUG_RE.test(slug))
+    return { ok: false, reason: `слаг "${slug}" не в форме kebab-case (строчные буквы, цифры, дефис)` };
+  if (!PARTS.includes(part))
+    return { ok: false, reason: `part "${part ?? ""}" не из ${PARTS.join("|")}` };
+  if (!String(text ?? "").trim())
+    return { ok: false, reason: "раздел без текста — нечего описывать" };
+
+  const file = domainFile(id, root);
+  const fresh = !existsSync(file);
+  if (fresh && !createDomain)
+    return {
+      ok: false,
+      reason: `домена "${id}" нет (${file}). Завести вместе с разделом: --new-domain`,
+    };
+
+  let raw = fresh ? domainScaffold(id) : readFileSync(file, "utf8");
+  if (!fresh) {
+    const dom = loadDomain(id, root);
+    if (dom.error) return { ok: false, reason: `${id}: ${dom.error}` };
+    if (dom.sections[slug])
+      return { ok: false, reason: `${address} уже объявлен — слаг выдаётся один раз` };
+  }
+
+  const eol = raw.includes("\r\n") ? "\r\n" : "\n";
+  const body = raw.replace(/\r\n?/g, "\n").replace(/\n+$/, "");
+  const next = `${body}\n\n${sectionScaffold({ slug, title, part, refs, text })}`;
+
+  if (fresh) mkdirSync(path.dirname(file), { recursive: true });
+  try {
+    writeFileSync(file, eol === "\r\n" ? next.replace(/\n/g, "\r\n") : next);
+  } catch (e) {
+    return { ok: false, reason: `не пишется ${file}: ${e.message}` };
+  }
+  return { ok: true, address, file, domainCreated: fresh };
+}
+
+function cmdNew(args) {
+  const positional = [];
+  const flags = {};
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--title" || a === "--part" || a === "--text" || a === "--refs") flags[a.slice(2)] = args[++i];
+    else if (a === "--new-domain") flags.newDomain = true;
+    else if (!a.startsWith("--")) positional.push(a);
+  }
+  const address = positional[0];
+  if (!address) fail(USAGE);
+  const res = addSection(address, {
+    title: flags.title ?? "",
+    part: flags.part,
+    refs: flags.refs ? flags.refs.split(",").map((s) => s.trim()).filter(Boolean) : [],
+    text: flags.text ?? positional[1],
+    createDomain: !!flags.newDomain,
+  });
+  if (!res.ok) fail(`refusing: ${res.reason}`);
+  if (!flags.title) {
+    process.stdout.write(`warn: раздел без названия — заголовок читают в списке доменов\n`);
+  }
+  if (res.domainCreated) process.stdout.write(`ok: домен "${parseAddress(address).domain}" заведён\n`);
+  process.stdout.write(`ok: ${res.address} -> ${res.file}\n`);
+  process.stdout.write(`  прочитать: cli spec show ${res.address}\n  проверить: cli spec lint\n`);
+}
+
+// How the seeding is going, read off the matcher's own meter. The number that
+// matters is not how many sections exist but how often an ask still comes back
+// with nothing — and, more sharply, how many asks IN A ROW did. A registry
+// that is catching up shows a falling share and a broken streak; one that is
+// being outrun by the work shows the opposite while its section count grows.
+async function cmdCoverage(args) {
+  const { readAsks, coverageOf } = await import("./spec-match.mjs");
+  const json = args.includes("--json");
+  const i = args.indexOf("--project");
+  const project = i >= 0 ? args[i + 1] : path.basename(process.cwd());
+  const all = args.includes("--all");
+  const cov = coverageOf(readAsks(), all ? null : project);
+  if (json) {
+    process.stdout.write(JSON.stringify({ ok: true, project: all ? null : project, ...cov }, null, 2) + "\n");
+    return;
+  }
+  const scope = all ? "все проекты" : `проект ${project}`;
+  if (!cov.asks) {
+    process.stdout.write(
+      `${scope}: матч ещё ни разу не спрашивали — мерить нечего.\n` +
+        `  Счётчик наполняется сам при каждом cli spec match.\n`,
+    );
+    return;
+  }
+  process.stdout.write(
+    `${scope}: ${cov.asks} запрос(ов), раздел найден ${cov.hit}, пусто ${cov.empty} (${Math.round(cov.share * 100)}%)\n`,
+  );
+  if (cov.streak)
+    process.stdout.write(`  подряд без раздела: ${cov.streak} — столько задач прошло мимо спеки\n`);
+  if (cov.repeated.length) {
+    process.stdout.write(`  спрашивают повторно, а раздела нет:\n`);
+    for (const [q, n] of cov.repeated.slice(0, 5))
+      process.stdout.write(`    ${n}×  ${q}\n`);
+  }
+  if (cov.recent.length) {
+    process.stdout.write(`  последние без ответа:\n`);
+    for (const r of cov.recent)
+      process.stdout.write(`    ${r.at}  ${r.task ? `#${r.task}  ` : ""}${r.query}\n`);
   }
 }
 
@@ -1372,6 +1541,12 @@ export async function run(args) {
       break;
     case "answer":
       await cmdAnswer(rest);
+      break;
+    case "new":
+      cmdNew(rest);
+      break;
+    case "coverage":
+      await cmdCoverage(rest);
       break;
     case "show":
       cmdShow(rest);

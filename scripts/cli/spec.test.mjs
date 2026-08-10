@@ -20,8 +20,10 @@ import {
   sectionFingerprint,
   blocksOf,
   SECTION_LINE_CEILING,
+  addSection,
+  stampTitle,
 } from "./spec.mjs";
-import { matchSections, addressesIn, stem, buildCorpus } from "./spec-match.mjs";
+import { matchSections, addressesIn, stem, buildCorpus, coverageOf } from "./spec-match.mjs";
 
 const cli = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "cli.mjs");
 
@@ -779,9 +781,9 @@ describe("cli spec answer — the structural closing answer (t#341)", () => {
   it("records updated AND stamps the section's provenance", () => {
     const { code, out } = specCli("answer", "1", "updated", "--text", NOTE);
     expect(code).toBe(0);
-    expect(out).toMatch(/updated: \d{4}-\d{2}-\d{2} · change: t#1/);
+    expect(out).toMatch(/updated: \d{4}-\d{2}-\d{2} · change: узел 1/);
     const sec = loadDomain("tasks", path.join(dir, "docs", "specs")).sections.model;
-    expect(sec.change).toBe("t#1");
+    expect(sec.change).toBe("узел 1");
     expect(saved().spec_answers[0].verdict).toBe("updated");
   });
 
@@ -791,7 +793,7 @@ describe("cli spec answer — the structural closing answer (t#341)", () => {
       task(9, { change: true, status: "in_progress", depends_on: ["t1"] }),
     );
     expect(specCli("answer", "1", "updated", "--text", NOTE).code).toBe(0);
-    expect(loadDomain("tasks", path.join(dir, "docs", "specs")).sections.model.change).toBe("t#9");
+    expect(loadDomain("tasks", path.join(dir, "docs", "specs")).sections.model.change).toBe("узел 9");
   });
 
   it("refuses a one-liner receipt", () => {
@@ -968,7 +970,7 @@ describe("cli spec answer updated — refuses to stamp a section holding a task 
 
   it("stamps normally once the reference is gone", () => {
     expect(specCli("answer", "1", "updated", "--text", NOTE).code).toBe(0);
-    expect(loadDomain("tasks", path.join(dir, "docs", "specs")).sections.model.change).toBe("t#1");
+    expect(loadDomain("tasks", path.join(dir, "docs", "specs")).sections.model.change).toBe("узел 1");
   });
 });
 
@@ -1790,5 +1792,119 @@ describe("anchors — the addressable unit inside a section", () => {
     expect(corpus.map((s) => s.address)).toEqual(["tasks#registry/address", "tasks#registry/lint"]);
     const res = matchSections("дубль слага отклоняется проверкой", { root: dir, min: 0 });
     expect(res.matches[0].address).toBe("tasks#registry/lint");
+  });
+});
+
+describe("spec new: заведение раздела", () => {
+  let dir;
+  beforeEach(() => {
+    dir = mkdtempSync(path.join(os.tmpdir(), "spec-new-"));
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  const TEXT = "- Первое правило.\n- Второе правило.";
+
+  it("заводит домен и раздел, которые реестр сразу читает", () => {
+    const res = addSection("orders#checkout", {
+      title: "Оформление заказа",
+      part: "требования",
+      text: TEXT,
+      createDomain: true,
+      root: dir,
+    });
+    expect(res.ok).toBe(true);
+    expect(res.domainCreated).toBe(true);
+    expect(listDomainIds(dir)).toEqual(["orders"]);
+    const dom = loadDomain("orders", dir);
+    expect(dom.sections.checkout.part).toBe("требования");
+    expect(dom.sections.checkout.title).toBe("Оформление заказа");
+    expect(showSection("orders#checkout", dir).text).toContain("Первое правило");
+  });
+
+  it("созданный с нуля реестр проходит собственный lint", () => {
+    addSection("orders#checkout", {
+      title: "Оформление заказа",
+      part: "требования",
+      text: TEXT,
+      createDomain: true,
+      root: dir,
+    });
+    expect(validateRegistry(dir, dir).filter((f) => f.severity === "error")).toEqual([]);
+  });
+
+  it("дописывает второй раздел, не трогая первый", () => {
+    addSection("orders#checkout", { title: "A", part: "требования", text: TEXT, createDomain: true, root: dir });
+    const first = showSection("orders#checkout", dir).text;
+    const res = addSection("orders#refund", {
+      title: "Возврат",
+      part: "инварианты",
+      refs: ["orders#checkout"],
+      text: "- Возврат не создаёт отрицательный остаток.",
+      root: dir,
+    });
+    expect(res.ok).toBe(true);
+    expect(showSection("orders#checkout", dir).text).toBe(first);
+    expect(loadDomain("orders", dir).sections.refund.refs).toEqual(["orders#checkout"]);
+  });
+
+  it("отказывает на дубле слага — иначе первый раздел стал бы недостижим", () => {
+    addSection("orders#checkout", { title: "A", part: "требования", text: TEXT, createDomain: true, root: dir });
+    const res = addSection("orders#checkout", { title: "B", part: "требования", text: TEXT, root: dir });
+    expect(res.ok).toBe(false);
+    expect(res.reason).toContain("уже объявлен");
+  });
+
+  it("отказывает на чужом part, пустом тексте и незаведённом домене", () => {
+    expect(addSection("orders#a", { title: "A", part: "выдумка", text: TEXT, createDomain: true, root: dir }).reason)
+      .toContain("part");
+    expect(addSection("orders#a", { title: "A", part: "требования", text: "  ", createDomain: true, root: dir }).reason)
+      .toContain("без текста");
+    const noDomain = addSection("billing#a", { title: "A", part: "требования", text: TEXT, root: dir });
+    expect(noDomain.ok).toBe(false);
+    expect(noDomain.reason).toContain("--new-domain");
+  });
+});
+
+describe("spec coverage: метр посева", () => {
+  const ask = (over = {}) => ({ ts: "2026-08-04T10:00:00.000Z", project: "p", query: "q", zero: false, ...over });
+
+  it("считает долю запросов, оставшихся без раздела", () => {
+    const cov = coverageOf([ask(), ask({ zero: true }), ask({ zero: true }), ask()], "p");
+    expect(cov.asks).toBe(4);
+    expect(cov.hit).toBe(2);
+    expect(cov.empty).toBe(2);
+    expect(cov.share).toBe(0.5);
+  });
+
+  it("серия считается только с конца — починенное покрытие рвёт её", () => {
+    expect(coverageOf([ask({ zero: true }), ask({ zero: true }), ask()], "p").streak).toBe(0);
+    expect(coverageOf([ask(), ask({ zero: true }), ask({ zero: true })], "p").streak).toBe(2);
+  });
+
+  it("повторный запрос без раздела виден отдельно — это заявка на раздел", () => {
+    const cov = coverageOf(
+      [ask({ zero: true, query: "возврат денег" }), ask({ zero: true, query: "Возврат Денег" }), ask({ zero: true, query: "другое" })],
+      "p",
+    );
+    expect(cov.repeated).toEqual([["возврат денег", 2]]);
+  });
+
+  it("чужой проект в счёт не идёт", () => {
+    const cov = coverageOf([ask({ project: "other", zero: true }), ask()], "p");
+    expect(cov.asks).toBe(1);
+    expect(cov.empty).toBe(0);
+  });
+});
+
+describe("провенанс раздела: название, а не номер", () => {
+  it("снимает префикс жанра и режет длинное", () => {
+    expect(stampTitle("CHANGE: спека как носитель состояния")).toBe("спека как носитель состояния");
+    expect(stampTitle("ТЕМА: снос фаз")).toBe("снос фаз");
+    expect(stampTitle("x".repeat(200)).length).toBe(80);
+  });
+
+  it("вычищает разделитель мета-строки — иначе штамп развалит собственный разбор", () => {
+    expect(stampTitle("до · после")).toBe("до после");
+    expect(stampTitle("две\nстроки")).toBe("две строки");
   });
 });
