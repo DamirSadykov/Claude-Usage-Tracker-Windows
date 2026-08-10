@@ -558,19 +558,14 @@ onMounted(loadTriagePrompt);
 // --- Task-ref migration & backups (#63) ---
 // Bare `#N` used to be treated as a task reference, but in prose it almost always
 // means a GitHub PR/issue — a number collision silently linked the wrong task. The
-// app now links only the explicit `t#N` form; this one-shot migration rewrites the
-// genuine `#N` task refs already in stored text to `t#N` so they keep linking. It
-// backs up todos.json first, and "Откатить" restores that backup.
+// app now links only the explicit `t#N` form, and rewrites the genuine `#N` task
+// refs in stored text on startup, since a board with both spellings is ambiguous
+// rather than merely old. What is left here is the safety net: the rewrite guesses,
+// so it backs todos.json up first and "Откатить" restores that backup.
 interface BackupInfo {
   name: string;
   when_ms: number;
 }
-interface MigrationReport {
-  refs: number;
-  tasks: number;
-  backup: string;
-}
-const migrating = ref(false);
 const restoring = ref(false);
 const migrateMsg = ref("");
 const latestBackup = ref<BackupInfo | null>(null);
@@ -588,22 +583,6 @@ function fmtBackupTime(ms: number): string {
     return new Date(ms).toLocaleString();
   } catch {
     return "";
-  }
-}
-
-async function runMigration() {
-  if (migrating.value) return;
-  migrating.value = true;
-  migrateMsg.value = "";
-  try {
-    const r = await invoke<MigrationReport>("migrate_todo_refs");
-    migrateMsg.value =
-      r.refs === 0 ? t("migrateNone") : t("migrateDone", { refs: r.refs, tasks: r.tasks });
-    await loadLatestBackup();
-  } catch (e) {
-    migrateMsg.value = String(e);
-  } finally {
-    migrating.value = false;
   }
 }
 
@@ -1637,16 +1616,13 @@ function handleSave() {
         </template>
       </div>
 
-      <!-- Task-ref migration (#63): rewrite bare `#N` → `t#N`, with a backup and a
-           one-click restore. `#N` now reads as a PR/issue, only `t#N` links. -->
+      <!-- Task-ref migration (#63): bare `#N` → `t#N` runs on startup; `#N` reads as
+           a PR/issue, only `t#N` links. What is offered here is the undo. -->
       <div class="card">
         <div class="field-label">{{ t('migrateTitle') }}</div>
         <div class="field-hint" style="margin-top: 6px">{{ t('migrateDesc') }}</div>
         <div class="budget-suggest" style="margin-top: 10px">
           <span style="display: flex; gap: 8px; flex-shrink: 0">
-            <button type="button" class="suggest-btn" :disabled="migrating" @click="runMigration">
-              {{ migrating ? t('migrateRunning') : t('migrateRun') }}
-            </button>
             <button
               type="button"
               class="suggest-btn"
