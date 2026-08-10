@@ -2,7 +2,7 @@ use std::sync::LazyLock;
 use std::time::Duration;
 
 use log::{debug, warn};
-use reqwest::header::{HeaderMap, HeaderValue, COOKIE, CONTENT_TYPE, ACCEPT, USER_AGENT, REFERER};
+use reqwest::header::{HeaderMap, HeaderValue, COOKIE, ACCEPT, USER_AGENT, REFERER};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
@@ -10,9 +10,13 @@ use tokio::sync::Mutex;
 /// connection pool и HTTP/2 stream, не плодит TCP/TLS handshake на каждый
 /// запрос — иначе claude.ai/Cloudflare видят «N разных клиентов с одной
 /// cookie» и отвечают 429.
+/// `cookie_store` — Cloudflare выдаёт `__cf_bm` в ответе и ждёт её обратно;
+/// без хранилища каждый запрос выглядит как первый визит и рано или поздно
+/// ловит страницу проверки вместо данных.
 static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
+        .cookie_store(true)
         .build()
         .expect("failed to build shared reqwest::Client")
 });
@@ -191,16 +195,22 @@ struct ApiPrepaidCredits {
 
 // --- Shared helpers ---
 
+/// Держать в согласии с версией Chrome, которую заявляет встроенный webview:
+/// Cloudflare привязывает `cf_clearance` к паре IP + User-Agent, поэтому
+/// разъехавшиеся строки обесценят cookie, добытую входом через webview.
+const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36";
+
+/// Заголовки как у macOS-оригинала: cookie сессии, `Accept`, браузерный
+/// `User-Agent`, `Referer` и `Origin` — и ничего сверх того. `Content-Type`
+/// на GET и `anthropic-client-*` со значением `unknown` отсюда убраны: браузер
+/// их не шлёт, а для POST `Content-Type` проставит сам `RequestBuilder::json`.
 fn build_headers(session_key: &str) -> Result<HeaderMap, Box<dyn std::error::Error + Send + Sync>> {
     let mut headers = HeaderMap::new();
     headers.insert(COOKIE, HeaderValue::from_str(&format!("sessionKey={}", session_key))?);
-    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
-    headers.insert(USER_AGENT, HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"));
+    headers.insert(USER_AGENT, HeaderValue::from_static(BROWSER_UA));
     headers.insert(REFERER, HeaderValue::from_static("https://claude.ai"));
     headers.insert("Origin", HeaderValue::from_static("https://claude.ai"));
-    headers.insert("anthropic-client-sha", HeaderValue::from_static("unknown"));
-    headers.insert("anthropic-client-version", HeaderValue::from_static("unknown"));
     Ok(headers)
 }
 
@@ -222,10 +232,12 @@ const DEFAULT_TIER: UsageTier = UsageTier {
 
 /// A failed usage fetch. `session_expired` is the one bit the UI acts on: it's
 /// set only when the failure is specifically a rejected/expired session cookie
-/// — an HTTP 401/403, or a redirect to the login page (claude.ai answering an
-/// unauthenticated API call with HTML instead of a 401). Network errors, a wrong
-/// org id (404) and a Claude outage (5xx) are NOT expired-cookie — they leave
-/// this false so the UI doesn't wrongly send the user to re-enter a valid key.
+/// — an HTTP 401/403 carrying the API's own JSON refusal, or a redirect to the
+/// login page (claude.ai answering an unauthenticated API call with HTML instead
+/// of a 401). Network errors, a wrong org id (404), a Claude outage (5xx) and a
+/// Cloudflare challenge — which also arrives as 403, but with an HTML page the
+/// API never sent — are NOT expired-cookie: they leave this false so the UI
+/// doesn't wrongly send the user to re-enter a perfectly valid key.
 #[derive(Debug)]
 pub struct FetchError {
     pub message: String,
@@ -251,6 +263,19 @@ impl std::error::Error for FetchError {}
 /// the expected JSON is almost always claude.ai serving its HTML login shell (or
 /// a redirect landing there) because the session cookie was rejected — so we
 /// read it as an expired key rather than an opaque "unexpected JSON".
+/// Cloudflare's interstitial rather than an answer from the API. It comes back
+/// as a 403 with an HTML page — indistinguishable from a rejected cookie by
+/// status alone, which is exactly how a valid key gets blamed. The API's own
+/// refusal is always JSON (`account_session_invalid`), so the markers below are
+/// unambiguous; `cf-mitigated` is also sent as a response header.
+fn is_cloudflare_challenge(body: &str) -> bool {
+    body.contains("Just a moment") || body.contains("cf-mitigated")
+}
+
+const CLOUDFLARE_CHALLENGE_MESSAGE: &str =
+    "Запрос заблокирован защитой Cloudflare — ключ сессии, скорее всего, действителен. \
+     Обычно проходит при следующем обновлении; если повторяется, войдите в claude.ai в браузере.";
+
 fn looks_like_login_page(final_url: &reqwest::Url, body: &str) -> bool {
     let path = final_url.path();
     let redirected_away = final_url.host_str() != Some("claude.ai")
@@ -290,10 +315,7 @@ pub async fn fetch_usage(session_key: &str, org_id: &str) -> Result<UsageData, F
     let usage_url = format!("https://claude.ai/api/organizations/{}/usage", org_id);
     let credits_url = format!("https://claude.ai/api/organizations/{}/prepaid/credits", org_id);
 
-    let (usage_resp, credits_resp) = tokio::join!(
-        client.get(&usage_url).headers(headers.clone()).send(),
-        client.get(&credits_url).headers(headers).send(),
-    );
+    let usage_resp = client.get(&usage_url).headers(headers.clone()).send().await;
 
     let usage_resp = match usage_resp {
         Ok(r) => r,
@@ -313,6 +335,7 @@ pub async fn fetch_usage(session_key: &str, org_id: &str) -> Result<UsageData, F
     let final_url = usage_resp.url().clone();
     let status = usage_resp.status();
     if !status.is_success() {
+        let cf_mitigated = usage_resp.headers().contains_key("cf-mitigated");
         let body = usage_resp.text().await.unwrap_or_default();
         warn!(
             "fetch_usage: usage API returned {} (final_url {}, body {} bytes): {}",
@@ -321,6 +344,10 @@ pub async fn fetch_usage(session_key: &str, org_id: &str) -> Result<UsageData, F
             body.len(),
             snippet(&body)
         );
+        if cf_mitigated || is_cloudflare_challenge(&body) {
+            warn!("fetch_usage: Cloudflare challenge, not a rejected session key");
+            return Err(FetchError::plain(CLOUDFLARE_CHALLENGE_MESSAGE.to_string()));
+        }
         let session_expired = matches!(status.as_u16(), 401 | 403);
         let hint = match status.as_u16() {
             401 | 403 => " — ключ сессии недействителен или истёк",
@@ -354,8 +381,11 @@ pub async fn fetch_usage(session_key: &str, org_id: &str) -> Result<UsageData, F
         );
         // A 2xx that isn't our JSON is almost always the login page → treat it as
         // an expired cookie so the user is sent to refresh the key, not puzzled
-        // by "unexpected JSON".
-        if looks_like_login_page(&final_url, &body) {
+        // by "unexpected JSON". Cloudflare's page is checked first: it is also
+        // HTML, but the key behind it is fine.
+        if is_cloudflare_challenge(&body) {
+            FetchError::plain(CLOUDFLARE_CHALLENGE_MESSAGE.to_string())
+        } else if looks_like_login_page(&final_url, &body) {
             FetchError {
                 message: "Ключ сессии истёк — Claude вернул страницу входа вместо данных".into(),
                 session_expired: true,
@@ -365,6 +395,11 @@ pub async fn fetch_usage(session_key: &str, org_id: &str) -> Result<UsageData, F
         }
     })?;
     debug!("fetch_usage: usage parsed OK ({} bytes)", body.len());
+
+    // Sent only now, after usage came back: two simultaneous requests carrying
+    // one cookie are the burst the lock above exists to avoid, and a failed
+    // usage fetch makes the credits call pointless anyway.
+    let credits_resp = client.get(&credits_url).headers(headers).send().await;
 
     let prepaid: Option<ApiPrepaidCredits> = match credits_resp {
         Ok(r) if r.status().is_success() => r.json().await.ok(),
@@ -791,6 +826,28 @@ mod tests {
         }"#;
         let u = parse(json, None);
         assert!(u.scoped_weekly.is_empty());
+    }
+
+    #[test]
+    fn cloudflare_challenge_is_told_apart_from_a_rejected_key() {
+        // Verbatim opening of the 5.5 KB page claude.ai served on 2026-08-04
+        // while the session key was in fact valid.
+        let challenge = r#"<!DOCTYPE html> <!--[if lt IE 7]> <html class="no-js ie6 oldie" lang="en-US"> <![endif]--><title>Just a moment...</title>"#;
+        assert!(is_cloudflare_challenge(challenge));
+
+        // The API's own refusal for a genuinely bad key — JSON, 214 bytes.
+        let rejected = r#"{"type":"error","error":{"type":"permission_error","message":"Invalid authorization","details":{"error_code":"account_session_invalid"}}}"#;
+        assert!(!is_cloudflare_challenge(rejected), "a real auth failure must stay an auth failure");
+
+        // Real usage payloads must never trip the check either.
+        assert!(!is_cloudflare_challenge(r#"{"five_hour":{"utilization":19.0}}"#));
+    }
+
+    #[test]
+    fn challenge_error_does_not_claim_the_key_expired() {
+        let e = FetchError::plain(CLOUDFLARE_CHALLENGE_MESSAGE.to_string());
+        assert!(!e.session_expired, "the UI must not ask for a new key on a challenge");
+        assert!(e.message.contains("Cloudflare"));
     }
 
     #[test]
