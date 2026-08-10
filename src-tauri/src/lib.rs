@@ -2500,8 +2500,15 @@ struct MigrationReport {
 /// `todos.json` to a timestamped file BEFORE writing, so a wrong guess is one
 /// "Откатить" click away. A dry pass first counts the work: if nothing would
 /// change, it skips the backup and the write entirely.
-#[tauri::command]
-fn migrate_todo_refs(app: AppHandle) -> Result<MigrationReport, String> {
+///
+/// Runs on startup, not on a button. `#N` means a PR/issue now and only `t#N`
+/// links a task, so a board left unmigrated is not "older" — it is ambiguous,
+/// and every reader of stored prose has to keep understanding both spellings.
+/// There is no answer the user could give to "rewrite them?" that is about
+/// their work, so the question is gone. The rewrite still guesses (a `#N` whose
+/// number happens to match a task, with no PR word in front of it), hence the
+/// backup and the restore button stay — the report is told after the fact.
+fn migrate_todo_refs(app: &AppHandle) -> Result<MigrationReport, String> {
     let path = todos_path(&app)?;
     // Dry pass on a clone so we don't back up (or churn the file) for a no-op.
     let mut probe = todos::load(&path);
@@ -2953,6 +2960,17 @@ pub fn run() {
                 });
             }
 
+            // Before anything reads the board: bring stored `#N` task references
+            // to the `t#N` form the rest of the app assumes.
+            match migrate_todo_refs(app.handle()) {
+                Ok(r) if r.refs > 0 => info!(
+                    "todo refs migrated: {} reference(s) in {} task(s), backup {}",
+                    r.refs, r.tasks, r.backup
+                ),
+                Ok(_) => {}
+                Err(e) => warn!("todo ref migration skipped: {e}"),
+            }
+
             spawn_poll_loop(app.handle().clone(), notify);
             spawn_status_loop(app.handle().clone());
             spawn_sysmon_loop(app.handle().clone());
@@ -3025,7 +3043,6 @@ pub fn run() {
             set_todo_status,
             add_todo_dep,
             remove_todo_dep,
-            migrate_todo_refs,
             latest_todo_backup,
             restore_todo_backup,
             export_todos,
