@@ -81,14 +81,14 @@ fn main() {
     );
     for n in &out.nodes {
         eprintln!(
-            "  #{} {:?} cost={:?} dur={:?} calendar={} gate={} theme={} blocks={} agents={}",
+            "  #{} {:?} cost={:?} dur={:?} calendar={} gate={} change={} blocks={} agents={}",
             n.number,
             n.measurability,
             n.cost,
             n.duration_minutes,
             n.duration_calendar,
             n.gate,
-            n.theme,
+            n.change,
             n.blocks,
             n.agents.len()
         );
