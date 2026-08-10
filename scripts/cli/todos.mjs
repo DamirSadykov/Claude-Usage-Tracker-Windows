@@ -508,16 +508,14 @@ function setKind({ data, file, todo, value }) {
   process.stdout.write(`ok: #${todo.number} kind -> ${kind || "manual"}\n`);
 }
 
-// Mark (or unmark) a todo as a CHANGE root (t#255, renamed `theme` → `change`
-// at t#345), in lockstep with todos.rs::Todo.change and GraphView. A change =
-// a root task that depends_on all of its children and closes last; its
-// DESCRIPTION carries the change's own delta — what this round changes and
-// why now, not the vision (vision lives in the spec the change points at,
-// docs/specs/README.md §1). Purely a marker over the dep graph — order is
-// already enforced by the done-gate. `off` removes the field (matches the Rust
-// skip_serializing_if, so unmarked rows stay clean, and also drops the legacy
-// `theme` field so an old file cannot resurrect it through the read alias). A
-// root that depends on nothing is not yet a group, so marking one says so.
+// Put a todo INTO a change, or take it out (c#9, formerly the root-task marker
+// of t#255). A change is a record now (`change.mjs`), so membership is the
+// `change_id` field, in lockstep with todos.rs::Todo.change_id — the value is
+// an address `c#N`, and `none` clears it. The old boolean form is refused
+// rather than reinterpreted: a session that remembers `change on` would
+// otherwise silently mark a task as something that no longer exists. Clearing
+// also drops the legacy `change`/`theme` flags of an unmigrated board, so an
+// old file cannot resurrect a root through the read alias.
 function setChange({ data, file, todo, value }) {
   const s = String(value).trim().toLowerCase();
   const clearing = ["off", "false", "none", "clear"].includes(s);
@@ -547,30 +545,20 @@ function setChange({ data, file, todo, value }) {
     process.stdout.write(`ok: #${todo.number} change -> none\n`);
     return;
   }
-  const change = s === "on" || s === "true";
-  if (change)
+  if (!clearing)
     fail(
-      `refusing: \`change on\` is the OLD root-task form — a change is a record now.\n` +
+      `refusing: \`change ${s}\` is the OLD root-task form — a change is a record now.\n` +
         `  cli change new "<title>"   then   todos set change ${todo.number} <c#N>`,
     );
-  if (change && !directPrereqs(data, todo).length) {
-    process.stdout.write(
-      `warn: #${todo.number} depends on nothing yet — a change root depends_on ALL of its children\n` +
-        `      and closes last. Add the edges: todos dep add ${todo.number} <child>\n`,
-    );
-  }
-  if (isChangeRoot(todo) === change) {
-    process.stdout.write(`ok: #${todo.number} already change ${change ? "on" : "off"}\n`);
-    return;
-  }
-  if (change) todo.change = true;
-  else {
+  if (isChangeRoot(todo)) {
     delete todo.change;
     delete todo.theme;
+    todo.updated_at = new Date().toISOString();
+    save(file, data);
+    process.stdout.write(`ok: #${todo.number} change -> none (old root flag dropped)\n`);
+    return;
   }
-  todo.updated_at = new Date().toISOString();
-  save(file, data);
-  process.stdout.write(`ok: #${todo.number} change -> ${change ? "on" : "off"}\n`);
+  process.stdout.write(`ok: #${todo.number} already change none\n`);
 }
 
 // --- process DSL declarations (t#302) ---------------------------------------
@@ -757,19 +745,21 @@ function setBudget({ data, file, todo, value }) {
 
 // Declare the PARALLEL LIMIT (§10): how many steps of a group the runner may
 // drive at once. Parallelism itself is never declared — it is already described
-// by the ABSENCE of an edge; only the ceiling is. The limit is meaningful on a
-// CHANGE (the group), so declaring it elsewhere warns but is not refused: the
-// board is a draft and a root gets marked `change` later just as often as earlier.
+// by the ABSENCE of an edge; only the ceiling is. The limit belongs to the
+// GROUP, and since c#9 the group is a record, not a root task — so a task can
+// only ever CLEAR an inherited limit here, never declare one. Reading stays:
+// an unmigrated board still carries the ceiling on its root task, and the
+// runner resolves it through the legacy virtual root.
 function setParallel({ data, file, todo, value }) {
   const limit = normalizeLimit(value);
   if (limit === undefined)
-    fail(`invalid parallel limit "${value}". valid: a positive whole number | none`);
-  if (limit !== null && !isChangeRoot(todo)) {
-    process.stdout.write(
-      `warn: #${todo.number} is not a change — a parallel limit only means something on a GROUP,\n` +
-        `      and the runner reads it off the change record. Put the task in one: todos set change ${todo.number} <c#N>\n`,
+    fail(`invalid parallel limit "${value}". valid: none (a change record holds the limit)`);
+  if (limit !== null)
+    fail(
+      `refusing: a parallel limit belongs to the CHANGE, not to a task.\n` +
+        `  cli change set parallel <c#N> ${limit}` +
+        (todo.change_id ? "" : `   (put #${todo.number} in one first: todos set change ${todo.number} <c#N>)`),
     );
-  }
   if ((todo.parallel_limit ?? null) === limit) {
     process.stdout.write(
       `ok: #${todo.number} already parallel ${limit === null ? "undeclared" : limit}\n`,
