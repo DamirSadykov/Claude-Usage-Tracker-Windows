@@ -23,15 +23,22 @@ jobs:
             code:
               - 'src/**'
               - 'src-tauri/**'
+              # The CLI, the hooks and most of the test suite live here. Left
+              # out, a change touching only `scripts/**` reported "no code
+              # changes" and ran nothing at all.
+              - 'scripts/**'
               - 'package.json'
               - 'package-lock.json'
               - 'tsconfig*.json'
               - 'vite.config.ts'
               - 'index.html'
               - '.github/workflows/ci.yml'
+            specs:
+              - 'docs/specs/**'
+              - 'scripts/cli/spec.mjs'
 
       - name: Setup Node.js
-        if: steps.changes.outputs.code == 'true'
+        if: steps.changes.outputs.code == 'true' || steps.changes.outputs.specs == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -48,8 +55,16 @@ jobs:
           workspaces: src-tauri -> target
 
       - name: Install dependencies
-        if: steps.changes.outputs.code == 'true'
+        if: steps.changes.outputs.code == 'true' || steps.changes.outputs.specs == 'true'
         run: npm ci
+
+      # The registry's own invariants — dangling refs, a duplicate slug, a
+      # section over the ceiling, a task link in prose, a path that no longer
+      # exists. Scanning is cheap; what it lacked was a place where it happens
+      # without anyone remembering to type it.
+      - name: Spec registry lint
+        if: steps.changes.outputs.specs == 'true'
+        run: node scripts/cli.mjs spec lint
 
       - name: Frontend unit tests
         if: steps.changes.outputs.code == 'true'
@@ -65,5 +80,5 @@ jobs:
         run: cargo test
 
       - name: No code changes
-        if: steps.changes.outputs.code != 'true'
+        if: steps.changes.outputs.code != 'true' && steps.changes.outputs.specs != 'true'
         run: echo "No code-affecting changes - skipping build and tests."

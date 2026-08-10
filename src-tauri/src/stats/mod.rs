@@ -17,11 +17,11 @@ mod project_links;
 mod snapshots;
 
 pub use analytics::{
-    Analytics, AnalyticsExt, DailyPoint, HeatCell, Insight, ModelUsage, PeriodCompare,
+    Analytics, AnalyticsExt, BlockTotals, DailyPoint, HeatCell, Insight, ModelUsage, PeriodCompare,
     Productivity, ProjectUsage, SessionUsage, SubagentSummary, SubagentUsage, TierBreakdown,
     ToolErrorStats, ToolUsage, Totals, TrendMetrics,
 };
-pub use cc_store::{CcActiveSession, CcUsageRow, ToolResultRow, TurnRow};
+pub use cc_store::{CcActiveSession, CcAgentRow, CcUsageRow, ToolResultRow, TurnRow};
 pub use project_links::ProjectLink;
 pub use forecast::{ForecastData, TierForecast};
 pub use snapshots::{UsageDelta, UsageSnapshot};
@@ -171,6 +171,32 @@ const MIGRATIONS: &[&str] = &[
         canonical TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_project_links_canonical ON project_links(canonical);",
+    // v13 — per-session lookups for task blocks (t#297). Block sums scan
+    // cc_usage / cc_tool_result by session_id + a ts window; neither table had
+    // an index on session_id. Additive: indexes only.
+    "CREATE INDEX IF NOT EXISTS idx_cc_usage_session_ts ON cc_usage(session_id, ts);
+     CREATE INDEX IF NOT EXISTS idx_cc_tool_result_session_ts ON cc_tool_result(session_id, ts);",
+    // v14 — agent instance identity (t#300). A subagent bills under its PARENT's
+    // session_id, and `agent_name` is only the agent TYPE (two general-purpose
+    // agents are indistinguishable), so parallel agents collapsed into one block.
+    // The instance key exists on disk: every line of a subagent transcript carries
+    // `agentId`, and `<session>/subagents/agent-<id>.meta.json` holds its type,
+    // spawning tool_use id and the description it was launched with. `cc_agent`
+    // stores that manifest; `cc_usage.agent_id` puts the key on every message so a
+    // block can be split per agent. Wiping cc_files forces the one re-ingest that
+    // back-fills both.
+    "ALTER TABLE cc_usage ADD COLUMN agent_id TEXT;
+     CREATE INDEX IF NOT EXISTS idx_cc_usage_agent ON cc_usage(agent_id, ts);
+     CREATE TABLE IF NOT EXISTS cc_agent (
+        agent_id    TEXT PRIMARY KEY,
+        session_id  TEXT,
+        agent_type  TEXT,
+        description TEXT,
+        tool_use_id TEXT,
+        spawn_depth INTEGER
+     );
+     CREATE INDEX IF NOT EXISTS idx_cc_agent_session ON cc_agent(session_id);
+     DELETE FROM cc_files;",
 ];
 
 fn migrate(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -332,6 +358,158 @@ mod tests {
     }
 
     #[test]
+    fn block_totals_sum_one_span_of_one_session() {
+        let db = mem_db();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(
+                "INSERT INTO cc_usage (message_id, ts, model, input, output, cache_create, cache_read, cost, session_id)
+                 VALUES ('m0','2026-07-28T09:00:00Z','claude-opus-4-8',10,10,0,0,0.5,'s1'),
+                        ('m1','2026-07-28T10:00:00Z','claude-opus-4-8',10,20,30,40,1.0,'s1'),
+                        ('m2','2026-07-28T10:30:00Z','claude-opus-4-8', 1, 2, 3, 4,0.25,'s1'),
+                        ('m3','2026-07-28T12:00:00Z','claude-opus-4-8',10,10,0,0,9.0,'s1'),
+                        ('m4','2026-07-28T10:10:00Z','claude-opus-4-8',10,10,0,0,7.0,'s2');
+                 INSERT INTO cc_tool_use (message_id, tool_name, n) VALUES
+                        ('m0','Read',5),('m1','Read',2),('m1','Bash',1),('m2','Edit',3),
+                        ('m3','Read',8),('m4','Read',4);
+                 INSERT INTO cc_tool_result (tool_use_id, session_id, ts, is_error) VALUES
+                        ('t0','s1','2026-07-28T09:05:00Z',1),
+                        ('t1','s1','2026-07-28T10:05:00Z',1),
+                        ('t2','s1','2026-07-28T10:20:00Z',0),
+                        ('t3','s1','2026-07-28T11:59:00Z',1),
+                        ('t4','s2','2026-07-28T10:15:00Z',1);",
+            )
+            .unwrap();
+        }
+        // Block bounds are inclusive: the closing message belongs to the block.
+        let b = db
+            .block_totals("s1", "2026-07-28T10:00:00Z", "2026-07-28T10:30:00Z")
+            .unwrap();
+        assert_eq!(b.messages, 2);
+        assert_eq!(b.total_tokens, 100 + 10);
+        assert!((b.cost - 1.25).abs() < 1e-9);
+        assert_eq!(b.tool_calls, 6);
+        assert_eq!(b.tool_errors, 1);
+
+        // Neither the earlier block of the same session nor a parallel session
+        // leaks in; a span with no rows is all-zero, not an error.
+        let many = db
+            .block_totals_many(&[
+                (
+                    "s1".into(),
+                    "2026-07-28T10:30:01Z".into(),
+                    "2026-07-28T12:00:00Z".into(),
+                ),
+                (
+                    "s9".into(),
+                    "2026-07-28T00:00:00Z".into(),
+                    "2026-07-29T00:00:00Z".into(),
+                ),
+            ])
+            .unwrap();
+        assert_eq!(many[0].messages, 1);
+        assert_eq!(many[0].tool_calls, 8);
+        assert_eq!(many[0].tool_errors, 1);
+        assert_eq!(many[1].messages, 0);
+        assert_eq!(many[1].tool_calls, 0);
+        assert_eq!(many[1].cost, 0.0);
+    }
+
+    #[test]
+    fn block_agents_split_a_block_between_parallel_agents() {
+        let db = mem_db();
+        // The case t#300 exists for: two `general-purpose` agents run inside ONE
+        // block of ONE session, so agent_name cannot tell them apart.
+        db.cc_agent_upsert(&[
+            CcAgentRow {
+                agent_id: "ag-1".into(),
+                session_id: Some("s1".into()),
+                agent_type: Some("general-purpose".into()),
+                description: Some("Автопривязка в хуке".into()),
+                tool_use_id: Some("toolu_1".into()),
+                spawn_depth: Some(1),
+            },
+            CcAgentRow {
+                agent_id: "ag-2".into(),
+                session_id: Some("s1".into()),
+                agent_type: Some("general-purpose".into()),
+                description: Some("Блоки на стороне Rust".into()),
+                tool_use_id: Some("toolu_2".into()),
+                spawn_depth: Some(1),
+            },
+        ])
+        .unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(
+                "INSERT INTO cc_usage (message_id, ts, model, input, output, cache_create, cache_read, cost, session_id, is_subagent, agent_name, agent_id)
+                 VALUES ('m1','2026-07-28T10:00:00Z','claude-opus-4-8',10,10,0,0,1.0,'s1',0,NULL,NULL),
+                        ('m2','2026-07-28T10:05:00Z','claude-opus-4-8',10,10,0,0,2.0,'s1',1,'general-purpose','ag-1'),
+                        ('m3','2026-07-28T10:06:00Z','claude-opus-4-8',10,10,0,0,4.0,'s1',1,'general-purpose','ag-2'),
+                        ('m4','2026-07-28T10:07:00Z','claude-opus-4-8',10,10,0,0,8.0,'s1',1,'general-purpose','ag-2'),
+                        ('m5','2026-07-28T11:00:00Z','claude-opus-4-8',10,10,0,0,9.0,'s1',1,'general-purpose','ag-1');",
+            )
+            .unwrap();
+        }
+        let rows = db
+            .block_agents("s1", "2026-07-28T10:00:00Z", "2026-07-28T10:10:00Z")
+            .unwrap();
+        // Sorted by cost: ag-2 ($12), ag-1 ($2), main loop ($1).
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].agent_id.as_deref(), Some("ag-2"));
+        assert!((rows[0].cost - 12.0).abs() < 1e-9);
+        assert_eq!(rows[0].messages, 2);
+        assert_eq!(rows[0].description.as_deref(), Some("Блоки на стороне Rust"));
+        assert_eq!(rows[1].agent_id.as_deref(), Some("ag-1"));
+        assert!((rows[1].cost - 2.0).abs() < 1e-9);
+        // The main loop is a row too, so the split sums back to the block total.
+        assert!(rows[2].agent_id.is_none());
+        assert!((rows[2].cost - 1.0).abs() < 1e-9);
+        let total = db
+            .block_totals("s1", "2026-07-28T10:00:00Z", "2026-07-28T10:10:00Z")
+            .unwrap();
+        assert!((rows.iter().map(|r| r.cost).sum::<f64>() - total.cost).abs() < 1e-9);
+        // ag-1's later message is outside the span and must not leak in.
+        assert_eq!(rows.iter().map(|r| r.messages).sum::<i64>(), total.messages);
+    }
+
+    #[test]
+    fn cc_agent_upsert_backfills_without_overwriting() {
+        let db = mem_db();
+        let partial = CcAgentRow {
+            agent_id: "ag-1".into(),
+            session_id: None,
+            agent_type: Some("Explore".into()),
+            description: None,
+            tool_use_id: None,
+            spawn_depth: None,
+        };
+        assert_eq!(db.cc_agent_upsert(&[partial]).unwrap(), 1);
+        let fuller = CcAgentRow {
+            agent_id: "ag-1".into(),
+            session_id: Some("s1".into()),
+            // A different type must NOT overwrite the stored one.
+            agent_type: Some("general-purpose".into()),
+            description: Some("нашлось позже".into()),
+            tool_use_id: Some("toolu_9".into()),
+            spawn_depth: Some(2),
+        };
+        assert_eq!(db.cc_agent_upsert(&[fuller]).unwrap(), 0);
+        let conn = db.conn.lock().unwrap();
+        let (sess, kind, descr, depth): (Option<String>, Option<String>, Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT session_id, agent_type, description, spawn_depth FROM cc_agent WHERE agent_id='ag-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(sess.as_deref(), Some("s1"));
+        assert_eq!(kind.as_deref(), Some("Explore"));
+        assert_eq!(descr.as_deref(), Some("нашлось позже"));
+        assert_eq!(depth, Some(2));
+    }
+
+    #[test]
     fn cleanup_before_removes_old_rows() {
         let db = mem_db();
         db.insert_at("2026-01-01T00:00:00Z", 10.0, 1.0, None);
@@ -395,6 +573,7 @@ mod tests {
             project: None,
             is_subagent: false,
             agent_name: None,
+            agent_id: None,
             tool_uses: Vec::new(),
             service_tier: None,
             git_commits: 0,
@@ -459,12 +638,12 @@ mod tests {
     // --- migrations: v8–v11 ---
 
     #[test]
-    fn migration_count_advances_to_twelve() {
+    fn migration_count_advances_to_fourteen() {
         let db = mem_db();
         let conn = db.conn.lock().unwrap();
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
         assert_eq!(v, MIGRATIONS.len() as i64);
-        assert_eq!(MIGRATIONS.len(), 12);
+        assert_eq!(MIGRATIONS.len(), 14);
     }
 
     #[test]

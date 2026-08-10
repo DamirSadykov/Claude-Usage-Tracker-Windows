@@ -29,6 +29,17 @@ const userLine = (text, extra = {}) =>
 const CLI = 'node "D:\\\\app\\\\scripts\\\\cli.mjs"';
 
 describe("parseSessionMoves", () => {
+  // The command was `set-status` until t#310 renamed it to `set status`; both
+  // spellings must be read, or every transcript older than the rename stops
+  // attributing.
+  it("reads both spellings of the status move", () => {
+    for (const cmd of ["set status 42 in_progress", "set-status 42 in_progress"]) {
+      const moves = parseSessionMoves(bashLine(`${CLI} todos ${cmd}`));
+      expect(moves).toHaveLength(1);
+      expect(moves[0]).toMatchObject({ ref: "42", statuses: ["in_progress"] });
+    }
+  });
+
   it("records a worked move with its ref, status and timestamp", () => {
     const raw = bashLine(`${CLI} todos set-status 42 in_progress`);
     expect(parseSessionMoves(raw)).toEqual([
