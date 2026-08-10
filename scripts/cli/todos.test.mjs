@@ -650,21 +650,18 @@ describe("declaration commands", () => {
     expect(read(1)).not.toHaveProperty("budget_usd");
   });
 
-  it("set parallel stores the limit on a change root without a warning", () => {
+  it("set parallel refuses a limit on a task and points at the change record", () => {
     seed([todo(1, { change: true }), todo(2)]);
-    const out = run("set", "parallel", "1", "2");
-    expect(out).not.toContain("warn:");
-    expect(read(1).parallel_limit).toBe(2);
-    run("set", "parallel", "1", "none");
+    const out = refuse("set", "parallel", "1", "2");
+    expect(out).toContain("belongs to the CHANGE");
+    expect(out).toContain("cli change set parallel <c#N> 2");
     expect(read(1)).not.toHaveProperty("parallel_limit");
   });
 
-  it("set parallel WARNS but still writes when the task is not a change", () => {
-    const out = run("set", "parallel", "2", "3");
-    expect(out).toContain("warn:");
-    expect(out).toContain("is not a change");
-    expect(out).toContain("todos set change 2 <c#N>");
-    expect(read(2).parallel_limit).toBe(3);
+  it("set parallel none clears a limit inherited from an unmigrated root", () => {
+    seed([todo(1, { change: true, parallel_limit: 2 }), todo(2)]);
+    run("set", "parallel", "1", "none");
+    expect(read(1)).not.toHaveProperty("parallel_limit");
   });
 
   it("set parallel refuses anything that is not a positive whole number", () => {
@@ -728,11 +725,11 @@ describe("declaration commands", () => {
   });
 
   it("writes no empty declaration fields — undeclared means absent", () => {
+    seed([todo(1, { parallel_limit: 2 }), todo(2)]);
     run("produces", "add", "1", "out.mjs");
     run("set", "verify", "1", "npm test");
     run("set", "retry", "1", "2");
     run("set", "budget", "1", "2");
-    run("set", "parallel", "1", "2");
     run("set", "on-issue", "1", "2");
     run("produces", "rm", "1", "out.mjs");
     run("set", "verify", "1", "");
@@ -959,7 +956,6 @@ describe("todos set", () => {
     ["verify", "npm test", (t) => expect(t.verify).toBe("npm test")],
     ["retry", "3", (t) => expect(t.retry_limit).toBe(3)],
     ["budget", "$2.5", (t) => expect(t.budget_usd).toBe(2.5)],
-    ["parallel", "2", (t) => expect(t.parallel_limit).toBe(2)],
   ];
 
   for (const [field, value, check] of scalars) {
@@ -1065,12 +1061,12 @@ describe("todos set", () => {
   }
 
   it("clears every optional field with none, leaving no empty key behind", () => {
+    seed([todo(1, { parallel_limit: 2 }), todo(2)]);
     run("set", "priority", "1", "high");
     run("set", "kind", "1", "auto");
     run("set", "verify", "1", "npm test");
     run("set", "retry", "1", "2");
     run("set", "budget", "1", "2");
-    run("set", "parallel", "1", "2");
     run("set", "priority", "1", "none");
     run("set", "kind", "1", "manual");
     run("set", "change", "1", "none");
