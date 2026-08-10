@@ -448,14 +448,25 @@ export function toProjectBands(
         if (!grouped.has(key)) grouped.set(key, []);
         grouped.get(key)!.push(t);
     }
-    return [...grouped.entries()].map(([name, todos]) => ({
-        name: name || "без проекта",
-        tasks: `${todos.length} задач`,
-        cost: formatMoney(spend.get(name) ?? 0),
-        lanes: [
-            ...new Set(todos.map((t) => index.laneOf.get(t.id) ?? "free")),
-        ],
-    }));
+    return [...grouped.entries()]
+        .sort(([, a], [, b]) => freshest(b) - freshest(a))
+        .map(([name, todos]) => ({
+            name: name || "без проекта",
+            tasks: `${todos.length} задач`,
+            cost: formatMoney(spend.get(name) ?? 0),
+            lanes: [
+                ...new Set(todos.map((t) => index.laneOf.get(t.id) ?? "free")),
+            ],
+        }));
+}
+
+function freshest(todos: BoardTodo[]): number {
+    let max = -Infinity;
+    for (const t of todos) {
+        const at = Date.parse(t.created_at ?? "");
+        if (!Number.isNaN(at) && at > max) max = at;
+    }
+    return max;
 }
 
 export function refEdges(board: BoardTodo[]): { from: string; to: string }[] {
