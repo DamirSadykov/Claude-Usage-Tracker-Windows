@@ -30,7 +30,7 @@ const linkMode = ref("deps");
 const layoutMode = ref("lanes");
 const costLayer = ref(false);
 const hideDone = ref(false);
-const selected = ref("#341");
+const selected = ref("");
 const bodies = ref<Record<string, HTMLElement | null>>({});
 const freeBodies = ref<Record<string, HTMLElement | null>>({});
 const slots = ref<Record<string, HTMLElement | null>>({});
@@ -307,7 +307,7 @@ function resetView() {
     layoutMode.value = "lanes";
     costLayer.value = false;
     hideDone.value = false;
-    selected.value = "#341";
+    selected.value = "";
     allWavesOn();
     wavePickerOpen.value = false;
     groupOpen.value = false;

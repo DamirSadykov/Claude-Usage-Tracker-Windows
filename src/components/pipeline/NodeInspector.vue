@@ -52,7 +52,9 @@ const REASON: Record<string, string> = {
 };
 
 const task = computed(() => cards.value.find((t) => t.id === props.id));
-const detail = computed(() => props.node ?? runDetails[props.id]);
+const detail = computed(() =>
+    props.node === undefined ? runDetails[props.id] : props.node,
+);
 const node = computed<RunGraphNode>(() => ({ ...BLANK, ...(detail.value ?? {}) }));
 const money = computed(() => moneyOf(node.value));
 
