@@ -94,7 +94,7 @@ describe("buildEnterContext", () => {
 // used to be pinned about the TEXT is now pinned about the DOCUMENT: it exists,
 // it is reachable at the path both hooks print, it teaches every key the parser
 // takes, and the example it shows really parses.
-const YAML_BLOCK = /```yaml\n([\s\S]*?)```/g;
+const YAML_BLOCK = /```yaml\r?\n([\s\S]*?)```/g;
 
 describe("the plan-format document", () => {
   const doc = readFileSync(planFormatDoc(), "utf8");
