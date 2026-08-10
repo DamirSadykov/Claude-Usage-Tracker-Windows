@@ -197,51 +197,56 @@ Trying to jump the chain is refused:
 # finish those first, or override with --force
 ```
 
-## Changes — a root task as the aggregator (t#255, renamed `theme` → `change` at t#345)
+## Changes — a record of its own, addressed `c#N` (t#255 → renamed at t#345 → made a record at c#9)
 
-How a piece of work **bigger than one task** lives on the graph — as a
-**change**. The entity used to be called a *theme*; the field, the setter and
-every command were renamed to `change` (old data with `theme` still reads
-fine — see below — but write the new name). See `tasks#changes` for the
-invariants behind this; here is how you drive it:
+How a piece of work **bigger than one task** lives on the board — as a
+**change**. It was a *theme*, then a root TASK marked with a flag; since c#9 it
+is a **record in its own right**, kept in the `changes` section of the board
+file and addressed `c#N`. See `tasks#changes` for the invariants behind this;
+here is how you drive it:
 
-- A change is an ordinary **root task that `depends_on` all of its children.** No
-  new entity: the aggregation *is* the dep edges. The root **closes last** — the
-  done-gate already refuses `done` while a prerequisite is open, so the order is
-  enforced, not just conventional.
-- A root is **worth creating from ~4–5 nodes**; below that the children speak for
-  themselves. Name it so it reads as a container (e.g. `CHANGE: <what>`), file it
-  on the same board as its children (deps are intra-board).
-- **Mark the root explicitly** — `todos set change <id> on` (or `add --change`;
-  the old `todos set theme … on` / `add --theme` spellings no longer write —
-  only `change` does). The stored flag is what lets consumers find the root
-  deterministically: walk UP the reverse dep edges to the nearest dependent with
-  `change` on, instead of guessing which downstream task is "the" aggregator.
-  The fold behaviour in the graph stays universal; the flag only marks intent.
-  A file (or a board) written before the rename with `theme: true` still counts
-  as a change root — the reader accepts either field — but nothing is ever
-  written back out under the old name.
-- **The change root's DESCRIPTION carries the change's DELTA — what this round
-  changes and why now** — not the vision. Vision as a concept has moved to the
-  spec the change is about (`docs/specs/README.md` §1): the spec is the
-  long-lived "what should exist and why", a change is a temporary delta against
-  it, and dies with its graph once closed. The description-printing mechanics
-  below are unchanged from before the rename; only what belongs in the text is
-  different — write it as "what this round is doing and why now", not as a
-  north star meant to outlive the change.
-- Direction of reading matters: the **description is read UPWARD** — working a
-  child, the delta arrives on its own: `set status <id> in_progress` auto-prints
-  the nearest change root's description next to the inherited handoff, the
-  SessionStart hook re-surfaces it for every in_progress task it shows (so it
-  survives the session boundary), and `todos vision <task>` re-reads it on
-  demand (the command name is unchanged). The walk stops at the **nearest** root
-  along each branch — an outer change wrapping an inner one stays out of view.
-  The root's **handoff stays the usual DOWNSTREAM baton** to whatever depends on
-  the root itself.
-- A change can point at the spec section(s) it is a delta of via
-  `todos set spec <task> <domain>#<slug>` — see `tasks#spec-registry`. That link
-  is what carries the vision the description used to serve alone; nothing here
-  forces you to set it.
+- `c#N` has its **own counter, independent of task numbers** — `c#1` and `#1`
+  are unrelated, so never pass a task number where an address is expected.
+- **Open one, then put tasks in it:**
+
+  ```
+  <cli> change new "<title>" [--delta "<what this round changes and why now>"]
+  <cli> todos set change <task> c#N        # membership is a FIELD, not an edge
+  <cli> change list | change show c#N
+  ```
+
+  In plan mode you do not do this by hand: `todos apply` opens the change from
+  the plan and files every step into it.
+- **Membership is the `change_id` field**, not a dep edge. It used to be an edge
+  and that was the reason for the rewrite: one edge type meant both "blocks me"
+  and "is part of me", and a forgotten edge silently dropped a task out of its
+  change, because "no edge" is a legal state of the graph.
+- **A change is worth opening from ~4–5 nodes**; below that the tasks speak for
+  themselves. Name it so it reads as a container (e.g. `CHANGE: <what>`).
+- **The status is not stored: a change is open while any of its tasks is open.**
+  Do not look for a flag — ask the membership. `change close` refuses while a
+  task is still open and stamps the moment it was declared finished; that stamp
+  is a date for the history, never the answer to "is it open".
+- **The change's DELTA — what this round changes and why now** — lives on the
+  record (`change set delta c#N "…"`), not on any task. Vision is not a delta:
+  it lives in the spec the change points at (`docs/specs/README.md` §1). The
+  spec is the long-lived "what should exist and why"; a change is a temporary
+  delta against it and dies with its tasks.
+- Direction of reading matters: the **delta is read UPWARD** — working a task,
+  it arrives on its own. `set status <id> in_progress` prints the delta of the
+  change the task belongs to next to the inherited handoff, the SessionStart
+  hook re-surfaces it for every in_progress task, and `todos vision <task>`
+  re-reads it on demand.
+- The ceilings of the group — `budget_usd` and `parallel_limit` — belong to the
+  record (`change set budget|parallel c#N …`); the runner reads them there.
+- A change points at the spec section(s) it is a delta of with
+  `change set spec c#N <domain>#<slug>`; a single task narrows that to its own
+  step with `todos set spec <task> <domain>#<slug>` — see `tasks#spec-registry`.
+- **A board written before the migration still reads.** An old root task
+  carrying the `change` (or the even older `theme`) flag is understood as a
+  change with the address `t#N`, its members found by walking the dep edges up.
+  Nothing is ever written back in that shape — migrate such a board with
+  `<cli> change migrate`.
 - **Setting it puts a gate at the other end.** Moving a linked task to
   `review`/`done` will not let the session stop until it has answered for each
   addressed section:
