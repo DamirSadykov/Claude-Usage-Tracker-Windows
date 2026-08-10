@@ -9,6 +9,7 @@ import {
     refEdges,
     specPorts,
     toLanes,
+    toProjectBands,
     toSpecLanes,
     toTaskLinks,
     toTaskNodes,
@@ -533,5 +534,41 @@ describe("статус карточки различает колонки дос
 
     it("взятая в работу не выглядит заблокированной", () => {
         expect(nodeStatus(byId.get("work")!, byId)).toBe("ready");
+    });
+});
+
+describe("полосы проектов", () => {
+    const board = [
+        todo({ id: "old-1", project: "давний", created_at: "2026-01-05T10:00:00Z" }),
+        todo({ id: "old-2", project: "давний", created_at: "2026-08-10T10:00:00Z" }),
+        todo({ id: "mid-1", project: "средний", created_at: "2026-06-01T10:00:00Z" }),
+    ];
+
+    it("ставит выше проект, в котором работа появилась позже", () => {
+        const bands = toProjectBands(board, [], laneIndex(board));
+        expect(bands.map((b) => b.name)).toEqual(["давний", "средний"]);
+    });
+
+    it("датирует полосу самой свежей задачей, а не самой старой", () => {
+        const older = [
+            todo({ id: "a", project: "один", created_at: "2026-01-01T10:00:00Z" }),
+            todo({ id: "b", project: "два", created_at: "2026-02-01T10:00:00Z" }),
+            todo({ id: "c", project: "один", created_at: "2026-03-01T10:00:00Z" }),
+        ];
+        expect(toProjectBands(older, [], laneIndex(older)).map((b) => b.name)).toEqual([
+            "один",
+            "два",
+        ]);
+    });
+
+    it("проект без дат не вытесняет датированный", () => {
+        const mixed = [
+            todo({ id: "x", project: "без дат" }),
+            todo({ id: "y", project: "с датой", created_at: "2026-05-01T10:00:00Z" }),
+        ];
+        expect(toProjectBands(mixed, [], laneIndex(mixed)).map((b) => b.name)).toEqual([
+            "с датой",
+            "без дат",
+        ]);
     });
 });
