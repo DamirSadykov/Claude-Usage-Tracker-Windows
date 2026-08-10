@@ -69,6 +69,7 @@ const legendItems = [
     { text: "заблокирована — ждёт предшественника", color: "var(--crit)" },
     { text: "готова — auto-нода, runner может взять", color: "var(--ok)" },
     { text: "готова — ждёт тебя (ручной гейт)", color: "var(--theme)" },
+    { text: "на проверке — сделана, ждёт приёмки", color: "var(--accent)" },
     { text: "⚡ auto-нода", color: "var(--warn)", mark: "none" as const },
 ];
 

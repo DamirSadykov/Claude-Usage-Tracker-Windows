@@ -46,6 +46,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { matchPlanCli } from "./settings.mjs";
 import { resolveAddress, showSection, sectionFingerprint, blocksOf } from "./spec.mjs";
+import { findChange, changeAddress } from "./change.mjs";
 
 // Kanban columns, in board order. Keep in lockstep with todos.rs::STATUSES.
 export const STATUSES = ["backlog", "queue", "in_progress", "review", "done"];
@@ -519,9 +520,39 @@ function setKind({ data, file, todo, value }) {
 // root that depends on nothing is not yet a group, so marking one says so.
 function setChange({ data, file, todo, value }) {
   const s = String(value).trim().toLowerCase();
-  if (!["on", "off", "true", "false"].includes(s))
-    fail(`invalid change "${value}". valid: on | off`);
+  const clearing = ["off", "false", "none", "clear"].includes(s);
+  if (!["on", "true"].includes(s) && !clearing) {
+    const change = findChange(data, value);
+    if (!change)
+      fail(
+        `invalid change "${value}". valid: <c#N> | none\n` +
+          `  a change is a record now, not a flag — see them: cli change list --all`,
+      );
+    if (todo.change_id === change.id) {
+      process.stdout.write(`ok: #${todo.number} already in ${changeAddress(change)}\n`);
+      return;
+    }
+    todo.change_id = change.id;
+    todo.updated_at = new Date().toISOString();
+    save(file, data);
+    process.stdout.write(
+      `ok: #${todo.number} change -> ${changeAddress(change)} "${change.title}"\n`,
+    );
+    return;
+  }
+  if (clearing && todo.change_id) {
+    delete todo.change_id;
+    todo.updated_at = new Date().toISOString();
+    save(file, data);
+    process.stdout.write(`ok: #${todo.number} change -> none\n`);
+    return;
+  }
   const change = s === "on" || s === "true";
+  if (change)
+    fail(
+      `refusing: \`change on\` is the OLD root-task form — a change is a record now.\n` +
+        `  cli change new "<title>"   then   todos set change ${todo.number} <c#N>`,
+    );
   if (change && !directPrereqs(data, todo).length) {
     process.stdout.write(
       `warn: #${todo.number} depends on nothing yet — a change root depends_on ALL of its children\n` +
@@ -736,7 +767,7 @@ function setParallel({ data, file, todo, value }) {
   if (limit !== null && !isChangeRoot(todo)) {
     process.stdout.write(
       `warn: #${todo.number} is not a change — a parallel limit only means something on a GROUP,\n` +
-        `      and the runner reads it off the change root. Mark it: todos set change ${todo.number} on\n`,
+        `      and the runner reads it off the change record. Put the task in one: todos set change ${todo.number} <c#N>\n`,
     );
   }
   if ((todo.parallel_limit ?? null) === limit) {
@@ -980,7 +1011,7 @@ const SET_FIELDS = {
     set: setKind,
   },
   change: {
-    values: "on | off   (a change root depends_on all its children and closes last)",
+    values: "<c#N> | none   (a change is a record: cli change list --all)",
     set: setChange,
   },
   project: { values: "<name> | none   (none = global, project-less)", set: setProject },
@@ -1764,7 +1795,31 @@ function directPrereqs(data, t) {
 // (an outer change wrapping an inner one stays out of view). Exported for the
 // SessionStart hook (hook.mjs), which surfaces the same vision for in_progress
 // tasks.
+export function changeAsRoot(record, data) {
+  if (!record) return null;
+  const members = (data?.todos ?? []).filter((x) => x && x.change_id === record.id);
+  const closed = members.length > 0 && members.every((x) => isDone(x));
+  return {
+    id: record.id,
+    number: record.number,
+    address: `c#${record.number}`,
+    subject: record.title,
+    description: record.delta ?? "",
+    plan: record.plan ?? "",
+    spec: Array.isArray(record.spec) ? [...record.spec] : [],
+    status: closed ? "done" : "queue",
+    budget_usd: record.budget_usd,
+    parallel_limit: record.parallel_limit,
+    record: true,
+    depends_on: members.map((x) => x.id),
+  };
+}
+
 export function changeRootsFor(data, t) {
+  if (t?.change_id) {
+    const record = (data?.changes ?? []).find((c) => c && c.id === t.change_id);
+    if (record) return [changeAsRoot(record, data)];
+  }
   const roots = [];
   const seen = new Set([t.id]);
   let frontier = [t.id];
@@ -1792,11 +1847,11 @@ export function changeRootsFor(data, t) {
 export function formatChangeVision(t, roots) {
   let out = `★ Vision inherited by #${t.number} "${t.subject}" from its change root(s) — the chain's north star; keep this task true to it (if it pulls away, stop and flag it):\n`;
   for (const r of roots) {
-    out += `\n── change t#${r.number} ${r.subject} [${col(r.status)}] ──\n`;
+    out += `\n── change ${r.address ?? `t#${r.number}`} ${r.subject} [${col(r.status)}] ──\n`;
     out +=
       r.description && r.description.trim()
         ? r.description.trim() + "\n"
-        : `(change root t#${r.number} has no description — its vision is missing; set it: todos set description ${r.number} --text "…")\n`;
+        : `(change ${r.address ?? `t#${r.number}`} has no delta — its vision is missing; write it on the record)\n`;
   }
   return out;
 }
@@ -2040,7 +2095,7 @@ function cmdVision(args) {
   }
   if (!roots.length && !specLink.addresses.length) {
     process.stdout.write(
-      `#${t.number} "${t.subject}" has no change root above it and no spec link of its own — nothing to inherit. (A change root = a dependent task with \`change\` on; mark one: todos set change <id> on. A spec link is \`todos set spec <id> <домен>#<слаг>\`.)\n`,
+      `#${t.number} "${t.subject}" has no change above it and no spec link of its own — nothing to inherit. (A change is a record: \`cli change new "<title>"\`, then \`todos set change <id> <c#N>\`. A spec link is \`todos set spec <id> <домен>#<слаг>\`.)\n`,
     );
     return;
   }

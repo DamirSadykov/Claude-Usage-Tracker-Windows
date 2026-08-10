@@ -173,6 +173,23 @@ export const isReason = (text) => {
 // validator asks the caller whether a reference resolves. When the board cannot
 // be read we answer YES to everything: refusing on a check we were unable to run
 // is precisely the false refusal this guard must not produce.
+function changeResolver() {
+  let data;
+  try {
+    data = loadBoard(boardPath());
+  } catch {
+    return () => false;
+  }
+  return (ref) => {
+    try {
+      const t = resolveTask(data, ref);
+      return Boolean(t && t.change_id);
+    } catch {
+      return false;
+    }
+  };
+}
+
 function boardResolver() {
   let data;
   try {
@@ -201,12 +218,13 @@ function boardResolver() {
 // work that was done. Otherwise the FULLEST reading (most steps) is the one
 // reported, since a reading that parsed nothing would only complain that there
 // are no steps.
-export function inspectPlan(text, { onBoard = () => true } = {}) {
+export function inspectPlan(text, { onBoard = () => true, inChange = () => false } = {}) {
   const sources = planCandidates(text);
   if (!sources.length) return { attempted: false, errors: [], warnings: [] };
   const readings = sources.map((source) => {
     const doc = readDocument(source);
-    return { steps: doc.steps.length, ...validate(doc, { onBoard }) };
+    const inheritsChange = doc.steps.some((s) => s.task && inChange(s.task));
+    return { steps: doc.steps.length, ...validate(doc, { onBoard, inheritsChange, requireChange: true }) };
   });
   const chosen =
     readings.find((r) => !r.errors.length) ||
@@ -349,7 +367,7 @@ function main() {
   } catch {
     return; // no stdin / bad JSON → nothing to judge, and silence lets it through
   }
-  const decision = decide(input, { onBoard: boardResolver() });
+  const decision = decide(input, { onBoard: boardResolver(), inChange: changeResolver() });
   if (!decision) return;
   process.stdout.write(JSON.stringify({ hookSpecificOutput: decision }) + "\n");
 }

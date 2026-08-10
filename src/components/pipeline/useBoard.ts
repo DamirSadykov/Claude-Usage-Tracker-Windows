@@ -11,6 +11,7 @@ import {
     toTaskNodes,
     wavesOf,
     type BoardTodo,
+    type BoardChange,
     type TaskCostRow,
 } from "./adapt";
 import {
@@ -22,6 +23,7 @@ import {
 
 export function useBoard(withPorts = false) {
     const board = ref<BoardTodo[]>([]);
+    const changes = ref<BoardChange[]>([]);
     const costs = ref<TaskCostRow[]>([]);
     const run = ref<Map<string, RunGraphNode>>(new Map());
     const live = ref(false);
@@ -37,6 +39,11 @@ export function useBoard(withPorts = false) {
             return;
         }
         try {
+            changes.value = await invoke<BoardChange[]>("get_changes");
+        } catch {
+            changes.value = [];
+        }
+        try {
             const payload = await invoke<{ tasks: TaskCostRow[] } | null>(
                 "get_task_costs",
             );
@@ -45,16 +52,19 @@ export function useBoard(withPorts = false) {
             costs.value = [];
         }
         try {
-            const changes = board.value
-                .filter((t) => t.change === true && t.number)
-                .map((t) => `#${t.number}`);
-            run.value = await loadRunLayer(changes);
+            const refs = [
+                ...changes.value.map((c) => `c#${c.number}`),
+                ...board.value
+                    .filter((t) => t.change === true && t.number)
+                    .map((t) => `#${t.number}`),
+            ];
+            run.value = await loadRunLayer(refs);
         } catch {
             run.value = new Map();
         }
     }
 
-    const index = computed(() => laneIndex(board.value));
+    const index = computed(() => laneIndex(board.value, changes.value));
 
     const edges = computed(() =>
         board.value.flatMap((t) =>
@@ -114,6 +124,7 @@ export function useBoard(withPorts = false) {
         live,
         error,
         board,
+        changes,
         run,
         index,
         nodeByLabel,

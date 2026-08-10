@@ -9,12 +9,14 @@ import {
     refEdges,
     specPorts,
     toLanes,
+    toSpecLanes,
     toTaskLinks,
     toTaskNodes,
     wavesOf,
     specTree,
     commonAncestor,
     type BoardTodo,
+    type BoardChange,
 } from "./adapt";
 import type { RunGraphNode } from "../../graphModel";
 
@@ -276,6 +278,45 @@ describe("вью-модель дорожек", () => {
         expect(lanes.map((l) => l.id).sort()).toEqual(["free:alpha", "free:beta"]);
     });
 
+    it("свежий change идёт первым, свободные задачи остаются под темами", () => {
+        const many = [
+            todo({
+                id: "old",
+                number: 10,
+                change: true,
+                depends_on: ["o1"],
+                subject: "Старая",
+                created_at: "2026-06-01T10:00:00Z",
+            }),
+            todo({ id: "o1", number: 11 }),
+            todo({
+                id: "new",
+                number: 12,
+                change: true,
+                depends_on: ["n1"],
+                subject: "Свежая",
+                created_at: "2026-08-01T10:00:00Z",
+            }),
+            todo({ id: "n1", number: 13 }),
+            todo({ id: "free", number: 14 }),
+        ];
+        const index = laneIndex(many);
+        const lanes = toLanes(many, new Map(), index, new Map());
+        expect(lanes.map((l) => l.id)).toEqual(["new", "old", "free:"]);
+    });
+
+    it("без даты порядок задаёт номер, свежий сверху", () => {
+        const many = [
+            todo({ id: "old", number: 10, change: true, depends_on: ["o1"], subject: "Старая" }),
+            todo({ id: "o1", number: 11 }),
+            todo({ id: "new", number: 20, change: true, depends_on: ["n1"], subject: "Свежая" }),
+            todo({ id: "n1", number: 21 }),
+        ];
+        const index = laneIndex(many);
+        const lanes = toLanes(many, new Map(), index, new Map());
+        expect(lanes.map((l) => l.id)).toEqual(["new", "old"]);
+    });
+
     it("прогресс и суммы собираются из графа прогона", () => {
         const index = laneIndex(board);
         const waves = wavesOf(
@@ -354,5 +395,143 @@ describe("specTree", () => {
         const tree = specTree(board);
         expect(commonAncestor(tree, "a", "b")).toBe("root");
         expect(commonAncestor(tree, "a", "loose")).toBeNull();
+    });
+});
+
+describe("дорожки из записей change'а", () => {
+    const changes = [
+        {
+            id: "ch-1",
+            number: 4,
+            title: "CHANGE: записи вместо корней",
+            delta: "что меняем в этом заходе\nвторая строка",
+            project: "board",
+            created_at: "2026-08-01T10:00:00Z",
+        },
+        {
+            id: "ch-2",
+            number: 2,
+            title: "CHANGE: прошлый заход",
+            project: "board",
+            created_at: "2026-06-01T10:00:00Z",
+        },
+    ];
+    const board = [
+        todo({ id: "a", number: 1, change_id: "ch-1", status: "done" }),
+        todo({ id: "b", number: 2, change_id: "ch-1" }),
+        todo({ id: "c", number: 3, change_id: "ch-2", status: "done" }),
+        todo({ id: "d", number: 4 }),
+    ];
+
+    it("принадлежность читается полем, а не обходом рёбер", () => {
+        const index = laneIndex(board, changes);
+        expect(index.laneOf.get("a")).toBe("ch-1");
+        expect(index.laneOf.get("d")).toBe("free:");
+        expect(index.members.get("ch-1")).toEqual(["a", "b"]);
+    });
+
+    it("дорожка собирается из записи, свежая сверху, свободные под ними", () => {
+        const index = laneIndex(board, changes);
+        const lanes = toLanes(board, new Map(), index, new Map());
+        expect(lanes.map((l) => l.id)).toEqual(["ch-1", "ch-2", "free:"]);
+        expect(lanes[0].kicker).toBe("тема · change c#4");
+        expect(lanes[0].title).toBe("CHANGE: записи вместо корней");
+        expect(lanes[0].note).toBe("что меняем в этом заходе");
+        expect(lanes[0].progressLabel).toContain("1 / 2 готово");
+    });
+
+    it("закрытая запись помечается закрытой дорожкой", () => {
+        const index = laneIndex(board, changes);
+        const lanes = toLanes(board, new Map(), index, new Map());
+        expect(lanes.find((l) => l.id === "ch-2")?.done).toBe(true);
+        expect(lanes.find((l) => l.id === "ch-1")?.done).toBe(false);
+    });
+
+    it("немигрированный корень и запись живут на одной доске", () => {
+        const mixed = [
+            ...board,
+            todo({ id: "root", number: 9, change: true, depends_on: ["leaf"], subject: "Старая тема" }),
+            todo({ id: "leaf", number: 10 }),
+        ];
+        const index = laneIndex(mixed, changes);
+        const lanes = toLanes(mixed, new Map(), index, new Map());
+        expect(lanes.map((l) => l.id)).toEqual(["ch-1", "ch-2", "root", "free:"]);
+        expect(index.laneOf.get("leaf")).toBe("root");
+    });
+});
+
+describe("specTree читает записи change'ей наравне со старыми корнями", () => {
+    const changes: BoardChange[] = [
+        {
+            id: "ch-1",
+            number: 4,
+            title: "CHANGE: записи вместо корней",
+            project: "tracker",
+            spec: ["tasks#registry"],
+        },
+    ];
+    const board: BoardTodo[] = [
+        todo({ id: "a", number: 1, change_id: "ch-1", project: "tracker" }),
+        todo({ id: "b", number: 2, change_id: "ch-1", project: "tracker", spec: ["tasks#gate"] }),
+        todo({ id: "loose", number: 3, project: "tracker" }),
+    ];
+
+    it("тема записи висит под её собственным разделом", () => {
+        const tree = specTree(board, changes);
+        expect(tree.byId.get("ch-1")?.kind).toBe("theme");
+        expect(tree.byId.get("ch-1")?.parent).toBe("tasks#registry");
+        expect(tree.byId.get("ch-1")?.label).toBe("c#4");
+    });
+
+    it("задача с change_id висит под темой записи, а не в свободных", () => {
+        const tree = specTree(board, changes);
+        expect(tree.byId.get("a")?.parent).toBe("ch-1");
+        expect(tree.byId.get("loose")?.parent).toBe("project:tracker");
+    });
+
+    it("собственный spec задачи внутри записи остаётся кросс-связью", () => {
+        const tree = specTree(board, changes);
+        expect(tree.cross).toContainEqual({ from: "b", to: "tasks#gate", kind: "spec" });
+    });
+});
+
+describe("toSpecLanes считает и записи, и старые корни", () => {
+    const board: BoardTodo[] = [
+        todo({ id: "root", number: 9, change: true, spec: ["tasks#registry"] }),
+    ];
+    const changes: BoardChange[] = [
+        { id: "ch-1", number: 4, title: "CHANGE", spec: ["tasks#registry"] },
+    ];
+    const section = {
+        address: "tasks#registry",
+        entry: { title: "Реестр" },
+    };
+
+    it("счётчик change'ей берёт и записи, и немигрированные корни", () => {
+        const lanes = toSpecLanes([section], board, changes);
+        expect(lanes[0].metrics).toContain("2 change'а");
+    });
+
+    it("без записей считает только старые корни", () => {
+        const lanes = toSpecLanes([section], board);
+        expect(lanes[0].metrics).toContain("1 change'а");
+    });
+});
+
+describe("статус карточки различает колонки доски", () => {
+    const board = [
+        todo({ id: "prev", number: 1, status: "done" }),
+        todo({ id: "review", number: 2, status: "review", depends_on: ["prev"] }),
+        todo({ id: "work", number: 3, status: "in_progress", depends_on: ["open"] }),
+        todo({ id: "open", number: 4, status: "queue" }),
+    ];
+    const byId = new Map(board.map((t) => [t.id, t]));
+
+    it("задача на приёмке — свой статус, не «ждёт тебя»", () => {
+        expect(nodeStatus(byId.get("review")!, byId)).toBe("review");
+    });
+
+    it("взятая в работу не выглядит заблокированной", () => {
+        expect(nodeStatus(byId.get("work")!, byId)).toBe("ready");
     });
 });

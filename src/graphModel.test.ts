@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { normalizeGraph, normalizeNode, loadRunLayer } from "./graphModel";
+import { normalizeGraph, normalizeNode, loadRunLayer, loadRunGroups } from "./graphModel";
 
 const invoked: { change: string }[] = [];
 vi.mock("@tauri-apps/api/core", () => ({
@@ -13,6 +13,16 @@ vi.mock("@tauri-apps/api/core", () => ({
           { id: "u-297", number: 297, measurability: "measured", cost: 1.95, messages: 20 },
         ],
         edges: [{ from: "u-297", to: "u-294", membership: true }],
+        groups: [
+          {
+            id: "u-294",
+            number: 294,
+            subject: "ТЕМА",
+            members: ["u-297"],
+            duration_minutes: 42,
+            record: false,
+          },
+        ],
       });
     }
     return Promise.resolve({
@@ -105,10 +115,29 @@ describe("contract from t#306", () => {
         { from: "u-295", to: "u-294", membership: true },
         { from: "u-297", to: "u-294", membership: true },
       ],
-      groups: [{ id: "u-294", number: 294, subject: "ТЕМА", members: ["u-295", "u-297"] }],
+      groups: [
+        {
+          id: "u-294",
+          number: 294,
+          subject: "ТЕМА",
+          members: ["u-295", "u-297"],
+          duration_minutes: 130,
+          record: true,
+        },
+      ],
     });
     expect(g.edges).toEqual([{ from: 295, to: 297 }]);
     expect(g.groups[0].members).toHaveLength(2);
+    expect(g.groups[0].duration_minutes).toBe(130);
+    expect(g.groups[0].record).toBe(true);
+  });
+
+  it("defaults a group's duration/record when the backend omits them", () => {
+    const g = normalizeGraph({
+      groups: [{ id: "g1", number: 1, subject: "x", members: [] }],
+    });
+    expect(g.groups[0].duration_minutes).toBeNull();
+    expect(g.groups[0].record).toBe(false);
   });
 
   it("refuses numbers for every non-measured state", () => {
@@ -147,6 +176,15 @@ describe("contract from t#306", () => {
     expect(layer.get("u-297")!.cost).toBeCloseTo(1.95, 5);
     expect(layer.get("u-299")!.cost).toBeCloseTo(8.36, 5);
     expect(layer.get("u-294")!.cost).toBeNull();
+  });
+
+  it("keeps groups alongside nodes, keyed by group id (t#367)", async () => {
+    const layer = await loadRunGroups(["294"]);
+    expect([...layer.nodes.keys()].sort()).toEqual(["u-294", "u-297"]);
+    const group = layer.groups.get("u-294");
+    expect(group?.duration_minutes).toBe(42);
+    expect(group?.record).toBe(false);
+    expect(group?.members).toEqual(["u-297"]);
   });
 
   it("carries whole-task attribution and the unattributed remainder", () => {

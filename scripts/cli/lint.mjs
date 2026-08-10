@@ -60,7 +60,18 @@ const boardNode = (t) => ({
 export function boardGraph(data, tasks) {
   const known = new Set((data.todos || []).filter(Boolean).map((t) => t.id));
   return {
-    changes: tasks
+    changes: [
+      ...(data.changes ?? [])
+        .filter(Boolean)
+        .map((c) => {
+          const members = (data.todos ?? []).filter((t) => t && t.change_id === c.id);
+          return {
+            label: `change c#${c.number} "${c.title}"`,
+            budget: typeof c.budget_usd === "number" ? String(c.budget_usd) : "",
+            runnable: members.some((t) => !isDone(t)),
+          };
+        }),
+      ...tasks
       .filter((t) => isChangeRoot(t) && !isDone(t))
       .map((t) => ({
         label: `change #${t.number} "${t.subject}"`,
@@ -73,6 +84,7 @@ export function boardGraph(data, tasks) {
           return member && !isDone(member);
         }),
       })),
+    ],
     nodes: tasks.map(boardNode),
     resolves: (ref) => known.has(ref),
     unknownRef: (ref) => `"${ref}", which is not a task on this board any more (deleted)`,

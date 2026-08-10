@@ -49,6 +49,7 @@ import {
   notifyTaskEvent,
 } from "./todos.mjs";
 import { checkGraph, splitFindings } from "./graph-rules.mjs";
+import { createChange, findChangeByTitle, changeAddress } from "./change.mjs";
 import { parseYamlSubset } from "./yaml-subset.mjs";
 import path from "node:path";
 
@@ -220,9 +221,18 @@ function documentGraph(doc, onBoard) {
   };
 }
 
-export function validate(doc, { onBoard = () => false } = {}) {
+export function validate(doc, { onBoard = () => false, inheritsChange = false, requireChange = false } = {}) {
   const { errors, warnings } = splitFindings(checkGraph(documentGraph(doc, onBoard)));
   if (!doc.steps.length) errors.push("no steps: the file declares nothing to record");
+  // A file that only CONTINUES existing tasks needs no group of its own — the
+  // one-step plan bound by `task: <N>` is the format's own normal case. A file
+  // that opens NEW tasks does: without a change they land nowhere, and "nowhere"
+  // used to be a silent state of the board.
+  if (requireChange && !doc.change && !inheritsChange && doc.steps.some((s) => !s.task))
+    errors.push(
+      "no change: a step that opens a NEW task belongs to one, and nothing here says which. " +
+        "Name it — `change: CHANGE: <что меняем>` — or bind the step to a task that already sits in a change (`task: <N>`)",
+    );
   const seen = new Set();
   const bound = new Set();
   for (const s of doc.steps) {
@@ -274,15 +284,9 @@ const sameSubject = (a, b) => a.trim().toLowerCase() === b.trim().toLowerCase();
 // steps sharing a phrase must not collapse onto one row, and a board that
 // already holds duplicates must not have them silently merged.
 function matchExisting(data, doc, project) {
-  const root = doc.change
-    ? data.todos.find((t) => t && sameSubject(t.subject, doc.change) && boardOf(t) === project)
-    : null;
-  const children = root
-    ? data.todos.filter(
-        (t) => t && Array.isArray(root.depends_on) && root.depends_on.includes(t.id),
-      )
-    : [];
-  const board = data.todos.filter((t) => t && boardOf(t) === project && t !== root);
+  const record = doc.change ? findChangeByTitle(data, doc.change, project) : null;
+  const children = record ? data.todos.filter((t) => t && t.change_id === record.id) : [];
+  const board = data.todos.filter((t) => t && boardOf(t) === project);
   const byStep = new Map();
   const adopted = new Set();
   const renamed = new Set();
@@ -296,10 +300,10 @@ function matchExisting(data, doc, project) {
     if (!hit) continue;
     byStep.set(s.id, hit);
     taken.add(hit.id);
-    if (root && !children.includes(hit)) adopted.add(hit.id);
+    if (record && !children.includes(hit)) adopted.add(hit.id);
     if (s.task && s.title && !sameSubject(hit.subject, s.title)) renamed.add(hit.id);
   }
-  return { root, byStep, adopted, renamed };
+  return { record, byStep, adopted, renamed };
 }
 
 const clipLine = (text, max = 60) => {
@@ -345,6 +349,8 @@ export function applyDocument(doc, { go = false, force = false, project, board }
   project = project ?? path.basename(process.cwd().replace(/[\\/]+$/, ""));
   const { errors, warnings } = validate(doc, {
     onBoard: (token) => Boolean(resolveTask(data, token)),
+    inheritsChange: doc.steps.some((s) => s.task && resolveTask(data, s.task)?.change_id),
+    requireChange: true,
   });
   if (errors.length)
     return {
@@ -359,12 +365,12 @@ export function applyDocument(doc, { go = false, force = false, project, board }
       applied: false,
     };
 
-  const { root: existingRoot, byStep, adopted, renamed } = matchExisting(data, doc, project);
+  const { record: existingChange, byStep, adopted, renamed } = matchExisting(data, doc, project);
   const plan = [];
   const say = (line) => plan.push(line);
 
   if (doc.change)
-    say(existingRoot ? `= change  ${fmtTask(existingRoot)}` : `+ change  "${doc.change}"`);
+    say(existingChange ? `= change  ${changeAddress(existingChange)} ${existingChange.title}` : `+ change  "${doc.change}"`);
   for (const s of doc.steps) {
     const hit = byStep.get(s.id);
     if (!hit) {
@@ -402,7 +408,9 @@ export function applyDocument(doc, { go = false, force = false, project, board }
       notes: [],
       log: [],
       created: [],
-      root: existingRoot,
+      change: existingChange,
+      changeCreated: false,
+      root: null,
       applied: false,
     };
 
@@ -416,19 +424,34 @@ export function applyDocument(doc, { go = false, force = false, project, board }
   // graph — it is the shape that made the previous run fork into duplicates.
   const created = [];
   const notes = [];
-  let root = existingRoot;
+  let change = existingChange;
+  let changeCreated = false;
   const { log } = capturing(() =>
     withDeferredSave(boardFile, data, () => {
-      if (doc.change && !root) {
-        root = newTodo(data, {
-          subject: doc.change,
-          description: doc.vision,
-          plan: doc.plan,
-          status: "queue",
-          change: true,
+      if (doc.change && !change) {
+        change = createChange(data, {
+          title: doc.change,
+          delta: doc.vision,
           project,
+          budget_usd: doc.budget ? Number(String(doc.budget).replace(/^\$/, "")) : undefined,
+          parallel_limit: doc.parallel ? Number(doc.parallel) : undefined,
         });
-        created.push(root);
+        if (doc.plan) change.plan = doc.plan;
+        changeCreated = true;
+      }
+      if (!change) {
+        const bound = doc.steps
+          .map((s) => (s.task ? resolveTask(data, s.task) : null))
+          .find((t) => t?.change_id);
+        if (bound) change = (data.changes ?? []).find((c) => c.id === bound.change_id) ?? null;
+      }
+      // No  in the file, but a step continues a task that already sits
+      // in one — the new steps join it rather than landing nowhere.
+      if (!change) {
+        const bound = doc.steps
+          .map((s) => (s.task ? resolveTask(data, s.task) : null))
+          .find((t) => t?.change_id);
+        if (bound) change = (data.changes ?? []).find((c) => c.id === bound.change_id) ?? null;
       }
       const tasks = new Map();
       for (const s of doc.steps) {
@@ -444,14 +467,13 @@ export function applyDocument(doc, { go = false, force = false, project, board }
       const set = (todo, field, value) =>
         setField({ data, file: boardFile, todo, field, value: String(value) });
 
-      if (root) {
-        if (doc.vision && (force || !String(root.description || "").trim()))
-          set(root, "description", doc.vision);
-        else if (doc.vision && !force && !sameSubject(root.description || "", doc.vision))
+      if (change) {
+        if (doc.vision && (force || !String(change.delta || "").trim())) change.delta = doc.vision;
+        else if (doc.vision && !force && !sameSubject(change.delta || "", doc.vision))
           notes.push(
-            `keep: #${root.number} already carries a vision — left as is (--force overwrites)`,
+            `keep: ${changeAddress(change)} already carries a delta — left as is (--force overwrites)`,
           );
-        if (doc.plan && (force || !String(root.plan || "").trim())) set(root, "plan", doc.plan);
+        if (doc.plan && (force || !String(change.plan || "").trim())) change.plan = doc.plan;
       }
       for (const s of doc.steps) {
         const t = tasks.get(s.id);
@@ -468,8 +490,10 @@ export function applyDocument(doc, { go = false, force = false, project, board }
           if (addDepEdge(data, t, on) === "added")
             notes.push(`ok: #${t.number} now depends on #${on.number}`);
         }
-        if (root && addDepEdge(data, root, t) === "added")
-          notes.push(`ok: #${root.number} now depends on #${t.number}`);
+        if (change && t.change_id !== change.id) {
+          t.change_id = change.id;
+          notes.push(`ok: #${t.number} now belongs to ${changeAddress(change)}`);
+        }
         // A declaration is a promise made BEFORE the work, so the board refuses
         // one on a closed node — and rightly. Re-applying a file whose early steps
         // are already done is the NORMAL case, though, and dying on it would undo
@@ -501,10 +525,10 @@ export function applyDocument(doc, { go = false, force = false, project, board }
         if (s.kind) set(t, "kind", s.kind);
         if (s.budget) set(t, "budget", s.budget);
       }
-      if (root) {
-        if (doc.parallel || doc.budget) set(root, "change", "on");
-        if (doc.parallel) set(root, "parallel", doc.parallel);
-        if (doc.budget) set(root, "budget", doc.budget);
+      if (change) {
+        if (doc.parallel) change.parallel_limit = Number(doc.parallel);
+        if (doc.budget) change.budget_usd = Number(String(doc.budget).replace(/^\$/, ""));
+        change.updated_at = new Date().toISOString();
       }
       for (const s of doc.steps) {
         if (!s.onIssue) continue;
@@ -525,20 +549,22 @@ export function applyDocument(doc, { go = false, force = false, project, board }
     notes,
     log,
     created,
-    root,
+    change,
+    changeCreated,
+    root: null,
     applied: true,
   };
 }
 
 // How a finished pass reads in one line, for whoever has to report it.
 export function summarize(result, doc) {
-  const newSteps = result.created.filter((t) => t !== result.root).length;
+  const newSteps = result.created.length;
   return (
     `${newSteps} new step(s), ${doc.steps.length - newSteps} matched (by task or subject)` +
-    (result.root
-      ? result.created.includes(result.root)
-        ? ", change root created"
-        : ", change root reused"
+    (result.change
+      ? result.changeCreated
+        ? `, change ${changeAddress(result.change)} created`
+        : `, change ${changeAddress(result.change)} reused`
       : "")
   );
 }
@@ -582,7 +608,7 @@ export function run(args) {
     }
     process.stdout.write(
       `${path.basename(file)}: ${doc.steps.length} step(s)` +
-        (doc.change ? ", 1 change root" : "") +
+        (doc.change ? ", 1 change" : "") +
         " — DRY RUN, nothing written\n" +
         plan.map((l) => "  " + l).join("\n") +
         "\n" +

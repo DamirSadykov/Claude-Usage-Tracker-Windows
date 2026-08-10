@@ -19,6 +19,7 @@ import { marked } from "marked";
 import { renderInsightHelp } from "../insightHelp/render";
 import { diffLines, diffHunks, diffStat, type DiffHunk } from "../specDiff";
 import type { Todo } from "./TodoWindow.vue";
+import type { BoardChange } from "./pipeline/adapt";
 
 const { t, locale } = useI18n();
 
@@ -26,6 +27,7 @@ const { t, locale } = useI18n();
 // belongs to, since the address alone does not say which registry it is in.
 const props = defineProps<{
   todos: Todo[];
+  changes: BoardChange[];
   project: string;
   target?: { address: string; project: string } | null;
 }>();
@@ -247,9 +249,9 @@ const markedTasks = computed(() => {
 function hueOf(n: number): number {
   return Math.round(((n || 0) * 137.508) % 360);
 }
-function tagStyle(x: Todo) {
+function tagStyle(x: { number?: number; status: string }) {
   const h = hueOf(x.number ?? 0);
-  const open = isOpen(x);
+  const open = x.status !== "done";
   return {
     color: `hsl(${h} 72% ${open ? 76 : 62}%)`,
     borderColor: `hsl(${h} 55% ${open ? 46 : 34}%)`,
@@ -354,12 +356,80 @@ const byId = computed(() => {
 // from the block hashes each answer recorded.
 const isOpen = (t: Todo) => t.status !== "done";
 
+interface SpecLinkRow {
+  id: string;
+  number: number;
+  label: string;
+  subject: string;
+  status: string;
+  spec: string[];
+  isChange: boolean;
+  children: Todo[];
+  openId: string | null;
+}
+
+const childrenOfTask = (root: Todo) =>
+  (root.depends_on ?? []).map((id) => byId.value.get(id)).filter((x): x is Todo => !!x);
+
+function recordAggStatus(members: Todo[]): string {
+  if (!members.length) return "backlog";
+  return members.every((m) => !isOpen(m)) ? "done" : "in_progress";
+}
+
+const linkRows = computed<SpecLinkRow[]>(() => {
+  const out: SpecLinkRow[] = [];
+  for (const c of props.changes ?? []) {
+    const members = props.todos.filter((t) => t.change_id === c.id);
+    out.push({
+      id: c.id,
+      number: c.number,
+      label: `c#${c.number}`,
+      subject: c.title,
+      status: recordAggStatus(members),
+      spec: c.spec ?? [],
+      isChange: true,
+      children: members,
+      openId: null,
+    });
+  }
+  for (const x of props.todos) {
+    if (x.change) {
+      out.push({
+        id: x.id,
+        number: x.number ?? 0,
+        label: `#${x.number}`,
+        subject: x.subject,
+        status: x.status,
+        spec: x.spec ?? [],
+        isChange: true,
+        children: childrenOfTask(x),
+        openId: x.id,
+      });
+      continue;
+    }
+    if ((x.spec ?? []).length) {
+      out.push({
+        id: x.id,
+        number: x.number ?? 0,
+        label: `#${x.number}`,
+        subject: x.subject,
+        status: x.status,
+        spec: x.spec ?? [],
+        isChange: false,
+        children: [],
+        openId: x.id,
+      });
+    }
+  }
+  return out;
+});
+
 const linkedBySection = computed(() => {
-  const m = new Map<string, Todo[]>();
-  for (const x of props.todos)
-    for (const a of x.spec ?? []) {
+  const m = new Map<string, SpecLinkRow[]>();
+  for (const row of linkRows.value)
+    for (const a of row.spec) {
       if (!m.has(a)) m.set(a, []);
-      m.get(a)!.push(x);
+      m.get(a)!.push(row);
     }
   return m;
 });
@@ -367,7 +437,7 @@ const linkedBySection = computed(() => {
 const marksFor = (address: string) =>
   (linkedBySection.value.get(address) ?? [])
     .slice()
-    .sort((a, b) => Number(isOpen(b)) - Number(isOpen(a)));
+    .sort((a, b) => Number(b.status !== "done") - Number(a.status !== "done"));
 
 // The list answers "what changes touch this section". The question that stayed
 // unanswered is the OTHER one — "which section does this change go to" — and no
@@ -375,18 +445,18 @@ const marksFor = (address: string) =>
 // the change. So the sidebar groups both ways and the direction is a toggle.
 const groupMode = ref<"sections" | "changes">("sections");
 
-const changeGroups = computed(() => {
-  const groups = props.todos
-    .filter((x) => (x.spec ?? []).length)
-    .map((task) => ({ task, addresses: task.spec ?? [] }));
-  return groups.sort((a, b) => {
-    const open = Number(isOpen(b.task)) - Number(isOpen(a.task));
-    if (open) return open;
-    const root = Number(!!b.task.change) - Number(!!a.task.change);
-    if (root) return root;
-    return (a.task.number ?? 0) - (b.task.number ?? 0);
-  });
-});
+const changeGroups = computed(() =>
+  linkRows.value
+    .filter((r) => r.spec.length)
+    .slice()
+    .sort((a, b) => {
+      const open = Number(b.status !== "done") - Number(a.status !== "done");
+      if (open) return open;
+      const root = Number(b.isChange) - Number(a.isChange);
+      if (root) return root;
+      return a.number - b.number;
+    }),
+);
 
 // A section's title for the change-grouped list — the address alone reads as a
 // slug, and the reader here has not seen the section yet.
@@ -399,18 +469,12 @@ const titleOf = (address: string) => {
 // first's provenance silently. `spec lint` warns about it too — this is the
 // same fact where the eye already is.
 const concurrent = (address: string) =>
-  marksFor(address).filter((t) => t.change && isOpen(t)).length > 1;
+  marksFor(address).filter((r) => r.status !== "done").length > 1;
 
-// Tasks whose OWN `spec` names the selected section. A change root among them
-// is rendered with its children under it — that is the third level, and it is
-// drawn from the same dependency edges the board's graph uses.
 const linked = computed(() => {
   if (!selected.value) return [];
-  return props.todos.filter((x) => (x.spec ?? []).includes(selected.value));
+  return linkRows.value.filter((r) => r.spec.includes(selected.value));
 });
-
-const childrenOf = (root: Todo) =>
-  (root.depends_on ?? []).map((id) => byId.value.get(id)).filter((x): x is Todo => !!x);
 
 // Every answer ever given about this section, newest first — the log §9 of the
 // genre rules asks to be able to review: a section answered `unchanged` five
@@ -516,20 +580,20 @@ const shortDate = (iso: string) => (iso || "").slice(0, 10);
            reader starts from the change and does not know where to look. -->
       <template v-else>
         <div v-if="!changeGroups.length" class="sv-empty">{{ t("specNoChanges") }}</div>
-        <div v-for="g in changeGroups" :key="g.task.id" class="sv-cgroup">
+        <div v-for="g in changeGroups" :key="g.id" class="sv-cgroup">
           <button
             class="sv-cgroup-head"
-            :class="{ closed: !isOpen(g.task) }"
-            :style="{ borderLeftColor: `hsl(${hueOf(g.task.number ?? 0)} 60% 45%)` }"
-            @click="emit('open', g.task.id)"
+            :class="{ closed: g.status === 'done' }"
+            :style="{ borderLeftColor: `hsl(${hueOf(g.number)} 60% 45%)` }"
+            @click="g.openId && emit('open', g.openId)"
           >
-            <span class="sv-badge" :class="`st-${g.task.status}`">{{ g.task.status }}</span>
-            <span v-if="g.task.change" class="sv-chip">change</span>
-            <span class="sv-num" :style="{ color: tagStyle(g.task).color }">#{{ g.task.number }}</span>
-            <span class="sv-subject">{{ g.task.subject }}</span>
+            <span class="sv-badge" :class="`st-${g.status}`">{{ g.status }}</span>
+            <span v-if="g.isChange" class="sv-chip">change</span>
+            <span class="sv-num" :style="{ color: tagStyle(g).color }">{{ g.label }}</span>
+            <span class="sv-subject">{{ g.subject }}</span>
           </button>
           <button
-            v-for="a in g.addresses"
+            v-for="a in g.spec"
             :key="a"
             class="sv-section sv-cgroup-sec"
             :class="{ active: selected === a }"
@@ -644,13 +708,13 @@ const shortDate = (iso: string) => (iso || "").slice(0, 10);
             :key="x.id"
             class="sv-change"
             :class="{ on: focus === x.id }"
-            :style="{ borderLeftColor: `hsl(${hueOf(x.number ?? 0)} 60% 45%)` }"
+            :style="{ borderLeftColor: `hsl(${hueOf(x.number)} 60% 45%)` }"
           >
             <div class="sv-change-row">
-              <button class="sv-task" @click="emit('open', x.id)">
+              <button class="sv-task" @click="x.openId && emit('open', x.openId)">
                 <span class="sv-badge" :class="`st-${x.status}`">{{ x.status }}</span>
-                <span v-if="x.change" class="sv-chip">change</span>
-                <span class="sv-num" :style="{ color: tagStyle(x).color }">#{{ x.number }}</span>
+                <span v-if="x.isChange" class="sv-chip">change</span>
+                <span class="sv-num" :style="{ color: tagStyle(x).color }">{{ x.label }}</span>
                 <span class="sv-subject">{{ x.subject }}</span>
               </button>
               <!-- Only a change that recorded blocks can be focused: dimming the
@@ -690,9 +754,9 @@ const shortDate = (iso: string) => (iso || "").slice(0, 10);
                 ><span class="sv-dop">{{ l.op }}</span>{{ l.text }}</div>
               </div>
             </div>
-            <div v-if="x.change" class="sv-children">
+            <div v-if="x.isChange" class="sv-children">
               <button
-                v-for="c in childrenOf(x)"
+                v-for="c in x.children"
                 :key="c.id"
                 class="sv-task sv-child"
                 @click="emit('open', c.id)"

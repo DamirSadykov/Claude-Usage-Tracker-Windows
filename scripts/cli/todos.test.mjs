@@ -132,12 +132,19 @@ describe("formatChangeVision", () => {
     expect(out).toContain("north star text");
   });
 
+  it("адресует запись как c#N, а немигрированный корень как t#N", () => {
+    const record = formatChangeVision(t, [
+      { number: 4, address: "c#4", subject: "CHANGE: запись", status: "queue", description: "дельта" },
+    ]);
+    expect(record).toContain("── change c#4 CHANGE: запись");
+  });
+
   it("nudges to fill an empty description instead of printing a blank block", () => {
     const out = formatChangeVision(t, [
       { number: 9, subject: "CHANGE: X", status: "queue", description: "  " },
     ]);
     expect(out).toContain("vision is missing");
-    expect(out).toContain("todos set description 9");
+    expect(out).toContain("t#9");
   });
 });
 
@@ -656,7 +663,7 @@ describe("declaration commands", () => {
     const out = run("set", "parallel", "2", "3");
     expect(out).toContain("warn:");
     expect(out).toContain("is not a change");
-    expect(out).toContain("todos set change 2 on");
+    expect(out).toContain("todos set change 2 <c#N>");
     expect(read(2).parallel_limit).toBe(3);
   });
 
@@ -948,7 +955,6 @@ describe("todos set", () => {
     ["status", "review", (t) => expect(t.status).toBe("review")],
     ["priority", "high", (t) => expect(t.priority).toBe("high")],
     ["kind", "auto", (t) => expect(t.kind).toBe("auto")],
-    ["change", "on", (t) => expect(t.change).toBe(true)],
     ["project", "elsewhere", (t) => expect(t.project).toBe("elsewhere")],
     ["verify", "npm test", (t) => expect(t.verify).toBe("npm test")],
     ["retry", "3", (t) => expect(t.retry_limit).toBe(3)],
@@ -1061,14 +1067,13 @@ describe("todos set", () => {
   it("clears every optional field with none, leaving no empty key behind", () => {
     run("set", "priority", "1", "high");
     run("set", "kind", "1", "auto");
-    run("set", "change", "1", "on");
     run("set", "verify", "1", "npm test");
     run("set", "retry", "1", "2");
     run("set", "budget", "1", "2");
     run("set", "parallel", "1", "2");
     run("set", "priority", "1", "none");
     run("set", "kind", "1", "manual");
-    run("set", "change", "1", "off");
+    run("set", "change", "1", "none");
     run("set", "verify", "1", "");
     run("set", "retry", "1", "none");
     run("set", "budget", "1", "none");
@@ -1077,7 +1082,7 @@ describe("todos set", () => {
     for (const key of [
       "priority",
       "kind",
-      "change",
+      "change_id",
       "verify",
       "retry_limit",
       "budget_usd",
@@ -1249,12 +1254,12 @@ describe("rules the CLI enforces instead of explaining", () => {
     expect(run("set", "verify", "2", "")).not.toContain("GATE");
   });
 
-  // §9/t#255: a change root aggregates — one that depends on nothing is not a group.
-  it("warns when a change root is marked before it has any children", () => {
+  // t#360: a change is a RECORD, so the flag form has nothing to mark any more.
+  it("refuses the old boolean form of set change and names the record form", () => {
     seed([todo(1), todo(2)]);
-    expect(run("set", "change", "1", "on")).toContain("depends on nothing yet");
-    run("dep", "add", "1", "2");
-    expect(run("set", "change", "1", "off")).not.toContain("depends on nothing");
+    const err = refuse("set", "change", "1", "on");
+    expect(err).toContain("is the OLD root-task form");
+    expect(err).toContain("cli change new");
   });
 
   // §1/§6: a declaration is made BEFORE the work.

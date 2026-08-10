@@ -22,6 +22,8 @@ export interface BoardTodo {
     status: string;
     kind?: string;
     change?: boolean;
+    change_id?: string;
+    created_at?: string;
     project?: string | null;
     depends_on?: string[];
     links?: string[];
@@ -30,6 +32,20 @@ export interface BoardTodo {
     spec?: string[];
     spec_answers?: { address: string; verdict: string }[];
     spec_seen?: { address: string }[];
+}
+
+export interface BoardChange {
+    id: string;
+    number: number;
+    title: string;
+    delta?: string;
+    project?: string | null;
+    spec?: string[];
+    budget_usd?: number;
+    parallel_limit?: number;
+    created_at?: string;
+    updated_at?: string;
+    closed_at?: string;
 }
 
 export interface TaskCostRow {
@@ -65,6 +81,8 @@ export function isGate(todo: BoardTodo): boolean {
 
 export function nodeStatus(todo: BoardTodo, byId: Map<string, BoardTodo>): NodeStatus {
     if (isDone(todo.status)) return "done";
+    if (todo.status === "review") return "review";
+    if (todo.status === "in_progress") return "ready";
     for (const dep of todo.depends_on ?? []) {
         const prev = byId.get(dep);
         if (prev && !isDone(prev.status)) return "blocked";
@@ -99,6 +117,7 @@ export function wavesOf<T>(ids: T[], edges: { from: T; to: T }[]): Map<T, number
 
 export interface LaneIndex {
     roots: BoardTodo[];
+    records: BoardChange[];
     laneOf: Map<string, string>;
     members: Map<string, string[]>;
 }
@@ -120,13 +139,21 @@ export function isFreeLane(id: string): boolean {
     return id.startsWith("free:");
 }
 
-export function laneIndex(board: BoardTodo[]): LaneIndex {
+export function laneIndex(board: BoardTodo[], changes: BoardChange[] = []): LaneIndex {
     const byId = new Map(board.map((t) => [t.id, t]));
     const roots = board
         .filter((t) => t.change === true)
         .sort((a, b) => (a.number ?? 0) - (b.number ?? 0));
     const laneOf = new Map<string, string>();
     const members = new Map<string, string[]>();
+    const records = changes.filter(Boolean);
+    const byRecord = new Map(records.map((c) => [c.id, c]));
+    for (const c of records) members.set(c.id, []);
+    for (const t of board) {
+        if (!t.change_id || !byRecord.has(t.change_id)) continue;
+        laneOf.set(t.id, t.change_id);
+        members.get(t.change_id)!.push(t.id);
+    }
     for (const root of roots) {
         const seen: string[] = [];
         const stack = [...(root.depends_on ?? [])];
@@ -151,7 +178,7 @@ export function laneIndex(board: BoardTodo[]): LaneIndex {
         laneOf.set(t.id, lane);
         members.set(lane, [...(members.get(lane) ?? []), t.id]);
     }
-    return { roots, laneOf, members };
+    return { roots, records, laneOf, members };
 }
 
 export interface Money {
@@ -328,6 +355,13 @@ function idOfLabel(board: BoardTodo[], label: string): string | undefined {
     return hit?.id;
 }
 
+export function newerFirst(a: BoardTodo, b: BoardTodo): number {
+    const ta = Date.parse(a.created_at ?? "");
+    const tb = Date.parse(b.created_at ?? "");
+    if (!Number.isNaN(ta) && !Number.isNaN(tb) && ta !== tb) return tb - ta;
+    return (b.number ?? 0) - (a.number ?? 0);
+}
+
 export function toLanes(
     board: BoardTodo[],
     run: Map<string, RunGraphNode>,
@@ -335,7 +369,32 @@ export function toLanes(
     waves: Map<string, number>,
 ): Lane[] {
     const byId = new Map(board.map((t) => [t.id, t]));
-    const lanes: Lane[] = index.roots.map((root) => {
+    const fromRecords: Lane[] = [...index.records]
+        .sort((a, b) => newerFirst(a as unknown as BoardTodo, b as unknown as BoardTodo))
+        .map((record) => {
+            const ids = index.members.get(record.id) ?? [];
+            const nodes = ids.map((id) => run.get(id)).filter(Boolean) as RunGraphNode[];
+            const totals = laneTotals(nodes);
+            const done = ids.filter((id) => isDone(byId.get(id)?.status ?? "")).length;
+            const levels = ids.map((id) => waves.get(id) ?? 1);
+            const span = levels.length
+                ? `волны ${Math.min(...levels)}–${Math.max(...levels)}`
+                : "";
+            const unknownNote = totals.unknown ? ` · ${totals.unknown} без замера` : "";
+            return {
+                id: record.id,
+                kicker: `тема · change c#${record.number}`,
+                title: record.title,
+                note: (record.delta ?? "").split("\n")[0] || undefined,
+                progress: ids.length ? done / ids.length : 0,
+                progressLabel: `${done} / ${ids.length} готово · ${span}${unknownNote}`,
+                cost: formatMoney(totals.cost),
+                duration: totals.minutes ? formatDuration(totals.minutes) : undefined,
+                tone: "theme" as const,
+                done: ids.length > 0 && done === ids.length,
+            };
+        });
+    const lanes: Lane[] = [...index.roots].sort(newerFirst).map((root) => {
         const ids = [root.id, ...(index.members.get(root.id) ?? [])];
         const nodes = ids.map((id) => run.get(id)).filter(Boolean) as RunGraphNode[];
         const totals = laneTotals(nodes);
@@ -358,6 +417,7 @@ export function toLanes(
             done: ids.length > 0 && done === ids.length,
         };
     });
+    lanes.unshift(...fromRecords);
     for (const [id, ids] of index.members) {
         if (!isFreeLane(id) || !ids.length) continue;
         lanes.push({
@@ -530,6 +590,7 @@ export function focusRows(
 export function toSpecLanes(
     sections: SpecSectionPayload[],
     board: BoardTodo[],
+    changes: BoardChange[] = [],
 ): SpecLane[] {
     const stateOf = (status: string) =>
         status === "in_progress" ? "в работе" : status === "queue" ? "очередь" : status;
@@ -550,9 +611,13 @@ export function toSpecLanes(
             section.lineCount !== undefined &&
             section.lineCeiling !== undefined &&
             section.lineCount > section.lineCeiling;
-        const changes = board.filter(
-            (t) => t.change === true && (t.spec ?? []).includes(section.address),
-        ).length;
+        const changeIds = new Set<string>();
+        for (const t of board)
+            if (t.change === true && (t.spec ?? []).includes(section.address))
+                changeIds.add(t.id);
+        for (const c of changes)
+            if ((c.spec ?? []).includes(section.address)) changeIds.add(c.id);
+        const changeCount = changeIds.size;
         return {
             id: section.address,
             kicker: overCeiling ? "раздел спеки · внимание" : "раздел спеки",
@@ -573,7 +638,7 @@ export function toSpecLanes(
             lintTone: overCeiling ? "warn" : "ok",
             metrics: [
                 `${incoming.length + outgoing.length} ссылок`,
-                `${changes} change'а`,
+                `${changeCount} change'а`,
             ],
             tone: overCeiling ? "warn" : "spec",
             incoming,
@@ -634,8 +699,8 @@ export function commonAncestor(tree: SpecTree, a: string, b: string): string | n
     return null;
 }
 
-export function specTree(board: BoardTodo[]): SpecTree {
-    const index = laneIndex(board);
+export function specTree(board: BoardTodo[], changes: BoardChange[] = []): SpecTree {
+    const index = laneIndex(board, changes);
     const byId = new Map<string, TreeNode>();
     const children = new Map<string, string[]>();
     const label = (t: BoardTodo) => (t.number ? `#${t.number}` : t.id);
@@ -692,6 +757,36 @@ export function specTree(board: BoardTodo[]): SpecTree {
             parent: home,
             project: root.project ?? null,
             weight: (index.members.get(root.id) ?? []).length,
+        });
+    }
+
+    for (const record of index.records) {
+        const own = record.spec ?? [];
+        const memberIds = index.members.get(record.id) ?? [];
+        const inherited = memberIds
+            .flatMap((id) => addressesOf(board.find((t) => t.id === id) ?? ({} as BoardTodo)))
+            .filter(Boolean);
+        const home = own[0] ?? inherited[0] ?? ORPHAN_SPEC;
+        if (!byId.has(home)) {
+            put({
+                id: home,
+                kind: "spec",
+                label: home === ORPHAN_SPEC ? "без раздела" : home,
+                title: home === ORPHAN_SPEC ? "темы без раздела спеки" : home,
+                parent: null,
+                project: null,
+                weight: 0,
+            });
+        }
+        themeSpec.set(record.id, home);
+        put({
+            id: record.id,
+            kind: "theme",
+            label: `c#${record.number}`,
+            title: record.title,
+            parent: home,
+            project: record.project ?? null,
+            weight: memberIds.length,
         });
     }
 

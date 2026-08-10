@@ -284,10 +284,10 @@ function inheritedBaton(task, { cwd } = {}) {
 // exported — and because it is the one block that must not go missing on a
 // slow board: a step without it works on a node whose frame (what must NOT be
 // touched, what the change deliberately keeps) exists only in the plan.
-function changeVision(task, all) {
+function changeVision(task, all, changes = []) {
   if (!all.length) return "";
   try {
-    const roots = changeRootsFor({ todos: all }, task);
+    const roots = changeRootsFor({ todos: all, changes }, task);
     if (!roots.length) return "";
     return formatChangeVision(task, roots).trim();
   } catch {
@@ -345,7 +345,7 @@ export function buildStepPrompt({ task, board, cwd, alongside = [] } = {}) {
     out += "\n" + line("Description:", task.description);
   if (task.plan && task.plan.trim()) out += "\n" + line("Plan:", task.plan);
 
-  const vision = changeVision(task, all);
+  const vision = changeVision(task, all, Array.isArray(board?.changes) ? board.changes : []);
   out +=
     "\n── VISION — the change this step serves ──\n" +
     (vision

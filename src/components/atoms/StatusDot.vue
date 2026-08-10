@@ -1,6 +1,6 @@
 <script setup lang="ts">
 defineProps<{
-    status: "blocked" | "ready" | "waiting" | "done";
+    status: "blocked" | "ready" | "waiting" | "review" | "done";
 }>();
 </script>
 
@@ -24,6 +24,9 @@ defineProps<{
 }
 .status-dot.waiting {
     background: var(--theme);
+}
+.status-dot.review {
+    background: var(--accent);
 }
 .status-dot.done {
     background: var(--ok);

@@ -1270,7 +1270,31 @@ async function boardLinkFindings(root, cwd = process.cwd()) {
   // without saying so. A warning, not an error: it is a legitimate situation
   // that needs to be SEEN, not forbidden.
   const openChanges = new Map();
-  for (const t of mod.loadBoard().todos ?? []) {
+  const board = mod.loadBoard();
+  for (const c of board.changes ?? []) {
+    if (!c || !Array.isArray(c.spec) || !c.spec.length) continue;
+    if (c.project && c.project !== project) continue;
+    const members = (board.todos ?? []).filter((t) => t && t.change_id === c.id);
+    const open = members.length === 0 || members.some((t) => !mod.isDone(t));
+    for (const address of c.spec) {
+      const r = resolveAddress(address, root);
+      if (!r.ok) {
+        out.push(
+          finding(
+            "dangling-task-link",
+            "error",
+            address,
+            `change c#${c.number} "${c.title}" ссылается на ${address}, которого в реестре нет: ${r.reason}`,
+          ),
+        );
+        continue;
+      }
+      if (!open) continue;
+      if (!openChanges.has(address)) openChanges.set(address, []);
+      openChanges.get(address).push({ number: `c#${c.number}`, subject: c.title });
+    }
+  }
+  for (const t of board.todos ?? []) {
     if (!t || !Array.isArray(t.spec) || !t.spec.length) continue;
     if (t.project && t.project !== project) continue;
     for (const address of t.spec) {
@@ -1300,7 +1324,7 @@ async function boardLinkFindings(root, cwd = process.cwd()) {
         "warning",
         address,
         `${address}: на раздел открыто ${changes.length} change'а сразу — ` +
-          changes.map((t) => `#${t.number} "${t.subject}"`).join(", ") +
+          changes.map((t) => `${String(t.number).startsWith("c#") ? t.number : "#" + t.number} "${t.subject}"`).join(", ") +
           `. Штамп второго затрёт провенанс первого, а правки лягут друг на друга без предупреждения`,
       ),
     );

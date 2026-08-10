@@ -1258,6 +1258,14 @@ fn get_todos(app: AppHandle) -> Result<Vec<todos::Todo>, String> {
     Ok(todos::load(&todos_path(&app)?).todos)
 }
 
+/// The change records of the board (t#360). Separate from [`get_todos`] because
+/// a change is no longer a task: the board's lanes read this, and a board that
+/// has not been migrated yet simply answers with an empty list.
+#[tauri::command]
+fn get_changes(app: AppHandle) -> Result<Vec<todos::Change>, String> {
+    Ok(todos::load(&todos_path(&app)?).changes)
+}
+
 // --- External-integration enrollment (plan External-integration-public-side, phase 4.2) ---
 
 /// Sealed device-key file, a sibling of todos.json (identity.rs owns the format).
@@ -2960,6 +2968,7 @@ pub fn run() {
             get_analytics_ext,
             export_analytics_json,
             get_todos,
+            get_changes,
             get_corrections_metrics,
             refresh_corrections_metrics,
             get_task_costs,

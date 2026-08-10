@@ -74,6 +74,12 @@ pub struct Todo {
     /// Keep in lockstep with the cc-todos CLI (`set-change`) and GraphView.vue.
     #[serde(default, alias = "theme", skip_serializing_if = "std::ops::Not::not")]
     pub change: bool,
+    /// Id of the [`Change`] record this task belongs to (t#360) — membership as a
+    /// field, replacing the member→root edge. None = outside every change, which
+    /// is a legal state (the board's free tasks). A board still carrying `change`
+    /// roots resolves membership through the edges instead, until it is migrated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_id: Option<String>,
     /// ISO date `YYYY-MM-DD` the user plans to do this; None = unscheduled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduled_for: Option<String>,
@@ -299,6 +305,42 @@ fn default_version() -> u32 {
     1
 }
 
+/// A CHANGE as a RECORD rather than a task (t#360): the delta of one round, the
+/// spec sections it moves and the group's ceilings. A task points at it through
+/// [`Todo::change_id`]; membership is a field, not a `depends_on` edge, so a
+/// missing edge can no longer drop a task out of its change in silence. Its
+/// status is DERIVED — open while any member is open — and never stored; only
+/// `closed_at` records the moment it was declared finished. Keep in lockstep
+/// with scripts/cli/change.mjs, which writes this shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Change {
+    pub id: String,
+    #[serde(default)]
+    pub number: u32,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub delta: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spec: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_limit: Option<u32>,
+    /// Task number this record was migrated from — the only bridge back to the
+    /// era when a change was a root task, and what makes the migration idempotent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub migrated_from: Option<u32>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_at: Option<String>,
+}
+
 /// The on-disk shape of `todos.json`. `version` lets us migrate the format
 /// later; unknown/missing fields default so older or hand-edited files load.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -307,6 +349,45 @@ pub struct TodoFile {
     pub version: u32,
     #[serde(default)]
     pub todos: Vec<Todo>,
+    /// Changes as records (t#360). Empty → omitted, so a board that has not been
+    /// migrated yet stays byte-identical. This field MUST survive every write:
+    /// dropping it would take every task's membership with it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changes: Vec<Change>,
+}
+
+impl TodoFile {
+    /// Resolve `c#N`, `cN`, a bare number or an id to a change record.
+    pub fn find_change(&self, change_ref: &str) -> Option<&Change> {
+        let r = change_ref.trim();
+        if let Some(c) = self.changes.iter().find(|c| c.id == r) {
+            return Some(c);
+        }
+        let digits = r
+            .trim_start_matches(['c', 'C'])
+            .trim_start_matches('#')
+            .trim();
+        let n: u32 = digits.parse().ok()?;
+        self.changes.iter().find(|c| c.number == n)
+    }
+
+    /// Tasks that point at this change, in board order.
+    pub fn change_members(&self, change_id: &str) -> Vec<&Todo> {
+        let mut members: Vec<&Todo> = self
+            .todos
+            .iter()
+            .filter(|t| t.change_id.as_deref() == Some(change_id))
+            .collect();
+        members.sort_by_key(|t| (t.number, t.id.clone()));
+        members
+    }
+
+    /// Open while any member is open; a change with no members is open too — it
+    /// has finished nothing. Never stored, always computed.
+    pub fn change_open(&self, change_id: &str) -> bool {
+        let members = self.change_members(change_id);
+        members.is_empty() || members.iter().any(|t| t.status != "done")
+    }
 }
 
 impl Default for TodoFile {
@@ -314,6 +395,7 @@ impl Default for TodoFile {
         TodoFile {
             version: default_version(),
             todos: Vec::new(),
+            changes: Vec::new(),
         }
     }
 }
@@ -1005,7 +1087,7 @@ pub fn parse_import(content: &str) -> Result<TodoFile, String> {
     let mut file: TodoFile = if value.is_array() {
         let todos: Vec<Todo> = serde_json::from_value(value)
             .map_err(|e| format!("not a list of tasks: {e}"))?;
-        TodoFile { version: default_version(), todos }
+        TodoFile { version: default_version(), todos, changes: Vec::new() }
     } else {
         serde_json::from_value(value).map_err(|e| format!("not a task file: {e}"))?
     };
@@ -1824,7 +1906,7 @@ mod tests {
     fn migration_archives_phase_pointer_plans_as_comments() {
         let mut t = todo("a", "done");
         t.plan = ".claude/phases/my-feature".to_string();
-        let f = migrated(TodoFile { version: 1, todos: vec![t] });
+        let f = migrated(TodoFile { version: 1, todos: vec![t], changes: Vec::new() });
         assert_eq!(f.version, 2);
         let t = &f.todos[0];
         assert!(t.plan.is_empty());
@@ -1839,7 +1921,7 @@ mod tests {
         let mut t = todo("a", "in_progress");
         t.description = String::new();
         t.plan = "# План: фича\n\n## Context (зачем)\n\nДолжно X, решили Y, потому что Z — и это вступление достаточно длинное.\n\n## Steps\n\n1. сделать A\n\n## Порядок\n\nПорядок: 1".to_string();
-        let f = migrated(TodoFile { version: 1, todos: vec![t] });
+        let f = migrated(TodoFile { version: 1, todos: vec![t], changes: Vec::new() });
         let t = &f.todos[0];
         assert!(t.description.contains("решили Y"));
         assert!(!t.description.contains("## Steps"));
@@ -1857,7 +1939,7 @@ mod tests {
         let mut b = todo("b", "backlog");
         b.description = String::new();
         b.plan = format!("просто прозаический текст без шагов {}", "y".repeat(100));
-        let f = migrated(TodoFile { version: 1, todos: vec![a, b] });
+        let f = migrated(TodoFile { version: 1, todos: vec![a, b], changes: Vec::new() });
         assert_eq!(f.todos[0].plan.len(), 200);
         assert!(f.todos[1].plan.starts_with("просто"));
         assert!(f.todos[1].description.is_empty());
@@ -1868,7 +1950,7 @@ mod tests {
     fn migration_is_guarded_by_version() {
         let mut t = todo("a", "done");
         t.plan = ".claude/phases/slug".to_string();
-        let f = migrated(TodoFile { version: 2, todos: vec![t] });
+        let f = migrated(TodoFile { version: 2, todos: vec![t], changes: Vec::new() });
         assert_eq!(f.todos[0].comments.len(), 0); // already v2 → untouched
         assert!(!f.todos[0].plan.is_empty());
     }

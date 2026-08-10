@@ -66,12 +66,21 @@ export interface RunGraphNode {
   agents: NodeAgent[];
 }
 
+export interface RunGraphGroup {
+  id: string;
+  number: number;
+  subject: string;
+  members: string[];
+  duration_minutes: number | null;
+  record: boolean;
+}
+
 export interface RunGraph {
   nodes: RunGraphNode[];
   edges: GraphEdge[];
   /// Membership edges (member → change) are carried but not drawn: the frame
   /// already says it. Kept so the model stays complete.
-  groups: { id: string; number: number; subject: string; members: string[] }[];
+  groups: RunGraphGroup[];
   /// Canonical export text (spec §17). The panel draws its own SVG; this is
   /// what the user copies out into a report.
   mermaid: string;
@@ -154,12 +163,14 @@ export function normalizeGraph(raw: unknown): RunGraph {
         }))
         .filter((e) => e.from && e.to)
     : [];
-  const groups = Array.isArray(r.groups)
+  const groups: RunGraphGroup[] = Array.isArray(r.groups)
     ? (r.groups as Record<string, unknown>[]).map((g) => ({
         id: str(g.id),
         number: num(g.number) ?? 0,
         subject: str(g.subject),
         members: Array.isArray(g.members) ? (g.members as unknown[]).map((m) => str(m)) : [],
+        duration_minutes: num(g.duration_minutes),
+        record: g.record === true,
       }))
     : [];
   return { nodes, edges, groups, mermaid: str(r.text ?? r.mermaid) };
@@ -193,23 +204,29 @@ export interface RunBlock {
   tool_errors: number;
 }
 
-/// The board carries several changes at once, and the graph shows them side by
-/// side, so the run layer is keyed by TASK ID across every change it loaded. A
-/// change that fails contributes nothing instead of emptying the others.
-export async function loadRunLayer(changes: string[]): Promise<Map<string, RunGraphNode>> {
-  const out = new Map<string, RunGraphNode>();
+export interface RunLayer {
+  nodes: Map<string, RunGraphNode>;
+  groups: Map<string, RunGraphGroup>;
+}
+
+export async function loadRunGroups(changes: string[]): Promise<RunLayer> {
+  const nodes = new Map<string, RunGraphNode>();
+  const groups = new Map<string, RunGraphGroup>();
   const graphs = await Promise.all([...new Set(changes)].filter(Boolean).map(loadRunGraph));
   for (const g of graphs) {
     for (const n of g.nodes) {
-      // A change root also appears as a member of an outer change; the richer row
-      // wins, so a second, unmeasured copy can't blank a measured one.
-      const prev = out.get(n.id);
+      const prev = nodes.get(n.id);
       if (!prev || (n.measurability === "measured" && prev.measurability !== "measured")) {
-        out.set(n.id, n);
+        nodes.set(n.id, n);
       }
     }
+    for (const grp of g.groups) groups.set(grp.id, grp);
   }
-  return out;
+  return { nodes, groups };
+}
+
+export async function loadRunLayer(changes: string[]): Promise<Map<string, RunGraphNode>> {
+  return (await loadRunGroups(changes)).nodes;
 }
 
 export async function loadTaskBlocks(task: string): Promise<RunBlock[]> {

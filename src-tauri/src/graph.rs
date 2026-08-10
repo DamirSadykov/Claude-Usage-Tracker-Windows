@@ -164,6 +164,16 @@ pub struct GraphGroup {
     pub number: u32,
     pub subject: String,
     pub members: Vec<String>,
+    /// Calendar span of the group: first `in_progress` of any member to the last
+    /// `done`/`review`. It used to be read off the root task's own node; with the
+    /// change a record, the span belongs to the frame instead. None when the group
+    /// has not started or its log runs backwards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_minutes: Option<i64>,
+    /// True when the frame stands for a change RECORD (`c#N`) rather than a root
+    /// task — the UI addresses the two differently.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub record: bool,
 }
 
 /// The whole answer: the model (for the UI) and the rendered text (for a paste).
@@ -181,6 +191,13 @@ pub struct TaskGraph {
 /// Task ids of a change's run: the root plus everything it reaches through
 /// `depends_on`, ordered by task number. An unresolvable ref yields nothing.
 pub fn subtree(board: &TodoFile, change_ref: &str) -> Vec<String> {
+    if let Some(change) = board.find_change(change_ref) {
+        return board
+            .change_members(&change.id)
+            .into_iter()
+            .map(|t| t.id.clone())
+            .collect();
+    }
     let Some(root) = task_sessions::resolve_task_ref(board, change_ref) else {
         return Vec::new();
     };
@@ -235,6 +252,33 @@ fn duration_minutes(t: &Todo) -> Option<i64> {
         .rev()
         .find(|e| (e.status == "done" || e.status == "review") && !e.at.is_empty())
         .and_then(|e| parse_ts(&e.at))?;
+    let minutes = (end - start).num_minutes();
+    (minutes >= 0).then_some(minutes)
+}
+
+/// Calendar span of a GROUP: earliest `in_progress` across its members to the
+/// latest `done`/`review`. A change record has no status log of its own, so its
+/// span is its members' — the same wall-clock the root task used to carry.
+fn group_span(members: &[&Todo]) -> Option<i64> {
+    let start = members
+        .iter()
+        .filter_map(|t| {
+            t.status_history
+                .iter()
+                .find(|e| e.status == "in_progress" && !e.at.is_empty())
+                .and_then(|e| parse_ts(&e.at))
+        })
+        .min()?;
+    let end = members
+        .iter()
+        .filter_map(|t| {
+            t.status_history
+                .iter()
+                .rev()
+                .find(|e| (e.status == "done" || e.status == "review") && !e.at.is_empty())
+                .and_then(|e| parse_ts(&e.at))
+        })
+        .max()?;
     let minutes = (end - start).num_minutes();
     (minutes >= 0).then_some(minutes)
 }
@@ -376,6 +420,24 @@ pub fn build(
 
     let mut groups: Vec<GraphGroup> = Vec::new();
     let mut claimed: HashSet<String> = HashSet::new();
+    if let Some(record) = board.find_change(change_ref) {
+        let members: Vec<String> = ids.iter().cloned().collect();
+        let member_todos: Vec<&Todo> = members
+            .iter()
+            .filter_map(|id| by_id.get(id.as_str()).copied())
+            .collect();
+        for m in &members {
+            claimed.insert(m.clone());
+        }
+        groups.push(GraphGroup {
+            id: record.id.clone(),
+            number: record.number,
+            subject: record.title.clone(),
+            members,
+            duration_minutes: group_span(&member_todos),
+            record: true,
+        });
+    }
     let change_roots: Vec<&str> = nodes
         .iter()
         .filter(|n| n.change)
@@ -407,6 +469,8 @@ pub fn build(
             number: t.number,
             subject: t.subject.clone(),
             members,
+            duration_minutes: duration_minutes(t),
+            record: false,
         });
     }
     groups.sort_by_key(|g| (g.number, g.id.clone()));
@@ -819,7 +883,7 @@ mod tests {
     }
 
     fn board(todos: Vec<Todo>) -> TodoFile {
-        TodoFile { version: 2, todos }
+        TodoFile { version: 2, todos, changes: Vec::new() }
     }
 
     fn block(task: &str) -> TaskBlock {
@@ -1298,5 +1362,130 @@ mod tests {
         assert_eq!(ids.len(), 3);
         // Ordered by task number: 273, 274, 275.
         assert_eq!(ids[0], "root");
+    }
+}
+
+#[cfg(test)]
+mod change_record_tests {
+    use super::*;
+    use crate::todos::{Change, StatusChange};
+
+    fn todo(id: &str, number: u32, change_id: Option<&str>) -> Todo {
+        Todo {
+            id: id.to_string(),
+            number,
+            subject: format!("задача {number}"),
+            status: "done".to_string(),
+            change_id: change_id.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    fn worked(mut t: Todo, from: &str, to: &str) -> Todo {
+        t.status_history = vec![
+            StatusChange { status: "in_progress".to_string(), at: from.to_string() },
+            StatusChange { status: "done".to_string(), at: to.to_string() },
+        ];
+        t
+    }
+
+    fn record() -> Change {
+        Change {
+            id: "ch-1".to_string(),
+            number: 3,
+            title: "CHANGE: записи вместо корней".to_string(),
+            delta: "дельта".to_string(),
+            project: Some("board".to_string()),
+            spec: vec!["tasks#changes".to_string()],
+            budget_usd: Some(60.0),
+            parallel_limit: Some(2),
+            migrated_from: Some(337),
+            created_at: "2026-08-01T10:00:00Z".to_string(),
+            updated_at: "2026-08-01T10:00:00Z".to_string(),
+            closed_at: None,
+        }
+    }
+
+    fn board() -> TodoFile {
+        TodoFile {
+            version: 2,
+            todos: vec![
+                worked(todo("t-1", 1, Some("ch-1")), "2026-08-01T10:00:00Z", "2026-08-01T12:00:00Z"),
+                worked(todo("t-2", 2, Some("ch-1")), "2026-08-02T09:00:00Z", "2026-08-03T09:00:00Z"),
+                todo("t-3", 3, None),
+            ],
+            changes: vec![record()],
+        }
+    }
+
+    #[test]
+    fn a_change_resolves_by_address_number_and_id() {
+        let b = board();
+        for r in ["c#3", "c3", "3", "ch-1"] {
+            assert_eq!(b.find_change(r).map(|c| c.id.as_str()), Some("ch-1"), "ref {r}");
+        }
+        assert!(b.find_change("c#9").is_none());
+    }
+
+    #[test]
+    fn subtree_of_a_record_is_its_members_not_an_edge_walk() {
+        let ids = subtree(&board(), "c#3");
+        assert_eq!(ids, vec!["t-1".to_string(), "t-2".to_string()]);
+    }
+
+    #[test]
+    fn membership_is_a_field_so_a_task_outside_stays_outside() {
+        let b = board();
+        assert_eq!(b.change_members("ch-1").len(), 2);
+        assert!(b.todos.iter().find(|t| t.id == "t-3").unwrap().change_id.is_none());
+    }
+
+    #[test]
+    fn status_is_derived_from_the_members() {
+        let mut b = board();
+        assert!(!b.change_open("ch-1"));
+        b.todos[0].status = "review".to_string();
+        assert!(b.change_open("ch-1"));
+    }
+
+    #[test]
+    fn a_change_with_no_members_is_open_it_finished_nothing() {
+        let mut b = board();
+        b.todos.clear();
+        assert!(b.change_open("ch-1"));
+    }
+
+    #[test]
+    fn the_frame_carries_the_calendar_span_the_root_task_used_to() {
+        let b = board();
+        let g = build(&b, "c#3", &[], &[], &[], &HashMap::new());
+        assert_eq!(g.groups.len(), 1);
+        let frame = &g.groups[0];
+        assert!(frame.record);
+        assert_eq!(frame.number, 3);
+        assert_eq!(frame.members, vec!["t-1".to_string(), "t-2".to_string()]);
+        assert_eq!(frame.duration_minutes, Some(2820));
+    }
+
+    #[test]
+    fn the_record_survives_a_round_trip_through_the_file() {
+        let b = board();
+        let text = serde_json::to_string(&b).unwrap();
+        let back: TodoFile = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.changes.len(), 1);
+        assert_eq!(back.changes[0].number, 3);
+        assert_eq!(back.todos[0].change_id.as_deref(), Some("ch-1"));
+    }
+
+    #[test]
+    fn an_unmigrated_board_writes_neither_field() {
+        let plain = TodoFile {
+            version: 1,
+            todos: vec![todo("t-1", 1, None)],
+            changes: Vec::new(),
+        };
+        let text = serde_json::to_string(&plain).unwrap();
+        assert!(!text.contains("changes"));
+        assert!(!text.contains("change_id"));
     }
 }

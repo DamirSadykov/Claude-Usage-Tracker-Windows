@@ -232,4 +232,25 @@ describe("cli.mjs hook (stdin payload)", () => {
       rmSync(specDir, { recursive: true, force: true });
     }
   });
+
+  // t#360: the vision lives on the change RECORD now. The hook used to hand
+  // changeRootsFor a board stripped down to its tasks, so a migrated change had
+  // no vision to inherit and the injection vanished without a word.
+  it("surfaces the vision of a change RECORD, not just of a root task", () => {
+    setup();
+    const data = JSON.parse(readFileSync(path.join(appDir, "todos.json"), "utf8"));
+    data.changes = [
+      {
+        id: "ch-1",
+        number: 7,
+        title: "CHANGE: записи вместо корней",
+        delta: "что меняем в этом заходе и почему сейчас",
+      },
+    ];
+    data.todos[0].change_id = "ch-1";
+    writeFileSync(path.join(appDir, "todos.json"), JSON.stringify(data));
+    const out = runHook();
+    expect(out).toContain("c#7");
+    expect(out).toContain("что меняем в этом заходе");
+  });
 });

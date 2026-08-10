@@ -440,7 +440,7 @@ mod tests {
     }
 
     fn board(todos: Vec<Todo>) -> TodoFile {
-        TodoFile { version: 1, todos }
+        TodoFile { version: 1, todos, changes: Vec::new() }
     }
 
     fn sess(id: &str, project: Option<&str>, start: &str, end: &str, tokens: i64, cost: f64) -> SessionUsage {
