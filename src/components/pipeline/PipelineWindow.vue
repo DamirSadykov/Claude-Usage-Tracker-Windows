@@ -47,9 +47,11 @@ const headline = computed(() => {
                         { id: 'board', label: 'Доска' },
                         { id: 'graph', label: 'Граф' },
                         { id: 'specs', label: 'Спеки' },
+                        { id: 'change', label: 'Change' },
                     ]"
                     @update:model-value="
-                        (value: string) => (mode = value === 'specs' ? 'reader' : 'lanes')
+                        (value: string) =>
+                            (mode = value === 'specs' ? 'reader' : value === 'change' ? 'change' : 'lanes')
                     "
                 />
                 <ToolButton variant="pri">+ Добавить</ToolButton>

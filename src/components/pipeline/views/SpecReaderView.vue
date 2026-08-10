@@ -12,6 +12,7 @@ import SpecTreeItem from "../../atoms/SpecTreeItem.vue";
 import SpecParagraph from "../../atoms/SpecParagraph.vue";
 import PanelRow from "../../atoms/PanelRow.vue";
 import { useSpecs } from "../useSpecs";
+import { selectChange } from "../useChange";
 import {
     domains as mockDomains,
     readerSection as mockReaderSection,
@@ -36,7 +37,7 @@ withDefaults(defineProps<{ chrome?: boolean }>(), { chrome: true });
 const emit = defineEmits<{
     (
         e: "mode",
-        value: "lanes" | "wires" | "rings" | "specs" | "reader" | "review",
+        value: "lanes" | "wires" | "rings" | "specs" | "reader" | "review" | "change",
     ): void;
 }>();
 
@@ -105,9 +106,14 @@ const changes = computed(() =>
     live.value
         ? specs
               .openChangesFor(selected.value)
-              .map((c) => ({ id: `#${c.number}`, title: c.title }))
-        : mockOpenChanges(mockReaderAddress),
+              .map((c) => ({ id: c.address, title: c.title, record: c.record }))
+        : mockOpenChanges(mockReaderAddress).map((c) => ({ ...c, record: false })),
 );
+
+function openChange(address: string) {
+    selectChange(address);
+    emit("mode", "change");
+}
 
 const linkCount = computed(() =>
     live.value ? specs.linkedTasksFor(selected.value).length : mockLinkCount(mockReaderAddress),
@@ -342,7 +348,9 @@ function onTab(value: string) {
                         :key="change.id"
                         :id="change.id"
                         :title="change.title"
+                        :count="change.record ? 'открыть карточку' : 'старый корень'"
                         kind="spec"
+                        @click="change.record && openChange(change.id)"
                     />
                     <div v-if="!changes.length" class="spec-empty">
                         Ни одна задача не ссылается на раздел (todos set spec &lt;задача&gt;
