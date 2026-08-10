@@ -684,6 +684,7 @@ const viewMode = ref<"board" | "graph" | "specs">("board");
 // screens (default) and the classic force layout. The choice is remembered per
 // machine so a session that prefers the old picture keeps it.
 const graphUiNew = ref(localStorage.getItem("graph-ui") !== "classic");
+const specsTab = ref(localStorage.getItem("specs-tab") === "on");
 const specMode = ref<PipelineMode>("reader");
 watch(graphUiNew, (on) =>
   localStorage.setItem("graph-ui", on ? "next" : "classic"),
@@ -1703,6 +1704,7 @@ onUnmounted(() => {
           {{ t("viewGraph") }}
         </button>
         <button
+          v-if="specsTab"
           class="tw-vt"
           :class="{ active: viewMode === 'specs' }"
           role="tab"
