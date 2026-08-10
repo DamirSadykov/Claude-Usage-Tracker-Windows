@@ -87,6 +87,8 @@ export function isReadyNode(t, byId) {
 // order and a settings threshold picks the minimum level that enters context.
 const PRIORITIES = ["high", "medium", "low"];
 
+export const SUBJECT_LIMIT = 150;
+
 // Task-graph node type (#88), in lockstep with todos.rs::Todo.kind and GraphView.
 // `auto` = a node a headless runner may execute unattended; `manual` (the default,
 // stored as an empty/absent field) = a human/review gate. Normalize returns the
@@ -863,6 +865,28 @@ function setDescription({ data, file, todo, value }) {
   );
 }
 
+function refuseIfSubjectTooLong(subject, taskRef) {
+  if (subject.length <= SUBJECT_LIMIT) return;
+  fail(
+    `refusing: title is ${subject.length} chars — the cap is ${SUBJECT_LIMIT}.\n` +
+      `put the long text in the description instead: cli todos set description ${taskRef} --text "…"`,
+  );
+}
+
+function setSubject({ data, file, todo, value }) {
+  const subject = String(value).trim();
+  if (!subject) fail(`refusing: #${todo.number} can't have an empty title`);
+  refuseIfSubjectTooLong(subject, todo.number);
+  if (todo.subject === subject) {
+    process.stdout.write(`ok: #${todo.number} already that title\n`);
+    return;
+  }
+  todo.subject = subject;
+  todo.updated_at = new Date().toISOString();
+  save(file, data);
+  process.stdout.write(`ok: #${todo.number} subject -> ${subject}\n`);
+}
+
 // Set (or clear) a todo's project (issue #54: a task filed with the wrong/empty
 // project couldn't be fixed from the CLI before — only in the app). <name> ties
 // it to that board; `--global`/`none`/`clear` makes it project-less. Clearing
@@ -941,6 +965,10 @@ function setSpec({ data, file, todo, value }) {
 // from what the code accepts. `declaration` marks a field of the process DSL —
 // a promise made before the work, hence refused on a closed node.
 const SET_FIELDS = {
+  subject: {
+    values: `"<title>"   max ${SUBJECT_LIMIT} chars — longer text goes in the description`,
+    set: setSubject,
+  },
   status: {
     values: `${STATUSES.join(" | ")}   [--force]   (done is refused while a prereq is open)`,
     set: setStatus,
@@ -1099,6 +1127,7 @@ function cmdAdd(args) {
   const { positional, flags } = parseArgs(args);
   const subject = String(positional[0] ?? flags.subject ?? "").trim();
   if (!subject) fail(ADD_USAGE);
+  refuseIfSubjectTooLong(subject, "<task>");
   const status = String(flags.status ?? "backlog");
   if (!STATUSES.includes(status))
     fail(`invalid status "${status}". valid: ${STATUSES.join(" | ")}`);

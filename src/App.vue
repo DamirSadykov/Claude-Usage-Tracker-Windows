@@ -11,6 +11,7 @@ import TodoWindow from "./components/TodoWindow.vue";
 import FocusControls from "./components/FocusControls.vue";
 import ServiceStatusBar from "./components/ServiceStatusBar.vue";
 import AboutPanel from "./components/AboutPanel.vue";
+import PipelineWindow from "./components/pipeline/PipelineWindow.vue";
 import { applyFont, writeCachedFontId, DEFAULT_FONT_ID } from "./fontSwitch";
 import {
     DEFAULT_THRESHOLDS,
@@ -30,6 +31,7 @@ const isMini = window.location.hash === "#mini";
 const isAnalytics = window.location.hash === "#analytics";
 const isTodos = window.location.hash === "#todos";
 const isSettings = window.location.hash === "#settings";
+const isPipeline = window.location.hash === "#pipeline";
 
 export interface UsageTier {
     percent_used: number;
@@ -789,6 +791,7 @@ onMounted(async () => {
     if (isAnalytics) return; // the analytics window has its own init flow
     if (isTodos) return; // the todos window self-initializes via TodoWindow
     if (isSettings) return; // the settings window self-initializes via SettingsWindow
+    if (isPipeline) return; // the pipeline preview renders mocked data only
 
     await loadSettings();
 
@@ -921,6 +924,7 @@ onUnmounted(() => {
     <AnalyticsWindow v-else-if="isAnalytics" />
     <TodoWindow v-else-if="isTodos" />
     <SettingsWindow v-else-if="isSettings" />
+    <PipelineWindow v-else-if="isPipeline" />
     <div v-else class="flyout accent-claude">
         <!-- Header -->
         <div class="fly-hd">

@@ -1,0 +1,41 @@
+.pipe-root {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    background: var(--win-bg);
+    color: var(--text);
+    font-family: var(--segoe);
+    overflow: hidden;
+}
+
+.pipe-canvas {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    position: relative;
+    background-color: var(--canvas-bg);
+    background-image: radial-gradient(
+        rgba(255, 255, 255, 0.045) 1px,
+        transparent 1px
+    );
+    background-size: 26px 26px;
+}
+.pipe-canvas.plain {
+    background-image: none;
+}
+
+.pipe-section {
+    margin: 0 20px 14px;
+    padding: 8px;
+    border: 1px solid var(--project-stroke);
+    border-radius: var(--r-card);
+    background: var(--project-bg);
+}
+
+.pipe-mono {
+    font-family: var(--mono);
+}
+
+.pipe-spacer {
+    flex: 1;
+}
