@@ -52,7 +52,7 @@ const totalOpenChanges = computed(() => {
     const migratedFrom = new Set(
         specs.changes.value.map((c) => c.migrated_from).filter((n): n is number => !!n),
     );
-    const openRecords = specs.changes.value.filter((c) => !c.closed_at).length;
+    const openRecords = specs.changes.value.filter((c) => specs.isOpenChange(c)).length;
     const openLegacy = specs.board.value.filter(
         (t) => t.change && t.status !== "done" && !(t.number && migratedFrom.has(t.number)),
     ).length;

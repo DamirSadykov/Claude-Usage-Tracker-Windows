@@ -7,6 +7,7 @@ import BubblesView from "./views/BubblesView.vue";
 import SpecLanesView from "./views/SpecLanesView.vue";
 import SpecReaderView from "./views/SpecReaderView.vue";
 import SpecReviewView from "./views/SpecReviewView.vue";
+import ChangeView from "./views/ChangeView.vue";
 import { SPEC_MODES, type PipelineMode } from "./modes";
 import "./pipeline.css";
 
@@ -24,6 +25,7 @@ const views = {
     specs: SpecLanesView,
     reader: SpecReaderView,
     review: SpecReviewView,
+    change: ChangeView,
 };
 
 const current = computed(() => views[mode.value]);

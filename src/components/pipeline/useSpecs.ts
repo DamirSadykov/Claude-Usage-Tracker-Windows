@@ -2,6 +2,12 @@ import { ref, computed, watch, onMounted } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { diffLines, diffHunks, diffStat, type DiffHunk, type DiffLine } from "../../specDiff";
 import { toSpecLanes, type BoardTodo, type BoardChange, type SpecSectionPayload } from "./adapt";
+import {
+    changeIsOpen,
+    changeMembers,
+    type ChangeRecord,
+    type ChangeTask,
+} from "./changeAdapt";
 import type { SpecLane } from "./types";
 
 export interface SectionEntry {
@@ -75,6 +81,8 @@ export interface SpecChange extends BoardChange {
 export interface ChangeLike {
     id: string;
     number: number;
+    address: string;
+    record: boolean;
     title: string;
     open: boolean;
 }
@@ -235,7 +243,8 @@ export function useSpecs() {
         );
 
     const isOpenTodo = (t: SpecTodo): boolean => t.status !== "done";
-    const isOpenChange = (c: BoardChange): boolean => !c.closed_at;
+    const isOpenChange = (c: BoardChange): boolean =>
+        changeIsOpen(changeMembers(board.value as ChangeTask[], c as ChangeRecord));
 
     function changeLikeFor(address: string): ChangeLike[] {
         const out: ChangeLike[] = [];
@@ -243,7 +252,14 @@ export function useSpecs() {
         for (const c of changes.value) {
             if (c.migrated_from) migratedFrom.add(c.migrated_from);
             if (!(c.spec ?? []).includes(address)) continue;
-            out.push({ id: c.id, number: c.number, title: c.title, open: isOpenChange(c) });
+            out.push({
+                id: c.id,
+                number: c.number,
+                address: `c#${c.number}`,
+                record: true,
+                title: c.title,
+                open: isOpenChange(c),
+            });
         }
         for (const t of board.value) {
             if (!t.change) continue;
@@ -252,6 +268,8 @@ export function useSpecs() {
             out.push({
                 id: t.id,
                 number: t.number ?? 0,
+                address: `t#${t.number ?? 0}`,
+                record: false,
                 title: t.subject,
                 open: isOpenTodo(t),
             });

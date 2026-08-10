@@ -221,10 +221,10 @@ const changeQueue = computed(() => {
         specs.changes.value.map((c) => c.migrated_from).filter((n): n is number => !!n),
     );
     for (const c of specs.changes.value) {
-        if (c.closed_at) continue;
+        if (!specs.isOpenChange(c)) continue;
         const conflict = (c.spec ?? []).some((a) => specs.concurrentAt(a));
         out.push({
-            id: c.id,
+            id: `c#${c.number}`,
             title: c.title,
             meta: (c.spec ?? []).join(", ") || "без раздела",
             tone: conflict ? "warn" : "ok",

@@ -5,9 +5,10 @@ export type PipelineMode =
     | "rings"
     | "specs"
     | "reader"
-    | "review";
+    | "review"
+    | "change";
 
-export const SPEC_MODES: PipelineMode[] = ["reader", "review"];
+export const SPEC_MODES: PipelineMode[] = ["reader", "review", "change"];
 
 export const linkModes = [
     { id: "deps", label: "Зависимости" },
