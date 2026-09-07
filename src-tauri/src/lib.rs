@@ -4,14 +4,17 @@ pub mod corrections;
 pub mod domain;
 pub mod enroll;
 pub mod external;
+pub mod graph;
 pub mod identity;
 pub mod memory;
-pub mod phases;
 pub mod project_groups;
 pub mod report;
 pub mod stats;
+pub mod spec;
 pub mod status;
 pub mod sysmon;
+pub mod task_cost;
+pub mod task_sessions;
 pub mod todos;
 pub mod triage;
 pub mod triage_schedule;
@@ -914,15 +917,27 @@ fn spawn_corrections_publisher(app: AppHandle) {
                 && last_publish.map_or(true, |t| t.elapsed() >= CORRECTIONS_PUBLISH_INTERVAL);
             if due {
                 if let Ok(cli) = cc_hook_script_path(&app) {
+                    let cli2 = cli.clone();
                     let res = tokio::task::spawn_blocking(move || {
-                        triage_schedule::run_corrections_publish(&cli)
+                        let corr = triage_schedule::run_corrections_publish(&cli);
+                        // Same cadence, same kind of deterministic transcript
+                        // scan: refresh the session→task attribution too (t#87)
+                        // so the board's cost badges stay current without a
+                        // second timer. Failures are independent.
+                        let attr = triage_schedule::run_task_cost_publish(&cli2);
+                        (corr, attr)
                     })
                     .await;
                     // Best-effort: a scan failure just means the card keeps its last
                     // data; log nothing louder than the existing diagnostics.
                     last_publish = Some(Instant::now());
-                    if matches!(res, Ok(Ok(()))) {
-                        let _ = app.emit("corrections-updated", ());
+                    if let Ok((corr, attr)) = res {
+                        if corr.is_ok() {
+                            let _ = app.emit("corrections-updated", ());
+                        }
+                        if attr.is_ok() {
+                            let _ = app.emit("task-costs-updated", ());
+                        }
                     }
                 }
             }
@@ -1243,6 +1258,41 @@ fn get_todos(app: AppHandle) -> Result<Vec<todos::Todo>, String> {
     Ok(todos::load(&todos_path(&app)?).todos)
 }
 
+/// The change records of the board (t#360). Separate from [`get_todos`] because
+/// a change is no longer a task: the board's lanes read this, and a board that
+/// has not been migrated yet simply answers with an empty list.
+#[tauri::command]
+fn get_changes(app: AppHandle) -> Result<Vec<todos::Change>, String> {
+    Ok(todos::load(&todos_path(&app)?).changes)
+}
+
+#[tauri::command]
+async fn close_change(app: AppHandle, change: String) -> Result<String, String> {
+    let cli = cc_hook_script_path(&app)?;
+    let change = change.trim().to_string();
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = std::process::Command::new("node");
+        cmd.arg(&cli).arg("change").arg("close").arg(&change);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000);
+        }
+        let out = cmd
+            .output()
+            .map_err(|e| format!("не удалось запустить node: {e}"))?;
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if out.status.success() {
+            Ok(stdout)
+        } else {
+            Err(if stderr.is_empty() { stdout } else { stderr })
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 // --- External-integration enrollment (plan External-integration-public-side, phase 4.2) ---
 
 /// Sealed device-key file, a sibling of todos.json (identity.rs owns the format).
@@ -1551,6 +1601,172 @@ async fn refresh_corrections_metrics(app: AppHandle) -> Result<(), String> {
         .map_err(|e| e.to_string())?
 }
 
+/// Path to the session→task attribution file, a sibling of todos.json (see
+/// task_cost.rs / `cli.mjs task-cost publish`). Read-only here.
+fn task_attribution_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).ok();
+    Ok(dir.join("task-attribution.json"))
+}
+
+/// Path to the append-only session→task binding journal, a sibling of
+/// todos.json (written by `cli todos take` / `set-status` and the SessionStart
+/// hook — see task_sessions.rs). Read-only here.
+fn task_sessions_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&dir).ok();
+    Ok(dir.join("task-sessions.jsonl"))
+}
+
+/// Session ends (last `cc_usage` ts) keyed by session id — what closes the last
+/// open block of a session.
+fn session_ends(usage: &[stats::SessionUsage]) -> HashMap<String, String> {
+    usage
+        .iter()
+        .map(|u| (u.session_id.clone(), u.end.clone()))
+        .collect()
+}
+
+/// Tokens/cost per task (t#87): the binding journal and the attribution file
+/// joined with per-session token totals from SQLite, resolved against the live
+/// board. None until either source exists.
+#[tauri::command]
+async fn get_task_costs(
+    app: AppHandle,
+    stats: tauri::State<'_, Arc<StatsDb>>,
+) -> Result<Option<task_cost::TaskCosts>, String> {
+    let attr = task_cost::load(&task_attribution_path(&app)?);
+    let events = task_sessions::load(&task_sessions_path(&app)?);
+    if attr.is_none() && events.is_empty() {
+        return Ok(None);
+    }
+    let board = todos::load(&todos_path(&app)?);
+    let usage = stats.sessions_all().map_err(|e| e.to_string())?;
+    let blocks = task_sessions::blocks(&events, &session_ends(&usage));
+    Ok(Some(task_cost::compute(
+        &attr.unwrap_or_default(),
+        &board,
+        &usage,
+        &blocks,
+    )))
+}
+
+/// The blocks a task is made of (t#297): every `(task, session, [from, to])`
+/// span the binding journal records, each with its own cost, tokens, messages,
+/// tool calls and tool errors. `task` optionally narrows the result to one task
+/// (`<uuid>` | `N` | `#N` | `t#N`); an unresolvable ref yields no blocks.
+#[tauri::command]
+async fn get_task_blocks(
+    app: AppHandle,
+    stats: tauri::State<'_, Arc<StatsDb>>,
+    task: Option<String>,
+) -> Result<task_sessions::TaskBlocks, String> {
+    let board = todos::load(&todos_path(&app)?);
+    let events = task_sessions::load(&task_sessions_path(&app)?);
+    let usage = stats.sessions_all().map_err(|e| e.to_string())?;
+    let mut blocks = task_sessions::blocks(&events, &session_ends(&usage));
+    if let Some(r) = task.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        match task_sessions::resolve_task_ref(&board, r) {
+            Some(id) => blocks.retain(|b| b.task == id),
+            None => blocks.clear(),
+        }
+    }
+    let spans: Vec<(String, String, String)> = blocks
+        .iter()
+        .map(|b| (b.session.clone(), b.from.clone(), b.to.clone()))
+        .collect();
+    let totals = stats.block_totals_many(&spans).map_err(|e| e.to_string())?;
+    Ok(task_sessions::compose(&blocks, &board, &totals))
+}
+
+/// The run graph of a change (t#306): the change's dependency subtree joined with
+/// the blocks of every task in it, returned BOTH as a model (for the UI) and as
+/// a rendered picture — `format` is `mermaid` (canonical, the default) or `d2`.
+/// A task with no recoverable block reports an unknown cost, never zero (see
+/// graph.rs). An unresolvable change yields an empty graph rather than an error,
+/// the same forgiving contract as `get_task_blocks`.
+#[tauri::command]
+async fn get_task_graph(
+    app: AppHandle,
+    stats: tauri::State<'_, Arc<StatsDb>>,
+    change: String,
+    format: Option<String>,
+) -> Result<graph::TaskGraph, String> {
+    let board = todos::load(&todos_path(&app)?);
+    let events = task_sessions::load(&task_sessions_path(&app)?);
+    let usage = stats.sessions_all().map_err(|e| e.to_string())?;
+    // The whole-task yardstick is judged over ALL blocks, then the graph keeps
+    // only the change's own ones.
+    let all = task_sessions::blocks(&events, &session_ends(&usage));
+    let attr = task_cost::load(&task_attribution_path(&app)?).unwrap_or_default();
+    let costs: HashMap<String, f64> = task_cost::compute(&attr, &board, &usage, &all)
+        .tasks
+        .into_iter()
+        .map(|t| (t.id, t.cost))
+        .collect();
+    let ids: HashSet<String> = graph::subtree(&board, &change).into_iter().collect();
+    let blocks: Vec<task_sessions::TaskBlock> =
+        all.into_iter().filter(|b| ids.contains(&b.task)).collect();
+    let spans: Vec<(String, String, String)> = blocks
+        .iter()
+        .map(|b| (b.session.clone(), b.from.clone(), b.to.clone()))
+        .collect();
+    let totals = stats.block_totals_many(&spans).map_err(|e| e.to_string())?;
+    let mut agents: Vec<Vec<graph::GraphAgent>> = Vec::with_capacity(spans.len());
+    for (session, from, to) in &spans {
+        let rows = stats
+            .block_agents(session, from, to)
+            .map_err(|e| e.to_string())?;
+        agents.push(
+            rows.into_iter()
+                .map(|a| graph::GraphAgent {
+                    agent_id: a.agent_id,
+                    agent_type: a.agent_type,
+                    description: a.description,
+                    cost: a.cost,
+                    total_tokens: a.total_tokens,
+                    messages: a.messages,
+                })
+                .collect(),
+        );
+    }
+    let mut out = graph::build(&board, &change, &blocks, &totals, &agents, &costs);
+    graph::render(&mut out, format.as_deref().unwrap_or("mermaid"));
+    Ok(out)
+}
+
+/// Shows a block's transcript in the OS file manager and returns its path
+/// (t#307). The file itself is opened in the manager rather than launched: a
+/// `.jsonl` has no reliable association, and the surrounding directory is what
+/// a reader wants anyway — the subagent files sit next to the session's own.
+#[tauri::command]
+async fn reveal_transcript(session: String, agent: Option<String>) -> Result<String, String> {
+    let base = cc::claude_dir().ok_or("Каталог Claude не найден")?;
+    let agent = agent.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let path = cc::transcript_path(&base, session.trim(), agent)
+        .ok_or("Транскрипт не найден — файл мог быть очищен по сроку хранения")?;
+    #[cfg(windows)]
+    let shown = std::process::Command::new("explorer")
+        .arg(format!("/select,{}", path.display()))
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string());
+    #[cfg(not(windows))]
+    let shown = open::that(path.parent().unwrap_or(&path)).map_err(|e| e.to_string());
+    shown?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// Re-derive the attribution now (runs `task-cost publish --all` via node) so
+/// the costs can be refreshed on demand. Mirrors refresh_corrections_metrics.
+#[tauri::command]
+async fn refresh_task_costs(app: AppHandle) -> Result<(), String> {
+    let cli = cc_hook_script_path(&app)?;
+    tokio::task::spawn_blocking(move || triage_schedule::run_task_cost_publish(&cli))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// Current nightly-triage schedule config (enabled / time / model + last-run
 /// bookkeeping) for the in-app controls. Forgiving: defaults if never set.
 #[tauri::command]
@@ -1703,19 +1919,24 @@ fn save_project_groups(
     Ok(())
 }
 
-// --- CLI + SessionStart hook installer ---
+// --- CLI + Claude Code hook installer ---
 //
-// The unified `cli.mjs` (todos / phases / hook areas) ships as bundled Node
-// scripts (resources). "Install" = wire the hook into the user's
-// ~/.claude/settings.json so Claude Code runs `cli.mjs hook` on every session
-// start. The CLI areas need no separate wiring — the hook hands Claude the
-// cli.mjs path and Claude calls `cli.mjs todos …` itself.
+// The unified `cli.mjs` (todos / triage / hook areas) ships as bundled Node
+// scripts (resources). "Install" = wire the hooks into the user's
+// ~/.claude/settings.json so Claude Code runs them around every session:
+//   • SessionStart → `cli.mjs hook`       — inject the task board.
+//   • Stop         → `cli.mjs stop-hook`  — block a stop that leaves a worked
+//                                           task without a HANDOFF baton (issue #59).
+//   • PostToolUse  → `cli.mjs plan-hook enter|exit` (matchers EnterPlanMode /
+//                    ExitPlanMode) — plan mode as the task-forming ritual (t#253).
+// The CLI areas need no separate wiring — the hook hands Claude the cli.mjs path
+// and Claude calls `cli.mjs todos …` itself.
 
 /// Absolute path to the unified `cli.mjs`, forward-slashed for a clean
 /// settings.json command on Windows. In a packaged build it's the bundled
 /// resource; in `tauri dev` it's the repo's `scripts/` (preferred there, since
 /// the resource copy under target/ is wiped on rebuild).
-fn cc_hook_script_path(app: &AppHandle) -> Result<String, String> {
+pub(crate) fn cc_hook_script_path(app: &AppHandle) -> Result<String, String> {
     let resource = app
         .path()
         .resolve("scripts/cli.mjs", tauri::path::BaseDirectory::Resource)
@@ -1773,10 +1994,10 @@ fn claude_settings_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(home.join(".claude").join("settings.json"))
 }
 
-/// True if any SessionStart hook command references cc-todos-hook.mjs.
-fn settings_has_cc_hook(v: &serde_json::Value) -> bool {
+/// True if any hook command under `event` (SessionStart / Stop) is ours.
+fn settings_has_cc_hook(v: &serde_json::Value, event: &str) -> bool {
     v.get("hooks")
-        .and_then(|h| h.get("SessionStart"))
+        .and_then(|h| h.get(event))
         .and_then(|s| s.as_array())
         .is_some_and(|groups| {
             groups.iter().any(|g| {
@@ -1791,65 +2012,251 @@ fn settings_has_cc_hook(v: &serde_json::Value) -> bool {
         })
 }
 
-#[derive(Serialize)]
-struct CcHookStatus {
-    installed: bool,
-    script_path: String,
-    settings_path: String,
+/// True if OUR command is wired under `event` inside the group whose `matcher`
+/// equals `matcher` (PostToolUse groups are matcher-scoped, unlike SessionStart /
+/// Stop where [`settings_has_cc_hook`] checks every group).
+fn settings_has_cc_hook_matched(v: &serde_json::Value, event: &str, matcher: &str) -> bool {
+    v.get("hooks")
+        .and_then(|h| h.get(event))
+        .and_then(|s| s.as_array())
+        .is_some_and(|groups| {
+            groups
+                .iter()
+                .filter(|g| g.get("matcher").and_then(|m| m.as_str()) == Some(matcher))
+                .any(|g| {
+                    g.get("hooks").and_then(|h| h.as_array()).is_some_and(|hs| {
+                        hs.iter().any(|hook| {
+                            hook.get("command")
+                                .and_then(|c| c.as_str())
+                                .is_some_and(is_our_hook_command)
+                        })
+                    })
+                })
+        })
 }
 
-/// Whether the SessionStart hook is already wired, plus the paths involved.
-#[tauri::command]
-fn cc_hook_status(app: AppHandle) -> Result<CcHookStatus, String> {
-    let settings = claude_settings_path(&app)?;
-    let installed = std::fs::read_to_string(&settings)
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .map(|v| settings_has_cc_hook(&v))
-        .unwrap_or(false);
-    Ok(CcHookStatus {
-        installed,
-        script_path: cc_hook_script_path(&app).unwrap_or_default(),
-        settings_path: settings.to_string_lossy().replace('\\', "/"),
-    })
-}
-
-/// Wire the SessionStart hook into ~/.claude/settings.json. Idempotent: updates an
-/// existing cc-todos entry's path in place, or appends a new group; preserves all
-/// other hooks and keys. Atomic write (temp → rename). Returns the wired path.
-#[tauri::command]
-fn install_cc_hook(app: AppHandle) -> Result<String, String> {
-    let script = cc_hook_script_path(&app)?;
-    let command = format!("node \"{script}\" hook");
-    let settings_path = claude_settings_path(&app)?;
-
-    let mut root: serde_json::Value = std::fs::read_to_string(&settings_path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-    if !root.is_object() {
-        root = serde_json::json!({});
-    }
-
-    let obj = root.as_object_mut().unwrap();
+/// Wire one MATCHER-scoped hook (PostToolUse) to `command`. The plain
+/// [`wire_hook_event`] rewrites OUR entry under every group of an event — correct
+/// for SessionStart/Stop with their single entry, wrong for PostToolUse where two
+/// of our entries live under different matchers (EnterPlanMode vs ExitPlanMode)
+/// and would clobber each other. This variant scopes the rewrite to the group
+/// with this exact `matcher`, appending `{matcher, hooks:[…]}` when absent.
+/// Foreign matchers and foreign hooks inside our matcher's group are untouched.
+fn wire_hook_event_matched(
+    root: &mut serde_json::Value,
+    event: &str,
+    matcher: &str,
+    command: &str,
+) {
+    let obj = root.as_object_mut().expect("settings root is an object");
     let hooks = obj.entry("hooks").or_insert_with(|| serde_json::json!({}));
     if !hooks.is_object() {
         *hooks = serde_json::json!({});
     }
-    let ss = hooks
+    let ev = hooks
         .as_object_mut()
         .unwrap()
-        .entry("SessionStart")
+        .entry(event)
         .or_insert_with(|| serde_json::json!([]));
-    if !ss.is_array() {
-        *ss = serde_json::json!([]);
+    if !ev.is_array() {
+        *ev = serde_json::json!([]);
     }
-    let groups = ss.as_array_mut().unwrap();
+    let groups = ev.as_array_mut().unwrap();
 
-    // Update our command in place if already present (re-install / moved path).
-    // While doing so, note the dir of any LEGACY (cc-todos-hook.mjs) entry so its
-    // now-orphan cc-*.mjs scripts can be deleted after the write — migrating to
-    // cli.mjs shouldn't leave the old standalone scripts piling up on disk.
+    let mut updated = false;
+    for g in groups.iter_mut() {
+        if g.get("matcher").and_then(|m| m.as_str()) != Some(matcher) {
+            continue;
+        }
+        if let Some(hs) = g.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+            for hook in hs.iter_mut() {
+                if hook
+                    .get("command")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(is_our_hook_command)
+                {
+                    hook["command"] = serde_json::Value::String(command.to_string());
+                    updated = true;
+                }
+            }
+        }
+    }
+    if !updated {
+        groups.push(serde_json::json!({
+            "matcher": matcher,
+            "hooks": [ { "type": "command", "command": command } ]
+        }));
+    }
+}
+
+/// The script path OUR SessionStart entry actually points at (the first quoted
+/// span of the command), whatever it is — not the path this build would wire.
+/// The two diverge after the app moves (a reinstall elsewhere, a dev checkout
+/// that was relocated), and that divergence is exactly the failure we hide today.
+fn wired_script_path(root: &serde_json::Value, event: &str) -> Option<String> {
+    root.get("hooks")?
+        .get(event)?
+        .as_array()?
+        .iter()
+        .filter_map(|g| g.get("hooks")?.as_array())
+        .flatten()
+        .filter_map(|h| h.get("command")?.as_str())
+        .find(|c| is_our_hook_command(c))
+        .and_then(|cmd| {
+            let start = cmd.find('"')?;
+            let rest = &cmd[start + 1..];
+            let end = rest.find('"')?;
+            Some(rest[..end].to_string())
+        })
+}
+
+#[derive(Serialize)]
+struct CcHookStatus {
+    installed: bool,
+    /// The Stop hook (HANDOFF guard) specifically — an install from before it
+    /// existed has `installed: true` but no Stop entry, so the UI can offer a
+    /// re-install rather than silently running without the guard.
+    stop_installed: bool,
+    /// The whole plan-mode wiring (t#253, t#318) — same story: an older install
+    /// lacks it until a re-install wires the EnterPlanMode/ExitPlanMode entries,
+    /// the keyboard-entry path and the PreToolUse format guard.
+    plan_installed: bool,
+    /// What this build WOULD wire (bundled resource, or the repo in dev).
+    script_path: String,
+    /// What settings.json currently points at, and whether that file is still
+    /// there. A wired-but-missing script is the silent failure: Claude Code runs
+    /// `node "<gone>"`, gets nothing, and the session simply has no tasks — while
+    /// the UI, which used to check only that SOME entry existed, said "Installed".
+    wired_path: String,
+    wired_path_exists: bool,
+    settings_path: String,
+}
+
+/// Whether our hooks are already wired, plus the paths involved.
+#[tauri::command]
+fn cc_hook_status(app: AppHandle) -> Result<CcHookStatus, String> {
+    let settings = claude_settings_path(&app)?;
+    let root = std::fs::read_to_string(&settings)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+    let wired = root
+        .as_ref()
+        .and_then(|v| wired_script_path(v, "SessionStart"))
+        .unwrap_or_default();
+    Ok(CcHookStatus {
+        installed: root
+            .as_ref()
+            .map(|v| settings_has_cc_hook(v, "SessionStart"))
+            .unwrap_or(false),
+        stop_installed: root
+            .as_ref()
+            .map(|v| settings_has_cc_hook(v, "Stop"))
+            .unwrap_or(false),
+        plan_installed: root
+            .as_ref()
+            .map(|v| {
+                settings_has_cc_hook_matched(v, "PostToolUse", "EnterPlanMode")
+                    && settings_has_cc_hook_matched(v, "PostToolUse", "ExitPlanMode")
+                    // The keyboard-entry path: an install without it delivers the
+                    // format only when the model calls EnterPlanMode itself.
+                    && settings_has_cc_hook(v, "UserPromptSubmit")
+                    // The format GUARD (t#318). Without this entry the plan is
+                    // still only ASKED for, and t#309 measured what asking buys —
+                    // so an install that lacks it is incomplete, not merely older.
+                    && settings_has_cc_hook_matched(v, "PreToolUse", "ExitPlanMode")
+            })
+            .unwrap_or(false),
+        script_path: cc_hook_script_path(&app).unwrap_or_default(),
+        wired_path_exists: !wired.is_empty() && Path::new(&wired).exists(),
+        wired_path: wired,
+        settings_path: settings.to_string_lossy().replace('\\', "/"),
+    })
+}
+
+/// Re-point our hooks at this build when the wired script is GONE (app moved or
+/// reinstalled elsewhere, dev checkout relocated). Runs on every app start.
+///
+/// Deliberately narrow, because it edits a config the user owns:
+///   • only when our entry is ALREADY there — never wires the hook for someone
+///     who didn't ask for it;
+///   • only when the wired file does NOT exist — a live path that merely differs
+///     from this build's (a deliberate dev checkout) is left alone;
+///   • silent and best-effort: any failure leaves settings.json untouched.
+/// Returns the healed path, if it healed anything.
+fn heal_cc_hook(app: &AppHandle) -> Option<String> {
+    let settings_path = claude_settings_path(app).ok()?;
+    let mut root: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings_path).ok()?).ok()?;
+    if !root.is_object() || !settings_has_cc_hook(&root, "SessionStart") {
+        return None; // not our user — don't install anything uninvited
+    }
+    let wired = wired_script_path(&root, "SessionStart")?;
+    if Path::new(&wired).exists() {
+        return None; // still a real file → nothing to heal
+    }
+
+    let script = cc_hook_script_path(app).ok()?;
+    wire_hook_event(&mut root, "SessionStart", &format!("node \"{script}\" hook"));
+    wire_hook_event(&mut root, "Stop", &format!("node \"{script}\" stop-hook"));
+    wire_hook_event_matched(
+        &mut root,
+        "PostToolUse",
+        "EnterPlanMode",
+        &format!("node \"{script}\" plan-hook enter"),
+    );
+    wire_hook_event_matched(
+        &mut root,
+        "PostToolUse",
+        "ExitPlanMode",
+        &format!("node \"{script}\" plan-hook exit"),
+    );
+    wire_hook_event_matched(
+        &mut root,
+        "PreToolUse",
+        "ExitPlanMode",
+        &format!("node \"{script}\" plan-guard"),
+    );
+    wire_hook_event(
+        &mut root,
+        "UserPromptSubmit",
+        &format!("node \"{script}\" plan-hook prompt"),
+    );
+    wire_hook_event_matched(
+        &mut root,
+        "PostToolUse",
+        "Read|Grep|Glob",
+        &format!("node \"{script}\" plan-hook prompt"),
+    );
+    let json = serde_json::to_string_pretty(&root).ok()?;
+    let tmp = settings_path.with_extension("json.tmp");
+    std::fs::write(&tmp, json.as_bytes()).ok()?;
+    std::fs::rename(&tmp, &settings_path).ok()?;
+    Some(script)
+}
+
+/// Wire one hook event (SessionStart / Stop) to `command` inside a settings root.
+///
+/// Idempotent: rewrites OUR entry under that event in place (a moved install dir,
+/// or an upgrade from the legacy standalone script), otherwise appends a group.
+/// Every foreign hook is left untouched — the user's own Stop hooks keep running
+/// alongside ours. Returns the dirs of any legacy `cc-todos-hook.mjs` entries it
+/// replaced, so the caller can clean up the orphaned scripts.
+fn wire_hook_event(root: &mut serde_json::Value, event: &str, command: &str) -> Vec<PathBuf> {
+    let obj = root.as_object_mut().expect("settings root is an object");
+    let hooks = obj.entry("hooks").or_insert_with(|| serde_json::json!({}));
+    if !hooks.is_object() {
+        *hooks = serde_json::json!({});
+    }
+    let ev = hooks
+        .as_object_mut()
+        .unwrap()
+        .entry(event)
+        .or_insert_with(|| serde_json::json!([]));
+    if !ev.is_array() {
+        *ev = serde_json::json!([]);
+    }
+    let groups = ev.as_array_mut().unwrap();
+
     let mut updated = false;
     let mut legacy_dirs: Vec<PathBuf> = Vec::new();
     for g in groups.iter_mut() {
@@ -1867,7 +2274,7 @@ fn install_cc_hook(app: AppHandle) -> Result<String, String> {
                             }
                         }
                     }
-                    hook["command"] = serde_json::Value::String(command.clone());
+                    hook["command"] = serde_json::Value::String(command.to_string());
                     updated = true;
                 }
             }
@@ -1878,6 +2285,81 @@ fn install_cc_hook(app: AppHandle) -> Result<String, String> {
             "hooks": [ { "type": "command", "command": command } ]
         }));
     }
+    legacy_dirs
+}
+
+/// Wire BOTH our hooks into ~/.claude/settings.json — SessionStart (task
+/// context) and Stop (the HANDOFF freshness guard, issue #59). Idempotent: updates
+/// an existing entry's path in place, or appends a new group; preserves all other
+/// hooks and keys. Atomic write (temp → rename). Returns the wired script path.
+#[tauri::command]
+fn install_cc_hook(app: AppHandle) -> Result<String, String> {
+    let script = cc_hook_script_path(&app)?;
+    let settings_path = claude_settings_path(&app)?;
+
+    let mut root: serde_json::Value = std::fs::read_to_string(&settings_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !root.is_object() {
+        root = serde_json::json!({});
+    }
+
+    // The dirs of any LEGACY (cc-todos-hook.mjs) entries we rewired — their
+    // now-orphan cc-*.mjs scripts get deleted after the write, so migrating to
+    // cli.mjs doesn't leave the old standalone scripts piling up on disk.
+    let mut legacy_dirs = wire_hook_event(
+        &mut root,
+        "SessionStart",
+        &format!("node \"{script}\" hook"),
+    );
+    legacy_dirs.extend(wire_hook_event(
+        &mut root,
+        "Stop",
+        &format!("node \"{script}\" stop-hook"),
+    ));
+    // Plan-mode ritual (t#253): PostToolUse is matcher-scoped, one entry per tool.
+    wire_hook_event_matched(
+        &mut root,
+        "PostToolUse",
+        "EnterPlanMode",
+        &format!("node \"{script}\" plan-hook enter"),
+    );
+    wire_hook_event_matched(
+        &mut root,
+        "PostToolUse",
+        "ExitPlanMode",
+        &format!("node \"{script}\" plan-hook exit"),
+    );
+    // The format GUARD (t#318), on the way IN to ExitPlanMode: PostToolUse fires
+    // after the plan has been shown and approved, so a plan that is not a valid
+    // graph file can only be caught before the permission prompt, not after it.
+    wire_hook_event_matched(
+        &mut root,
+        "PreToolUse",
+        "ExitPlanMode",
+        &format!("node \"{script}\" plan-guard"),
+    );
+    // The EnterPlanMode entry above only fires when the MODEL calls that tool; a
+    // user flipping plan mode from the keyboard never triggers it, so the format
+    // never arrived (measured: 9 of 9 real plan-mode sessions entered by mode,
+    // only 3 also called the tool). These entries key off permission_mode in the
+    // payload and cover both ways in; a shared one-shot marker in plan-hook.mjs
+    // keeps them from injecting the format twice.
+    legacy_dirs.extend(wire_hook_event(
+        &mut root,
+        "UserPromptSubmit",
+        &format!("node \"{script}\" plan-hook prompt"),
+    ));
+    // ...and the same on the tools a planning session reaches for first, because
+    // UserPromptSubmit alone misses the mode being flipped AFTER the prompt was
+    // sent (measured: 12 seconds after, and no further prompt to carry it).
+    wire_hook_event_matched(
+        &mut root,
+        "PostToolUse",
+        "Read|Grep|Glob",
+        &format!("node \"{script}\" plan-hook prompt"),
+    );
 
     if let Some(dir) = settings_path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
@@ -2018,8 +2500,15 @@ struct MigrationReport {
 /// `todos.json` to a timestamped file BEFORE writing, so a wrong guess is one
 /// "Откатить" click away. A dry pass first counts the work: if nothing would
 /// change, it skips the backup and the write entirely.
-#[tauri::command]
-fn migrate_todo_refs(app: AppHandle) -> Result<MigrationReport, String> {
+///
+/// Runs on startup, not on a button. `#N` means a PR/issue now and only `t#N`
+/// links a task, so a board left unmigrated is not "older" — it is ambiguous,
+/// and every reader of stored prose has to keep understanding both spellings.
+/// There is no answer the user could give to "rewrite them?" that is about
+/// their work, so the question is gone. The rewrite still guesses (a `#N` whose
+/// number happens to match a task, with no PR word in front of it), hence the
+/// backup and the restore button stay — the report is told after the fact.
+fn migrate_todo_refs(app: &AppHandle) -> Result<MigrationReport, String> {
     let path = todos_path(&app)?;
     // Dry pass on a clone so we don't back up (or churn the file) for a no-op.
     let mut probe = todos::load(&path);
@@ -2064,23 +2553,53 @@ fn restore_todo_backup(
     })
 }
 
-/// All phase plans the tracker can find, across every project that has a
-/// `.claude/phases/` dir. Read-only: the plans are authored by the `cc-phases`
-/// CLI and live in each project. The frontend matches a plan to a task card by
-/// (project basename, task_number). The disk walk (resolve project paths, read
-/// each plan) runs off the async runtime so it can't stall the UI.
+/// Write the whole board to a file the user picked (#181). The frontend only opens
+/// the OS save dialog and hands the path down — the file is written here, so the app
+/// never needs a broad filesystem capability. Numbers are backfilled first so an
+/// exported board always carries stable `#N` references. Returns the task count.
 #[tauri::command]
-async fn get_phase_plans() -> Result<Vec<phases::Plan>, String> {
-    let claude = cc::claude_dir().ok_or("Cannot resolve Claude config directory")?;
-    tauri::async_runtime::spawn_blocking(move || {
-        let mut out = Vec::new();
-        for (base, path) in phases::project_paths(&claude) {
-            out.extend(phases::read_plans(&base, &path));
-        }
-        out
-    })
-    .await
-    .map_err(|e| e.to_string())
+fn export_todos(app: AppHandle, path: String) -> Result<usize, String> {
+    let mut file = todos::load(&todos_path(&app)?);
+    todos::ensure_numbers(&mut file);
+    let count = file.todos.len();
+    todos::save(std::path::Path::new(&path), &file)?;
+    Ok(count)
+}
+
+/// Read an exported board and report what importing it WOULD do — nothing is
+/// written. Backs the preview the user confirms before the merge runs.
+#[tauri::command]
+fn preview_todo_import(app: AppHandle, path: String) -> Result<todos::ImportReport, String> {
+    let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let incoming = todos::parse_import(&content)?;
+    let mut local = todos::load(&todos_path(&app)?);
+    todos::ensure_numbers(&mut local);
+    let now = chrono::Utc::now().to_rfc3339();
+    let (_, report) = todos::merge_import(&local, &incoming, &now);
+    Ok(report)
+}
+
+/// Merge an exported board into the local one and persist it (#181). Takes a backup
+/// BEFORE writing (the merge only ever adds, but a bad file is one "Откатить" away),
+/// then runs the merge under the write lock so the watcher's snapshot stays in
+/// lockstep. An empty incoming file is a no-op: no backup, no write.
+#[tauri::command]
+fn apply_todo_import(app: AppHandle, path: String) -> Result<todos::ImportReport, String> {
+    let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let incoming = todos::parse_import(&content)?;
+    if incoming.todos.is_empty() {
+        return Ok(todos::ImportReport::default());
+    }
+    let backup = todos::backup(&todos_path(&app)?)?;
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut report = todos::ImportReport::default();
+    write_todos_locked(&app, |file| {
+        let (merged, r) = todos::merge_import(file, &incoming, &now);
+        *file = merged;
+        report = r;
+    })?;
+    report.backup = Some(backup);
+    Ok(report)
 }
 
 /// Show the standalone Todo window (declared hidden in tauri.conf.json).
@@ -2235,6 +2754,7 @@ pub fn run() {
             }
         }))
         .plugin(tauri_plugin_store::Builder::default().build())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
@@ -2263,6 +2783,17 @@ pub fn run() {
                 if let Some(tray) = app.tray_by_id("main-tray") {
                     let _ = tray.set_tooltip(Some(format!("Claude Usage Tracker{suffix}")));
                 }
+            }
+
+            // Self-heal the Claude Code hooks: if they're wired to a script that
+            // no longer exists (the app was reinstalled elsewhere, a dev checkout
+            // moved), re-point them at this build. Otherwise Claude Code keeps
+            // running `node "<gone>"` every session, gets nothing, and the tasks
+            // silently stop reaching it — with the settings panel still saying
+            // "Installed". Only touches settings.json when OUR entry is already
+            // there and its path is dead (see heal_cc_hook).
+            if let Some(healed) = heal_cc_hook(app.handle()) {
+                info!("Re-pointed the Claude Code hooks at {healed} (the wired script was gone)");
             }
 
             // Diagnostics: route panics to a marker file in the log dir, and pick
@@ -2429,6 +2960,17 @@ pub fn run() {
                 });
             }
 
+            // Before anything reads the board: bring stored `#N` task references
+            // to the `t#N` form the rest of the app assumes.
+            match migrate_todo_refs(app.handle()) {
+                Ok(r) if r.refs > 0 => info!(
+                    "todo refs migrated: {} reference(s) in {} task(s), backup {}",
+                    r.refs, r.tasks, r.backup
+                ),
+                Ok(_) => {}
+                Err(e) => warn!("todo ref migration skipped: {e}"),
+            }
+
             spawn_poll_loop(app.handle().clone(), notify);
             spawn_status_loop(app.handle().clone());
             spawn_sysmon_loop(app.handle().clone());
@@ -2443,6 +2985,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             configure,
+            crate::spec::spec_projects,
+            crate::spec::spec_domains,
+            crate::spec::spec_section,
             refresh_now,
             open_claude,
             ensure_project,
@@ -2468,8 +3013,15 @@ pub fn run() {
             get_analytics_ext,
             export_analytics_json,
             get_todos,
+            get_changes,
+            close_change,
             get_corrections_metrics,
             refresh_corrections_metrics,
+            get_task_costs,
+            get_task_blocks,
+            get_task_graph,
+            reveal_transcript,
+            refresh_task_costs,
             get_triage_digest,
             get_triage_schedule,
             set_triage_schedule,
@@ -2491,10 +3043,11 @@ pub fn run() {
             set_todo_status,
             add_todo_dep,
             remove_todo_dep,
-            migrate_todo_refs,
             latest_todo_backup,
             restore_todo_backup,
-            get_phase_plans,
+            export_todos,
+            preview_todo_import,
+            apply_todo_import,
             open_todo_window,
             open_settings_window,
             enrollment_status,
@@ -2542,5 +3095,219 @@ mod hook_install_tests {
         // A second run over the now-clean dir must not error.
         remove_legacy_scripts(&dir);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The commands `install_cc_hook` wires, so the tests read like the real thing.
+    const SS_CMD: &str = r#"node "C:/app/scripts/cli.mjs" hook"#;
+    const STOP_CMD: &str = r#"node "C:/app/scripts/cli.mjs" stop-hook"#;
+
+    /// Every command wired under one hook event, in order.
+    fn commands_for(root: &serde_json::Value, event: &str) -> Vec<String> {
+        root["hooks"][event]
+            .as_array()
+            .map(|groups| {
+                groups
+                    .iter()
+                    .filter_map(|g| g["hooks"].as_array())
+                    .flatten()
+                    .filter_map(|h| h["command"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn wires_both_events_into_empty_settings() {
+        let mut root = serde_json::json!({});
+        wire_hook_event(&mut root, "SessionStart", SS_CMD);
+        wire_hook_event(&mut root, "Stop", STOP_CMD);
+        assert_eq!(commands_for(&root, "SessionStart"), vec![SS_CMD]);
+        assert_eq!(commands_for(&root, "Stop"), vec![STOP_CMD]);
+        assert!(settings_has_cc_hook(&root, "SessionStart"));
+        assert!(settings_has_cc_hook(&root, "Stop"));
+    }
+
+    #[test]
+    fn rewires_a_moved_install_in_place_without_duplicating() {
+        // An older install under a different path: re-installing must UPDATE it,
+        // not append a second entry that would run the hook twice.
+        let mut root = serde_json::json!({
+            "hooks": {
+                "SessionStart": [ { "hooks": [ { "type": "command", "command": r#"node "D:/old/cli.mjs" hook"# } ] } ],
+                "Stop": [ { "hooks": [ { "type": "command", "command": r#"node "D:/old/cli.mjs" stop-hook"# } ] } ]
+            }
+        });
+        wire_hook_event(&mut root, "SessionStart", SS_CMD);
+        wire_hook_event(&mut root, "Stop", STOP_CMD);
+        assert_eq!(commands_for(&root, "SessionStart"), vec![SS_CMD]);
+        assert_eq!(commands_for(&root, "Stop"), vec![STOP_CMD]);
+    }
+
+    #[test]
+    fn adds_the_stop_guard_to_an_install_that_predates_it() {
+        // The upgrade path: SessionStart was wired before the guard existed, and
+        // the user has their OWN Stop hook — ours is appended, theirs survives.
+        let foreign = r#"node "$HOME/knowledge/invariant-review.mjs""#;
+        let mut root = serde_json::json!({
+            "hooks": {
+                "SessionStart": [ { "hooks": [ { "type": "command", "command": SS_CMD } ] } ],
+                "Stop": [ { "hooks": [ { "type": "command", "command": foreign } ] } ]
+            }
+        });
+        assert!(!settings_has_cc_hook(&root, "Stop"));
+        wire_hook_event(&mut root, "SessionStart", SS_CMD);
+        wire_hook_event(&mut root, "Stop", STOP_CMD);
+        assert_eq!(commands_for(&root, "Stop"), vec![foreign, STOP_CMD]);
+        assert!(settings_has_cc_hook(&root, "Stop"));
+    }
+
+    #[test]
+    fn migrating_from_the_legacy_script_reports_its_dir_for_cleanup() {
+        let mut root = serde_json::json!({
+            "hooks": {
+                "SessionStart": [ { "hooks": [ { "type": "command", "command": r#"node "D:/x/scripts/cc-todos-hook.mjs""# } ] } ]
+            }
+        });
+        let legacy = wire_hook_event(&mut root, "SessionStart", SS_CMD);
+        assert_eq!(legacy, vec![PathBuf::from("D:/x/scripts")]);
+        assert_eq!(commands_for(&root, "SessionStart"), vec![SS_CMD]);
+    }
+
+    #[test]
+    fn reads_back_the_path_settings_actually_point_at() {
+        // The status must report the WIRED path, not the one this build would
+        // write — they diverge exactly when the install broke.
+        let root = serde_json::json!({
+            "hooks": {
+                "SessionStart": [
+                    { "hooks": [ { "type": "command", "command": r#"node "$HOME/other/tool.mjs""# } ] },
+                    { "hooks": [ { "type": "command", "command": r#"node "D:/gone/scripts/cli.mjs" hook"# } ] }
+                ]
+            }
+        });
+        assert_eq!(
+            wired_script_path(&root, "SessionStart").as_deref(),
+            Some("D:/gone/scripts/cli.mjs"),
+        );
+        // No entry of ours under Stop → nothing to report.
+        assert_eq!(wired_script_path(&root, "Stop"), None);
+    }
+
+    #[test]
+    fn healing_is_scoped_to_a_dead_path_on_an_existing_install() {
+        // The rule heal_cc_hook enforces, spelled out over its two inputs: we only
+        // rewrite when our entry EXISTS and the file it points at is GONE. A live
+        // path that merely differs from this build's (a deliberate dev checkout)
+        // must be left alone — healing it would hijack the user's own wiring.
+        let this_file = file!(); // a path that definitely exists
+        let should_heal = |has_entry: bool, wired: &str| has_entry && !Path::new(wired).exists();
+
+        assert!(should_heal(true, "D:/gone/scripts/cli.mjs")); // ours, dead → heal
+        assert!(!should_heal(true, this_file)); // ours, alive → leave it
+        assert!(!should_heal(false, "D:/gone/scripts/cli.mjs")); // not ours → never wire uninvited
+    }
+
+    #[test]
+    fn a_malformed_event_value_is_replaced_not_trusted() {
+        // Someone hand-wrote `"Stop": {}` (an object, not an array) — we reset it
+        // to a valid array rather than panicking or silently doing nothing.
+        let mut root = serde_json::json!({ "hooks": { "Stop": {} } });
+        wire_hook_event(&mut root, "Stop", STOP_CMD);
+        assert_eq!(commands_for(&root, "Stop"), vec![STOP_CMD]);
+    }
+
+    /// The plan-mode pair (t#253): PostToolUse entries are matcher-scoped.
+    const ENTER_CMD: &str = r#"node "C:/app/scripts/cli.mjs" plan-hook enter"#;
+    const EXIT_CMD: &str = r#"node "C:/app/scripts/cli.mjs" plan-hook exit"#;
+
+    fn wire_plan_pair(root: &mut serde_json::Value) {
+        wire_hook_event_matched(root, "PostToolUse", "EnterPlanMode", ENTER_CMD);
+        wire_hook_event_matched(root, "PostToolUse", "ExitPlanMode", EXIT_CMD);
+    }
+
+    #[test]
+    fn matched_wiring_keeps_the_two_matchers_apart() {
+        // The exact failure the matched variant exists for: the plain
+        // wire_hook_event would rewrite BOTH our PostToolUse entries to one
+        // command. Wiring the pair — and re-wiring it (an upgrade) — must leave
+        // exactly one entry per matcher, each with its own subcommand.
+        let mut root = serde_json::json!({});
+        wire_plan_pair(&mut root);
+        wire_plan_pair(&mut root); // idempotency: a re-install must not duplicate
+        assert_eq!(commands_for(&root, "PostToolUse"), vec![ENTER_CMD, EXIT_CMD]);
+        assert!(settings_has_cc_hook_matched(&root, "PostToolUse", "EnterPlanMode"));
+        assert!(settings_has_cc_hook_matched(&root, "PostToolUse", "ExitPlanMode"));
+    }
+
+    #[test]
+    fn matched_wiring_updates_a_moved_install_and_spares_foreign_matchers() {
+        // A moved install is re-pointed in place; a foreign PostToolUse hook
+        // (another tool's matcher group) survives untouched.
+        let foreign = r#"node "$HOME/lint/on-edit.mjs""#;
+        let mut root = serde_json::json!({
+            "hooks": { "PostToolUse": [
+                { "matcher": "Edit", "hooks": [ { "type": "command", "command": foreign } ] },
+                { "matcher": "EnterPlanMode", "hooks": [ { "type": "command", "command": r#"node "D:/old/cli.mjs" plan-hook enter"# } ] }
+            ] }
+        });
+        wire_plan_pair(&mut root);
+        assert_eq!(
+            commands_for(&root, "PostToolUse"),
+            vec![foreign, ENTER_CMD, EXIT_CMD],
+        );
+        // The foreign matcher's group is not "ours", even though ours exist now.
+        assert!(!settings_has_cc_hook_matched(&root, "PostToolUse", "Edit"));
+    }
+
+    /// The format guard (t#318) shares the ExitPlanMode matcher with `plan-hook
+    /// exit`, but lives under a different EVENT.
+    const GUARD_CMD: &str = r#"node "C:/app/scripts/cli.mjs" plan-guard"#;
+    const PROMPT_CMD: &str = r#"node "C:/app/scripts/cli.mjs" plan-hook prompt"#;
+
+    #[test]
+    fn the_guard_is_wired_under_pretooluse_without_disturbing_the_posttooluse_pair() {
+        // Same matcher, two events: if the event were ignored anywhere in the
+        // wiring, the guard and `plan-hook exit` would overwrite each other and
+        // the plan would be checked only after the user had approved it.
+        let mut root = serde_json::json!({});
+        wire_plan_pair(&mut root);
+        wire_hook_event_matched(&mut root, "PreToolUse", "ExitPlanMode", GUARD_CMD);
+        wire_hook_event_matched(&mut root, "PreToolUse", "ExitPlanMode", GUARD_CMD); // re-install
+        assert_eq!(commands_for(&root, "PreToolUse"), vec![GUARD_CMD]);
+        assert_eq!(commands_for(&root, "PostToolUse"), vec![ENTER_CMD, EXIT_CMD]);
+        assert!(settings_has_cc_hook_matched(&root, "PreToolUse", "ExitPlanMode"));
+    }
+
+    #[test]
+    fn a_moved_install_re_points_the_guard_and_spares_a_foreign_pretooluse_hook() {
+        let foreign = r#"node "$HOME/audit/before-bash.mjs""#;
+        let mut root = serde_json::json!({
+            "hooks": { "PreToolUse": [
+                { "matcher": "Bash", "hooks": [ { "type": "command", "command": foreign } ] },
+                { "matcher": "ExitPlanMode", "hooks": [ { "type": "command", "command": r#"node "D:/old/cli.mjs" plan-guard"# } ] }
+            ] }
+        });
+        wire_hook_event_matched(&mut root, "PreToolUse", "ExitPlanMode", GUARD_CMD);
+        assert_eq!(commands_for(&root, "PreToolUse"), vec![foreign, GUARD_CMD]);
+        assert!(!settings_has_cc_hook_matched(&root, "PreToolUse", "Bash"));
+    }
+
+    #[test]
+    fn an_install_without_the_guard_does_not_count_as_plan_mode_installed() {
+        // What `plan_installed` reports drives the re-install the UI offers, so an
+        // install made before t#318 has to read as incomplete — otherwise the
+        // panel says "installed" and the plan is never checked.
+        let plan_installed = |v: &serde_json::Value| {
+            settings_has_cc_hook_matched(v, "PostToolUse", "EnterPlanMode")
+                && settings_has_cc_hook_matched(v, "PostToolUse", "ExitPlanMode")
+                && settings_has_cc_hook(v, "UserPromptSubmit")
+                && settings_has_cc_hook_matched(v, "PreToolUse", "ExitPlanMode")
+        };
+        let mut root = serde_json::json!({});
+        wire_plan_pair(&mut root);
+        wire_hook_event(&mut root, "UserPromptSubmit", PROMPT_CMD);
+        assert!(!plan_installed(&root));
+        wire_hook_event_matched(&mut root, "PreToolUse", "ExitPlanMode", GUARD_CMD);
+        assert!(plan_installed(&root));
     }
 }

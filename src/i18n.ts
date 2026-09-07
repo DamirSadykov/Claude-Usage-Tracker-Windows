@@ -148,6 +148,9 @@ const messages = {
     updateLater: "Later",
     restartNow: "Restart",
     updateError: "Update check failed",
+    updateInstalling: "Installing…",
+    saving: "Saving…",
+    saved: "Saved ✓",
     diagProblem: "Something went wrong. Help us fix it?",
     diagCrashed: "The app crashed on the previous run.",
     reportIssue: "Report a problem",
@@ -173,6 +176,8 @@ const messages = {
     todoDeleteConfirmBody: "This can't be undone:",
     todoEmpty: "No tasks yet",
     todoSubjectPlaceholder: "What needs doing?",
+    todoSubjectRemaining: "{n} characters left",
+    todoSubjectOverLimit: "{n} characters over the limit",
     todoDescription: "Description",
     todoPlan: "Plan",
     todoPlanHint: "you write it — not generated",
@@ -180,12 +185,13 @@ const messages = {
     todoHandoffHint: "what this task hands to the tasks that depend on it",
     todoHandoffInherited: "Inherited from dependencies",
     todoHandoffItemEmpty: "no handoff — nothing carried forward",
-    phasesLabel: "Phases",
-    visionLabel: "Vision",
-    phasesSetting: "Phases in tasks",
-    phasesSettingDesc:
-      "Show phase checkboxes on task cards.",
-    todoEstimate: "Estimate (min)",
+    taskGuardSetting: "HANDOFF guard for tasks",
+    taskGuardDesc:
+      "Which tasks must leave a handoff before the session ends. A task's baton is what a dependent task inherits — without it, the next task starts blind.",
+    taskGuardBoth: "Submitted and unfinished",
+    taskGuardSubmitted: "Only moved to review/done",
+    taskGuardUnfinished: "Only left in progress",
+    taskGuardOff: "Off",
     todoScheduledFor: "When",
     todoPriority: "Priority",
     todoPriorityNone: "No priority",
@@ -199,14 +205,9 @@ const messages = {
     taskCtxPrioLow: "Low and above",
     taskCtxPrioMedium: "Medium and above",
     taskCtxPrioHigh: "High only",
-    sessionCtxSetting: "Session context",
-    sessionCtxDesc:
-      "What a session leads with when the project has an active phase plan: the current phase (focused) or always the task board.",
-    sessionCtxPhase: "Active phase",
-    sessionCtxTasks: "Always tasks",
     hookContextSetting: "Task context in sessions",
     hookContextSettingDesc:
-      "Inject your active tasks — and, mid-plan, the current phase — into every Claude Code session (SessionStart hook). Off: sessions start with no task/phase context.",
+      "Inject your active tasks into every Claude Code session (SessionStart hook). Off: sessions start with no task context.",
     todoProject: "Project",
     todoProjectPlaceholder: "e.g. my-app (optional)",
     todoShowDone: "Show done",
@@ -247,6 +248,55 @@ const messages = {
     statusMapEmpty: "Statuses will appear here after the first external-task poll.",
     viewBoard: "Board",
     viewGraph: "Graph",
+    viewSpecs: "Specs",
+    graphUiNew: "New layout",
+    graphUiOld: "Classic layout",
+    specRefresh: "Re-read the registry",
+    specNoDomains: "No specs in this project — the registry looks for <domain>/spec.md under specRoot",
+    specTryThese: "Projects that do have one:",
+    specBySection: "By section",
+    specByChange: "By change",
+    specConcurrent: "Two or more open changes touch this section — the second stamp overwrites the first's provenance",
+    specFocus: "Show only the bullets this change wrote",
+    specFocusOff: "show all",
+    specDiffLive: "in flight — against the file as it stands now",
+    specDiffFrozen: "recorded when the change closed",
+    todoSpec: "Spec",
+    todoSpecInherited: "inherited from the change root",
+    todoSpecHint: "Open this section on the Specs tab",
+    // --- per-block help for the Specs tab (shared insight-help markdown) ---
+    specHelpRegistry:
+      "## What this list is\n" +
+      "The spec domains of the selected project and the sections inside each. The registry reads `<domain>/spec.md` under `specRoot` (a setting, `docs/specs` by default); the project directory itself comes from the Claude Code transcripts.\n\n" +
+      "- Projects that have a registry are listed first; the rest are marked with a dot.\n" +
+      "- A section's address is `<domain>#<slug>` — the same string a task uses to link to it.\n" +
+      "- `part` is the section's role: requirements (what must exist), design (how it is built), invariants (what must not break).\n" +
+      "- A section marked external is declared here while its text lives in another repository.",
+    specHelpSection:
+      "## The spec section\n" +
+      "The long-lived state of a subsystem — what stays true between tasks. The SECTION, not the file, is the unit of reading: taking a linked task puts exactly this into the session's context.\n\n" +
+      "- The date and `t#N` on the right say when the section last moved and which change moved it.\n" +
+      "- `refs` are the neighbouring sections this one looks at. They are kept as addresses, never as text: follow one only when you actually need it.\n" +
+      "- The size guide is about 120 lines. A section past it is split in two, or injecting one section quietly becomes injecting half the file again.",
+    specHelpChanges:
+      "## Changes on this section\n" +
+      "Tasks whose `spec` field names this address. A change is the DELTA to the spec — what this round changes and why now. Under a change root its task graph is expanded.\n\n" +
+      "- The link is made with `todos set spec <task> <domain>#<slug>`.\n" +
+      "- A step inherits its change root's address when it declares none of its own.\n" +
+      "- Clicking a row opens that task's card.",
+    specHelpAnswers:
+      "## Closing answers\n" +
+      "When a session closes a linked task, the Stop hook shows it this section IN FULL and will not let it stop without an answer: `unchanged` — the section still holds, `updated` — it drifted and was edited.\n\n" +
+      "- The answer is given with `cli spec answer`, not as a phrase in the conversation: the guard looks for a record, because a guard that matches wording only teaches you to reword.\n" +
+      "- `updated` stamps the section's date and change for you.\n" +
+      "- The answers are listed together on purpose: the same boilerplate given to different sections is only visible side by side.",
+
+    specPickSection: "Pick a section on the left",
+    specExternal: "external",
+    specChanges: "Changes on this section",
+    specNoChanges: "No task links to this section (todos set spec <task> <domain>#<slug>)",
+    specAnswers: "Closing answers",
+    specNoAnswers: "No task has answered for this section yet",
     graphTabDeps: "Dependencies",
     graphTabRef: "References",
     graphExternal: "other project",
@@ -257,14 +307,77 @@ const messages = {
     graphHintRef:
       "Left-click a node to highlight its links · right-click a node to open it · read-only: references come from t#N mentions in the task text — unlink by editing it",
     graphRemoveDep: "Remove this dependency",
+    graphRemoveDepTitle: "Remove this dependency?",
+    graphRemoveDepRel: "depends on",
     graphDepRedundant: "Already linked: {path}",
     graphEmptyDeps: "No dependencies yet — drag one task onto another to make one blocked by the other",
     graphEmptyRef: "No references on this board — mention a task by t#N in another task's text to link them",
     graphResetView: "Reset view",
     graphStatusFilter: "Which statuses to show",
+    graphKindAuto: "Auto node — a headless runner may run it unattended (#88)",
+    graphPipeBlocked: "Blocked — waiting on a prerequisite",
+    graphPipeReadyAuto: "Ready — no open deps; an auto node a runner could pick up",
+    graphPipeReadyManual: "Ready — no open deps; waiting for you (manual gate)",
+    graphSearch: "Find node…",
+    graphSearchHint: "#number or text · Enter jumps to the next match",
+    graphSearchNoMatch: "no matches",
+    graphFocusComponent: "Component only",
+    graphFocusHint: "Show only the tasks connected to the selected one (its connectivity component)",
+    graphFocusChip: "only {task}",
+    graphCollapseChange: "Fold this task's prerequisite subtree (change) into one node",
+    graphExpandChange: "Unfold the hidden subtree — the badge is its done/total",
+    graphLegendChange: "collapsed change — done/total of the folded subtree",
+    graphRun: "Run layer",
+    graphRunHint:
+      "Overlay what each task actually cost: money, time and agents per node, from the binding journal (t#306). Only tasks inside a change carry it.",
+    graphRunLoading: "reading blocks…",
+    graphRunNoData: "No change on this view carries run data yet",
+    graphRunMeasured: "measured",
+    // Short forms go INSIDE the node (190px wide); the full wording is the
+    // tooltip and the panel.
+    graphRunNoInProgress: "not worked",
+    graphRunNoBlocks: "no journal",
+    graphRunEmptyBlocks: "empty block",
+    graphRunNoInProgressFull: "never taken into work — no block exists",
+    graphRunNoBlocksFull: "the session predates the binding journal",
+    graphRunEmptyBlocksFull: "block is degenerate — the work landed in a neighbour",
+    graphRunCalendar: "span (calendar time of the change, not work)",
+    graphRunPanel: "Run of #{n}",
+    graphRunBlocks: "Blocks",
+    graphRunAgents: "Who worked",
+    graphRunMainLoop: "main loop",
+    graphRunTranscript: "transcript",
+    graphRunTranscriptHint: "Show this block's transcript in the file manager",
+    graphRunAgentTranscriptHint:
+      "Show this agent's transcript. Available while the task has a single block — with several, which session ran the agent is not recorded.",
+    graphRunTaskCost: "whole task",
+    graphRunUnattributed: "outside the blocks",
+    graphRunNoBlockRows: "No blocks — nothing bound this task to a session",
+    graphRunClose: "Close",
     todoFilterAll: "All projects",
     todoFrom: "from",
     todoFromHint: "Filed from this project (a cross-project task)",
+    todoImported: "import",
+    todoImportedHint:
+      "Arrived via a board import. If a task with the same id already existed here, this is the incoming copy — your original was kept untouched, so reconcile the two and delete one.",
+    todoCostHint: "Claude Code spend attributed to this task",
+    todoCostSessions: "session(s)",
+    todoCostTokens: "tokens",
+    todoBlocks: "Cost by block",
+    todoBlocksHint:
+      "One block = this task worked by one session over one stretch of time. A session binds itself with `todos take <id>`, or implicitly when it moves the task to in_progress.",
+    todoBlocksEmpty:
+      "No blocks yet — no session has bound itself to this task. Older work is attributed per whole session instead.",
+    todoBlocksExplicit: "declared",
+    todoBlocksAuto: "guessed",
+    todoBlocksAutoHint:
+      "Bound automatically by the SessionStart hook because this was the only in_progress task — not declared by the session itself.",
+    todoBlocksCalls: "calls",
+    todoBlocksErrors: "errors",
+    todoBlocksSum: "blocks total",
+    todoBlocksOutside: "outside blocks",
+    todoBlocksOutsideHint:
+      "Attributed to the task but not inside any block: work between blocks, or sessions that predate the binding journal. Not an error — it is the part the block split cannot place.",
     statusPending: "Pending",
     statusInProgress: "In progress",
     statusDone: "Done",
@@ -583,22 +696,46 @@ const messages = {
       "Keep the placeholders <BOARD>, <STAGING>, <TODAY> (filled in at run time) and the digest output contract (kinds overdue / stale / no_priority / suggestion).",
     migrateTitle: "Task references (#N → t#N)",
     migrateDesc:
-      "A bare #N now reads as a GitHub PR/issue and no longer links to a task — only the explicit t#N form does. This rewrites the genuine #N task references already in your tasks to t#N. It backs up todos.json first; Restore undoes it. Optional: run it once to fix existing text — going forward the CLI and Claude Code hook already instruct the agent to write t#N.",
-    migrateRun: "Migrate #N → t#N",
-    migrateRunning: "Migrating…",
-    migrateNone: "Nothing to migrate — no task references needed rewriting.",
-    migrateDone: "Done: rewrote {refs} reference(s) across {tasks} task(s).",
+      "A bare #N reads as a GitHub PR/issue and no longer links to a task — only the explicit t#N form does. Genuine #N task references in stored text are rewritten to t#N on startup, so a board never carries both spellings at once. The rewrite has to guess (a number that matches a task, with no PR word in front), so todos.json is backed up before it and Restore undoes it.",
     migrateRestore: "Restore",
     migrateRestoring: "Restoring…",
     migrateRestored: "Restored from the latest backup.",
     migrateRestoreConfirm:
       "Restore todos.json from the latest backup? Any changes made after that backup will be lost.",
     migrateBackupAt: "Latest backup: {date}",
+    ioTitle: "Import / export tasks",
+    ioDesc:
+      "Move your board between machines. Import MERGES — it never overwrites and never drops: a task number already taken here is reassigned, and an incoming task that also exists locally is added as a NEW task (marked «import») instead of replacing yours. A backup is taken first, so Restore above undoes an import too.",
+    ioExport: "Export…",
+    ioExporting: "Exporting…",
+    ioExported: "Exported {count} task(s).",
+    ioImport: "Import…",
+    ioReading: "Reading…",
+    ioImportEmpty: "That file has no tasks to import.",
+    ioImportNothingNew: "Nothing new — every task in that file is already on the board.",
+    ioPreviewTitle: "Nothing has been written yet — this is what the import would do:",
+    ioStatAdded: "{n} new task(s) added as-is",
+    ioStatRenumbered: "{n} renumbered (their number is already taken here)",
+    ioStatForked: "{n} added as NEW tasks — they also exist here, so your version is kept untouched",
+    ioStatUnchanged: "{n} already on the board, unchanged — skipped",
+    ioStatDropped: "{n} link(s) dropped (pointing outside the board, or cyclic)",
+    ioKind_added: "new",
+    ioKind_renumbered: "renumbered",
+    ioKind_forked: "fork",
+    ioMore: "…and {n} more",
+    ioApply: "Import",
+    ioApplying: "Importing…",
+    ioCancel: "Cancel",
+    ioImported: "Imported: {added} added, {forked} filed as new. {total} task(s) on the board.",
     installCcHook: "Claude Code CLI + hook",
     installCcHookDesc:
-      "Wire the SessionStart hook into ~/.claude/settings.json so every Claude Code session sees this project's tasks and edits them via the cc-todos CLI.",
+      "Wire the SessionStart and Stop hooks into ~/.claude/settings.json so every Claude Code session sees this project's tasks, edits them via the cc-todos CLI, and can't end a session that worked a task without leaving a handoff.",
     installCcHookOn: "Installed",
     installCcHookOff: "Not installed",
+    installCcHookStopMissing:
+      "The Stop hook (HANDOFF guard) isn't wired yet — reinstall to add it.",
+    installCcHookBroken:
+      "The wired script no longer exists — Claude Code has been getting nothing from it. Reinstall to re-point the hook (the app also repairs this on start).",
     installCcHookBtn: "Install",
     installCcHookReinstall: "Reinstall / update path",
     installCcHookDone: "Done — wired {path}",
@@ -764,6 +901,9 @@ const messages = {
     updateLater: "Позже",
     restartNow: "Перезапустить",
     updateError: "Не удалось проверить обновления",
+    updateInstalling: "Установка…",
+    saving: "Сохранение…",
+    saved: "Сохранено ✓",
     diagProblem: "Что-то пошло не так. Помочь нам это исправить?",
     diagCrashed: "В прошлый раз приложение завершилось с ошибкой.",
     reportIssue: "Сообщить о проблеме",
@@ -789,6 +929,8 @@ const messages = {
     todoDeleteConfirmBody: "Это нельзя отменить:",
     todoEmpty: "Пока нет задач",
     todoSubjectPlaceholder: "Что нужно сделать?",
+    todoSubjectRemaining: "осталось {n} симв.",
+    todoSubjectOverLimit: "превышение на {n} симв.",
     todoDescription: "Описание",
     todoPlan: "План",
     todoPlanHint: "пишешь ты — не генерируется",
@@ -796,12 +938,13 @@ const messages = {
     todoHandoffHint: "что задача передаёт тем, кто от неё зависит",
     todoHandoffInherited: "Наследуется от зависимостей",
     todoHandoffItemEmpty: "нет handoff — переносить нечего",
-    phasesLabel: "Фазы",
-    visionLabel: "Видение",
-    phasesSetting: "Фазы в задачах",
-    phasesSettingDesc:
-      "Показывать чекбоксы фаз на карточках задач.",
-    todoEstimate: "Оценка (мин)",
+    taskGuardSetting: "Guard HANDOFF для задач",
+    taskGuardDesc:
+      "Какие задачи обязаны оставить handoff до конца сессии. Батон задачи — это то, что наследует зависимая задача; без него следующая задача стартует вслепую.",
+    taskGuardBoth: "Сданные и недоделанные",
+    taskGuardSubmitted: "Только переведённые в review/done",
+    taskGuardUnfinished: "Только оставленные в работе",
+    taskGuardOff: "Выключен",
     todoScheduledFor: "Когда",
     todoPriority: "Приоритет",
     todoPriorityNone: "Без приоритета",
@@ -815,14 +958,9 @@ const messages = {
     taskCtxPrioLow: "Низкий и выше",
     taskCtxPrioMedium: "Средний и выше",
     taskCtxPrioHigh: "Только высокий",
-    sessionCtxSetting: "Контекст сессии",
-    sessionCtxDesc:
-      "С чего начинать сессию, когда у проекта есть активный план фаз: с текущей фазы (фокус) или всегда с доски задач.",
-    sessionCtxPhase: "Активная фаза",
-    sessionCtxTasks: "Всегда задачи",
     hookContextSetting: "Контекст задач в сессиях",
     hookContextSettingDesc:
-      "Вставлять ваши активные задачи — а в проекте с планом и текущую фазу — в каждую сессию Claude Code (хук SessionStart). Выкл.: сессии стартуют без контекста задач/фаз.",
+      "Вставлять ваши активные задачи в каждую сессию Claude Code (хук SessionStart). Выкл.: сессии стартуют без контекста задач.",
     todoProject: "Проект",
     todoProjectPlaceholder: "напр. my-app (необязательно)",
     todoShowDone: "Показать готовые",
@@ -863,6 +1001,55 @@ const messages = {
     statusMapEmpty: "Статусы появятся здесь после первого поллинга внешних задач.",
     viewBoard: "Доска",
     viewGraph: "Граф",
+    viewSpecs: "Спеки",
+    graphUiNew: "Новый вид",
+    graphUiOld: "Классический вид",
+    specRefresh: "Перечитать реестр",
+    specNoDomains: "В проекте нет спек — реестр ищет <домен>/spec.md внутри specRoot",
+    specTryThese: "Спеки есть у проектов:",
+    specBySection: "По разделам",
+    specByChange: "По change'ам",
+    specConcurrent: "На раздел открыто больше одного change'а — штамп второго затрёт провенанс первого",
+    specFocus: "Показать только пункты, которые написал этот change",
+    specFocusOff: "показать все",
+    specDiffLive: "в работе — против файла, каким он сейчас",
+    specDiffFrozen: "записан при закрытии change'а",
+    todoSpec: "Спека",
+    todoSpecInherited: "унаследована от change-root'а",
+    todoSpecHint: "Открыть раздел на вкладке «Спеки»",
+    // --- пояснения к блокам вкладки Specs (общий insight-help markdown) ---
+    specHelpRegistry:
+      "## Что это за список\n" +
+      "Домены реестра спек выбранного проекта и разделы внутри каждого. Реестр читает `<домен>/spec.md` внутри `specRoot` (настройка, по умолчанию `docs/specs`), а каталог самого проекта берётся из транскриптов Claude Code.\n\n" +
+      "- Проекты со спеками стоят в списке первыми, остальные помечены точкой.\n" +
+      "- Адрес раздела — `<домен>#<слаг>`, той же строкой задача на него ссылается.\n" +
+      "- `part` — роль раздела: требования (что должно быть), устройство (как сделано), инварианты (что не должно ломаться).\n" +
+      "- Раздел, помеченный как внешний, объявлен здесь, а текст его живёт в другом репозитории.",
+    specHelpSection:
+      "## Раздел спеки\n" +
+      "Долгоживущее состояние подсистемы — то, что остаётся верным между задачами. Единица чтения — РАЗДЕЛ, а не файл: при взятии слинкованной задачи в контекст сессии попадает ровно он.\n\n" +
+      "- Дата и `t#N` справа — когда раздел двигали в последний раз и какой change это сделал.\n" +
+      "- `refs` — соседние разделы, на которые этот смотрит. Хранятся адресами, а не текстом: разворачивать по ссылке стоит только тогда, когда сосед реально понадобился.\n" +
+      "- Ориентир размера — около 120 строк. Переросший раздел делят надвое, иначе впрыск одного раздела снова тихо становится впрыском половины файла.",
+    specHelpChanges:
+      "## Change'и на этом разделе\n" +
+      "Задачи, чьё поле `spec` называет этот адрес. Change — это ДЕЛЬТА к спеке: что меняется в этом заходе и почему сейчас. Под change-root'ом раскрыт его граф задач.\n\n" +
+      "- Связь ставится командой `todos set spec <задача> <домен>#<слаг>`.\n" +
+      "- Шаг наследует адрес своего change-root'а, если не объявил собственного.\n" +
+      "- Клик по строке открывает карточку задачи.",
+    specHelpAnswers:
+      "## Ответы при закрытии\n" +
+      "Когда сессия закрывает слинкованную задачу, Stop-хук показывает ей этот раздел ЦЕЛИКОМ и не отпускает без ответа: `unchanged` — раздел всё ещё верен, `updated` — разошёлся и правлен.\n\n" +
+      "- Ответ даётся командой `cli spec answer`, а не фразой в переписке: гард ищет запись, потому что гард, сверяющий формулировку, учит переформулировать, а не думать.\n" +
+      "- `updated` сам проставляет разделу дату и change.\n" +
+      "- Ответы стоят списком намеренно: одинаковая отписка на разные разделы видна только рядом.",
+
+    specPickSection: "Выберите раздел слева",
+    specExternal: "внешний",
+    specChanges: "Change'ы на этом разделе",
+    specNoChanges: "Ни одна задача не ссылается на раздел (todos set spec <задача> <домен>#<слаг>)",
+    specAnswers: "Ответы при закрытии",
+    specNoAnswers: "По этому разделу ещё никто не отвечал",
     graphTabDeps: "Зависимости",
     graphTabRef: "Ссылки",
     graphExternal: "другой проект",
@@ -873,14 +1060,77 @@ const messages = {
     graphHintRef:
       "ЛКМ по ноде — подсветить связи · ПКМ по ноде — открыть · только чтение: ссылки из упоминаний t#N в тексте, удаляются правкой текста",
     graphRemoveDep: "Удалить эту зависимость",
+    graphRemoveDepTitle: "Удалить эту связь?",
+    graphRemoveDepRel: "зависит от",
     graphDepRedundant: "Связь уже есть: {path}",
     graphEmptyDeps: "Зависимостей пока нет — перетащите одну задачу на другую, чтобы связать их",
     graphEmptyRef: "На этой доске нет ссылок — упомяните задачу через t#N в тексте другой, чтобы связать",
     graphResetView: "Сбросить вид",
     graphStatusFilter: "Какие статусы показывать",
+    graphKindAuto: "Auto-нода — headless-runner может выполнить без участия (#88)",
+    graphPipeBlocked: "Заблокирована — ждёт предшественника",
+    graphPipeReadyAuto: "Готова — открытых зависимостей нет; auto-нода, runner может взять",
+    graphPipeReadyManual: "Готова — открытых зависимостей нет; ждёт тебя (ручной гейт)",
+    graphSearch: "Найти узел…",
+    graphSearchHint: "#номер или текст · Enter — к следующему совпадению",
+    graphSearchNoMatch: "нет совпадений",
+    graphFocusComponent: "Только компонента",
+    graphFocusHint: "Показать только задачи, связанные с выбранной (её компоненту связности)",
+    graphFocusChip: "только {task}",
+    graphCollapseChange: "Свернуть поддерево-предпосылки этой задачи (change) в один узел",
+    graphExpandChange: "Развернуть скрытое поддерево — бейдж: готово/всего",
+    graphLegendChange: "свёрнутый change — готово/всего в свёрнутом поддереве",
+    graphRun: "Слой прогона",
+    graphRunHint:
+      "Наложить на граф, во что задача обошлась: деньги, время и агенты на узле — из журнала привязок (t#306). Есть только у задач внутри change'а.",
+    graphRunLoading: "читаю блоки…",
+    graphRunNoData: "Ни один change на этом виде пока не несёт данных прогона",
+    graphRunMeasured: "измерено",
+    // Короткие формы — ВНУТРЬ узла (ширина 190px); полная фраза идёт в подсказку
+    // и в панель.
+    graphRunNoInProgress: "не бралась",
+    graphRunNoBlocks: "нет журнала",
+    graphRunEmptyBlocks: "блок пуст",
+    graphRunNoInProgressFull: "не бралась в работу — блока нет",
+    graphRunNoBlocksFull: "сессия старше журнала привязок",
+    graphRunEmptyBlocksFull: "блок вырожден — работа ушла в соседний",
+    graphRunCalendar: "размах (календарное время change'а, не работа)",
+    graphRunPanel: "Прогон #{n}",
+    graphRunBlocks: "Блоки",
+    graphRunAgents: "Кто работал",
+    graphRunMainLoop: "главный цикл",
+    graphRunTranscript: "транскрипт",
+    graphRunTranscriptHint: "Показать транскрипт этого блока в проводнике",
+    graphRunAgentTranscriptHint:
+      "Показать транскрипт агента. Доступно, пока у задачи один блок — при нескольких не записано, в какой сессии агент работал.",
+    graphRunTaskCost: "по задаче целиком",
+    graphRunUnattributed: "вне блоков",
+    graphRunNoBlockRows: "Блоков нет — задачу ни одна сессия к себе не привязала",
+    graphRunClose: "Закрыть",
     todoFilterAll: "Все проекты",
     todoFrom: "из",
     todoFromHint: "Поставлена из этого проекта (кросс-проектная задача)",
+    todoImported: "импорт",
+    todoImportedHint:
+      "Пришла с импортом доски. Если задача с таким же id тут уже была — это входящая копия, ваш оригинал остался нетронутым: сверьте их и одну удалите.",
+    todoCostHint: "Атрибуцированная стоимость работы Claude Code по этой задаче",
+    todoCostSessions: "сессий",
+    todoCostTokens: "токенов",
+    todoBlocks: "Стоимость по блокам",
+    todoBlocksHint:
+      "Блок — это задача, которую одна сессия вела один отрезок времени. Сессия привязывает себя командой `todos take <id>` либо неявно, переводя задачу в in_progress.",
+    todoBlocksEmpty:
+      "Блоков пока нет — ни одна сессия не привязала себя к этой задаче. Прошлая работа считается целыми сессиями.",
+    todoBlocksExplicit: "объявлено",
+    todoBlocksAuto: "угадано",
+    todoBlocksAutoHint:
+      "Привязано автоматически хуком SessionStart, потому что задача была единственной в работе, — сама сессия этого не объявляла.",
+    todoBlocksCalls: "вызовов",
+    todoBlocksErrors: "ошибок",
+    todoBlocksSum: "сумма блоков",
+    todoBlocksOutside: "вне блоков",
+    todoBlocksOutsideHint:
+      "Отнесено к задаче, но не попало ни в один блок: работа между блоками либо сессии старше журнала привязок. Это не ошибка, а та часть, которую разрез на блоки не размещает.",
     statusPending: "В очереди",
     statusInProgress: "В работе",
     statusDone: "Готово",
@@ -1199,22 +1449,46 @@ const messages = {
       "Сохраняйте плейсхолдеры <BOARD>, <STAGING>, <TODAY> (подставляются при запуске) и контракт вывода дайджеста (виды overdue / stale / no_priority / suggestion).",
     migrateTitle: "Ссылки на задачи (#N → t#N)",
     migrateDesc:
-      "Голый #N теперь трактуется как PR/issue на GitHub и больше не ведёт на задачу — линкуется только явная форма t#N. Эта миграция перепишет настоящие #N-ссылки на задачи в ваших задачах в t#N. Перед записью делается бэкап todos.json; кнопка «Откатить» его восстанавливает. Опционально: запустите один раз, чтобы поправить существующий текст — дальше CLI и хук Claude Code уже велят агенту писать t#N.",
-    migrateRun: "Мигрировать #N → t#N",
-    migrateRunning: "Миграция…",
-    migrateNone: "Мигрировать нечего — переписывать ссылки не потребовалось.",
-    migrateDone: "Готово: переписано ссылок — {refs}, в задачах — {tasks}.",
+      "Голый #N трактуется как PR/issue на GitHub и не ведёт на задачу — линкуется только явная форма t#N. Настоящие #N-ссылки в сохранённых текстах переписываются в t#N при запуске, поэтому на доске никогда не живут обе формы сразу. Переписывание угадывает (номер совпал с задачей, а слова про PR перед ним нет), поэтому перед ним делается бэкап todos.json, а «Откатить» его возвращает.",
     migrateRestore: "Откатить",
     migrateRestoring: "Восстановление…",
     migrateRestored: "Восстановлено из последнего бэкапа.",
     migrateRestoreConfirm:
       "Восстановить todos.json из последнего бэкапа? Изменения, сделанные после этого бэкапа, будут потеряны.",
     migrateBackupAt: "Последний бэкап: {date}",
+    ioTitle: "Импорт / экспорт задач",
+    ioDesc:
+      "Перенос доски между компьютерами. Импорт СЛИВАЕТ, а не перезаписывает: занятый здесь номер задачи переприсваивается, а входящая задача, которая есть и тут, добавляется НОВОЙ (с меткой «импорт»), — ваша версия остаётся нетронутой. Перед записью снимается бэкап, поэтому «Откатить» выше отменяет и импорт.",
+    ioExport: "Экспорт…",
+    ioExporting: "Экспорт…",
+    ioExported: "Выгружено задач: {count}.",
+    ioImport: "Импорт…",
+    ioReading: "Чтение…",
+    ioImportEmpty: "В файле нет задач для импорта.",
+    ioImportNothingNew: "Нового нет — все задачи из файла уже на доске.",
+    ioPreviewTitle: "Ещё ничего не записано — вот что сделает импорт:",
+    ioStatAdded: "добавится как есть: {n}",
+    ioStatRenumbered: "перенумеруется: {n} (номер уже занят здесь)",
+    ioStatForked: "добавится НОВЫМИ задачами: {n} — они есть и здесь, ваша версия останется нетронутой",
+    ioStatUnchanged: "уже на доске без изменений: {n} — пропустим",
+    ioStatDropped: "связей отброшено: {n} (ведут за пределы доски или образуют цикл)",
+    ioKind_added: "новая",
+    ioKind_renumbered: "перенумер.",
+    ioKind_forked: "копия",
+    ioMore: "…и ещё {n}",
+    ioApply: "Импортировать",
+    ioApplying: "Импорт…",
+    ioCancel: "Отмена",
+    ioImported: "Импортировано: добавлено {added}, заведено новыми {forked}. Задач на доске: {total}.",
     installCcHook: "CLI + хук Claude Code",
     installCcHookDesc:
-      "Прописать SessionStart-хук в ~/.claude/settings.json, чтобы каждая сессия Claude Code видела задачи этого проекта и меняла их через CLI cc-todos.",
+      "Прописать хуки SessionStart и Stop в ~/.claude/settings.json, чтобы каждая сессия Claude Code видела задачи этого проекта, меняла их через CLI cc-todos и не завершала сессию с рабочей задачей без handoff.",
     installCcHookOn: "Установлено",
     installCcHookOff: "Не установлено",
+    installCcHookStopMissing:
+      "Хук Stop (guard HANDOFF) ещё не прописан — переустановите, чтобы добавить его.",
+    installCcHookBroken:
+      "Прописанного скрипта больше нет на диске — Claude Code всё это время не получал от него ничего. Переустановите, чтобы перенацелить хук (приложение также чинит это при старте).",
     installCcHookBtn: "Установить",
     installCcHookReinstall: "Переустановить / обновить путь",
     installCcHookDone: "Готово — прописан {path}",

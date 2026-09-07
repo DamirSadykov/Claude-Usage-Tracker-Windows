@@ -2,6 +2,7 @@
 import { ref, watch, onMounted, onUnmounted } from "vue";
 import type { Ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
+import { open as openFileDialog, save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 import { useI18n } from "vue-i18n";
 import {
   ALERT_TIER_KEYS,
@@ -41,8 +42,12 @@ const {
   currentVersion,
   availableVersion,
   status: updateStatus,
+  progress: updateProgress,
+  errorMessage: updateErrorMessage,
   checkHours: updateCheckHours,
   checkForUpdate,
+  installUpdate,
+  relaunchApp,
   saveUpdaterSettings,
 } = useUpdater();
 
@@ -84,6 +89,9 @@ const props = defineProps<{
   runtimeInsightKinds: string[];
   locale: string;
   uiFont: string;
+  // Bumped by the host each time the main window confirms a persisted save
+  // (the `settings-changed` round-trip). Watched below to flash "Saved ✓".
+  savedTick?: number;
 }>();
 
 const emit = defineEmits<{
@@ -287,10 +295,20 @@ function toggleRuntime(kind: string) {
 
 onMounted(loadIgnoredInsights);
 
-// --- cc-todos CLI + SessionStart hook installer ---
+// --- cc-todos CLI + Claude Code hook installer ---
+// The installer wires two hooks: SessionStart (task context) and Stop (the
+// HANDOFF freshness guard). `stop_installed` is false for an install made before
+// the guard existed — the UI then nudges a re-install instead of leaving it off.
 interface CcHookStatus {
   installed: boolean;
+  stop_installed: boolean;
   script_path: string;
+  /// What settings.json points at right now, and whether that file still exists.
+  /// A wired-but-missing script is the silent failure mode: Claude Code runs
+  /// `node "<gone>"` and the session just has no tasks. The app re-points the
+  /// hooks on start (heal_cc_hook); this surfaces the state in the meantime.
+  wired_path: string;
+  wired_path_exists: boolean;
   settings_path: string;
 }
 const ccHookStatus = ref<CcHookStatus | null>(null);
@@ -319,37 +337,10 @@ async function doInstallCcHook() {
 }
 onMounted(loadCcHookStatus);
 
-// --- Phases in tasks (issue #16) ---
-// Lives in the Tasks tab. A UI-only flag stored straight in settings.json (like
-// ignoredInsights above) — no backend config, so it stays out of the Save flow.
-// Default ON.
-const phasesEnabled = ref(true);
-
-async function loadPhasesEnabled() {
-  try {
-    const { load: loadStore } = await import("@tauri-apps/plugin-store");
-    const store = await loadStore("settings.json");
-    const v = await store.get<boolean>("phasesEnabled");
-    if (typeof v === "boolean") phasesEnabled.value = v;
-  } catch {}
-}
-
-async function togglePhasesEnabled() {
-  phasesEnabled.value = !phasesEnabled.value;
-  try {
-    const { load: loadStore } = await import("@tauri-apps/plugin-store");
-    const store = await loadStore("settings.json");
-    await store.set("phasesEnabled", phasesEnabled.value);
-    await store.save();
-  } catch {}
-}
-
-onMounted(loadPhasesEnabled);
-
 // --- Task priority in context (issue #32) ---
 // The LOWEST task priority the SessionStart hook injects into a Claude Code
 // session: all | low | medium | high. A UI-only flag in settings.json read
-// directly by the hook (like phasesEnabled above) — no backend config. Default
+// directly by the hook (like ignoredInsights above) — no backend config. Default
 // `medium`, so low/unset tasks stay out of context unless the user lowers the bar.
 const TASK_CTX_LEVELS = ["all", "low", "medium", "high"] as const;
 const taskCtxPrio = ref<string>("medium");
@@ -383,42 +374,10 @@ async function setTaskCtxPrio(v: string) {
 
 onMounted(loadTaskCtxPrio);
 
-// What a session LEADS WITH when the project is mid-plan: "phase" (the current
-// phase, focused) or "tasks" (always the task board). UI-only flag in settings.json
-// read by the SessionStart hook (like taskContextPriority). Default "phase".
-const SESSION_CTX_MODES = ["phase", "tasks"] as const;
-const sessionCtx = ref<string>("phase");
-
-function sessionCtxLabel(m: string): string {
-  return m === "tasks" ? t("sessionCtxTasks") : t("sessionCtxPhase");
-}
-
-async function loadSessionCtx() {
-  try {
-    const { load: loadStore } = await import("@tauri-apps/plugin-store");
-    const store = await loadStore("settings.json");
-    const v = await store.get<string>("sessionContext");
-    if (typeof v === "string" && (SESSION_CTX_MODES as readonly string[]).includes(v))
-      sessionCtx.value = v;
-  } catch {}
-}
-
-async function setSessionCtx(v: string) {
-  sessionCtx.value = v;
-  try {
-    const { load: loadStore } = await import("@tauri-apps/plugin-store");
-    const store = await loadStore("settings.json");
-    await store.set("sessionContext", v);
-    await store.save();
-  } catch {}
-}
-
-onMounted(loadSessionCtx);
-
 // --- Task context in sessions (master hook switch) ---
 // A UI-only flag in settings.json read by the SessionStart hook: when OFF, the
-// hook injects nothing into a session (no task board, no phase context). Default
-// ON. Same store-write pattern as phasesEnabled above.
+// hook injects nothing into a session (no task context at all). Default ON.
+// Same store-write pattern as ignoredInsights above.
 const hookContextEnabled = ref(true);
 
 async function loadHookContext() {
@@ -441,6 +400,42 @@ async function toggleHookContext() {
 }
 
 onMounted(loadHookContext);
+
+// --- HANDOFF guard (issue #59) ---
+// Which TASKS must leave a handoff before a session ends (read by the Stop
+// hook). "submitted" = moved to review/done this session; "unfinished" = worked
+// and left in_progress; "both" (default); "off".
+const TASK_GUARD_MODES = ["both", "submitted", "unfinished", "off"] as const;
+const taskHandoffGuard = ref<string>("both");
+
+function taskGuardLabel(m: string): string {
+  if (m === "off") return t("taskGuardOff");
+  if (m === "submitted") return t("taskGuardSubmitted");
+  if (m === "unfinished") return t("taskGuardUnfinished");
+  return t("taskGuardBoth");
+}
+
+async function loadTaskGuard() {
+  try {
+    const { load: loadStore } = await import("@tauri-apps/plugin-store");
+    const store = await loadStore("settings.json");
+    const v = await store.get<string>("taskHandoffGuard");
+    if (typeof v === "string" && (TASK_GUARD_MODES as readonly string[]).includes(v))
+      taskHandoffGuard.value = v;
+  } catch {}
+}
+
+async function setTaskGuard(v: string) {
+  taskHandoffGuard.value = v;
+  try {
+    const { load: loadStore } = await import("@tauri-apps/plugin-store");
+    const store = await loadStore("settings.json");
+    await store.set("taskHandoffGuard", v);
+    await store.save();
+  } catch {}
+}
+
+onMounted(loadTaskGuard);
 
 // --- Task audit schedule (#35) ---
 // Moved here from the tasks window. The in-app scheduler runs a headless
@@ -563,19 +558,14 @@ onMounted(loadTriagePrompt);
 // --- Task-ref migration & backups (#63) ---
 // Bare `#N` used to be treated as a task reference, but in prose it almost always
 // means a GitHub PR/issue — a number collision silently linked the wrong task. The
-// app now links only the explicit `t#N` form; this one-shot migration rewrites the
-// genuine `#N` task refs already in stored text to `t#N` so they keep linking. It
-// backs up todos.json first, and "Откатить" restores that backup.
+// app now links only the explicit `t#N` form, and rewrites the genuine `#N` task
+// refs in stored text on startup, since a board with both spellings is ambiguous
+// rather than merely old. What is left here is the safety net: the rewrite guesses,
+// so it backs todos.json up first and "Откатить" restores that backup.
 interface BackupInfo {
   name: string;
   when_ms: number;
 }
-interface MigrationReport {
-  refs: number;
-  tasks: number;
-  backup: string;
-}
-const migrating = ref(false);
 const restoring = ref(false);
 const migrateMsg = ref("");
 const latestBackup = ref<BackupInfo | null>(null);
@@ -593,22 +583,6 @@ function fmtBackupTime(ms: number): string {
     return new Date(ms).toLocaleString();
   } catch {
     return "";
-  }
-}
-
-async function runMigration() {
-  if (migrating.value) return;
-  migrating.value = true;
-  migrateMsg.value = "";
-  try {
-    const r = await invoke<MigrationReport>("migrate_todo_refs");
-    migrateMsg.value =
-      r.refs === 0 ? t("migrateNone") : t("migrateDone", { refs: r.refs, tasks: r.tasks });
-    await loadLatestBackup();
-  } catch (e) {
-    migrateMsg.value = String(e);
-  } finally {
-    migrating.value = false;
   }
 }
 
@@ -630,6 +604,108 @@ async function runRestore() {
 }
 
 onMounted(loadLatestBackup);
+
+// --- Board import / export (#181) ---
+// Carrying todos.json between machines by hand DESTROYS whatever the other machine
+// added: both number tasks with max+1, so the same number lands on different tasks
+// and a straight copy overwrites the board. Import here is a MERGE that never
+// overwrites — a taken number is reassigned, and an incoming task whose id already
+// exists locally is filed as a NEW task (a fork) instead of replacing the local one.
+// The user sees a preview of exactly that before anything is written.
+interface ImportItem {
+  subject: string;
+  kind: string; // "added" | "renumbered" | "forked"
+  from_number: number;
+  to_number: number;
+}
+interface ImportReport {
+  added: number;
+  renumbered: number;
+  forked: number;
+  unchanged: number; // already on the board, untouched since → skipped (import is idempotent)
+  dropped_edges: number;
+  rewritten_refs: number;
+  backup: string | null;
+  total_after: number;
+  items: ImportItem[];
+}
+const exporting = ref(false);
+const importing = ref(false);
+const ioMsg = ref("");
+// A previewed import awaiting the user's confirmation: nothing is written until then.
+const pendingImport = ref<{ path: string; report: ImportReport } | null>(null);
+
+function defaultExportName(): string {
+  const d = new Date();
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `todos-${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}.json`;
+}
+
+async function runExport() {
+  if (exporting.value) return;
+  ioMsg.value = "";
+  const path = await saveFileDialog({
+    defaultPath: defaultExportName(),
+    filters: [{ name: "JSON", extensions: ["json"] }],
+  });
+  if (!path) return; // user cancelled
+  exporting.value = true;
+  try {
+    const count = await invoke<number>("export_todos", { path });
+    ioMsg.value = t("ioExported", { count });
+  } catch (e) {
+    ioMsg.value = String(e);
+  } finally {
+    exporting.value = false;
+  }
+}
+
+async function pickImport() {
+  if (importing.value) return;
+  ioMsg.value = "";
+  pendingImport.value = null;
+  const picked = await openFileDialog({
+    multiple: false,
+    filters: [{ name: "JSON", extensions: ["json"] }],
+  });
+  const path = typeof picked === "string" ? picked : null;
+  if (!path) return; // user cancelled
+  importing.value = true;
+  try {
+    const report = await invoke<ImportReport>("preview_todo_import", { path });
+    if (report.added + report.renumbered + report.forked === 0) {
+      // Nothing to do. Distinguish "the file is empty" from "you already have all
+      // of it" — the second is the normal outcome of importing the same file twice.
+      ioMsg.value = report.unchanged > 0 ? t("ioImportNothingNew") : t("ioImportEmpty");
+      return;
+    }
+    pendingImport.value = { path, report };
+  } catch (e) {
+    ioMsg.value = String(e);
+  } finally {
+    importing.value = false;
+  }
+}
+
+async function confirmImport() {
+  if (!pendingImport.value || importing.value) return;
+  const { path } = pendingImport.value;
+  importing.value = true;
+  try {
+    const r = await invoke<ImportReport>("apply_todo_import", { path });
+    ioMsg.value = t("ioImported", {
+      added: r.added + r.renumbered,
+      forked: r.forked,
+      total: r.total_after,
+    });
+    pendingImport.value = null;
+    await loadLatestBackup(); // the import took one; "Откатить" now undoes it
+  } catch (e) {
+    ioMsg.value = String(e);
+  } finally {
+    importing.value = false;
+  }
+}
 
 // Keep each threshold triple strictly ascending with a 1% gap so the colour
 // bands can't overlap. Fixed slider scale (5..99) + clamping — dynamic min/max
@@ -663,8 +739,37 @@ function goalOrNull(v: number | ""): number | null {
   return Number(v);
 }
 
+// Save feedback: the save round-trips through the main window (emit → persist →
+// `settings-changed` back → host bumps `savedTick`). "saving" is set on click and
+// flips to "saved" only when that confirmation arrives, so the tick reflects a real
+// on-disk write, not an optimistic guess. A fallback timer clears a stuck "saving"
+// if the confirmation never comes (e.g. the main window failed to persist).
+const saveState = ref<"idle" | "saving" | "saved">("idle");
+let saveResetTimer: ReturnType<typeof setTimeout> | null = null;
+let saveFailTimer: ReturnType<typeof setTimeout> | null = null;
+
+watch(() => props.savedTick, () => {
+  if (saveState.value !== "saving") return;
+  if (saveFailTimer) { clearTimeout(saveFailTimer); saveFailTimer = null; }
+  saveState.value = "saved";
+  if (saveResetTimer) clearTimeout(saveResetTimer);
+  saveResetTimer = setTimeout(() => (saveState.value = "idle"), 2000);
+});
+
+onUnmounted(() => {
+  if (saveResetTimer) clearTimeout(saveResetTimer);
+  if (saveFailTimer) clearTimeout(saveFailTimer);
+});
+
 function handleSave() {
   const errPct = goalOrNull(localGoalErrorRatePct.value);
+  saveState.value = "saving";
+  if (saveResetTimer) { clearTimeout(saveResetTimer); saveResetTimer = null; }
+  if (saveFailTimer) clearTimeout(saveFailTimer);
+  // No confirmation within 5s → assume it didn't land; drop the "saving" label.
+  saveFailTimer = setTimeout(() => {
+    if (saveState.value === "saving") saveState.value = "idle";
+  }, 5000);
   emit("save", {
     sessionKey: localSessionKey.value.trim(),
     orgId: localOrgId.value.trim(),
@@ -1313,11 +1418,29 @@ function handleSave() {
           {{ updateStatus === 'checking' ? t('checkingUpdates') : t('checkForUpdates') }}
         </button>
         <div v-if="updateStatus === 'uptodate'" class="field-hint">{{ t('upToDate') }}</div>
-        <div v-else-if="updateStatus === 'available'" class="field-hint">
-          {{ t('updateAvailable', { version: availableVersion }) }}
-        </div>
+        <!-- An update was found: offer to install it right here (the main-window
+             banner isn't visible from this standalone window). installUpdate()
+             downloads, then relaunches once ready. -->
+        <template v-else-if="updateStatus === 'available'">
+          <div class="field-hint">{{ t('updateAvailable', { version: availableVersion }) }}</div>
+          <button type="button" class="btn-check" style="margin-top: 8px" @click="installUpdate">
+            {{ t('updateNow') }}
+          </button>
+        </template>
+        <template v-else-if="updateStatus === 'downloading'">
+          <div class="field-hint">{{ t('updateDownloading', { pct: updateProgress }) }}</div>
+          <div class="update-progress-track">
+            <div class="update-progress-bar" :style="{ width: updateProgress + '%' }"></div>
+          </div>
+        </template>
+        <template v-else-if="updateStatus === 'ready'">
+          <div class="field-hint">{{ t('updateReady') }}</div>
+          <button type="button" class="btn-check" style="margin-top: 8px" @click="relaunchApp">
+            {{ t('restartNow') }}
+          </button>
+        </template>
         <div v-else-if="updateStatus === 'error'" class="field-hint" style="color: #f87171">
-          {{ t('updateError') }}
+          {{ t('updateError') }}<template v-if="updateErrorMessage"> — {{ updateErrorMessage }}</template>
         </div>
       </div>
 
@@ -1341,13 +1464,34 @@ function handleSave() {
 
       <!-- ===== Tasks ===== -->
       <template v-if="tab === 'tasks'">
-      <!-- Install the cc-todos CLI + SessionStart hook into ~/.claude/settings.json -->
+      <!-- Install the cc-todos CLI + the SessionStart/Stop hooks into ~/.claude/settings.json -->
       <div class="card" style="display: flex; align-items: center; gap: 12px">
         <div style="flex: 1; min-width: 0">
           <div class="card-title" style="font-size: 13px">{{ t('installCcHook') }}</div>
           <div class="card-sub">{{ t('installCcHookDesc') }}</div>
           <div v-if="ccHookStatus" class="card-sub" style="margin-top: 6px">
             {{ ccHookStatus.installed ? t('installCcHookOn') : t('installCcHookOff') }}
+            <span v-if="ccHookStatus.installed && ccHookStatus.wired_path" class="muted">
+              — {{ ccHookStatus.wired_path }}
+            </span>
+          </div>
+          <!-- Wired, but the script is gone: Claude Code has been running
+               `node "<gone>"` and getting nothing. -->
+          <div
+            v-if="ccHookStatus && ccHookStatus.installed && !ccHookStatus.wired_path_exists"
+            class="field-hint"
+            style="margin-top: 4px; color: #f87171"
+          >
+            {{ t('installCcHookBroken') }}
+          </div>
+          <!-- Installed before the Stop guard existed: the SessionStart hook runs,
+               but nothing checks the handoff at session end until a re-install. -->
+          <div
+            v-if="ccHookStatus && ccHookStatus.installed && !ccHookStatus.stop_installed"
+            class="field-hint"
+            style="margin-top: 4px; color: #fbbf24"
+          >
+            {{ t('installCcHookStopMissing') }}
           </div>
           <div v-if="installCcMsg" class="field-hint" style="margin-top: 4px">{{ installCcMsg }}</div>
         </div>
@@ -1356,7 +1500,7 @@ function handleSave() {
         </button>
       </div>
 
-      <!-- Master switch: does the SessionStart hook inject task/phase context? -->
+      <!-- Master switch: does the SessionStart hook inject task context? -->
       <div class="card toggle-card" @click="toggleHookContext">
         <div style="flex: 1; min-width: 0">
           <div class="card-title" style="font-size: 13px">{{ t('hookContextSetting') }}</div>
@@ -1367,15 +1511,17 @@ function handleSave() {
         </div>
       </div>
 
-      <!-- Phases in tasks (issue #16) — UI-only flag in settings.json. -->
-      <div class="card toggle-card" @click="togglePhasesEnabled">
-        <div style="flex: 1; min-width: 0">
-          <div class="card-title" style="font-size: 13px">{{ t('phasesSetting') }}</div>
-          <div class="card-sub">{{ t('phasesSettingDesc') }}</div>
-        </div>
-        <div class="toggle" :class="{ on: phasesEnabled }">
-          <div class="toggle-knob"></div>
-        </div>
+      <!-- HANDOFF guard (issue #59): which tasks must leave a handoff (Stop hook). -->
+      <div class="card">
+        <div class="field-label">{{ t('taskGuardSetting') }}</div>
+        <select
+          class="field-input"
+          :value="taskHandoffGuard"
+          @change="setTaskGuard(($event.target as HTMLSelectElement).value)"
+        >
+          <option v-for="m in TASK_GUARD_MODES" :key="m" :value="m">{{ taskGuardLabel(m) }}</option>
+        </select>
+        <div class="field-hint">{{ t('taskGuardDesc') }}</div>
       </div>
 
       <!-- Task priority in context (issue #32) — UI-only flag in settings.json,
@@ -1390,20 +1536,6 @@ function handleSave() {
           <option v-for="lv in TASK_CTX_LEVELS" :key="lv" :value="lv">{{ taskCtxPrioLabel(lv) }}</option>
         </select>
         <div class="field-hint">{{ t('taskCtxPrioDesc') }}</div>
-      </div>
-
-      <!-- Session context (phase vs tasks) — UI-only flag in settings.json, read by
-           the SessionStart hook to choose what a mid-plan session leads with. -->
-      <div class="card">
-        <div class="field-label">{{ t('sessionCtxSetting') }}</div>
-        <select
-          class="field-input"
-          :value="sessionCtx"
-          @change="setSessionCtx(($event.target as HTMLSelectElement).value)"
-        >
-          <option v-for="m in SESSION_CTX_MODES" :key="m" :value="m">{{ sessionCtxLabel(m) }}</option>
-        </select>
-        <div class="field-hint">{{ t('sessionCtxDesc') }}</div>
       </div>
 
       <!-- Task audit schedule (#35) — daily headless audit of the task board.
@@ -1484,16 +1616,13 @@ function handleSave() {
         </template>
       </div>
 
-      <!-- Task-ref migration (#63): rewrite bare `#N` → `t#N`, with a backup and a
-           one-click restore. `#N` now reads as a PR/issue, only `t#N` links. -->
+      <!-- Task-ref migration (#63): bare `#N` → `t#N` runs on startup; `#N` reads as
+           a PR/issue, only `t#N` links. What is offered here is the undo. -->
       <div class="card">
         <div class="field-label">{{ t('migrateTitle') }}</div>
         <div class="field-hint" style="margin-top: 6px">{{ t('migrateDesc') }}</div>
         <div class="budget-suggest" style="margin-top: 10px">
           <span style="display: flex; gap: 8px; flex-shrink: 0">
-            <button type="button" class="suggest-btn" :disabled="migrating" @click="runMigration">
-              {{ migrating ? t('migrateRunning') : t('migrateRun') }}
-            </button>
             <button
               type="button"
               class="suggest-btn"
@@ -1509,12 +1638,87 @@ function handleSave() {
           {{ t('migrateBackupAt', { date: fmtBackupTime(latestBackup.when_ms) }) }}
         </div>
       </div>
+
+      <!-- Board import / export (#181): moving a board between machines. Import is a
+           merge that never overwrites — see the script block for why a plain copy
+           of todos.json loses tasks. -->
+      <div class="card">
+        <div class="field-label">{{ t('ioTitle') }}</div>
+        <div class="field-hint" style="margin-top: 6px">{{ t('ioDesc') }}</div>
+        <div class="budget-suggest" style="margin-top: 10px">
+          <span style="display: flex; gap: 8px; flex-shrink: 0">
+            <button type="button" class="suggest-btn" :disabled="exporting" @click="runExport">
+              {{ exporting ? t('ioExporting') : t('ioExport') }}
+            </button>
+            <button
+              type="button"
+              class="suggest-btn"
+              :disabled="importing || !!pendingImport"
+              @click="pickImport"
+            >
+              {{ importing && !pendingImport ? t('ioReading') : t('ioImport') }}
+            </button>
+          </span>
+          <span v-if="ioMsg" class="field-hint" style="margin: 0">{{ ioMsg }}</span>
+        </div>
+
+        <!-- Preview: nothing has been written yet. Spell out the two non-obvious
+             outcomes (renumbered, forked) so the user knows what they're accepting. -->
+        <div v-if="pendingImport" class="io-preview">
+          <div class="io-preview-head">{{ t('ioPreviewTitle') }}</div>
+          <ul class="io-preview-stats">
+            <li v-if="pendingImport.report.added">
+              {{ t('ioStatAdded', { n: pendingImport.report.added }) }}
+            </li>
+            <li v-if="pendingImport.report.renumbered">
+              {{ t('ioStatRenumbered', { n: pendingImport.report.renumbered }) }}
+            </li>
+            <li v-if="pendingImport.report.forked">
+              {{ t('ioStatForked', { n: pendingImport.report.forked }) }}
+            </li>
+            <li v-if="pendingImport.report.unchanged">
+              {{ t('ioStatUnchanged', { n: pendingImport.report.unchanged }) }}
+            </li>
+            <li v-if="pendingImport.report.dropped_edges">
+              {{ t('ioStatDropped', { n: pendingImport.report.dropped_edges }) }}
+            </li>
+          </ul>
+          <div class="io-preview-list">
+            <div v-for="(it, i) in pendingImport.report.items.slice(0, 12)" :key="i" class="io-row">
+              <span class="io-kind" :class="'io-kind--' + it.kind">{{ t('ioKind_' + it.kind) }}</span>
+              <span class="io-num">
+                <template v-if="it.from_number !== it.to_number">
+                  #{{ it.from_number }} → #{{ it.to_number }}
+                </template>
+                <template v-else>#{{ it.to_number }}</template>
+              </span>
+              <span class="io-subj">{{ it.subject }}</span>
+            </div>
+            <div v-if="pendingImport.report.items.length > 12" class="field-hint" style="margin: 4px 0 0">
+              {{ t('ioMore', { n: pendingImport.report.items.length - 12 }) }}
+            </div>
+          </div>
+          <div style="display: flex; gap: 8px; margin-top: 10px">
+            <button type="button" class="suggest-btn" :disabled="importing" @click="confirmImport">
+              {{ importing ? t('ioApplying') : t('ioApply') }}
+            </button>
+            <button type="button" class="suggest-btn" :disabled="importing" @click="pendingImport = null">
+              {{ t('ioCancel') }}
+            </button>
+          </div>
+        </div>
+      </div>
       </template>
     </div>
 
     <div class="settings-save-bar">
-      <button type="submit" class="save-btn" :disabled="!localSessionKey || !localOrgId">
-        {{ t('save') }}
+      <button
+        type="submit"
+        class="save-btn"
+        :class="{ saved: saveState === 'saved' }"
+        :disabled="!localSessionKey || !localOrgId || saveState === 'saving'"
+      >
+        {{ saveState === 'saving' ? t('saving') : saveState === 'saved' ? t('saved') : t('save') }}
       </button>
     </div>
     </div>
@@ -1906,6 +2110,33 @@ function handleSave() {
   cursor: not-allowed;
 }
 
+/* Persisted confirmation — green fill, and it stays fully opaque even though the
+   button isn't disabled while showing "Saved ✓". */
+.save-btn.saved {
+  background: #16a34a;
+  opacity: 1;
+}
+
+.save-btn.saved:disabled {
+  opacity: 1;
+}
+
+/* Download progress in the Updates tab (mirrors the main-window banner bar). */
+.update-progress-track {
+  margin-top: 8px;
+  height: 5px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.1);
+  overflow: hidden;
+}
+
+.update-progress-bar {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 3px;
+  transition: width 160ms;
+}
+
 .btn-check {
   width: 100%;
   margin-top: 4px;
@@ -1954,6 +2185,78 @@ function handleSave() {
 
 .suggest-btn:hover {
   background: rgba(255, 255, 255, 0.06);
+}
+
+/* Import preview (#181) — shown before anything is written. */
+.io-preview {
+  margin-top: 10px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.io-preview-head {
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.io-preview-stats {
+  margin: 0 0 8px;
+  padding-left: 18px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.io-preview-list {
+  max-height: 180px;
+  overflow-y: auto;
+}
+
+.io-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12px;
+  padding: 2px 0;
+}
+
+.io-kind {
+  flex-shrink: 0;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+/* Plain add vs the two outcomes the user must actually notice. */
+.io-kind--added {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--muted);
+}
+
+.io-kind--renumbered {
+  background: rgba(88, 166, 255, 0.16);
+  color: #58a6ff;
+}
+
+.io-kind--forked {
+  background: rgba(210, 153, 34, 0.18);
+  color: #d29922;
+}
+
+.io-num {
+  flex-shrink: 0;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  color: var(--muted);
+}
+
+.io-subj {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .prompt-editor {

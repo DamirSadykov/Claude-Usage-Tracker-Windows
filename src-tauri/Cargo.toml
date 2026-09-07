@@ -21,6 +21,11 @@ tauri-plugin-single-instance = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 tauri-plugin-log = "2"
+# Native file picker for board import/export (#181). Only the DIALOG plugin: the
+# file itself is read/written by Rust (std::fs), so no fs plugin and no broad
+# filesystem capability is granted — the app can touch exactly the path the user
+# picked in the OS dialog.
+tauri-plugin-dialog = "2"
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
