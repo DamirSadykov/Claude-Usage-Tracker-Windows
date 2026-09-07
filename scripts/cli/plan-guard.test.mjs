@@ -27,6 +27,7 @@ import {
   discussionDeclaration,
   isReason,
   decide,
+  architectDecision,
   planFormatDoc,
 } from "./plan-guard.mjs";
 import { readDocument, validate } from "./apply.mjs";
@@ -347,6 +348,48 @@ describe("decide · the PreToolUse contract", () => {
   });
 });
 
+describe("architectDecision · configured lifecycle hook", () => {
+  it("lets an approved plan continue and passes the workspace to the architect", () => {
+    const calls = [];
+    const seen = architectDecision(
+      { ...exitPlan(VALID), cwd: "D:\\repo" },
+      (duty, prompt, opts) => {
+        calls.push({ duty, prompt, opts });
+        return { ok: true, text: "No structural findings.\nVERDICT: approve" };
+      },
+    );
+    expect(seen).toBeNull();
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({ duty: "architect", opts: { cwd: "D:\\repo" } });
+    expect(calls[0].prompt).toContain(VALID);
+  });
+
+  it("blocks a plan when the architect reports an obligation issue", () => {
+    const seen = architectDecision(exitPlan(VALID), () => ({
+      ok: true,
+      text: "Step 2 has no dependency on step 1.\nVERDICT: issue",
+    }));
+    expect(seen).toMatchObject({ hookEventName: "PreToolUse", permissionDecision: "deny" });
+    expect(seen.permissionDecisionReason).toContain("Step 2 has no dependency");
+  });
+
+  it("fails open when the configured CLI is unavailable or the hook is disabled", () => {
+    expect(architectDecision(exitPlan(VALID), () => ({ ok: false, error: "missing" }))).toBeNull();
+    expect(architectDecision(exitPlan(VALID), () => ({ ok: true, skipped: true }))).toBeNull();
+    expect(architectDecision(exitPlan(DISCUSSION), () => { throw new Error("must not run"); })).toBeNull();
+  });
+
+  it("does not invoke the architect for another broadly wired tool", () => {
+    let calls = 0;
+    const seen = architectDecision(
+      { tool_name: "Bash", tool_input: { plan: VALID } },
+      () => { calls += 1; return { ok: true, text: "VERDICT: issue" }; },
+    );
+    expect(seen).toBeNull();
+    expect(calls).toBe(0);
+  });
+});
+
 // End to end through the dispatcher, because the promise "a hook never breaks a
 // session" is about the PROCESS: exit 0 always, and stdout that is either empty
 // or exactly one JSON object.
@@ -356,6 +399,7 @@ describe("cli.mjs plan-guard · the process", () => {
       encoding: "utf8",
       input,
       windowsHide: true,
+      env: { ...process.env, CODEX_BIN: path.join(path.dirname(CLI), "no-such-codex.exe") },
     });
 
   it("emits the deny payload for a broken plan and exits 0", () => {

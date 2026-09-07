@@ -58,6 +58,13 @@ export function hookContextEnabled(appData) {
   return typeof v === "boolean" ? v : true;
 }
 
+// Opt in to the role/lifecycle map at SessionStart. It is separate from the
+// task list so a session can receive the operating model with an empty board.
+// The master `hookContextEnabled` switch in hook.mjs still overrides it.
+export function workflowContextEnabled(appData) {
+  return readSettings(appData).workflowContextEnabled === true;
+}
+
 // `taskHandoffGuard`: which tasks owe a baton before a session ends —
 // off|submitted|unfinished|both. Default both.
 const TASK_GUARD_MODES = ["off", "submitted", "unfinished", "both"];
@@ -69,10 +76,24 @@ export function taskHandoffGuard(appData) {
 // `specDeltaGuard`: does closing a task that carries a `spec` link demand an
 // explicit answer per addressed section (docs/specs/README.md §8, t#341) —
 // on|off. Default on: the guard is inert for a board that links no specs, so
-// it costs nothing until the link is made deliberately.
+// it costs nothing until the link is made deliberately. Only reachable at all
+// while `specsEnabled` is true — the master switch below turns the whole spec
+// channel off before this mode is ever consulted.
 export function specDeltaGuard(appData) {
   const v = readSettings(appData).specDeltaGuard;
   return v === "off" || v === false ? "off" : "on";
+}
+
+// `specsEnabled`: master switch for the spec registry's participation in the
+// AUTOMATIC workflow — the SessionStart injection, the section printed on the
+// move into in_progress, baseline recording, and the Stop guard's spec half.
+// Default FALSE: a change is then just a group of tasks sharing one goal (its
+// `description`, the ★ vision), and nothing asks about spec sections on its
+// own. Manual `cli spec …` commands are UNAFFECTED by this switch — they stay
+// fully callable either way, so a link already on a task can still be read or
+// answered by hand; this only gates what happens without being asked.
+export function specsEnabled(appData) {
+  return readSettings(appData).specsEnabled === true;
 }
 
 // `matchPlanCli`: absolute path to a kb-style CLI that turns task/plan text into

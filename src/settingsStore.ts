@@ -56,6 +56,7 @@ export interface SettingsSnapshot {
     runtimeInsightKinds: string[];
     systemInfoEnabled: boolean;
     correctionsEnabled: boolean;
+    specsEnabled: boolean;
     // Raw persisted locale — null when unset. Callers decide whether to apply it
     // (validating "en"/"ru"); an unset value must NOT clobber the running locale.
     locale: string | null;
@@ -96,6 +97,7 @@ export function defaultSettings(): SettingsSnapshot {
         runtimeInsightKinds: ["long_session", "cold_rewrites"],
         systemInfoEnabled: true,
         correctionsEnabled: false,
+        specsEnabled: false,
         locale: null,
         uiFont: DEFAULT_FONT_ID,
     };
@@ -153,6 +155,7 @@ export async function readSettingsSnapshot(): Promise<SettingsSnapshot> {
 
         s.systemInfoEnabled = (await get<boolean>("systemInfoEnabled")) ?? s.systemInfoEnabled;
         s.correctionsEnabled = (await get<boolean>("correctionsEnabled")) ?? s.correctionsEnabled;
+        s.specsEnabled = (await get<boolean>("specsEnabled")) ?? s.specsEnabled;
         s.locale = (await get<string>("locale")) ?? null;
         s.uiFont = (await get<string>("uiFont")) ?? s.uiFont;
     } catch {

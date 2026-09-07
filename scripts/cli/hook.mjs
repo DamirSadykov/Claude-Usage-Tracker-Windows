@@ -32,10 +32,11 @@ import {
   appendTaskSessionEvent,
   lastTaskSessionEvent,
   STATUSES,
-  setFieldNames,
 } from "./todos.mjs";
-import { taskContextMinRank, hookContextEnabled } from "./settings.mjs";
+import { taskContextMinRank, hookContextEnabled, workflowContextEnabled } from "./settings.mjs";
 import { resolveRoot } from "./spec.mjs";
+import { readAgentConfig } from "./agents.mjs";
+import { planGuardWired } from "./claude-hooks.mjs";
 
 // The unified CLI is this module's grandparent-relative entry (scripts/cli.mjs);
 // resolve its absolute path so the contract below can hand Claude exact,
@@ -51,9 +52,131 @@ const CLI = path.join(
 // repeated path.
 const CLI_NOTE = `<cli> = node "${CLI}"`;
 
+export function contractBlock(source, refExample = 12) {
+  if (source === "resume" || source === "compact") {
+    return [
+      `──────── TASK TRACKER · USER's todos (CLI) ────────`,
+      `${CLI_NOTE} (written <cli> below) — the full contract was shown at startup; \`<cli> todos --help\` has the complete command set if it got compacted away.`,
+    ].join("\n");
+  }
+  return [
+    `──────── TASK TRACKER · how to edit the USER's todos (CLI) ────────`,
+    `USER's todos, not yours — never hand-edit; go through the CLI (${CLI_NOTE}, written <cli> below). Full set: \`<cli> todos --help\`.`,
+    `  change a field  → <cli> todos set <field> <id> <value>   (\`<cli> todos set\` alone lists every field and its values)`,
+    `                    status takes ${STATUSES.join(" | ")}`,
+    `  add a follow-up → <cli> todos add "<subject>" [--project <name>]`,
+    `  note a finding  → <cli> todos comment add <id> --text "<body>"`,
+    `  link two tasks  → <cli> todos dep add <task> <depends-on>  (blocking, acyclic, one board)  ·  <cli> todos ref add <task> <target>  (non-blocking, cross-project ok)`,
+    `  handoff         → what a task passes to whatever depends on it: inherited notes auto-print on → in_progress; leave yours with \`<cli> todos handoff set <id> --text "<body>"\`.`,
+    `  see the board   → <cli> todos list  [--all | --status <col>[,<col>]]`,
+    `Rules: <id> = N or #N. Touch only the field you're setting; add/comment only what's asked (new tasks → backlog). Prose: t#${refExample} links a task, bare #N is a GitHub PR/issue, inline t#N draws a non-blocking ref only — use \`dep add\` for a real dependency.`,
+  ].join("\n");
+}
+
 // Priority ranks, shared with todos.rs::PRIORITIES / the cc-todos CLI. Unset = 0.
 const PRANK = { high: 3, medium: 2, low: 1 };
 const prank = (t) => (t && PRANK[t.priority]) || 0;
+
+// Operating context, not a command to start a model on SessionStart. The main
+// session receives this before its first user prompt, then chooses the fitting
+// stage once it has a real request. A static block cannot require auth, network,
+// or provider execution, so the optional feature cannot delay a session.
+// It is built from STATE, not printed as a constant. The map used to name a
+// critic nothing called, an architect gate whose hook was not wired, and a
+// runner/worker/review chain that belongs to `cli run` — a separate process —
+// as if this session walked all of it. Every line below is conditioned on what
+// agents.json and Claude's own settings.json actually say, and the two executors
+// are kept apart: what THIS session does, and what the auto runner does.
+export function workflowState(appData, cwd = process.cwd(), host = "claude") {
+  const cfg = readAgentConfig(appData);
+  const model = (duty) => {
+    const p = cfg.duties[duty];
+    return p && p.model ? `${p.provider}/${p.model}` : "";
+  };
+  const mode = (duty) => cfg.duties[duty]?.mode || "off";
+  return {
+    critic: mode("critic"),
+    criticModel: model("critic"),
+    architect: mode("architect") !== "off",
+    architectModel: model("architect"),
+    planGuard: host === "claude" && planGuardWired(cwd),
+    worker: model("worker"),
+    review: mode("review") !== "off",
+    reviewModel: model("review"),
+  };
+}
+
+function criticLine(state) {
+  if (state.critic === "off") return "1 critic — off; go straight to 2.";
+  if (state.critic === "agent")
+    return `1 critic — goal, assumptions, risks, alternatives. Runs as ${state.criticModel || "the configured critic model"} when plan mode opens; its reply is input to you, not orders.`;
+  return "1 critic — goal, assumptions, risks, alternatives. YOU do this pass; starting an agent for it is the wrong move.";
+}
+
+function architectLine(state) {
+  if (!state.planGuard)
+    return "   No gate: `plan-guard` is not wired in Claude Code's settings, so nothing checks the plan — not the format, not the architect. Re-run the tracker's hook installer to get it.";
+  if (!state.architect)
+    return "   Architect gate off; the deterministic format guard still refuses a plan that is not a graph file.";
+  return `   Gate: ${state.architectModel || "the configured architect model"} refuses a plan with unmet obligations — revise and call ExitPlanMode again.`;
+}
+
+export function buildWorkflowContext(state = workflowState(), host = "claude") {
+  const runner =
+    "runner → worker" +
+    (state.worker ? ` (${state.worker})` : "") +
+    (state.review ? ` → review (${state.reviewModel || "configured"})` : "") +
+    " → verify+reconcile → next ready step; issue → retry inside the node's budget → parked for the user.";
+  if (host === "codex") {
+    const critic = state.critic === "off"
+      ? "1 critic — off; go straight to 2."
+      : state.critic === "agent"
+        ? `1 critic — goal, assumptions, risks, alternatives. The configured profile is ${state.criticModel || "the critic model"}; no separate critic call is wired for this Codex session, so YOU do this pass.`
+        : "1 critic — goal, assumptions, risks, alternatives. YOU do this pass.";
+    return [
+      "──────── WORKFLOW · this Codex session ────────",
+      "0 triage — one reversible step? do it, skip the rest. This map is for work that is neither.",
+      critic,
+      "   question still open → ask the user, then back to 1.",
+      "2 plan — frame and decompose non-trivial work before implementation; keep the plan current as evidence changes.",
+      "   No tracker ExitPlanMode gate is wired for Codex; this session owns plan quality and review.",
+      "3 implement → verify. Check fails → fix and re-verify. The PLAN was wrong → back to 2. Out of moves → ask the user.",
+      `Auto runner — \`cli run\`, its own process, NOT this session: ${runner}`,
+    ].join("\n");
+  }
+  return [
+    "──────── WORKFLOW · this session ────────",
+    "0 triage — one reversible step? do it, skip the rest. This map is for work that is neither.",
+    criticLine(state),
+    "   question still open → ask the user, then back to 1.",
+    "2 plan mode → ExitPlanMode.",
+    architectLine(state),
+    "3 implement → verify. Check fails → fix and re-verify. The PLAN was wrong → back to 2. Out of moves → ask the user.",
+    `Auto runner — \`cli run\`, its own process, NOT this session: ${runner}`,
+  ].join("\n");
+}
+
+function criticSummary(state) {
+  if (state.critic === "off") return "off";
+  if (state.critic === "agent") return `agent ${state.criticModel || "configured"}`;
+  return "you";
+}
+
+function planGateSummary(state, host) {
+  if (host === "codex") return "none (Codex)";
+  if (!state.planGuard) return "none";
+  if (!state.architect) return "format only";
+  return `architect ${state.architectModel || "configured"}`;
+}
+
+function runnerSummary(state) {
+  const review = state.review ? state.reviewModel || "configured" : "off";
+  return `worker ${state.worker || "unset"}, review ${review}`;
+}
+
+export function buildWorkflowSummary(state = workflowState(), host = "claude") {
+  return `workflow — critic: ${criticSummary(state)} · plan gate: ${planGateSummary(state, host)} · runner: ${runnerSummary(state)}`;
+}
 
 // Settings reads (taskContextPriority, hookContextEnabled) live in ./settings.mjs —
 // one place that owns the file path + each forgiving default, shared with the Stop
@@ -128,16 +251,20 @@ export function bindSessionToTask(session, tasks) {
   }
 }
 
-function main() {
+const KNOWN_SOURCES = new Set(["startup", "resume", "compact", "clear"]);
+
+function main(args = []) {
   // SessionStart hooks receive a JSON payload on stdin (session_id, cwd,
   // source, …). Fall back to process.cwd() if it's absent or unparseable.
   let cwd = process.cwd();
   let session = "";
+  let source = "startup";
   try {
     const raw = readFileSync(0, "utf8");
     const j = JSON.parse(raw);
     if (j && typeof j.cwd === "string" && j.cwd) cwd = j.cwd;
     if (j && typeof j.session_id === "string") session = j.session_id.trim();
+    if (j && typeof j.source === "string" && KNOWN_SOURCES.has(j.source)) source = j.source;
   } catch {
     // no stdin / bad JSON → keep process.cwd()
   }
@@ -151,6 +278,7 @@ function main() {
   // (cost attribution must not depend on how chatty the hook is).
   const contextOn = hookContextEnabled(appData);
   const file = path.join(appData, "com.claude-usage-tracker.app", "todos.json");
+  const fileLine = `File (don't edit): ${file}`;
 
   let data = null;
   try {
@@ -162,14 +290,24 @@ function main() {
   }
   const todos = Array.isArray(data && data.todos) ? data.todos : [];
   const changes = Array.isArray(data && data.changes) ? data.changes : [];
+  const hostIndex = args.indexOf("--host");
+  const hostValue = hostIndex >= 0 ? String(args[hostIndex + 1] || "") : "claude";
+  const host = hostValue === "codex" ? "codex" : "claude";
+  const compactSource = source === "resume" || source === "compact";
+  const workflow = workflowContextEnabled(appData)
+    ? compactSource
+      ? buildWorkflowSummary(workflowState(appData, cwd, host), host)
+      : buildWorkflowContext(workflowState(appData, cwd, host), host)
+    : "";
 
   const project = path.basename(String(cwd).replace(/[\\/]+$/, ""));
   // General cross-project note (issue #13): tasks aren't limited to the current
   // project. The hook itself stays group-agnostic — Claude discovers associations
   // on demand via `cli.mjs todos related`.
-  const crossProjectNote =
-    `Cross-project: \`--project <name>\` on add files a task against another project ` +
-    `("${project}" is saved as its "from"). \`<cli> todos related ${project}\` lists associated projects.`;
+  const crossProjectNote = compactSource
+    ? ""
+    : `Cross-project: \`--project <name>\` on add files a task against another project ` +
+      `("${project}" is saved as its "from"). \`<cli> todos related ${project}\` lists associated projects.`;
   // Kanban columns the tracker recognizes. Legacy `pending` (written before the
   // columns existed) is shown as `backlog`, matching the tracker's own load-time
   // migration, so Claude only ever sees a real column.
@@ -243,10 +381,10 @@ function main() {
         `· raise a task's priority:    <cli> todos set priority <id> <high|medium|low|none>`,
         `· see the whole board:        <cli> todos list  (backlog | queue | in_progress | review | done)`,
         ...(bindNote ? [bindNote] : []),
-        crossProjectNote,
-        `File (don't edit): ${file}`,
+        ...(crossProjectNote ? [crossProjectNote] : []),
+        fileLine,
       ].join("\n");
-      process.stdout.write(note + "\n");
+      process.stdout.write((workflow ? `${note}\n\n${workflow}` : note) + "\n");
       return;
     }
 
@@ -281,7 +419,7 @@ function main() {
         const date = String(t.scheduled_for).slice(0, 10);
         due = date < today ? ` ⏰ overdue (${date})` : ` ⏰ today`;
       }
-      return `- ${num}[${col(t.status)}]${prio}${due} ${clip(t.subject)}  ⟨id:${t.id}⟩`;
+      return `- ${num}[${col(t.status)}]${prio}${due} ${clip(t.subject)}`;
     });
     if (hidden) {
       lines.push(
@@ -318,12 +456,13 @@ function main() {
     // change root's when it has none (specAddressesFor). Printed NEXT TO the
     // vision above, never instead of it. Deduped ACROSS shown tasks (not just
     // within one task's own list) so several subtasks sharing a root's `spec`
-    // don't repeat the same section.
+    // don't repeat the same section. Silent altogether while `specsEnabled` is
+    // off (default) — specAddressesFor(appData) then yields no addresses.
     const specRoot = resolveRoot(cwd, appData);
     const specSeen = new Set();
     for (const t of shown) {
       if (col(t.status) !== "in_progress") continue;
-      const specLink = specAddressesFor(t, changeRootsFor({ todos, changes }, t));
+      const specLink = specAddressesFor(t, changeRootsFor({ todos, changes }, t), appData);
       const fresh = specLink.addresses.filter((a) => !specSeen.has(a));
       fresh.forEach((a) => specSeen.add(a));
       if (fresh.length) {
@@ -339,27 +478,17 @@ function main() {
     // banner so the two are unmistakably separate. Plain stdout on exit 0 is the
     // most robust way to inject SessionStart context (no additionalContext nesting).
     const context = [
-      `──────── TASK TRACKER · how to edit the USER's todos (CLI) ────────`,
-      `These are the USER's todos, not your working task list. The tracker owns todos.json — change it ONLY through the CLI (${CLI_NOTE}, written <cli> below), never by hand.`,
-      `The survival kit is below; for anything it does not cover, \`<cli> todos --help\` is the authoritative command set.`,
-      `  change a field  → <cli> todos set <field> <id> <value>   — one setter for all of: ${setFieldNames().join(" · ")}`,
-      `                    (status takes ${STATUSES.join(" | ")}; \`<cli> todos set\` prints each field's values)`,
-      `  add a follow-up → <cli> todos add "<subject>" [--project <name>]`,
-      `  note a finding  → <cli> todos comment add <id> --text "<body>"`,
-      `  link two tasks  → <cli> todos dep add <task> <depends-on>  (blocking, acyclic, one board)  ·  <cli> todos ref add <task> <target>  (non-blocking, cross-project ok)`,
-      `  handoff         → what a task passes to whatever depends on it: inherited notes auto-print on → in_progress; leave yours with \`<cli> todos handoff set <id> --text "<body>"\`.`,
-      `  see the board   → <cli> todos list  [--all | --status <col>[,<col>]]`,
-      `Rules: <id> is a task's uuid, its number N, or #N — every command takes any of the three. Each command touches only its own field — leave the rest to the user. add/comment ONLY what the user asked to track, not your scratchpad; new tasks land in backlog. Reference a task in prose as t#${refExample} ("blocked by t#${refExample}") — a bare #N means a GitHub PR/issue, NOT a task link, and an inline t#N draws only a ref edge, never a blocking dep (use \`dep add\` for that).`,
-      crossProjectNote,
-      `File (don't edit): ${file}`,
+      contractBlock(source, refExample),
+      ...(crossProjectNote ? [crossProjectNote] : []),
+      fileLine,
       "",
-      `──────── TASKS · project "${project}" · ⏰ due first, then queued & unblocked, up to ${CAP} ────────`,
-      `⏰ = due today / overdue — surfaced first, whatever the column or priority. Below them (priority-gated by the tracker's "task priority in context" setting): queue tasks whose dependencies are all done — current roots of the graph — plus every in_progress task. Titles only; backlog, blocked queue tasks and non-due/below-threshold tasks are held back (\`<cli> todos list\` shows the whole board).`,
+      `──────── TASKS · project "${project}" · ⏰ due/overdue first (any column, any priority), then queue-roots + in_progress, up to ${CAP} ────────`,
+      `Queue layer gated by "task priority in context"; backlog, blocked and below-threshold held back — \`<cli> todos list\` shows the whole board.`,
       lines.join("\n"),
       ...(bindNote ? [bindNote] : []),
     ].join("\n");
 
-    process.stdout.write(context + "\n");
+    process.stdout.write((workflow ? `${context}\n\n${workflow}` : context) + "\n");
     return;
   }
 
@@ -373,11 +502,11 @@ function main() {
     `Use the CLI (${CLI_NOTE}), don't hand-edit the JSON (the tracker may write it concurrently):`,
     `· add a task: <cli> todos add "<subject>" [--project <name>] [--description <text>] — lands in backlog; only what the user explicitly wants tracked.`,
     `· see tasks: <cli> todos list — statuses: backlog | queue | in_progress | review | done.`,
-    crossProjectNote,
-    `File (don't edit): ${file}`,
+    ...(crossProjectNote ? [crossProjectNote] : []),
+    fileLine,
   ].join("\n");
 
-  process.stdout.write(note + "\n");
+  process.stdout.write((workflow ? `${note}\n\n${workflow}` : note) + "\n");
 }
 
 // Render a possibly multi-line value as an indented block under a one-line label,
@@ -402,9 +531,9 @@ function block(label, text, pad = "    ", cap = 2000) {
 
 // Entry for the unified dispatcher: `cli.mjs hook`. A todo hook must NEVER break
 // a session, so any error is swallowed (exit 0, no output).
-export function run() {
+export function run(args = []) {
   try {
-    main();
+    main(args);
   } catch {
     process.exit(0);
   }

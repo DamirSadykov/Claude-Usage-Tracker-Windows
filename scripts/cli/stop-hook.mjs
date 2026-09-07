@@ -33,7 +33,7 @@
 import { readFileSync, openSync, readSync, closeSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { taskHandoffGuard, specDeltaGuard } from "./settings.mjs";
+import { taskHandoffGuard, specDeltaGuard, specsEnabled } from "./settings.mjs";
 
 const CLI = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "cli.mjs");
 
@@ -556,7 +556,7 @@ async function specGuardParts(cwd, appData) {
     const root = specMod.resolveRoot(cwd, appData);
     return {
       addressesFor: (data) => (t) =>
-        todosMod.specAddressesFor(t, todosMod.changeRootsFor(data, t)).addresses,
+        todosMod.specAddressesFor(t, todosMod.changeRootsFor(data, t), appData).addresses,
       render: (address) => {
         const res = specMod.showSection(address, root, appData);
         if (!res.ok) return `— ${address}: ${res.reason}`;
@@ -600,7 +600,11 @@ async function main() {
     process.env.APPDATA ||
     path.join(process.env.USERPROFILE || "", "AppData", "Roaming");
   const taskMode = taskHandoffGuard(appData);
-  const specMode = specDeltaGuard(appData);
+  // The spec half of this guard is reachable only while `specsEnabled` is on —
+  // off (the default) forces it to "off" regardless of `specDeltaGuard`, same
+  // as if the board linked no specs at all. The HANDOFF half above is a
+  // different feature and is never touched by this switch.
+  const specMode = specsEnabled(appData) ? specDeltaGuard(appData) : "off";
   if (taskMode === "off" && specMode === "off") return; // both switched off
 
   const since = sessionStartMs(input.transcript_path);

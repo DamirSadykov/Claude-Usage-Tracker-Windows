@@ -255,6 +255,12 @@ const messages = {
     hookContextSetting: "Task context in sessions",
     hookContextSettingDesc:
       "Inject your active tasks into every Claude Code session (SessionStart hook). Off: sessions start with no task context.",
+    workflowContextSetting: "Role workflow at session start",
+    workflowContextSettingDesc:
+      "Show this session's own lifecycle before its first prompt, plus the separate auto runner's worker → review path. Requires task context to be enabled.",
+    specsEnabledSetting: "Spec registry for changes",
+    specsEnabledSettingDesc:
+      "Link a change to a docs/specs section and ask about it automatically (session injection, the closing guard). Off (default): a change is just a group of tasks sharing one goal — nothing asks about spec sections on its own. Manual `cli spec …` commands still work either way.",
     todoProject: "Project",
     todoProjectPlaceholder: "e.g. my-app (optional)",
     todoShowDone: "Show done",
@@ -786,6 +792,12 @@ const messages = {
     installCcHookBtn: "Install",
     installCcHookReinstall: "Reinstall / update path",
     installCcHookDone: "Done — wired {path}",
+    installCodexHook: "Codex CLI hook",
+    installCodexHookDesc:
+      "Wire the SessionStart hook into ~/.codex/hooks.json so every Codex session sees this project's tasks and the duty map. Codex asks you to trust the new hook once, on the next session start.",
+    installCodexHookBroken:
+      "The wired script no longer exists — Codex has been getting nothing from it. Reinstall to re-point the hook.",
+    installCodexHookDone: "Done — wired {path}; trust the hook when Codex asks on the next start",
     statusNone: "All systems operational",
     statusMinor: "Minor service issues",
     statusMajor: "Partial service outage",
@@ -1055,6 +1067,12 @@ const messages = {
     hookContextSetting: "Контекст задач в сессиях",
     hookContextSettingDesc:
       "Вставлять ваши активные задачи в каждую сессию Claude Code (хук SessionStart). Выкл.: сессии стартуют без контекста задач.",
+    workflowContextSetting: "Процесс ролей в начале сеанса",
+    workflowContextSettingDesc:
+      "Перед первым сообщением показывать жизненный цикл этого сеанса и отдельный путь автозапуска: исполнитель → проверка. Работает, только когда включён контекст задач.",
+    specsEnabledSetting: "Реестр спек для change'ей",
+    specsEnabledSettingDesc:
+      "Привязывать change к разделу docs/specs и спрашивать о нём автоматически (вставка в сессию, закрывающий guard). Выкл. (по умолчанию): change — просто группа задач с одной целью, ничего само не спрашивает про разделы спек. Ручные команды `cli spec …` работают в обоих состояниях.",
     todoProject: "Проект",
     todoProjectPlaceholder: "напр. my-app (необязательно)",
     todoShowDone: "Показать готовые",
@@ -1586,6 +1604,12 @@ const messages = {
     installCcHookBtn: "Установить",
     installCcHookReinstall: "Переустановить / обновить путь",
     installCcHookDone: "Готово — прописан {path}",
+    installCodexHook: "Хук Codex CLI",
+    installCodexHookDesc:
+      "Прописать хук SessionStart в ~/.codex/hooks.json, чтобы каждая сессия Codex видела задачи этого проекта и карту обязанностей. Codex один раз попросит доверить новый хук при следующем старте.",
+    installCodexHookBroken:
+      "Прописанного скрипта больше нет на диске — Codex всё это время не получал от него ничего. Переустановите, чтобы перенацелить хук.",
+    installCodexHookDone: "Готово — прописан {path}; подтвердите доверие хуку, когда Codex спросит при старте",
     statusNone: "Все системы работают",
     statusMinor: "Незначительные сбои",
     statusMajor: "Частичный сбой сервиса",

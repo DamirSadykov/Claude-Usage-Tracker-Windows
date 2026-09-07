@@ -24,6 +24,7 @@ import {
   changeRootsFor,
   formatChangeVision,
   specAddressesFor,
+  specAddressesForManual,
   formatSpecSections,
   isChangeRoot,
   formatDeclarations,
@@ -36,6 +37,64 @@ import {
   readTaskSessionEvents,
   lastTaskSessionEvent,
 } from "./todos.mjs";
+
+describe("todos list scope and pagination", () => {
+  let dir;
+  const cli = path.join(fileURLToPath(new URL(".", import.meta.url)), "..", "cli.mjs");
+  const currentProject = path.basename(process.cwd());
+
+  const run = (...args) => execFileSync(process.execPath, [cli, "todos", "list", ...args], {
+    env: { ...process.env, APPDATA: dir },
+    encoding: "utf8",
+  });
+
+  beforeEach(() => {
+    dir = mkdtempSync(path.join(os.tmpdir(), "cut-list-"));
+    const appDir = path.join(dir, "com.claude-usage-tracker.app");
+    mkdirSync(appDir, { recursive: true });
+    const todos = [
+      { id: "mine-1", number: 1, subject: "mine one", status: "queue", project: currentProject },
+      { id: "global-1", number: 2, subject: "global one", status: "queue" },
+      { id: "other-1", number: 3, subject: "other one", status: "queue", project: "other-project" },
+      ...Array.from({ length: 22 }, (_, i) => ({
+        id: `mine-${i + 4}`,
+        number: i + 4,
+        subject: `mine ${i + 4}`,
+        status: "queue",
+        project: currentProject,
+      })),
+    ];
+    writeFileSync(path.join(appDir, "todos.json"), JSON.stringify({ version: 1, todos }));
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  it("defaults to the current project and keeps global/cross-project tasks explicit", () => {
+    const out = run();
+    expect(out).toContain(`project \"${currentProject}\"`);
+    expect(out).toContain("mine one");
+    expect(out).not.toContain("global one");
+    expect(out).not.toContain("other one");
+    expect(run("--global")).toContain("global one");
+    expect(run("--all", "--limit", "30")).toContain("other one");
+  });
+
+  it("returns a bounded text page and tells the caller how to continue", () => {
+    const first = run("--limit", "2");
+    expect(first).toContain("page 1/12 · 2 of 23");
+    expect(first).toContain("mine one");
+    expect(first).toContain("next: --page 2 --limit 2");
+    const second = run("--page", "2", "--limit", "2");
+    expect(second).toContain("#5 [queue] mine 5");
+    expect(second).not.toContain("mine one");
+  });
+
+  it("keeps legacy JSON as an array, but returns continuation metadata for an explicit page", () => {
+    expect(Array.isArray(JSON.parse(run("--json")))).toBe(true);
+    const page = JSON.parse(run("--json", "--page", "2", "--limit", "2"));
+    expect(page).toMatchObject({ page: 2, limit: 2, total: 23, pages: 12 });
+    expect(page.items).toHaveLength(2);
+  });
+});
 
 // Minimal board builder: rows are [id, {change, depends_on, ...}].
 const board = (...rows) => ({
@@ -152,10 +211,15 @@ describe("formatChangeVision", () => {
 // anchor — the addressed section(s) of `docs/specs` its own `spec` field (or,
 // failing that, its change root's) names, printed WHOLE and next to the vision,
 // never instead of it (docs/specs/README.md §7/§8).
-describe("specAddressesFor", () => {
+//
+// `specAddressesForManual` is the pure resolver, with no `specsEnabled` gate —
+// exactly what the two manual `cli spec …` commands call (spec.mjs, spec-match.mjs)
+// and the right function to test the RESOLUTION rule against. The gate itself
+// (specAddressesFor, t#361) has its own describe block below.
+describe("specAddressesForManual", () => {
   it("uses the task's own spec field when it has one", () => {
     const t = { spec: ["proj#a", "proj#b"] };
-    expect(specAddressesFor(t, [{ spec: ["proj#c"] }])).toEqual({
+    expect(specAddressesForManual(t, [{ spec: ["proj#c"] }])).toEqual({
       source: "task",
       addresses: ["proj#a", "proj#b"],
     });
@@ -164,24 +228,88 @@ describe("specAddressesFor", () => {
   it("falls back to the change root's spec field when the task has none", () => {
     const t = {};
     const roots = [{ spec: ["proj#a"] }];
-    expect(specAddressesFor(t, roots)).toEqual({ source: "root", addresses: ["proj#a"] });
+    expect(specAddressesForManual(t, roots)).toEqual({ source: "root", addresses: ["proj#a"] });
   });
 
   it("collects and dedups addresses across several roots", () => {
     const t = {};
     const roots = [{ spec: ["proj#a"] }, { spec: ["proj#a", "proj#b"] }];
-    expect(specAddressesFor(t, roots)).toEqual({ source: "root", addresses: ["proj#a", "proj#b"] });
+    expect(specAddressesForManual(t, roots)).toEqual({ source: "root", addresses: ["proj#a", "proj#b"] });
   });
 
   it("ignores the root's spec entirely once the task carries its own — no double-print", () => {
     const t = { spec: ["proj#a"] };
     const roots = [{ spec: ["proj#a"] }];
-    expect(specAddressesFor(t, roots)).toEqual({ source: "task", addresses: ["proj#a"] });
+    expect(specAddressesForManual(t, roots)).toEqual({ source: "task", addresses: ["proj#a"] });
   });
 
   it("returns nothing when neither the task nor any root carries a spec — the channel stays silent", () => {
-    expect(specAddressesFor({}, [])).toEqual({ source: "root", addresses: [] });
-    expect(specAddressesFor({}, [{}])).toEqual({ source: "root", addresses: [] });
+    expect(specAddressesForManual({}, [])).toEqual({ source: "root", addresses: [] });
+    expect(specAddressesForManual({}, [{}])).toEqual({ source: "root", addresses: [] });
+  });
+});
+
+// t#361: `specsEnabled` (settings.mjs) is the master switch for the whole spec
+// channel's part in the AUTOMATIC workflow, default false. `specAddressesFor`
+// is GATED BY DEFAULT — omitting `appData` does NOT skip the check, it just
+// means the check reads the real settings.json (same as `roamingBase()`
+// would). Only the separately named `specAddressesForManual` above bypasses
+// the gate, and only because the two manual `cli spec …` commands call it BY
+// NAME, on purpose.
+describe("specAddressesFor — the specsEnabled gate (t#361)", () => {
+  let dir;
+  beforeEach(() => {
+    dir = mkdtempSync(path.join(os.tmpdir(), "cut-todos-specgate-"));
+    mkdirSync(path.join(dir, "com.claude-usage-tracker.app"), { recursive: true });
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  const settings = (obj) =>
+    writeFileSync(path.join(dir, "com.claude-usage-tracker.app", "settings.json"), JSON.stringify(obj));
+
+  it("yields no addresses when specsEnabled is false — the default, even with no settings.json at all", () => {
+    const t = { spec: ["proj#a"] };
+    expect(specAddressesFor(t, [{ spec: ["proj#b"] }], dir)).toEqual({ source: "off", addresses: [] });
+  });
+
+  it("yields no addresses when specsEnabled is explicitly false, task or root carrying a spec notwithstanding", () => {
+    settings({ specsEnabled: false });
+    const t = {};
+    expect(specAddressesFor(t, [{ spec: ["proj#a"] }], dir)).toEqual({ source: "off", addresses: [] });
+  });
+
+  it("resolves normally once specsEnabled is true", () => {
+    settings({ specsEnabled: true });
+    const t = { spec: ["proj#a"] };
+    expect(specAddressesFor(t, [{ spec: ["proj#b"] }], dir)).toEqual({
+      source: "task",
+      addresses: ["proj#a"],
+    });
+  });
+
+  // The footgun this describe block guards against: a call site that forgets
+  // to pass `appData` must NOT come back on. It stays gated — just against
+  // whatever settings.json `roamingBase()` would itself resolve to (here,
+  // APPDATA is pinned to the same empty temp dir so the assertion is hermetic).
+  it("stays gated even when a call site passes no appData at all — the switch is not opt-in", () => {
+    const prevAppData = process.env.APPDATA;
+    process.env.APPDATA = dir;
+    try {
+      const t = { spec: ["proj#a"] };
+      expect(specAddressesFor(t, [{ spec: ["proj#b"] }])).toEqual({ source: "off", addresses: [] });
+    } finally {
+      if (prevAppData === undefined) delete process.env.APPDATA;
+      else process.env.APPDATA = prevAppData;
+    }
+  });
+
+  it("specAddressesForManual bypasses the gate by name, for the two manual `cli spec …` callers", () => {
+    settings({ specsEnabled: false });
+    const t = { spec: ["proj#a"] };
+    expect(specAddressesForManual(t, [{ spec: ["proj#b"] }])).toEqual({
+      source: "task",
+      addresses: ["proj#a"],
+    });
   });
 });
 

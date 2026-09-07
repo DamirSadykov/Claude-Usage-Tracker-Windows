@@ -144,10 +144,10 @@ refs: tasks#plan-mode, tasks#context
 - Каждый модуль `scripts/cli/*.mjs` обязан быть перечислен в
   `bundle.resources` (`src-tauri/tauri.conf.json`) — установленная сборка,
   в отличие от dev, не находит неперечисленные модули; на момент этой
-  правки перечислены все 18 модулей `scripts/cli/*.mjs`, включая
+  правки перечислены все 26 модулей `scripts/cli/*.mjs`, включая
   `plan-guard.mjs`, `run.mjs`, `run-step.mjs`, `adoption.mjs`, `lint.mjs`,
   `apply.mjs`, `graph-rules.mjs`, `spec.mjs`, `yaml-subset.mjs`,
-  `settings.mjs`.
+  `settings.mjs`, `claude-hooks.mjs`.
 - Установка хуков идёт кодом (`install_cc_hook` / `heal_cc_hook` в
   `src-tauri/src/lib.rs`), не руками: пишет и чинит записи в
   `~/.claude/settings.json`, никогда не трогает чужие хуки того же события

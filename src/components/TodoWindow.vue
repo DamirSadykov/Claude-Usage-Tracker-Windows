@@ -684,7 +684,19 @@ const viewMode = ref<"board" | "graph" | "specs">("board");
 // screens (default) and the classic force layout. The choice is remembered per
 // machine so a session that prefers the old picture keeps it.
 const graphUiNew = ref(localStorage.getItem("graph-ui") !== "classic");
+// `specsTab` is a per-machine opt-in; `settings.specsEnabled` (t#361) is the
+// master switch — the tab needs BOTH. With the switch off (its default) the
+// tab is gone even on a machine that opted in, and any view already parked on
+// `specs` (a stored state, or the switch flipped while this window is open)
+// falls back to the board rather than rendering with no tab to reach it from.
 const specsTab = ref(localStorage.getItem("specs-tab") === "on");
+const specsTabVisible = computed(() => specsTab.value && settings.value.specsEnabled);
+watch(
+  () => settings.value.specsEnabled,
+  (on) => {
+    if (!on && viewMode.value === "specs") viewMode.value = "board";
+  },
+);
 const specMode = ref<PipelineMode>("reader");
 watch(graphUiNew, (on) =>
   localStorage.setItem("graph-ui", on ? "next" : "classic"),
@@ -763,6 +775,7 @@ const detailAnswers = computed(() => detail.value?.spec_answers ?? []);
 // other changes on it, which is the context a reader wants next.
 const specTarget = ref<{ address: string; project: string } | null>(null);
 function openSpecSection(address: string) {
+  if (!settings.value.specsEnabled) return;
   specTarget.value = { address, project: detail.value?.project ?? "" };
   viewMode.value = "specs";
   closeDetail();
@@ -1704,7 +1717,7 @@ onUnmounted(() => {
           {{ t("viewGraph") }}
         </button>
         <button
-          v-if="specsTab"
+          v-if="specsTabVisible"
           class="tw-vt"
           :class="{ active: viewMode === 'specs' }"
           role="tab"
