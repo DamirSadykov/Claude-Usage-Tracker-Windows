@@ -5,7 +5,18 @@
 // Same layer split as task-cost.mjs / corrections.mjs: Node owns TRANSCRIPT
 // PARSING, Rust owns the join with SQLite. It has to be that way here — the
 // database has no project file paths at all (`cc_files` stores transcripts), so
-// "what did the step actually produce" is only knowable from the transcript.
+// "what did the step actually produce" is knowable from two sources, one
+// strong and one weak (t#520). The strong one — a mutating tool_use in the
+// transcript of the session bound to the task — is all `todos run <change>
+// --go` ever needs, because that flow binds every step to its own session.
+// The agent-driven flow (`--next` / `--report`) hands the work to a subagent
+// whose session id nobody records, so there is no transcript to read; the
+// weak source — the declared file still on disk, with an mtime after the
+// window's start — is consulted only then, and every `produces` line says
+// which of the two it rests on. The window starts at `handout_at` (stamped by
+// `--next`, scripts/cli/run.mjs) when the node has one, and falls back to the
+// `in_progress` boundary below only for a node `--next` never touched — a
+// `--go` step, which binds and starts its own session in the same breath.
 //
 // What the reconciliation reads:
 //   produces (t#302)          what the step promised BEFORE the work (DSL §6)
@@ -13,7 +24,14 @@
 //                             inside which a session's file writes belong to
 //                             THIS step (block fold mirrors task_sessions.rs)
 //   the session transcripts   Write / Edit / MultiEdit / NotebookEdit tool_use
-//                             entries = what was really touched
+//                             entries = what was really touched (strong)
+//   handout_at                the last time `--next` handed this node out —
+//                             the floor an mtime must clear to count as weak
+//                             evidence, when the node has one (t#520)
+//   status_history            the latest entry into in_progress — the SAME
+//                             floor for a node `handout_at` never touched
+//                             (`--go`; same field `attemptsSoFar` in run.mjs
+//                             counts on)
 //   depends_on (reversed)     the dependent nodes; a promised output counts as
 //                             CONSUMED when it shows up in their blocks
 //
@@ -26,7 +44,14 @@
 // `--verify ok|issue`; a declared-but-not-run check leaves the outcome
 // UNFINALIZED rather than guessing (§15, «никаких значений из воздуха»).
 
-import { readFileSync, writeFileSync, renameSync, readdirSync, existsSync } from "node:fs";
+import {
+  readFileSync,
+  writeFileSync,
+  renameSync,
+  readdirSync,
+  existsSync,
+  statSync,
+} from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -221,15 +246,79 @@ function touchesIn(blocks, touchesBySession) {
   return out.sort((a, b) => String(a.ts || "").localeCompare(String(b.ts || "")));
 }
 
+// ── weak evidence (t#520) ───────────────────────────────────────────────────
+export function attemptStartOf(todo) {
+  const h = Array.isArray(todo?.status_history) ? todo.status_history : [];
+  const entries = h.filter(
+    (e) => e && e.status === "in_progress" && typeof e.at === "string" && e.at,
+  );
+  return entries.length ? entries[entries.length - 1].at : null;
+}
+
+// `--next` (scripts/cli/run.mjs) stamps `handout_at` on every node of the wave
+// it hands out, overwritten on each re-hand-out. A `--go` step never goes
+// through `--next`, so it never gets one — that path is untouched by design.
+export function handoutStartOf(todo) {
+  const at = typeof todo?.handout_at === "string" ? todo.handout_at.trim() : "";
+  return at || null;
+}
+
+// The boundary an mtime must clear to count as weak evidence: `handout_at`
+// when the node has one, else the `in_progress` floor `attemptStartOf` reads —
+// the fallback that keeps a `--go` step's behaviour exactly as it was before
+// t#520 gave `--next` a stamp of its own.
+export function evidenceWindowStartOf(todo) {
+  const handout = handoutStartOf(todo);
+  if (handout) return { at: handout, source: "handout" };
+  const attempt = attemptStartOf(todo);
+  if (attempt) return { at: attempt, source: "in_progress" };
+  return { at: null, source: null };
+}
+
+function defaultStatFile(absPath) {
+  return statSync(absPath).mtime.toISOString();
+}
+
+export function weakFileEvidence(
+  item,
+  { root = process.cwd(), windowStart, statFile = defaultStatFile } = {},
+) {
+  if (!windowStart) return null;
+  const rel = normalizePath(item);
+  if (!rel) return null;
+  const abs = path.resolve(root, rel);
+  const fromRoot = path.relative(path.resolve(root), abs);
+  if (!fromRoot || fromRoot.startsWith("..") || path.isAbsolute(fromRoot)) return null;
+  let mtime;
+  try {
+    mtime = statFile(abs);
+  } catch {
+    return null;
+  }
+  if (typeof mtime !== "string" || !(mtime > windowStart)) return null;
+  return { path: rel, at: mtime };
+}
+
 // ── the reconciliation ───────────────────────────────────────────────────────
-// Pure: everything it needs is passed in, so the whole verdict is unit-testable
-// without a filesystem.
-//   data     the board (for depends_on and the dependents' numbers)
-//   todo     the node under reconciliation
-//   blocks   ALL folded blocks (this node's and its dependents')
-//   touches  Map<session, touch[]> — un-windowed; windows are applied here
-//   verify   "ok" | "issue" | undefined — the runner's verdict, never run here
-export function buildOutcomeReport({ data, todo, blocks = [], touches = new Map(), verify }) {
+// Mostly pure: everything but the weak file-evidence stat is passed in or
+// injected, so the transcript-only verdict stays unit-testable without a real
+// filesystem.
+//   data      the board (for depends_on and the dependents' numbers)
+//   todo      the node under reconciliation
+//   blocks    ALL folded blocks (this node's and its dependents')
+//   touches   Map<session, touch[]> — un-windowed; windows are applied here
+//   verify    "ok" | "issue" | undefined — the runner's verdict, never run here
+//   root      repo root declared outputs resolve against for weak evidence
+//   statFile  injectable fs.statSync wrapper (t#520)
+export function buildOutcomeReport({
+  data,
+  todo,
+  blocks = [],
+  touches = new Map(),
+  verify,
+  root = process.cwd(),
+  statFile = defaultStatFile,
+}) {
   const board = (data && Array.isArray(data.todos) ? data.todos : []).filter(Boolean);
   const own = blocks.filter((b) => b.task === todo.id);
   const dependents = board.filter(
@@ -255,9 +344,15 @@ export function buildOutcomeReport({ data, todo, blocks = [], touches = new Map(
     .map((p) => String(p ?? "").trim())
     .filter(Boolean);
 
+  const window = evidenceWindowStartOf(todo);
   const produces = declared.map((item) => {
     const checkable = isPathLike(item);
     const hit = checkable ? wrote.find((t) => pathMatches(item, t.path)) : undefined;
+    const fileHit =
+      checkable && !hit
+        ? weakFileEvidence(item, { root, windowStart: window.at, statFile })
+        : null;
+    const evidence = hit ? "transcript" : fileHit ? "file" : null;
     const consumers = checkable
       ? dependents.filter((d) =>
           (seenByDependent.get(d.id) || []).some((t) => pathMatches(item, t.path)),
@@ -266,10 +361,11 @@ export function buildOutcomeReport({ data, todo, blocks = [], touches = new Map(
     return {
       path: item,
       checkable,
-      produced: !!hit,
-      produced_at: hit ? hit.ts : null,
+      produced: !!hit || !!fileHit,
+      produced_at: hit ? hit.ts : fileHit ? fileHit.at : null,
       produced_by: hit ? hit.tool : null,
       produced_in_session: hit ? hit.session : null,
+      evidence,
       consumed: consumers.length > 0,
       consumed_by: consumers.map((d) => ({ id: d.id, number: d.number })),
     };
@@ -322,6 +418,7 @@ export function buildOutcomeReport({ data, todo, blocks = [], touches = new Map(
       source: b.source || "",
     })),
     dependents: dependents.map((d) => ({ id: d.id, number: d.number })),
+    evidence_window: window,
     produces,
     missing,
     unconsumed,
@@ -466,10 +563,14 @@ function printReport(r) {
       out.push(`  ✗ ${p.path} — NOT produced\n`);
       continue;
     }
-    const by = `${p.produced_by}${p.produced_at ? ` ${p.produced_at}` : ""}`;
     const taken = p.consumed
       ? `consumed by ${p.consumed_by.map((c) => `#${c.number}`).join(", ")}`
       : "not consumed — unclaimed output (not an error, §15)";
+    const by =
+      p.evidence === "file"
+        ? `file evidence only, mtime ${p.produced_at} — no session bound, weaker than a transcript hit ` +
+          `(window since ${r.evidence_window.source} ${r.evidence_window.at})`
+        : `${p.produced_by}${p.produced_at ? ` ${p.produced_at}` : ""}`;
     out.push(`  ✓ ${p.path} — produced (${by}), ${taken}\n`);
   }
   if (r.side_effects.length) {
