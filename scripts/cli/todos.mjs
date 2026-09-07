@@ -47,6 +47,7 @@ import { fileURLToPath } from "node:url";
 import { matchPlanCli } from "./settings.mjs";
 import { resolveAddress, showSection, sectionFingerprint, blocksOf } from "./spec.mjs";
 import { findChange, changeAddress } from "./change.mjs";
+import { withBoardLock } from "./board-lock.mjs";
 
 // Kanban columns, in board order. Keep in lockstep with todos.rs::STATUSES.
 export const STATUSES = ["backlog", "queue", "in_progress", "review", "done"];
@@ -193,7 +194,7 @@ function save(file, data) {
     deferred.dirty = true;
     return;
   }
-  const tmp = file + ".tmp";
+  const tmp = `${file}.${process.pid}.tmp`;
   writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n");
   renameSync(tmp, file);
 }
@@ -2397,8 +2398,28 @@ function usage(code) {
 }
 
 // Entry for the unified dispatcher: `cli.mjs todos <cmd> …` → run([...]).
+//
+// Every board mutation is one load -> change -> save cycle, and the runner fires
+// several of them at once: a parallel wave moves two nodes through their own
+// `cli todos set status` processes. The write itself is atomic (save(): temp +
+// rename), the CYCLE is not — both processes read the same file and the later
+// writer replays a board that never saw the earlier change, so one transition
+// vanishes (t#528, seen live on c#19: #524 lost its in_progress, #525 its done
+// and its handoff). A cross-process lock around the mutating commands makes the
+// cycle the unit. Read-only commands stay outside it, and `run` must stay
+// outside too: it spawns these very commands as children and would deadlock on
+// its own lock.
+export const MUTATING = new Set([
+  "add", "set", "take", "produces", "rm", "comment", "dep", "ref", "handoff",
+]);
+
 export function run(args) {
   const [cmd, ...rest] = args;
+  if (MUTATING.has(cmd)) return withBoardLock(todosPath(), () => dispatch(cmd, rest));
+  return dispatch(cmd, rest);
+}
+
+function dispatch(cmd, rest) {
   switch (cmd) {
     case "add":
       cmdAdd(rest);

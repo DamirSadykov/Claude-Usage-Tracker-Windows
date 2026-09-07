@@ -340,7 +340,7 @@ function sinkPath() {
 
 // Atomic write (temp + rename), matching corrections.mjs / todos.mjs.
 function saveAtomic(file, data) {
-  const tmp = file + ".tmp";
+  const tmp = `${file}.${process.pid}.tmp`;
   writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n");
   renameSync(tmp, file);
 }

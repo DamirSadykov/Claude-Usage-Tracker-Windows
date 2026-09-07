@@ -31,6 +31,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { resolveTask, readTaskSessionEvents } from "./todos.mjs";
+import { withBoardLock } from "./board-lock.mjs";
 
 // Tools that CHANGE a file — the only evidence that something was produced.
 // `Read` carries a `file_path` too and is deliberately NOT here: reading a file
@@ -66,7 +67,7 @@ function loadTodos(file) {
 }
 
 function saveTodos(file, data) {
-  const tmp = file + ".tmp";
+  const tmp = `${file}.${process.pid}.tmp`;
   writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n");
   renameSync(tmp, file);
 }
@@ -511,6 +512,11 @@ function usage(code) {
 
 export function run(args) {
   const f = parseFlags(args);
+  if (f.write) return withBoardLock(appDataFile("todos.json"), () => reconcileAndReport(f));
+  return reconcileAndReport(f);
+}
+
+function reconcileAndReport(f) {
   const ref = f.positional[0];
   if (!ref || ref === "-h" || ref === "--help" || ref === "help") usage(ref ? 0 : 1);
 
