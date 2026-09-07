@@ -635,7 +635,7 @@ mod tests {
         assert_eq!(db.cc_file_state("a.jsonl").unwrap().unwrap().0, 456);
     }
 
-    // --- migrations: v8–v11 ---
+    // --- migrations: v8–v14 ---
 
     #[test]
     fn migration_count_advances_to_fourteen() {
