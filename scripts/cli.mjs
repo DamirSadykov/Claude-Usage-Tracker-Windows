@@ -74,7 +74,7 @@ function usage(code) {
       "  task-cost <…> session->task attribution for tokens-per-task (scan / publish)\n" +
       "  agents  <…>   model/provider profiles used by autonomous task runs\n" +
       "  spec    <…>   spec registry (t#339): domains / show / refs / lint over docs/specs\n" +
-      "  hook          SessionStart hook (wired into ~/.claude/settings.json)\n" +
+      "  hook [--host claude|codex]  SessionStart context for an AI CLI\n" +
       "  stop-hook     Stop hook — blocks a stop that leaves a worked task without a handoff baton\n" +
       "  plan-hook     plan-mode hooks (enter/prompt = format, exit = record + match-plan)\n" +
       "  plan-guard    PreToolUse hook on ExitPlanMode — refuses a plan that is not a valid graph file\n\n" +

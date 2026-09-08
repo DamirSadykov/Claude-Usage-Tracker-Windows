@@ -2377,6 +2377,124 @@ fn install_cc_hook(app: AppHandle) -> Result<String, String> {
     Ok(script)
 }
 
+/// `~/.codex/hooks.json` — Codex reads its hooks from a separate file, not from
+/// `config.toml`; the trust hash for each entry lives in `config.toml` under
+/// `[hooks.state]` and is written by Codex itself when the user approves the hook
+/// on first run. The installer therefore touches only hooks.json.
+fn codex_hooks_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let home = app.path().home_dir().map_err(|e| e.to_string())?;
+    Ok(home.join(".codex").join("hooks.json"))
+}
+
+const CODEX_SESSION_START_MATCHER: &str = "startup|resume|clear|compact";
+const CODEX_HOOK_TIMEOUT_SECS: u64 = 30;
+const CODEX_HOOK_CONTEXT_LIMIT: u64 = 12000;
+
+/// Wire OUR SessionStart entry into a Codex hooks file. Same idempotency rules
+/// as [`wire_hook_event`] (rewrite our command in place, else append a group),
+/// but the entry carries the two fields Codex reads that Claude Code does not:
+/// `timeout` and `additionalContextLimit` (the cap on injected context bytes).
+fn wire_codex_session_start(root: &mut serde_json::Value, command: &str) {
+    let obj = root.as_object_mut().expect("hooks root is an object");
+    let hooks = obj.entry("hooks").or_insert_with(|| serde_json::json!({}));
+    if !hooks.is_object() {
+        *hooks = serde_json::json!({});
+    }
+    let ev = hooks
+        .as_object_mut()
+        .unwrap()
+        .entry("SessionStart")
+        .or_insert_with(|| serde_json::json!([]));
+    if !ev.is_array() {
+        *ev = serde_json::json!([]);
+    }
+    let groups = ev.as_array_mut().unwrap();
+    let mut updated = false;
+    for g in groups.iter_mut() {
+        if let Some(hs) = g.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+            for hook in hs.iter_mut() {
+                if hook
+                    .get("command")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(is_our_hook_command)
+                {
+                    hook["command"] = serde_json::Value::String(command.to_string());
+                    hook["timeout"] = serde_json::json!(CODEX_HOOK_TIMEOUT_SECS);
+                    hook["additionalContextLimit"] = serde_json::json!(CODEX_HOOK_CONTEXT_LIMIT);
+                    updated = true;
+                }
+            }
+        }
+    }
+    if !updated {
+        groups.push(serde_json::json!({
+            "matcher": CODEX_SESSION_START_MATCHER,
+            "hooks": [ {
+                "type": "command",
+                "command": command,
+                "timeout": CODEX_HOOK_TIMEOUT_SECS,
+                "additionalContextLimit": CODEX_HOOK_CONTEXT_LIMIT
+            } ]
+        }));
+    }
+}
+
+#[derive(Serialize)]
+struct CodexHookStatus {
+    installed: bool,
+    script_path: String,
+    wired_path: String,
+    wired_path_exists: bool,
+    hooks_path: String,
+}
+
+#[tauri::command]
+fn codex_hook_status(app: AppHandle) -> Result<CodexHookStatus, String> {
+    let hooks_path = codex_hooks_path(&app)?;
+    let root = std::fs::read_to_string(&hooks_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+    let wired = root
+        .as_ref()
+        .and_then(|v| wired_script_path(v, "SessionStart"))
+        .unwrap_or_default();
+    Ok(CodexHookStatus {
+        installed: root
+            .as_ref()
+            .map(|v| settings_has_cc_hook(v, "SessionStart"))
+            .unwrap_or(false),
+        script_path: cc_hook_script_path(&app).unwrap_or_default(),
+        wired_path_exists: !wired.is_empty() && Path::new(&wired).exists(),
+        wired_path: wired,
+        hooks_path: hooks_path.to_string_lossy().replace('\\', "/"),
+    })
+}
+
+/// Wire `cli hook --host codex` as a Codex SessionStart hook. Only hooks.json is
+/// written; Codex asks the user to trust the new entry on the next session and
+/// records the hash in config.toml itself. Atomic write, foreign hooks preserved.
+#[tauri::command]
+fn install_codex_hook(app: AppHandle) -> Result<String, String> {
+    let script = cc_hook_script_path(&app)?;
+    let hooks_path = codex_hooks_path(&app)?;
+    let mut root: serde_json::Value = std::fs::read_to_string(&hooks_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !root.is_object() {
+        root = serde_json::json!({});
+    }
+    wire_codex_session_start(&mut root, &format!("node \"{script}\" hook --host codex"));
+    if let Some(dir) = hooks_path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let json = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
+    let tmp = hooks_path.with_extension("json.tmp");
+    std::fs::write(&tmp, json.as_bytes()).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &hooks_path).map_err(|e| e.to_string())?;
+    Ok(script)
+}
+
 /// Last-seen `id -> status` map, shared between the file watcher and the write
 /// commands. The watcher diffs the file against this to fire review/done alerts;
 /// the commands refresh it under the same lock right after they write, so the
@@ -3038,6 +3156,8 @@ pub fn run() {
             save_project_groups,
             install_cc_hook,
             cc_hook_status,
+            install_codex_hook,
+            codex_hook_status,
             upsert_todo,
             delete_todo,
             set_todo_status,
@@ -3114,6 +3234,26 @@ mod hook_install_tests {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn codex_session_start_is_appended_with_codex_fields_and_kept_idempotent() {
+        let mut root = serde_json::json!({
+            "hooks": { "SessionStart": [ { "matcher": "startup", "hooks": [
+                { "type": "command", "command": "node \"C:/kb/hooks.mjs\" lifecycle codex SessionStart", "timeout": 30 }
+            ] } ] }
+        });
+        wire_codex_session_start(&mut root, "node \"C:/app/scripts/cli.mjs\" hook --host codex");
+        let groups = root["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[1]["matcher"], CODEX_SESSION_START_MATCHER);
+        assert_eq!(groups[1]["hooks"][0]["additionalContextLimit"], CODEX_HOOK_CONTEXT_LIMIT);
+        assert_eq!(groups[1]["hooks"][0]["timeout"], CODEX_HOOK_TIMEOUT_SECS);
+        wire_codex_session_start(&mut root, "node \"D:/moved/scripts/cli.mjs\" hook --host codex");
+        let groups = root["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[1]["hooks"][0]["command"], "node \"D:/moved/scripts/cli.mjs\" hook --host codex");
+        assert_eq!(groups[0]["hooks"][0]["command"], "node \"C:/kb/hooks.mjs\" lifecycle codex SessionStart");
     }
 
     #[test]

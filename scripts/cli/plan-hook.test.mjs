@@ -12,15 +12,67 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   buildEnterContext,
+  buildCriticContext,
   buildExitContext,
   buildDiscussionContext,
   buildRecordedContext,
   approval,
+  readPlanText,
   recordPlan,
   runMatchPlan,
   formatAlreadySent,
   planFormatDoc,
 } from "./plan-hook.mjs";
+import { emptyAgentConfig, saveAgentConfig } from "./agents.mjs";
+
+describe("buildCriticContext", () => {
+  let dir;
+  let previous;
+  beforeEach(() => {
+    dir = mkdtempSync(path.join(os.tmpdir(), "cut-critic-"));
+    previous = process.env.APPDATA;
+    process.env.APPDATA = dir;
+  });
+  afterEach(() => {
+    if (previous === undefined) delete process.env.APPDATA;
+    else process.env.APPDATA = previous;
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("stays silent in session mode and for blank requests", () => {
+    const invoke = () => { throw new Error("must not run"); };
+    expect(buildCriticContext("plan this", { invoke })).toBe("");
+    const cfg = emptyAgentConfig();
+    cfg.duties.critic.mode = "agent";
+    saveAgentConfig(cfg);
+    expect(buildCriticContext("   ", { invoke })).toBe("");
+  });
+
+  it("fails open when the critic throws or declines", () => {
+    const cfg = emptyAgentConfig();
+    cfg.duties.critic.mode = "agent";
+    saveAgentConfig(cfg);
+    expect(buildCriticContext("plan this", { invoke: () => { throw new Error("down"); } })).toBe("");
+    expect(buildCriticContext("plan this", { invoke: () => ({ ok: false }) })).toBe("");
+  });
+
+  it("returns bounded critic input when the duty succeeds", () => {
+    const cfg = emptyAgentConfig();
+    cfg.duties.critic.mode = "agent";
+    saveAgentConfig(cfg);
+    const calls = [];
+    const context = buildCriticContext("Add export", {
+      cwd: "C:/work",
+      invoke: (...args) => { calls.push(args); return { ok: true, text: "Risk: users need a migration." }; },
+    });
+    expect(calls[0][0]).toBe("critic");
+    expect(calls[0][1]).toContain("Add export");
+    expect(calls[0][2]).toMatchObject({ cwd: "C:/work", timeoutMs: 45_000 });
+    expect(context).toContain("──────── CRITIC · before planning");
+    expect(context).toContain("Risk: users need a migration.");
+    expect(context).toContain("this session still owns the plan");
+  });
+});
 import {
   DOC_FIELDS,
   DSL_DOC_FIELDS,
@@ -429,22 +481,50 @@ describe("runMatchPlan", () => {
 // may: the harness's verdict in `tool_response`, and whether the plan is a
 // document of the language at all.
 describe("approval — the harness's own verdict, verbatim", () => {
-  // Both wordings are the ones this project's transcripts actually carry
-  // (7 ExitPlanMode calls, 19–28 July).
+  // The prose wording below is what this project's transcripts carried
+  // 19–28 July. The harness has since moved to a structured object on
+  // approval — {plan, isAgent, filePath}, no prose — confirmed against every
+  // ExitPlanMode call found on this machine (2026-07 through 2026-09, five
+  // repositories): all 7 approval samples came back as that object with a
+  // non-empty `plan`; the only two non-approvals found — one real rejection,
+  // one "ExitPlanMode called outside plan mode" error — both came back as a
+  // plain string, never an object (t#271). Both shapes are tested here; the
+  // prose stays live as a fallback for an older harness build.
   const APPROVED =
     "User has approved your plan. You can now start coding. Start with updating your todo list if applicable\n\n" +
     "Your plan has been saved to: C:\\Users\\me\\.claude\\plans\\giggly-map.md";
   const REJECTED =
     "The user doesn't want to proceed with this tool use. The tool use was rejected (eg. if it was a file edit, the new_string was NOT written to the file).";
+  const APPROVED_OBJECT = {
+    plan: "change: CHANGE: X\nsteps:\n  1:\n    title: Шаг\n",
+    isAgent: false,
+    filePath: "C:\\Users\\me\\.claude\\plans\\quiet-wondering-glacier.md",
+  };
 
-  it("reads approval and the path the harness saved the plan to", () => {
+  it("reads approval and the path the harness saved the plan to (legacy prose)", () => {
     const a = approval({ tool_response: APPROVED });
     expect(a.approved).toBe(true);
     expect(a.savedTo).toMatch(/giggly-map\.md$/);
   });
 
+  it("reads approval from the structured object the harness sends now", () => {
+    const a = approval({ tool_response: APPROVED_OBJECT });
+    expect(a.approved).toBe(true);
+    expect(a.savedTo).toBe(APPROVED_OBJECT.filePath);
+  });
+
   it("reads a refusal as a refusal", () => {
     expect(approval({ tool_response: REJECTED }).approved).toBe(false);
+  });
+
+  it("does not treat an object with no plan and no filePath as approved", () => {
+    expect(approval({ tool_response: { plan: "", isAgent: false, filePath: "" } }).approved).toBe(false);
+  });
+
+  it("reads approval from filePath alone when the inline plan is empty", () => {
+    const a = approval({ tool_response: { plan: "", isAgent: false, filePath: "C:\\plans\\p.md" } });
+    expect(a.approved).toBe(true);
+    expect(a.savedTo).toBe("C:\\plans\\p.md");
   });
 
   // Silence is not consent: no response, an object shape we don't know, a hook
@@ -454,8 +534,62 @@ describe("approval — the harness's own verdict, verbatim", () => {
       expect(approval(input).approved).toBe(false);
   });
 
-  it("survives a response that arrived as an object", () => {
+  it("survives a response that arrived as an object without a plan field", () => {
     expect(approval({ tool_response: { text: APPROVED } }).approved).toBe(true);
+  });
+});
+
+// t#271: the plan text moved to `tool_response.plan` the same way the approval
+// verdict did, with `tool_response.filePath` as the on-disk fallback and
+// `tool_input.plan` kept as the last resort for an older harness build.
+describe("readPlanText — where the plan text actually is", () => {
+  let dir;
+  beforeEach(() => {
+    dir = mkdtempSync(path.join(os.tmpdir(), "plan-text-"));
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  it("prefers tool_response.plan — the journal-line shape, tool_input empty", () => {
+    const r = readPlanText({
+      tool_input: {},
+      tool_response: {
+        plan: "change: CHANGE: X\nsteps:\n  1:\n    title: Шаг\n",
+        isAgent: false,
+        filePath: "C:\\plans\\p.md",
+      },
+    });
+    expect(r.source).toBe("tool_response.plan");
+    expect(r.text).toContain("CHANGE: X");
+  });
+
+  it("falls back to the file at tool_response.filePath when the inline text is empty", () => {
+    const file = path.join(dir, "plan.md");
+    writeFileSync(file, "change: CHANGE: file-fallback\nsteps:\n  1:\n    title: Шаг\n");
+    const r = readPlanText({ tool_input: {}, tool_response: { plan: "", isAgent: false, filePath: file } });
+    expect(r.source).toBe("tool_response.filePath");
+    expect(r.text).toContain("file-fallback");
+  });
+
+  it("never throws when the file at filePath cannot be read", () => {
+    expect(readPlanText({ tool_response: { plan: "", filePath: path.join(dir, "missing.md") } })).toEqual({
+      text: "",
+      source: "",
+    });
+  });
+
+  it("still honors tool_input.plan for an older or different harness build", () => {
+    const r = readPlanText({
+      tool_input: { plan: "change: CHANGE: legacy\nsteps:\n  1:\n    title: Шаг\n" },
+      tool_response: "User has approved your plan.",
+    });
+    expect(r.source).toBe("tool_input.plan");
+    expect(r.text).toContain("legacy");
+  });
+
+  it("returns empty when no shape carries a plan", () => {
+    expect(
+      readPlanText({ tool_input: {}, tool_response: "The user doesn't want to proceed with this tool use." }),
+    ).toEqual({ text: "", source: "" });
   });
 });
 
@@ -687,6 +821,62 @@ describe("the exit journal", () => {
     expect(rows[0].session).toBe("sess-1");
   });
 
+  // The journal-line shape from t#271's diagnosis: plan in `tool_response`,
+  // `tool_input` empty. Before the fix this took the "silent" branch every time.
+  it("records the journal-line payload — plan in tool_response, tool_input empty", () => {
+    const rows = exitHook(
+      payload({
+        tool_input: {},
+        tool_response: {
+          plan: "change: CHANGE: журнал-строка\nsteps:\n  1:\n    title: Шаг\n",
+          isAgent: false,
+          filePath: "C:\\Users\\me\\.claude\\plans\\quiet-wondering-glacier.md",
+        },
+      }),
+    );
+    expect(rows[0].branch).toBe("recorded");
+    expect(rows[0].approved).toBe(true);
+    expect(rows[0].plan_source).toBe("tool_response.plan");
+    expect(rows[0].input_keys).toEqual([]);
+  });
+
+  it("falls back to the plan file on disk when tool_response.plan is empty", () => {
+    const planFile = path.join(dir, "plan-on-disk.md");
+    writeFileSync(planFile, "change: CHANGE: с-диска\nsteps:\n  1:\n    title: Шаг\n");
+    const rows = exitHook(
+      payload({
+        tool_input: {},
+        tool_response: { plan: "", isAgent: false, filePath: planFile },
+      }),
+    );
+    expect(rows[0].branch).toBe("recorded");
+    expect(rows[0].plan_source).toBe("tool_response.filePath");
+  });
+
+  it("still records the legacy tool_input.plan shape", () => {
+    const rows = exitHook(payload());
+    expect(rows[0].branch).toBe("recorded");
+    expect(rows[0].plan_source).toBe("tool_input.plan");
+  });
+
+  // The exact wording this project's own transcripts carry for a genuine
+  // refusal (t#271 step 1) — a plain string, not an object, and with
+  // `tool_input` empty the way the real bridge sends it now.
+  it("records nothing for a rejected payload shaped like the real harness rejection", () => {
+    const rows = exitHook(
+      payload({
+        tool_input: {},
+        tool_response:
+          "The user doesn't want to proceed with this tool use. The tool use was rejected " +
+          "(eg. if it was a file edit, the new_string was NOT written to the file).",
+      }),
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0].branch).toBe("silent");
+    expect(rows[0].approved).toBe(false);
+    expect(rows[0].plan_chars).toBe(0);
+  });
+
   it("counts the declarations of a plan it recorded", () => {
     const rows = exitHook(
       payload({
@@ -731,5 +921,7 @@ describe("the exit journal", () => {
       .map((l) => JSON.parse(l));
     expect(rows[0].branch).toBe("record-failed");
     expect(rows[0].error).toBeTruthy();
+    expect(rows[0].file).toBeTruthy();
+    expect(existsSync(rows[0].file)).toBe(true);
   });
 });

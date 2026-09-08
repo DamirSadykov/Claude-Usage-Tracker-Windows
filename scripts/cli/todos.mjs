@@ -17,7 +17,8 @@
 //   take <id> [--session <id>]      bind THIS session to a task (cost attribution, t#295)
 //   comment add <id> --text "<body>" [--by claude|user]
 //   comment list <id> [--json]
-//   list [--project <name> | --all] [--status <col>[,<col>]] [--priority <level>] [--json]
+//   list [--project <name> | --global | --all] [--status <col>[,<col>]] [--priority <level>]
+//        [--page <N>] [--limit <N>] [--json]
 //        defaults to THIS project (cwd basename) + project-less tasks; --all spans every project.
 //        --status filters by kanban column (backlog|queue|in_progress|review|done), comma-separated to combine
 //   dep add|rm|list <task> [<depends-on>]  task-graph deps (#88): blocking edges, within one board, acyclic
@@ -44,7 +45,7 @@ import { randomUUID } from "node:crypto";
 import { spawn, execFileSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { matchPlanCli } from "./settings.mjs";
+import { matchPlanCli, specsEnabled } from "./settings.mjs";
 import { resolveAddress, showSection, sectionFingerprint, blocksOf } from "./spec.mjs";
 import { findChange, changeAddress } from "./change.mjs";
 import { withBoardLock } from "./board-lock.mjs";
@@ -449,6 +450,7 @@ function setStatus({ data, file, todo, value, flags }) {
     // Spec channel (t#340, docs/specs/README.md §7/§8): the addressed spec
     // section(s) for this task or its change root, printed NEXT TO the vision
     // above, never instead of it — same anchor, one extra thing in context.
+    // Silent altogether while `specsEnabled` is off (specAddressesFor).
     const specLink = specAddressesFor(todo, roots);
     if (specLink.addresses.length) {
       process.stdout.write("\n" + formatSpecSections(todo, specLink));
@@ -949,8 +951,10 @@ function setSpec({ data, file, todo, value }) {
     // Clearing the link on a task being closed disarms the closing guard, and
     // does it without a trace: the board afterwards is indistinguishable from
     // one where the link was never made. Every other escape hatch here says its
-    // own name out loud (`--force`), so this one must too.
-    if (col(todo.status) === "review" || col(todo.status) === "done") {
+    // own name out loud (`--force`), so this one must too. Only while
+    // `specsEnabled` is on, though — with the spec channel off there is no
+    // closing guard left to disarm, so the refusal itself stands down.
+    if (specsEnabled() && (col(todo.status) === "review" || col(todo.status) === "done")) {
       fail(
         `refusing: #${todo.number} is ${todo.status} — dropping its spec link now would silently ` +
           `disarm the closing guard, and leave no record that it ever pointed anywhere.\n` +
@@ -1457,18 +1461,23 @@ function cmdList(args) {
   let todos = load(file).todos.filter(Boolean);
   const pi = args.indexOf("--project");
   const hasProject = pi !== -1 && args[pi + 1] && !args[pi + 1].startsWith("--");
-  if (hasProject) {
+  let scopeLabel;
+  if (args.includes("--all")) {
+    scopeLabel = "all projects";
+  } else if (hasProject) {
     const p = args[pi + 1];
     todos = todos.filter((t) => (t.project || "") === p);
-  } else if (!args.includes("--all")) {
-    // Default scope: THIS session's project (the cwd basename) plus project-less
-    // (global) tasks — mirroring the SessionStart hook's filter (hook.mjs), so a
-    // bare `todos list` shows the current board instead of every project's tasks.
-    // `--all` opts back into the full cross-project list; `--project <name>`
-    // targets another board. cwd is the project dir (the CLI runs there), same as
-    // cmdAdd derives `cwdProject`.
+    scopeLabel = `project \"${p}\"`;
+  } else if (args.includes("--global")) {
+    todos = todos.filter((t) => !t.project);
+    scopeLabel = "global tasks";
+  } else {
+    // A bare list is THIS project only. Global tasks used to sneak into every
+    // project's output and made a large multi-project board look unbounded;
+    // inspect them deliberately with --global, or use --all for every board.
     const cwdProject = path.basename(process.cwd().replace(/[\\/]+$/, ""));
-    todos = todos.filter((t) => !t.project || t.project === cwdProject);
+    todos = todos.filter((t) => t.project === cwdProject);
+    scopeLabel = `project \"${cwdProject}\"`;
   }
   // --status <col>[,<col>]: keep only the named kanban columns (a bare `list`
   // shows the whole board, done included, which floods context). Comma-separate
@@ -1492,19 +1501,44 @@ function cmdList(args) {
       fail(`invalid --priority "${args[pri + 1]}". valid: ${PRIORITIES.join(" | ")} | none`);
     todos = todos.filter((t) => (t.priority || "") === want);
   }
+  const pageArg = args.indexOf("--page");
+  const limitArg = args.indexOf("--limit");
+  const parsePositive = (flag, at, fallback) => {
+    if (at === -1) return fallback;
+    const raw = args[at + 1];
+    if (!/^[1-9]\d*$/.test(String(raw || ""))) fail(`${flag} needs a positive integer`);
+    return Number(raw);
+  };
+  const page = parsePositive("--page", pageArg, 1);
+  const limit = parsePositive("--limit", limitArg, 20);
+  const total = todos.length;
+  const pages = Math.max(1, Math.ceil(total / limit));
+  if (page > pages && total) fail(`--page ${page} is outside the available range 1..${pages}`);
+  const items = todos.slice((page - 1) * limit, page * limit);
+  const paginated = pageArg !== -1 || limitArg !== -1;
+
   if (args.includes("--json")) {
-    process.stdout.write(JSON.stringify(todos, null, 2) + "\n");
+    // Preserve the raw-array contract for automation that did not request a
+    // page (notably the nightly triage exporter). A caller asking for paging
+    // gets the metadata required to continue safely.
+    process.stdout.write(JSON.stringify(
+      paginated ? { items, page, limit, total, pages, scope: scopeLabel } : todos,
+      null,
+      2,
+    ) + "\n");
     return;
   }
-  if (!todos.length) {
+  if (!total) {
     process.stdout.write("(no todos)\n");
     return;
   }
-  for (const t of todos) {
+  process.stdout.write(`(${scopeLabel} · page ${page}/${pages} · ${items.length} of ${total})\n`);
+  for (const t of items) {
     const num = t.number ? `#${t.number} ` : "";
     const prio = t.priority ? ` ‹${t.priority}›` : "";
     process.stdout.write(`${num}[${t.status}]${prio} ${t.subject}  ⟨id:${t.id}⟩\n`);
   }
+  if (page < pages) process.stdout.write(`next: --page ${page + 1} --limit ${limit}\n`);
 }
 
 // Resolve a task locator to its todo object. Accepts an id, a bare number, a
@@ -1855,7 +1889,7 @@ export function formatChangeVision(t, roots) {
 // also inherits its root's, so the two can't double-print the same address.
 // Addresses collected from several roots are deduped in encounter order, since
 // two branches can name the same section.
-export function specAddressesFor(t, roots) {
+function resolveSpecAddresses(t, roots) {
   const own = Array.isArray(t.spec) ? t.spec.filter(Boolean) : [];
   if (own.length) return { source: "task", addresses: own };
   const seen = new Set();
@@ -1869,6 +1903,28 @@ export function specAddressesFor(t, roots) {
     }
   }
   return { source: "root", addresses };
+}
+
+// THE choke point every AUTOMATIC consumer goes through (the SessionStart
+// injection, the section printed on the move into in_progress, baseline
+// recording) — GATED BY DEFAULT: `specsEnabled` false (the default) turns it
+// off, `{ source: "off", addresses: [] }`, before either `t.spec` or `roots`
+// is even read, so `recordSpecBaseline` is never reached either. `appData`
+// only needs passing when a call site already resolved a non-default one
+// (hook.mjs); omitted, it resolves the same real settings.json `roamingBase()`
+// would (settings.mjs::readSettings). The gate applies whether or not the
+// caller passes `appData` — there is no way to reach it and skip the check.
+export function specAddressesFor(t, roots, appData) {
+  if (!specsEnabled(appData)) return { source: "off", addresses: [] };
+  return resolveSpecAddresses(t, roots);
+}
+
+// The two manual `cli spec …` commands (spec.mjs::cmdAnswer, spec-match.mjs's
+// `fromBoard`) call THIS one, by name, instead — a link the user typed a
+// command about stays readable regardless of the automatic switch above. Named
+// so the opt-out is visible at the call site without opening this file.
+export function specAddressesForManual(t, roots) {
+  return resolveSpecAddresses(t, roots);
 }
 
 // One addressed section's block, in the exact three shapes `showSection` can
@@ -2337,7 +2393,8 @@ function usage(code) {
       "  rm <task> [--go]                delete a task and every reference to it; --dry-run is the DEFAULT\n" +
       '  comment add <id> --text "<body>" [--by claude|user]\n' +
       "  comment list <id> [--json]\n" +
-      "  list [--project <name> | --all] [--status <col>[,<col>]] [--priority <level>] [--json]\n" +
+      "  list [--project <name> | --global | --all] [--status <col>[,<col>]] [--priority <level>]\n" +
+      "       [--page <N>] [--limit <N>] [--json]  (text: page 1, 20 tasks by default)\n" +
       "                                  default: this project (cwd) + global (open + done); --all = every project\n" +
       "                                  --status filters by column: " +
       STATUSES.join(" | ") +

@@ -968,7 +968,7 @@ export function stampRefFor(roots, todo) {
 }
 
 async function cmdAnswer(args) {
-  const { resolveTask, loadBoard, boardPath, saveBoard, changeRootsFor, specAddressesFor } =
+  const { resolveTask, loadBoard, boardPath, saveBoard, changeRootsFor, specAddressesForManual } =
     await import("./todos.mjs");
   const positional = [];
   const flags = {};
@@ -987,7 +987,7 @@ async function cmdAnswer(args) {
   if (!todo) fail(`refusing: no task matches "${token}"`);
 
   const roots = changeRootsFor(data, todo);
-  const link = specAddressesFor(todo, roots);
+  const link = specAddressesForManual(todo, roots);
   if (!link.addresses.length)
     fail(
       `refusing: #${todo.number} "${todo.subject}" carries no spec link (neither its own nor its change root's) — ` +

@@ -476,7 +476,14 @@ describe("cli stop-hook — the spec guard end to end", () => {
     ...extra,
   });
 
+  const settings = (obj) =>
+    writeFileSync(
+      path.join(dir, "com.claude-usage-tracker.app", "settings.json"),
+      JSON.stringify(obj),
+    );
+
   it("blocks the stop and prints the addressed section in full", () => {
+    settings({ specsEnabled: true });
     board(closing());
     const { code, out } = runHook();
     expect(code).toBe(2);
@@ -486,6 +493,7 @@ describe("cli stop-hook — the spec guard end to end", () => {
   });
 
   it("lets the stop through once the section is answered", () => {
+    settings({ specsEnabled: true });
     board(
       closing({
         spec_answers: [
@@ -504,6 +512,7 @@ describe("cli stop-hook — the spec guard end to end", () => {
   it("reports BOTH a missing baton and a missing spec answer in one block", () => {
     // They cannot be reported one after the other: the hook fires once per stop
     // cycle (`stop_hook_active`), so the second complaint would never be seen.
+    settings({ specsEnabled: true });
     board(closing({ handoff: "", handoff_at: undefined }));
     const { code, out } = runHook();
     expect(code).toBe(2);
@@ -512,10 +521,24 @@ describe("cli stop-hook — the spec guard end to end", () => {
   });
 
   it("stays silent when the guard is switched off in settings", () => {
-    writeFileSync(
-      path.join(dir, "com.claude-usage-tracker.app", "settings.json"),
-      JSON.stringify({ specDeltaGuard: "off" }),
-    );
+    settings({ specsEnabled: true, specDeltaGuard: "off" });
+    board(closing());
+    expect(runHook().code).toBe(0);
+  });
+
+  // t#361: specsEnabled is off by DEFAULT — no settings.json at all forces the
+  // spec half of this guard to "off" regardless of specDeltaGuard, while the
+  // HANDOFF half (a different feature) keeps working untouched.
+  it("stays silent about specs by default, but still raises the handoff complaint alone", () => {
+    board(closing({ handoff: "", handoff_at: undefined }));
+    const { code, out } = runHook();
+    expect(code).toBe(2);
+    expect(out).toMatch(/leaves no usable HANDOFF/);
+    expect(out).not.toMatch(/left the section unanswered/);
+    expect(out).not.toContain("tasks#done-gate");
+  });
+
+  it("stays completely silent by default when only the spec answer is missing", () => {
     board(closing());
     expect(runHook().code).toBe(0);
   });

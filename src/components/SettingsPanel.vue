@@ -461,6 +461,39 @@ async function doInstallCcHook() {
 }
 onMounted(loadCcHookStatus);
 
+interface CodexHookStatus {
+  installed: boolean;
+  script_path: string;
+  wired_path: string;
+  wired_path_exists: boolean;
+  hooks_path: string;
+}
+const codexHookStatus = ref<CodexHookStatus | null>(null);
+const installCodexBusy = ref(false);
+const installCodexMsg = ref("");
+
+async function loadCodexHookStatus() {
+  try {
+    codexHookStatus.value = await invoke<CodexHookStatus>("codex_hook_status");
+  } catch {
+    codexHookStatus.value = null;
+  }
+}
+async function doInstallCodexHook() {
+  installCodexBusy.value = true;
+  installCodexMsg.value = "";
+  try {
+    const p = await invoke<string>("install_codex_hook");
+    installCodexMsg.value = t("installCodexHookDone", { path: p });
+    await loadCodexHookStatus();
+  } catch (e) {
+    installCodexMsg.value = String(e);
+  } finally {
+    installCodexBusy.value = false;
+  }
+}
+onMounted(loadCodexHookStatus);
+
 // --- Task priority in context (issue #32) ---
 // The LOWEST task priority the SessionStart hook injects into a Claude Code
 // session: all | low | medium | high. A UI-only flag in settings.json read
@@ -503,6 +536,7 @@ onMounted(loadTaskCtxPrio);
 // hook injects nothing into a session (no task context at all). Default ON.
 // Same store-write pattern as ignoredInsights above.
 const hookContextEnabled = ref(true);
+const workflowContextEnabled = ref(false);
 
 async function loadHookContext() {
   try {
@@ -510,6 +544,8 @@ async function loadHookContext() {
     const store = await loadStore("settings.json");
     const v = await store.get<boolean>("hookContextEnabled");
     if (typeof v === "boolean") hookContextEnabled.value = v;
+    const workflow = await store.get<boolean>("workflowContextEnabled");
+    if (typeof workflow === "boolean") workflowContextEnabled.value = workflow;
   } catch {}
 }
 
@@ -523,7 +559,50 @@ async function toggleHookContext() {
   } catch {}
 }
 
+async function toggleWorkflowContext() {
+  workflowContextEnabled.value = !workflowContextEnabled.value;
+  try {
+    const { load: loadStore } = await import("@tauri-apps/plugin-store");
+    const store = await loadStore("settings.json");
+    await store.set("workflowContextEnabled", workflowContextEnabled.value);
+    await store.save();
+  } catch {}
+}
+
 onMounted(loadHookContext);
+
+// --- Spec registry channel (t#361) ---
+// Master switch for the spec registry's part in the AUTOMATIC workflow: the
+// SessionStart injection, the section printed on the move into in_progress,
+// and the Stop guard's spec half. Default OFF — with it off a change is just a
+// group of tasks sharing one goal (its description, the ★ vision), and nothing
+// asks about spec sections on its own. Manual `cli spec …` commands stay fully
+// callable either way. Emits `settings-changed` on top of the shared store
+// write so a window already open (TodoWindow's Specs tab) hides live.
+const specsEnabled = ref(false);
+
+async function loadSpecsEnabled() {
+  try {
+    const { load: loadStore } = await import("@tauri-apps/plugin-store");
+    const store = await loadStore("settings.json");
+    const v = await store.get<boolean>("specsEnabled");
+    if (typeof v === "boolean") specsEnabled.value = v;
+  } catch {}
+}
+
+async function toggleSpecsEnabled() {
+  specsEnabled.value = !specsEnabled.value;
+  try {
+    const { load: loadStore } = await import("@tauri-apps/plugin-store");
+    const store = await loadStore("settings.json");
+    await store.set("specsEnabled", specsEnabled.value);
+    await store.save();
+    const { emit } = await import("@tauri-apps/api/event");
+    await emit("settings-changed");
+  } catch {}
+}
+
+onMounted(loadSpecsEnabled);
 
 // --- HANDOFF guard (issue #59) ---
 // Which TASKS must leave a handoff before a session ends (read by the Stop
@@ -1688,6 +1767,30 @@ function handleSave() {
         </button>
       </div>
 
+      <div class="card" style="display: flex; align-items: center; gap: 12px">
+        <div style="flex: 1; min-width: 0">
+          <div class="card-title" style="font-size: 13px">{{ t('installCodexHook') }}</div>
+          <div class="card-sub">{{ t('installCodexHookDesc') }}</div>
+          <div v-if="codexHookStatus" class="card-sub" style="margin-top: 6px">
+            {{ codexHookStatus.installed ? t('installCcHookOn') : t('installCcHookOff') }}
+            <span v-if="codexHookStatus.installed && codexHookStatus.wired_path" class="muted">
+              — {{ codexHookStatus.wired_path }}
+            </span>
+          </div>
+          <div
+            v-if="codexHookStatus && codexHookStatus.installed && !codexHookStatus.wired_path_exists"
+            class="field-hint"
+            style="margin-top: 4px; color: #f87171"
+          >
+            {{ t('installCodexHookBroken') }}
+          </div>
+          <div v-if="installCodexMsg" class="field-hint" style="margin-top: 4px">{{ installCodexMsg }}</div>
+        </div>
+        <button type="button" class="suggest-btn" :disabled="installCodexBusy" @click="doInstallCodexHook">
+          {{ codexHookStatus && codexHookStatus.installed ? t('installCcHookReinstall') : t('installCcHookBtn') }}
+        </button>
+      </div>
+
       <!-- Master switch: does the SessionStart hook inject task context? -->
       <div class="card toggle-card" @click="toggleHookContext">
         <div style="flex: 1; min-width: 0">
@@ -1695,6 +1798,31 @@ function handleSave() {
           <div class="card-sub">{{ t('hookContextSettingDesc') }}</div>
         </div>
         <div class="toggle" :class="{ on: hookContextEnabled }">
+          <div class="toggle-knob"></div>
+        </div>
+      </div>
+
+      <div
+        class="card toggle-card"
+        :class="{ disabled: !hookContextEnabled }"
+        @click="hookContextEnabled && toggleWorkflowContext()"
+      >
+        <div style="flex: 1; min-width: 0">
+          <div class="card-title" style="font-size: 13px">{{ t('workflowContextSetting') }}</div>
+          <div class="card-sub">{{ t('workflowContextSettingDesc') }}</div>
+        </div>
+        <div class="toggle" :class="{ on: workflowContextEnabled }">
+          <div class="toggle-knob"></div>
+        </div>
+      </div>
+
+      <!-- Master switch: does a change carry the spec registry (t#361)? -->
+      <div class="card toggle-card" @click="toggleSpecsEnabled">
+        <div style="flex: 1; min-width: 0">
+          <div class="card-title" style="font-size: 13px">{{ t('specsEnabledSetting') }}</div>
+          <div class="card-sub">{{ t('specsEnabledSettingDesc') }}</div>
+        </div>
+        <div class="toggle" :class="{ on: specsEnabled }">
           <div class="toggle-knob"></div>
         </div>
       </div>
@@ -2263,6 +2391,11 @@ function handleSave() {
   align-items: center;
   gap: 12px;
   cursor: pointer;
+}
+
+.toggle-card.disabled {
+  cursor: default;
+  opacity: .5;
 }
 
 .toggle {

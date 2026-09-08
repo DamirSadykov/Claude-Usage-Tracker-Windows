@@ -41,6 +41,7 @@ import { fileURLToPath } from "node:url";
 import { matchPlanCli, roamingBase } from "./settings.mjs";
 import { readDocument, applyDocument, summarize } from "./apply.mjs";
 import { DISCUSSION_KEY, discussionDeclaration, isReason, planCandidates } from "./plan-guard.mjs";
+import { criticRunsAsAgent, invokeDutySync } from "./agents.mjs";
 
 const CLI = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "cli.mjs");
 
@@ -112,6 +113,41 @@ const FORMAT_DOC = path.join(
 );
 
 export const planFormatDoc = () => FORMAT_DOC;
+
+// The critic is optional input before the session makes a plan, not a second
+// planner. It only spends the configured duty when the user deliberately chose
+// agent mode; every provider failure is silence because this runs in a blocking
+// UserPromptSubmit hook with Claude Code's own 60-second ceiling.
+export function buildCriticContext(promptText, {
+  invoke = invokeDutySync,
+  cwd = process.cwd(),
+  appData,
+} = {}) {
+  if (!criticRunsAsAgent(appData) || !String(promptText || "").trim()) return "";
+  try {
+    const result = invoke(
+      "critic",
+      [
+        "Assess this user's request before planning. Identify the goal, assumptions, risks, viable alternatives, and the smallest question that needs a user decision.",
+        "Do not edit files, propose file edits, or grow the scope. Give concise input for the main session to weigh.",
+        "",
+        "User request:",
+        String(promptText).trim(),
+      ].join("\n"),
+      { cwd, timeoutMs: 45_000 },
+    );
+    const text = String(result?.text || "").trim();
+    if (result?.skipped || !result?.ok || !text) return "";
+    const clipped = text.length > 2_000 ? text.slice(0, 1_999) + "…" : text;
+    return [
+      "──────── CRITIC · before planning ────────",
+      clipped,
+      "This is input for this session to weigh, not orders; this session still owns the plan.",
+    ].join("\n");
+  } catch {
+    return "";
+  }
+}
 
 // Exported for the unit tests.
 export function buildEnterContext() {
@@ -238,14 +274,22 @@ export function buildExitContext(warnings) {
 // to do it here is already in the payload — the plan text, and the harness's own
 // verdict on it.
 //
-// APPROVAL is the one thing the hook must not assume. ExitPlanMode is called
-// whether or not the user says yes, and the answer arrives in `tool_response`:
-// approved plans read "User has approved your plan" and carry the path the
-// harness saved them to, while a refusal reads "The user doesn't want to
-// proceed" (both wordings verified against this project's transcripts, 7 calls,
-// 19–28 July: 5 approved, 2 rejected). Nothing is recorded without that proof —
-// a rejected plan silently becoming a graph is the one failure that would cost
-// the user trust in the tracker.
+// APPROVAL is the one thing the hook must not assume. ExitPlanMode's answer
+// used to arrive as prose in `tool_response` ("User has approved your plan" vs
+// "The user doesn't want to proceed") — that wording is gone. The harness now
+// returns a STRUCTURED object on approval, {plan, isAgent, filePath}, no prose
+// at all, which is exactly why every plan since 2026-08-03 read as unapproved
+// (t#271). Checked against this machine's own Claude Code transcripts
+// (2026-07 through 2026-09, five repositories, every ExitPlanMode call found):
+// every approval sample (7) came back as that object with a non-empty `plan`
+// and/or `filePath`; the two non-approvals found — one genuine rejection, one
+// "ExitPlanMode called outside plan mode" error — both came back as a plain
+// error STRING, never as an object. So an object response carrying either
+// field is the approval signal now (either can be the one populated — see
+// readPlanText's file fallback below); the older prose match stays as a
+// second accepted signal for a harness build that still emits it. Nothing is
+// recorded without one of the two — a rejected plan silently becoming a graph
+// is the one failure that would cost the user trust in the tracker.
 const APPROVED_RE = /has approved your plan/i;
 const SAVED_TO_RE = /plan has been saved to:\s*(.+?)\s*$/im;
 
@@ -261,19 +305,50 @@ const responseText = (input) => {
 
 // { approved, savedTo }. Exported for the unit tests.
 export function approval(input) {
+  const r = input?.tool_response;
+  const plan = r && typeof r === "object" && typeof r.plan === "string" ? r.plan.trim() : "";
+  const filePath = r && typeof r === "object" && typeof r.filePath === "string" ? r.filePath.trim() : "";
+  if (plan || filePath) {
+    return { approved: true, savedTo: filePath };
+  }
   const text = responseText(input).replace(/\\+n/g, "\n");
   const m = SAVED_TO_RE.exec(text);
   return { approved: APPROVED_RE.test(text), savedTo: m ? m[1].replace(/\\\\/g, "\\") : "" };
 }
 
+// The plan text itself moved the same way: the harness puts it in
+// `tool_response.plan` now, and gives `tool_response.filePath` — the plan file
+// it already saved to disk — for the case that string is empty or missing.
+// `tool_input.plan` is kept as the last resort so an older or different
+// harness build still works. Reading the file is the one new I/O path here, so
+// it stays inside its own try — a moved or unreadable plan file must fall
+// through to the older shapes, never break the hook. Exported for the tests.
+export function readPlanText(input) {
+  const r = input?.tool_response;
+  const fromResponse = r && typeof r === "object" && typeof r.plan === "string" ? r.plan : "";
+  if (fromResponse.trim()) return { text: fromResponse, source: "tool_response.plan" };
+  const filePath = r && typeof r === "object" && typeof r.filePath === "string" ? r.filePath : "";
+  if (filePath) {
+    try {
+      const fileText = readFileSync(filePath, "utf8");
+      if (fileText.trim()) return { text: fileText, source: "tool_response.filePath" };
+    } catch {
+      // plan file moved / unreadable / harness quirk → fall through
+    }
+  }
+  const fromInput = input?.tool_input && typeof input.tool_input.plan === "string" ? input.tool_input.plan : "";
+  if (fromInput.trim()) return { text: fromInput, source: "tool_input.plan" };
+  return { text: "", source: "" };
+}
+
 // The plan is kept as the file it is, next to the board: a graph recorded from a
 // document nobody can look at afterwards is a graph with no provenance.
 //
-// A plan declared `discussion:` is kept too, under its own suffix. It records
-// nothing, so provenance is not the reason — the count is: t#322 could only say
-// "1 of 5 approved plans created no task" by reading transcripts, and could not
-// say which of those were discussions on purpose. Filed here, the next
-// measurement reads the answer off a directory instead of inferring it.
+// Called from `main()` BEFORE the approval decision (t#271), not from inside
+// whichever branch happens to record it: an approval that `approval()` reads
+// wrong tomorrow, the way it read every approval wrong for a month, must cost
+// the graph, not the plan text too. Every later branch reuses this one file
+// instead of writing its own.
 function keepPlanFile(session, text, suffix = "") {
   try {
     const dir = path.join(roamingBase(), "com.claude-usage-tracker.app", "plans");
@@ -285,6 +360,22 @@ function keepPlanFile(session, text, suffix = "") {
     return file;
   } catch {
     return ""; // provenance is a nicety; failing to keep it must not stop the record
+  }
+}
+
+// A plan declared `discussion:` is marked as one by renaming the file already
+// kept above, not by writing a second copy: t#322 could only say "1 of 5
+// approved plans created no task" by reading transcripts, and could not say
+// which of those were discussions on purpose — the suffix is what lets the
+// next measurement read that answer off a directory instead of inferring it.
+function markDiscussion(file) {
+  if (!file) return file;
+  try {
+    const renamed = file.replace(/\.yaml$/, "-discussion.yaml");
+    renameSync(file, renamed);
+    return renamed;
+  } catch {
+    return file; // still provenance, just without the label
   }
 }
 
@@ -336,7 +427,7 @@ export function declaredCounts(doc) {
 // Record it, and say what happened. Returns null when this plan is not a
 // document of the language at all — then the instruction stands and the session
 // records it by hand. Exported for the unit tests.
-export function recordPlan(planText, { session = "", apply = applyDocument } = {}) {
+export function recordPlan(planText, { session = "", apply = applyDocument, file } = {}) {
   // A text can hold more than one reading: a fenced block, the whole text, and —
   // the case that matters — a quoted example of the format sitting above the
   // real plan. The guard may pass such a text on the strength of ONE valid
@@ -358,7 +449,7 @@ export function recordPlan(planText, { session = "", apply = applyDocument } = {
   const { doc, source } = [...readings.values()][0];
   const result = apply(doc, { go: true });
   if (!result.ok) return null;
-  return { doc, source, result, file: keepPlanFile(session, source) };
+  return { doc, source, result, file: file !== undefined ? file : keepPlanFile(session, source) };
 }
 
 // What a plan declared `discussion:` reads on the way out (t#325). The recording
@@ -450,18 +541,25 @@ function main(args) {
     // carry the format. The tool events cover that: whatever the session reads or
     // greps while planning arrives with permission_mode already "plan". The reply
     // must name the event that actually fired, which the payload carries.
+    const appData =
+      process.env.APPDATA ||
+      path.join(process.env.USERPROFILE || "", "AppData", "Roaming");
+    const critic = buildCriticContext(input.prompt, {
+      cwd: typeof input.cwd === "string" && input.cwd ? input.cwd : process.cwd(),
+      appData,
+    });
     emit(
       typeof input.hook_event_name === "string" ? input.hook_event_name : "UserPromptSubmit",
-      buildEnterContext(),
+      [buildEnterContext(), critic].filter(Boolean).join("\n\n"),
     );
     return;
   }
   if (sub === "exit") {
-    const plan =
-      input && input.tool_input && typeof input.tool_input.plan === "string"
-        ? input.tool_input.plan
-        : "";
+    const { text: plan, source: planSource } = readPlanText(input);
     const warnings = runMatchPlan(plan, matchPlanCli());
+    // Kept BEFORE the approval decision below, not inside whichever branch ends
+    // up recording it — see keepPlanFile's own comment for why.
+    const kept = plan.trim() ? keepPlanFile(input.session_id, plan) : "";
     // The journal line of this invocation (see noteExit): filled in as the
     // branches decide, written once at whichever exit is taken.
     const seen = responseText(input);
@@ -469,9 +567,14 @@ function main(args) {
       session: typeof input.session_id === "string" ? input.session_id : "",
       cwd: typeof input.cwd === "string" ? input.cwd : "",
       plan_chars: plan.length,
+      // Which of tool_response.plan / tool_response.filePath / tool_input.plan
+      // actually supplied the text — so the NEXT shape change is diagnosable
+      // from this column alone, the way this one had to be found by hand.
+      plan_source: planSource,
       // The keys the harness put in the payload — the field that tells a broken
       // bridge (no plan text at all) from a plan the tracker chose not to record.
       input_keys: Object.keys((input && input.tool_input) || {}),
+      response_type: typeof (input && input.tool_response),
       response_chars: seen.length,
       response_head: seen.slice(0, 80),
       // The SHAPE of the response, not its text: which keys the harness put in
@@ -489,7 +592,7 @@ function main(args) {
     // hearing, the graph is not written, and nothing asks for it to be.
     if (!approval(input).approved) {
       const w = String(warnings || "").trim();
-      noteExit({ ...note, approved: false, branch: w ? "not-approved" : "silent" });
+      noteExit({ ...note, approved: false, branch: w ? "not-approved" : "silent", file: kept });
       // Nothing to record and nothing to instruct — but a case-warning about a
       // plan the user just turned down is exactly what the next attempt needs.
       if (w) emit("PostToolUse", ["──────── PLAN · not approved ────────", ...kbLines(w)].join("\n"));
@@ -504,9 +607,9 @@ function main(args) {
     // the fallback the session can act on.
     let recorded = null;
     try {
-      recorded = recordPlan(plan, { session: input.session_id });
+      recorded = recordPlan(plan, { session: input.session_id, file: kept });
     } catch (err) {
-      noteExit({ ...note, branch: "record-failed", error: String((err && err.message) || err).slice(0, 200) });
+      noteExit({ ...note, branch: "record-failed", error: String((err && err.message) || err).slice(0, 200), file: kept });
       emit("PostToolUse", buildExitContext(warnings));
       return;
     }
@@ -521,15 +624,14 @@ function main(args) {
     // rather than dropped in silence.
     const declared = discussionDeclaration(plan);
     if (!recorded && declared && isReason(declared.reason)) {
-      keepPlanFile(input.session_id, plan, "-discussion");
-      noteExit({ ...note, branch: "discussion" });
+      noteExit({ ...note, branch: "discussion", file: markDiscussion(kept) });
       emit("PostToolUse", buildDiscussionContext(warnings));
       return;
     }
     noteExit(
       recorded
-        ? { ...note, branch: "recorded", ...declaredCounts(recorded.doc) }
-        : { ...note, branch: "instruction" },
+        ? { ...note, branch: "recorded", file: kept, ...declaredCounts(recorded.doc) }
+        : { ...note, branch: "instruction", file: kept },
     );
     emit(
       "PostToolUse",

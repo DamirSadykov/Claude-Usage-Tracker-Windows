@@ -36,6 +36,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { DSL_DOC_FIELDS, readDocument, validate } from "./apply.mjs";
 import { boardPath, loadBoard, resolveTask } from "./todos.mjs";
+import { invokeDutySync } from "./agents.mjs";
 
 const FORMAT_DOC = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -360,6 +361,36 @@ export function decide(input, opts = {}) {
   return deny(buildRefusal(errors, warnings));
 }
 
+export function architectDecision(input, invoke = invokeDutySync) {
+  if (input?.tool_name !== "ExitPlanMode") return null;
+  const plan = input?.tool_input?.plan;
+  if (typeof plan !== "string" || !plan.trim() || discussionDeclaration(plan)) return null;
+  const prompt = [
+    "You are the architect hook reviewing a plan before it reaches the user.",
+    "Judge the declared obligations: boundaries, dependency order, produces, verify, retries and review gates.",
+    "Do not edit files. Point out only concrete structural risks that make the plan unsafe or incomplete.",
+    "End with exactly `VERDICT: approve` or `VERDICT: issue`.",
+    "",
+    plan,
+  ].join("\n");
+  let result;
+  try { result = invoke("architect", prompt, { cwd: input?.cwd || process.cwd() }); }
+  catch { return null; }
+  // Hooks fail open on unavailable CLIs/auth/timeouts; the deterministic format
+  // guard above still ran and remains authoritative.
+  if (!result || result.skipped || !result.ok) return null;
+  const verdicts = [...String(result.text || "").matchAll(/^\s*VERDICT:\s*(approve|issue)\s*$/gim)];
+  if (verdicts.at(-1)?.[1]?.toLowerCase() !== "issue") return null;
+  const reason = String(result.text || "").replace(/^\s*VERDICT:.*$/gim, "").trim().slice(0, 4000);
+  return deny([
+    "PLAN REFUSED — the configured architect model found unmet obligations.",
+    "",
+    reason || "The architect returned an issue without details.",
+    "",
+    "Revise the plan and call ExitPlanMode again.",
+  ].join("\n"));
+}
+
 function main() {
   let input = {};
   try {
@@ -368,8 +399,9 @@ function main() {
     return; // no stdin / bad JSON → nothing to judge, and silence lets it through
   }
   const decision = decide(input, { onBoard: boardResolver(), inChange: changeResolver() });
-  if (!decision) return;
-  process.stdout.write(JSON.stringify({ hookSpecificOutput: decision }) + "\n");
+  const finalDecision = decision || architectDecision(input);
+  if (!finalDecision) return;
+  process.stdout.write(JSON.stringify({ hookSpecificOutput: finalDecision }) + "\n");
 }
 
 // Entry for the unified dispatcher (`cli.mjs plan-guard`). Exit 0 always: the

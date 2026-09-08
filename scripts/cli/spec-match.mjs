@@ -300,7 +300,7 @@ function fail(msg) {
 // through todos.mjs dynamically, the way the rest of the registry reads the
 // board — a match must not take a static dependency on it.
 async function fromBoard(token) {
-  const { loadBoard, resolveTask, changeRootsFor, specAddressesFor } = await import("./todos.mjs");
+  const { loadBoard, resolveTask, changeRootsFor, specAddressesForManual } = await import("./todos.mjs");
   const data = loadBoard();
   const todo = resolveTask(data, token);
   if (!todo) fail(`refusing: no task matches "${token}"`);
@@ -313,7 +313,7 @@ async function fromBoard(token) {
   // adding the root's delta on top pushes the right answer under the bar.
   return {
     todo,
-    linked: specAddressesFor(todo, roots).addresses,
+    linked: specAddressesForManual(todo, roots).addresses,
     text: [todo.subject, todo.description].filter(Boolean).join("\n"),
   };
 }

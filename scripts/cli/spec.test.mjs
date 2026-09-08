@@ -1125,6 +1125,12 @@ describe("cli todos set spec none — refused on a closing task (audit 1.1)", ()
       ),
     );
 
+  const settings = (obj) =>
+    writeFileSync(
+      path.join(dir, "com.claude-usage-tracker.app", "settings.json"),
+      JSON.stringify(obj),
+    );
+
   beforeEach(() => {
     dir = mkdtempSync(path.join(os.tmpdir(), "cut-spec-disarm-"));
     mkdirSync(path.join(dir, "com.claude-usage-tracker.app"), { recursive: true });
@@ -1133,7 +1139,8 @@ describe("cli todos set spec none — refused on a closing task (audit 1.1)", ()
   });
   afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
-  it("refuses on review and keeps the link", () => {
+  it("refuses on review and keeps the link, while specsEnabled is on", () => {
+    settings({ specsEnabled: true });
     board("review");
     const { code, out } = todosCli("set", "spec", "1", "none");
     expect(code).not.toBe(0);
@@ -1141,13 +1148,28 @@ describe("cli todos set spec none — refused on a closing task (audit 1.1)", ()
     expect(JSON.parse(readFileSync(boardFile, "utf8")).todos[0].spec).toEqual(["tasks#model"]);
   });
 
-  it("refuses on done as well", () => {
+  it("refuses on done as well, while specsEnabled is on", () => {
+    settings({ specsEnabled: true });
     board("done");
     expect(todosCli("set", "spec", "1", "none").code).not.toBe(0);
   });
 
   it("still clears freely while the work is open", () => {
+    settings({ specsEnabled: true });
     board("in_progress");
+    expect(todosCli("set", "spec", "1", "none").code).toBe(0);
+    expect(JSON.parse(readFileSync(boardFile, "utf8")).todos[0].spec).toBeUndefined();
+  });
+
+  // t#361: with the master switch off (its default) there is no closing guard
+  // left to disarm, so the refusal itself stands down — clearing on review/done
+  // is allowed exactly like on an open task.
+  it("clears freely on review and done once specsEnabled is off (default)", () => {
+    board("review");
+    expect(todosCli("set", "spec", "1", "none").code).toBe(0);
+    expect(JSON.parse(readFileSync(boardFile, "utf8")).todos[0].spec).toBeUndefined();
+
+    board("done");
     expect(todosCli("set", "spec", "1", "none").code).toBe(0);
     expect(JSON.parse(readFileSync(boardFile, "utf8")).todos[0].spec).toBeUndefined();
   });
@@ -1244,6 +1266,12 @@ describe("`updated` must be backed by an actual edit (t#352)", () => {
     mkdirSync(path.join(dir, "com.claude-usage-tracker.app"), { recursive: true });
     boardFile = path.join(dir, "com.claude-usage-tracker.app", "todos.json");
     writeHappyRegistry(path.join(dir, "docs", "specs"));
+    // The spec channel is off by default (t#361) — this suite is about the
+    // baseline it records, so it needs the master switch on explicitly.
+    writeFileSync(
+      path.join(dir, "com.claude-usage-tracker.app", "settings.json"),
+      JSON.stringify({ specsEnabled: true }),
+    );
     writeFileSync(
       boardFile,
       JSON.stringify(
@@ -1339,6 +1367,12 @@ describe("attributing a single bullet to the task that wrote it (t#353)", () => 
     dir = mkdtempSync(path.join(os.tmpdir(), "cut-spec-blocks-"));
     mkdirSync(path.join(dir, "com.claude-usage-tracker.app"), { recursive: true });
     boardFile = path.join(dir, "com.claude-usage-tracker.app", "todos.json");
+    // The spec channel is off by default (t#361) — this suite is about the
+    // per-bullet baseline it records, so it needs the master switch on explicitly.
+    writeFileSync(
+      path.join(dir, "com.claude-usage-tracker.app", "settings.json"),
+      JSON.stringify({ specsEnabled: true }),
+    );
     writeDomain(
       path.join(dir, "docs", "specs"),
       "tasks",

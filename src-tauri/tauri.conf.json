@@ -119,6 +119,7 @@
       "../scripts/cli/agents.mjs": "scripts/cli/agents.mjs",
       "../scripts/cli/duty-mode.mjs": "scripts/cli/duty-mode.mjs",
       "../scripts/cli/providers.mjs": "scripts/cli/providers.mjs",
+      "../scripts/cli/claude-hooks.mjs": "scripts/cli/claude-hooks.mjs",
       "../scripts/cli/agent-providers.json": "scripts/cli/agent-providers.json",
       "../docs/plan-format.md": "docs/plan-format.md"
     },
