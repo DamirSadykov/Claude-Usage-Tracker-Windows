@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, readdirSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
@@ -855,6 +855,20 @@ describe("cli spec answer — the structural closing answer (t#341)", () => {
     );
     expect(specCli("answer", "1", "unchanged", "--text", NOTE).code).toBe(0);
     expect(saved().spec_answers[0].address).toBe("tasks#model");
+  });
+
+  it("refuses on a future-version board with exit 4 and no backup", () => {
+    const data = JSON.parse(readFileSync(boardFile, "utf8"));
+    data.version = 99;
+    writeFileSync(boardFile, JSON.stringify(data));
+    const before = readFileSync(boardFile);
+    const { code, out } = specCli("answer", "1", "unchanged", "--text", NOTE);
+    expect(code).toBe(4);
+    expect(out).toContain("is newer than this writer");
+    expect(readFileSync(boardFile).equals(before)).toBe(true);
+    expect(
+      readdirSync(path.dirname(boardFile)).some((f) => f.includes(".corrupt-")),
+    ).toBe(false);
   });
 });
 

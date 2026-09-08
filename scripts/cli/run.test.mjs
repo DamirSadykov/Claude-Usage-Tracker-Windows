@@ -12,10 +12,13 @@ import {
   rmSync,
   writeFileSync,
   readFileSync,
+  readdirSync,
   existsSync,
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import {
   runChange,
   isGate,
@@ -789,6 +792,38 @@ describe("stampHandout — the one thing --next writes (t#520)", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("run --next on a future-version board (t#575)", () => {
+  const cli = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "cli.mjs");
+  let dir;
+  let appDir;
+  let boardFile;
+
+  beforeEach(() => {
+    dir = mkdtempSync(path.join(os.tmpdir(), "cut-run-future-"));
+    appDir = path.join(dir, "com.claude-usage-tracker.app");
+    mkdirSync(appDir, { recursive: true });
+    boardFile = path.join(appDir, "todos.json");
+    writeFileSync(
+      boardFile,
+      JSON.stringify({ version: 99, todos: [changeRoot(1, [2, 3], { parallel_limit: 2 }), auto(2), auto(3)] }),
+    );
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  it("refuses the hand-out with exit 4, no backup, board untouched", () => {
+    const before = readFileSync(boardFile);
+    const r = spawnSync(process.execPath, [cli, "todos", "run", "1", "--next"], {
+      encoding: "utf8",
+      env: { ...process.env, APPDATA: dir },
+      windowsHide: true,
+    });
+    expect(r.status).toBe(4);
+    expect(r.stderr).toContain("is newer than this writer");
+    expect(readFileSync(boardFile).equals(before)).toBe(true);
+    expect(readdirSync(appDir).some((f) => f.includes(".corrupt-"))).toBe(false);
   });
 });
 

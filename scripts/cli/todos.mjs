@@ -49,6 +49,9 @@ import { matchPlanCli, specsEnabled } from "./settings.mjs";
 import { resolveAddress, showSection, sectionFingerprint, blocksOf } from "./spec.mjs";
 import { findChange, changeAddress } from "./change.mjs";
 import { withBoardLock, renameWithRetry } from "./board-lock.mjs";
+import { CURRENT, BoardUnreadableError, readBoardTolerant, recoveryLine, refusalFor } from "./board-recover.mjs";
+
+export { CURRENT, BoardUnreadableError };
 
 // Kanban columns, in board order. Keep in lockstep with todos.rs::STATUSES.
 export const STATUSES = ["backlog", "queue", "in_progress", "review", "done"];
@@ -145,15 +148,19 @@ function todosPath() {
 
 // A missing/corrupt file yields an empty store rather than throwing — same
 // forgiving contract as todos.rs::load.
+const printedRecovery = new Set();
+
 function load(file) {
-  try {
-    const data = JSON.parse(readFileSync(file, "utf8"));
-    if (!data || !Array.isArray(data.todos)) return { version: 1, todos: [] };
-    if (typeof data.version !== "number") data.version = 1;
-    return data;
-  } catch {
-    return { version: 1, todos: [] };
+  const { data, issue } = readBoardTolerant(file);
+  if (issue) {
+    const key = `${issue.kind}:${file}`;
+    if (!printedRecovery.has(key)) {
+      printedRecovery.add(key);
+      process.stderr.write(recoveryLine(issue) + "\n");
+    }
+    Object.defineProperty(data, "__boardIssue", { value: issue, enumerable: false, configurable: true });
   }
+  return data;
 }
 
 // Association groups live next to todos.json (project-groups.json), written by
@@ -191,10 +198,13 @@ function relatedProjects(project) {
 // (rename replaces the destination on Windows). 2-space pretty-print matches the
 // tracker's serde output so hand-readable diffs stay stable.
 function save(file, data) {
+  const issue = data && data.__boardIssue;
+  if (issue) throw refusalFor(issue);
   if (deferred) {
     deferred.dirty = true;
     return;
   }
+  data.version = CURRENT;
   const tmp = `${file}.${process.pid}.tmp`;
   writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n");
   renameWithRetry(tmp, file);

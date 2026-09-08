@@ -6,7 +6,7 @@
 // `vision <task>` and the in_progress anchor print.
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import {
   mkdtempSync,
   mkdirSync,
@@ -1528,5 +1528,120 @@ describe("no call site left on an old setter name", () => {
       if (shell.test(text) || argv.test(text)) offenders.push(f);
     }
     expect(offenders).toEqual([]);
+  });
+});
+
+describe("todos — board recovery & versions (t#575)", () => {
+  const cli = path.join(fileURLToPath(new URL(".", import.meta.url)), "..", "cli.mjs");
+  const FIXTURES = path.join(fileURLToPath(new URL(".", import.meta.url)), "..", "..", "tests", "board-fixtures");
+  let dir;
+  let boardFile;
+
+  const run = (...args) => {
+    const r = spawnSync(process.execPath, [cli, "todos", ...args], {
+      encoding: "utf8",
+      env: { ...process.env, APPDATA: dir },
+      windowsHide: true,
+    });
+    return { code: r.status, out: r.stdout || "", err: r.stderr || "" };
+  };
+
+  const putFixture = (relPath) => {
+    writeFileSync(boardFile, readFileSync(path.join(FIXTURES, relPath)));
+  };
+
+  const corruptBackups = () =>
+    readdirSync(path.join(dir, "com.claude-usage-tracker.app")).filter((f) => f.includes(".corrupt-"));
+
+  beforeEach(() => {
+    dir = mkdtempSync(path.join(os.tmpdir(), "cut-recover-"));
+    mkdirSync(path.join(dir, "com.claude-usage-tracker.app"), { recursive: true });
+    boardFile = path.join(dir, "com.claude-usage-tracker.app", "todos.json");
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  for (const name of ["truncated.json", "not-object.json", "todos-not-array.json", "empty-file.json"]) {
+    describe(`fixture corrupt/${name}`, () => {
+      beforeEach(() => putFixture(`corrupt/${name}`));
+
+      it("refuses a mutating command with exit 4 and leaves the file untouched", () => {
+        const before = readFileSync(boardFile);
+        const { code, err } = run("add", "restore test");
+        expect(code).toBe(4);
+        expect(err).toMatch(/board unreadable \(/);
+        expect(readFileSync(boardFile).equals(before)).toBe(true);
+      });
+
+      it("writes a backup that carries the original bytes", () => {
+        const original = readFileSync(boardFile);
+        run("add", "restore test 1");
+        const backups = corruptBackups();
+        expect(backups.length).toBeGreaterThanOrEqual(1);
+        for (const b of backups) {
+          expect(readFileSync(path.join(dir, "com.claude-usage-tracker.app", b)).equals(original)).toBe(true);
+        }
+      });
+
+      it("lets a reading command through with exit 0, printing the recovery state", () => {
+        const { code, out, err } = run("list");
+        expect(code).toBe(0);
+        expect(err).toMatch(/board recovery:.*unreadable/);
+        expect(err).toContain(boardFile);
+        expect(out).not.toMatch(/board unreadable/);
+      });
+
+      it("does not touch the board file on a reading command either", () => {
+        const before = readFileSync(boardFile);
+        run("list");
+        expect(readFileSync(boardFile).equals(before)).toBe(true);
+      });
+    });
+  }
+
+  it("Node still reads a todo whose field has the wrong type (asymmetry with Rust)", () => {
+    putFixture("corrupt/todo-field-type.json");
+    const { code, out, err } = run("list", "--all", "--json");
+    expect(code).toBe(0);
+    expect(err).not.toMatch(/board recovery/);
+    const printed = JSON.parse(out);
+    expect(printed.some((t) => t.subject.includes("число записано строкой"))).toBe(true);
+  });
+
+  it("treats a missing file as an empty CURRENT board, not corruption", () => {
+    const { code, out, err } = run("list");
+    expect(code).toBe(0);
+    expect(err).toBe("");
+    expect(existsSync(boardFile)).toBe(false);
+
+    const added = run("add", "first task on a fresh board");
+    expect(added.code).toBe(0);
+    expect(corruptBackups()).toHaveLength(0);
+    expect(JSON.parse(readFileSync(boardFile, "utf8")).version).toBe(2);
+  });
+
+  describe("fixture v2/future-version.json", () => {
+    beforeEach(() => putFixture("v2/future-version.json"));
+
+    it("is readable: a reading command sees the task and prints the recovery state", () => {
+      const { code, out, err } = run("list", "--all", "--json");
+      expect(code).toBe(0);
+      expect(err).toMatch(/version 99.*CURRENT 2/);
+      expect(JSON.parse(out).some((t) => t.number === 60)).toBe(true);
+    });
+
+    it("refuses a mutating command with exit 4, no backup, file untouched", () => {
+      const before = readFileSync(boardFile);
+      const { code, err } = run("set", "status", "60", "queue");
+      expect(code).toBe(4);
+      expect(err).toContain("board version 99 is newer than this writer (CURRENT 2)");
+      expect(corruptBackups()).toHaveLength(0);
+      expect(readFileSync(boardFile).equals(before)).toBe(true);
+    });
+  });
+
+  it("stamps version 2 on save even when the file never carried one", () => {
+    writeFileSync(boardFile, JSON.stringify({ todos: [] }));
+    expect(run("add", "no version on disk yet").code).toBe(0);
+    expect(JSON.parse(readFileSync(boardFile, "utf8")).version).toBe(2);
   });
 });

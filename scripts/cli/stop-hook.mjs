@@ -34,6 +34,7 @@ import { readFileSync, openSync, readSync, closeSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { taskHandoffGuard, specDeltaGuard, specsEnabled } from "./settings.mjs";
+import { readBoardTolerant, recoveryLine } from "./board-recover.mjs";
 
 const CLI = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "cli.mjs");
 
@@ -464,30 +465,14 @@ function specReason(tasks, { blocks = [], omitted = 0, lint = [] } = {}) {
 
 // The tracker's todos.json — the same file the SessionStart hook reads. Returns
 // the array, or [] when it's missing/unreadable (the guard then only sees plans).
-function readChanges(appData) {
-  try {
-    const raw = readFileSync(
-      path.join(appData, "com.claude-usage-tracker.app", "todos.json"),
-      "utf8",
-    );
-    const changes = JSON.parse(raw).changes;
-    return Array.isArray(changes) ? changes : [];
-  } catch {
-    return [];
-  }
-}
-
-function readTodos(appData) {
-  try {
-    const raw = readFileSync(
-      path.join(appData, "com.claude-usage-tracker.app", "todos.json"),
-      "utf8",
-    );
-    const todos = JSON.parse(raw).todos;
-    return Array.isArray(todos) ? todos : [];
-  } catch {
-    return [];
-  }
+function readBoard(appData) {
+  const file = path.join(appData, "com.claude-usage-tracker.app", "todos.json");
+  const { data, issue } = readBoardTolerant(file);
+  if (issue) process.stderr.write(recoveryLine(issue) + "\n");
+  return {
+    todos: Array.isArray(data.todos) ? data.todos : [],
+    changes: Array.isArray(data.changes) ? data.changes : [],
+  };
 }
 
 const hhmm = (ms) => {
@@ -610,7 +595,7 @@ async function main() {
   const since = sessionStartMs(input.transcript_path);
   if (since == null) return; // unknown session window → stand down
 
-  const todos = readTodos(appData);
+  const { todos, changes } = readBoard(appData);
   const project = path.basename(String(cwd).replace(/[\\/]+$/, ""));
   // Which tasks THIS session actually moved (its transcript) — the guard scopes to
   // those, never to another session's or a merely-touched task (#219).
@@ -625,7 +610,7 @@ async function main() {
   if (specMode !== "off") {
     const parts = await specGuardParts(cwd, appData);
     if (parts) {
-      const board = { todos, changes: readChanges(appData) };
+      const board = { todos, changes };
       specTasks = auditSpecAnswers(
         todos,
         project,

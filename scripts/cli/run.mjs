@@ -75,6 +75,7 @@ import {
   changeAsRoot,
   envWithoutSession,
   boardPath,
+  loadBoard,
   saveBoard,
   readTaskSessionEvents,
 } from "./todos.mjs";
@@ -98,16 +99,6 @@ function appDataFile(name) {
     process.env.APPDATA ||
     path.join(process.env.USERPROFILE || "", "AppData", "Roaming");
   return path.join(appData, "com.claude-usage-tracker.app", name);
-}
-
-function loadTodos(file) {
-  try {
-    const data = JSON.parse(readFileSync(file, "utf8"));
-    if (!data || !Array.isArray(data.todos)) return { version: 1, todos: [] };
-    return data;
-  } catch {
-    return { version: 1, todos: [] };
-  }
 }
 
 // ── the node ─────────────────────────────────────────────────────────────────
@@ -1212,7 +1203,7 @@ async function cmdNext(ref, f) {
 
   const file = appDataFile("todos.json");
   const { root, limit, groupBudget, ctx, outcome, handoutAt } = withBoardLock(file, () => {
-    const data = loadTodos(file);
+    const data = loadBoard(file);
     const c = buildRunContext({ data, change: ref, dry: true, cwd: process.cwd(), timeoutMs, spent });
     const l = resolveParallelLimit(c.root, parallel);
     const gb = typeof c.root.budget_usd === "number" ? c.root.budget_usd : null;
@@ -1267,7 +1258,7 @@ async function cmdReport(ref, f) {
   }
 
   const file = appDataFile("todos.json");
-  const data = loadTodos(file);
+  const data = loadBoard(file);
   const ctx = buildRunContext({ data, change: ref, dry: false, cwd: process.cwd(), timeoutMs, spent: 0 });
   const task = resolveTask(ctx.data, taskRef);
   if (!task) fail(`no such task: ${taskRef}`);
@@ -1405,7 +1396,7 @@ function cmdHistory(ref, f) {
   const records = readRunLog();
   let change = null;
   if (ref) {
-    const data = loadTodos(appDataFile("todos.json"));
+    const data = loadBoard(appDataFile("todos.json"));
     const { root } = collectChange(data, ref);
     if (!root) fail(`no such change: ${ref}`);
     change = root.number;
@@ -1535,7 +1526,7 @@ export async function run(args) {
 
   const dry = !f.go;
   const file = appDataFile("todos.json");
-  const data = loadTodos(file);
+  const data = loadBoard(file);
   const { root } = collectChange(data, ref);
   if (!root) fail(`no such task: ${ref}`);
   if (!dry && typeof root.budget_usd !== "number") {
