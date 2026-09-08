@@ -53,7 +53,7 @@ import {
 import os from "node:os";
 import path from "node:path";
 
-import { resolveTask, readTaskSessionEvents, loadBoard, saveBoard } from "./todos.mjs";
+import { resolveTask, readTaskSessionEvents, loadBoard, loadBoardForWrite, saveBoard } from "./todos.mjs";
 import { withBoardLock } from "./board-lock.mjs";
 
 // Tools that CHANGE a file — the only evidence that something was produced.
@@ -470,9 +470,9 @@ function parseFlags(args) {
   return f;
 }
 
-function reconcile(ref, verify) {
+function reconcile(ref, verify, write = false) {
   const file = appDataFile("todos.json");
-  const data = loadBoard(file);
+  const data = write ? loadBoardForWrite(file) : loadBoard(file);
   const todo = resolveTask(data, ref);
   if (!todo) fail(`no such task: ${ref}`);
 
@@ -607,7 +607,7 @@ function reconcileAndReport(f) {
     verify = v;
   }
 
-  const { file, data, todo, report } = reconcile(ref, verify);
+  const { file, data, todo, report } = reconcile(ref, verify, f.write);
   if (f.write && report.finalized) report.written = applyOutcome(file, data, todo, report);
 
   if (f.json) process.stdout.write(JSON.stringify(report, null, 2) + "\n");

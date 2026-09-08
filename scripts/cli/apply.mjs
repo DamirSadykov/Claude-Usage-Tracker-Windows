@@ -37,6 +37,7 @@ import { readFileSync } from "node:fs";
 import {
   boardPath,
   loadBoard,
+  loadBoardForWrite,
   saveBoard,
   withDeferredSave,
   isDone,
@@ -346,7 +347,7 @@ function capturing(fn) {
 // that came into being, `applied` whether anything was written.
 export function applyDocument(doc, { go = false, force = false, project, board } = {}) {
   const boardFile = board?.file ?? boardPath();
-  const data = board?.data ?? loadBoard(boardFile);
+  const data = board?.data ?? (go ? loadBoardForWrite(boardFile) : loadBoard(boardFile));
   project = project ?? path.basename(process.cwd().replace(/[\\/]+$/, ""));
   const { errors, warnings } = validate(doc, {
     onBoard: (token) => Boolean(resolveTask(data, token)),

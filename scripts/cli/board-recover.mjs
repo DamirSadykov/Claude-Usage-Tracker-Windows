@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import path from "node:path";
 import { withBoardLock } from "./board-lock.mjs";
 
 export const CURRENT = 2;
@@ -42,6 +43,14 @@ function backupTimestamp(d = new Date()) {
 }
 
 function writeCorruptBackup(file, raw) {
+  const prefix = `${path.basename(file)}.corrupt-`;
+  try {
+    const dir = path.dirname(file);
+    const existing = fs
+      .readdirSync(dir)
+      .find((name) => name.startsWith(prefix) && fs.readFileSync(path.join(dir, name), "utf8") === raw);
+    if (existing) return { path: path.join(path.dirname(file), existing), madeNow: false };
+  } catch {}
   const backup = `${file}.corrupt-${backupTimestamp()}`;
   let fd;
   try {

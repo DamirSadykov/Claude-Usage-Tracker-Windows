@@ -969,7 +969,7 @@ export function stampRefFor(roots, todo) {
 }
 
 async function cmdAnswer(args) {
-  const { resolveTask, loadBoard, boardPath, saveBoard, changeRootsFor, specAddressesForManual } =
+  const { resolveTask, loadBoardForWrite, boardPath, saveBoard, changeRootsFor, specAddressesForManual } =
     await import("./todos.mjs");
   const positional = [];
   const flags = {};
@@ -984,7 +984,7 @@ async function cmdAnswer(args) {
 
   const file = boardPath();
   withBoardLock(file, () => {
-    const data = loadBoard(file);
+    const data = loadBoardForWrite(file);
     const todo = resolveTask(data, token);
     if (!todo) fail(`refusing: no task matches "${token}"`);
 

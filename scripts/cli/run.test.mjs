@@ -797,6 +797,7 @@ describe("stampHandout — the one thing --next writes (t#520)", () => {
 
 describe("run --next on a future-version board (t#575)", () => {
   const cli = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "cli.mjs");
+  const fixtures = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "tests", "board-fixtures");
   let dir;
   let appDir;
   let boardFile;
@@ -806,10 +807,7 @@ describe("run --next on a future-version board (t#575)", () => {
     appDir = path.join(dir, "com.claude-usage-tracker.app");
     mkdirSync(appDir, { recursive: true });
     boardFile = path.join(appDir, "todos.json");
-    writeFileSync(
-      boardFile,
-      JSON.stringify({ version: 99, todos: [changeRoot(1, [2, 3], { parallel_limit: 2 }), auto(2), auto(3)] }),
-    );
+    writeFileSync(boardFile, readFileSync(path.join(fixtures, "v2", "future-version.json")));
   });
   afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
@@ -824,6 +822,25 @@ describe("run --next on a future-version board (t#575)", () => {
     expect(r.stderr).toContain("is newer than this writer");
     expect(readFileSync(boardFile).equals(before)).toBe(true);
     expect(readdirSync(appDir).some((f) => f.includes(".corrupt-"))).toBe(false);
+  });
+
+  it("refuses --go and --report before creating the run journal", () => {
+    const before = readFileSync(boardFile);
+    const env = { ...process.env, APPDATA: dir };
+    const go = spawnSync(process.execPath, [cli, "todos", "run", "60", "--go"], {
+      encoding: "utf8",
+      env,
+      windowsHide: true,
+    });
+    const report = spawnSync(process.execPath, [cli, "todos", "run", "60", "--report", "60", "--result", "ok"], {
+      encoding: "utf8",
+      env,
+      windowsHide: true,
+    });
+    expect(go.status).toBe(4);
+    expect(report.status).toBe(4);
+    expect(readFileSync(boardFile).equals(before)).toBe(true);
+    expect(existsSync(path.join(appDir, "runs.jsonl"))).toBe(false);
   });
 });
 

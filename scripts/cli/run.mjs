@@ -76,6 +76,7 @@ import {
   envWithoutSession,
   boardPath,
   loadBoard,
+  loadBoardForWrite,
   saveBoard,
   readTaskSessionEvents,
 } from "./todos.mjs";
@@ -1203,7 +1204,7 @@ async function cmdNext(ref, f) {
 
   const file = appDataFile("todos.json");
   const { root, limit, groupBudget, ctx, outcome, handoutAt } = withBoardLock(file, () => {
-    const data = loadBoard(file);
+    const data = loadBoardForWrite(file);
     const c = buildRunContext({ data, change: ref, dry: true, cwd: process.cwd(), timeoutMs, spent });
     const l = resolveParallelLimit(c.root, parallel);
     const gb = typeof c.root.budget_usd === "number" ? c.root.budget_usd : null;
@@ -1258,7 +1259,7 @@ async function cmdReport(ref, f) {
   }
 
   const file = appDataFile("todos.json");
-  const data = loadBoard(file);
+  const data = loadBoardForWrite(file);
   const ctx = buildRunContext({ data, change: ref, dry: false, cwd: process.cwd(), timeoutMs, spent: 0 });
   const task = resolveTask(ctx.data, taskRef);
   if (!task) fail(`no such task: ${taskRef}`);
@@ -1526,7 +1527,7 @@ export async function run(args) {
 
   const dry = !f.go;
   const file = appDataFile("todos.json");
-  const data = loadBoard(file);
+  const data = dry ? loadBoard(file) : loadBoardForWrite(file);
   const { root } = collectChange(data, ref);
   if (!root) fail(`no such task: ${ref}`);
   if (!dry && typeof root.budget_usd !== "number") {

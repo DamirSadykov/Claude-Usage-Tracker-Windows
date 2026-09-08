@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { boardPath, loadBoard, saveBoard } from "./todos.mjs";
+import { boardPath, loadBoard, loadBoardForWrite, saveBoard } from "./todos.mjs";
 import { withBoardLock } from "./board-lock.mjs";
 
 export const CHANGE_REF = /^c\s*#?\s*(\d+)$/i;
@@ -256,7 +256,7 @@ function cmdNew(args) {
   if (!title) fail(USAGE);
   const file = boardPath();
   const change = withBoardLock(file, () => {
-    const data = loadBoard(file);
+    const data = loadBoardForWrite(file);
     const project = flags.global ? null : String(flags.project ?? currentProject());
     const twin = findChangeByTitle(data, title, project);
     if (twin)
@@ -352,7 +352,7 @@ function cmdClose(args) {
   if (!positional[0]) fail(USAGE);
   const file = boardPath();
   const { change, total, already } = withBoardLock(file, () => {
-    const data = loadBoard(file);
+    const data = loadBoardForWrite(file);
     const c = resolveOrFail(data, positional[0]);
     if (c.legacy)
       fail(
@@ -429,7 +429,7 @@ function cmdSet(args) {
   if (!ref) fail(`usage: cli change set ${field} <c#N> <value>`);
   const file = boardPath();
   const { change, shown } = withBoardLock(file, () => {
-    const data = loadBoard(file);
+    const data = loadBoardForWrite(file);
     const c = resolveOrFail(data, ref);
     if (c.legacy)
       fail(
@@ -448,7 +448,7 @@ async function cmdMigrate(args) {
   const { describe: describeMigration, migrate } = await import("./change-migrate.mjs");
   const file = boardPath();
   withBoardLock(file, () => {
-    const data = loadBoard(file);
+    const data = flags.go ? loadBoardForWrite(file) : loadBoard(file);
     const lines = describeMigration(data);
     if (!lines.length) {
       process.stdout.write("нечего мигрировать: ни одного корня с флагом на доске\n");

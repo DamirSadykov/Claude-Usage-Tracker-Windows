@@ -1564,22 +1564,17 @@ describe("todos — board recovery & versions (t#575)", () => {
     describe(`fixture corrupt/${name}`, () => {
       beforeEach(() => putFixture(`corrupt/${name}`));
 
-      it("refuses a mutating command with exit 4 and leaves the file untouched", () => {
+      it("refuses twice, preserves the file, and creates one byte-identical backup", () => {
         const before = readFileSync(boardFile);
-        const { code, err } = run("add", "restore test");
-        expect(code).toBe(4);
-        expect(err).toMatch(/board unreadable \(/);
+        const first = run("add", "x");
+        const second = run("add", "x");
+        expect(first.code).toBe(4);
+        expect(second.code).toBe(4);
+        expect(first.err).toMatch(/board unreadable \(/);
         expect(readFileSync(boardFile).equals(before)).toBe(true);
-      });
-
-      it("writes a backup that carries the original bytes", () => {
-        const original = readFileSync(boardFile);
-        run("add", "restore test 1");
         const backups = corruptBackups();
-        expect(backups.length).toBeGreaterThanOrEqual(1);
-        for (const b of backups) {
-          expect(readFileSync(path.join(dir, "com.claude-usage-tracker.app", b)).equals(original)).toBe(true);
-        }
+        expect(backups).toHaveLength(1);
+        expect(readFileSync(path.join(dir, "com.claude-usage-tracker.app", backups[0])).equals(before)).toBe(true);
       });
 
       it("lets a reading command through with exit 0, printing the recovery state", () => {
@@ -1595,6 +1590,22 @@ describe("todos — board recovery & versions (t#575)", () => {
         run("list");
         expect(readFileSync(boardFile).equals(before)).toBe(true);
       });
+    });
+  }
+
+  for (const [name, value] of [
+    ["todo-not-object", { todos: [{}, 1] }],
+    ["changes-not-array", { todos: [], changes: {} }],
+  ]) {
+    it(`refuses ${name} through the CLI`, () => {
+      writeFileSync(boardFile, JSON.stringify(value));
+      const before = readFileSync(boardFile);
+      const first = run("add", "x");
+      const second = run("add", "x");
+      expect(first.code).toBe(4);
+      expect(second.code).toBe(4);
+      expect(readFileSync(boardFile).equals(before)).toBe(true);
+      expect(corruptBackups()).toHaveLength(1);
     });
   }
 
@@ -1629,13 +1640,16 @@ describe("todos — board recovery & versions (t#575)", () => {
       expect(JSON.parse(out).some((t) => t.number === 60)).toBe(true);
     });
 
-    it("refuses a mutating command with exit 4, no backup, file untouched", () => {
+    it("refuses all early-write paths with exit 4 and leaves journals absent", () => {
       const before = readFileSync(boardFile);
-      const { code, err } = run("set", "status", "60", "queue");
-      expect(code).toBe(4);
-      expect(err).toContain("board version 99 is newer than this writer (CURRENT 2)");
+      const take = run("take", "60", "--session", "test-session");
+      const status = run("set", "status", "60", "backlog");
+      expect(take.code).toBe(4);
+      expect(status.code).toBe(4);
+      expect(take.err).toContain("board version 99 is newer than this writer (CURRENT 2)");
       expect(corruptBackups()).toHaveLength(0);
       expect(readFileSync(boardFile).equals(before)).toBe(true);
+      expect(existsSync(path.join(dir, "com.claude-usage-tracker.app", "task-sessions.jsonl"))).toBe(false);
     });
   });
 

@@ -250,6 +250,12 @@ function fail(msg) {
 // the path and the JSON contract on their own.
 export const boardPath = () => todosPath();
 export const loadBoard = (file = todosPath()) => load(file);
+export function assertBoardWritable(data) {
+  const issue = data && data.__boardIssue;
+  if (issue) throw refusalFor(issue);
+  return data;
+}
+export const loadBoardForWrite = (file = todosPath()) => assertBoardWritable(load(file));
 export const saveBoard = (file, data) => save(file, data);
 
 export function taskSessionsPath() {
@@ -344,7 +350,7 @@ function cmdTake(args) {
     );
   }
   const file = todosPath();
-  const data = load(file);
+  const data = loadBoardForWrite(file);
   const todo = resolveTask(data, id);
   if (!todo) fail(`no todo with id ${id}`);
   const written = appendTaskSessionEvent({
@@ -632,7 +638,7 @@ const PRODUCES_USAGE =
 function cmdProduces(args) {
   const [sub, ...rest] = args;
   const file = todosPath();
-  const data = load(file);
+  const data = loadBoardForWrite(file);
   if (sub === "add" || sub === "rm") {
     const t = resolveTask(data, rest[0]);
     const item = String(rest[1] ?? "").trim();
@@ -1126,7 +1132,7 @@ function cmdSet(args) {
   if (typeof value !== "string")
     fail(`usage: cli todos set ${field} <task> ${spec.values}`);
   const file = todosPath();
-  const data = load(file);
+  const data = loadBoardForWrite(file);
   const todo = resolveTask(data, task);
   if (!todo) fail(`no todo with id ${task}`);
   setField({ data, file, todo, field, value, flags });
@@ -1184,7 +1190,7 @@ function cmdAdd(args) {
     kind = k;
   }
   const file = todosPath();
-  const data = load(file);
+  const data = loadBoardForWrite(file);
   const cwdProject = path.basename(process.cwd().replace(/[\\/]+$/, ""));
   // Project resolution (issue #54): a bare `add` defaults to the CURRENT project
   // (cwd basename), mirroring `todos list` and the SessionStart hook — a follow-up
@@ -1287,7 +1293,7 @@ const RM_USAGE =
 function cmdRemove(args) {
   const { positional, flags } = parseArgs(args);
   const file = todosPath();
-  const data = load(file);
+  const data = loadBoardForWrite(file);
   const todo = resolveTask(data, positional[0]);
   if (!todo) fail(RM_USAGE);
 
@@ -1370,7 +1376,7 @@ function cmdComment(args) {
     if (!id || !body.trim()) fail(COMMENT_USAGE);
     const author = flags.by === "user" ? "user" : "claude";
     const file = todosPath();
-    const data = load(file);
+    const data = loadBoardForWrite(file);
     const todo = resolveTask(data, id); // id | N | #N, as the help promises
     if (!todo) fail(`no todo with id ${id}`);
     if (!Array.isArray(todo.comments)) todo.comments = [];
@@ -1634,7 +1640,7 @@ const DEP_USAGE =
 function cmdDep(args) {
   const [sub, ...rest] = args;
   const file = todosPath();
-  const data = load(file);
+  const data = loadBoardForWrite(file);
   if (sub === "add" || sub === "rm") {
     const from = resolveTask(data, rest[0]);
     const on = resolveTask(data, rest[1]);
@@ -1712,7 +1718,7 @@ const REF_USAGE =
 function cmdRef(args) {
   const [sub, ...rest] = args;
   const file = todosPath();
-  const data = load(file);
+  const data = loadBoardForWrite(file);
   if (sub === "add" || sub === "rm") {
     const from = resolveTask(data, rest[0]);
     const to = resolveTask(data, rest[1]);
@@ -2048,7 +2054,7 @@ const HANDOFF_USAGE =
 function cmdHandoff(args) {
   const [sub, ...rest] = args;
   const file = todosPath();
-  const data = load(file);
+  const data = loadBoardForWrite(file);
 
   // WRITE — set / clear this task's own handoff.
   if (sub === "set" || sub === "clear") {
