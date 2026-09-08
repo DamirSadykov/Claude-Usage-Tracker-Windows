@@ -51,6 +51,7 @@ import {
 import { checkGraph, splitFindings } from "./graph-rules.mjs";
 import { createChange, findChangeByTitle, changeAddress } from "./change.mjs";
 import { parseYamlSubset } from "./yaml-subset.mjs";
+import { withBoardLock } from "./board-lock.mjs";
 import path from "node:path";
 
 const USAGE =
@@ -570,6 +571,12 @@ export function summarize(result, doc) {
 }
 
 export function run(args) {
+  const flags0 = new Set(args.filter((a) => a.startsWith("--")));
+  if (flags0.has("--go")) return withBoardLock(boardPath(), () => apply(args));
+  return apply(args);
+}
+
+function apply(args) {
   const positional = args.filter((a) => !a.startsWith("--"));
   const flags = new Set(args.filter((a) => a.startsWith("--")));
   const file = positional[0];
