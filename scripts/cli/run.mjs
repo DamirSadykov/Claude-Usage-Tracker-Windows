@@ -80,6 +80,7 @@ import {
 } from "./todos.mjs";
 import { findChange } from "./change.mjs";
 import { resolveDuty } from "./agents.mjs";
+import { withBoardLock } from "./board-lock.mjs";
 
 export const DEFAULT_PARALLEL_LIMIT = 1;
 
@@ -1210,14 +1211,15 @@ async function cmdNext(ref, f) {
   }
 
   const file = appDataFile("todos.json");
-  const data = loadTodos(file);
-  const ctx = buildRunContext({ data, change: ref, dry: true, cwd: process.cwd(), timeoutMs, spent });
-  const { root } = ctx;
-  const limit = resolveParallelLimit(root, parallel);
-  const groupBudget = typeof root.budget_usd === "number" ? root.budget_usd : null;
-
-  const outcome = nextFrontier(ctx, { limit, groupBudget, spentKnown });
-  const handoutAt = stampHandout(file, data, outcome.wave || []);
+  const { root, limit, groupBudget, ctx, outcome, handoutAt } = withBoardLock(file, () => {
+    const data = loadTodos(file);
+    const c = buildRunContext({ data, change: ref, dry: true, cwd: process.cwd(), timeoutMs, spent });
+    const l = resolveParallelLimit(c.root, parallel);
+    const gb = typeof c.root.budget_usd === "number" ? c.root.budget_usd : null;
+    const o = nextFrontier(c, { limit: l, groupBudget: gb, spentKnown });
+    const at = stampHandout(file, data, o.wave || []);
+    return { root: c.root, limit: l, groupBudget: gb, ctx: c, outcome: o, handoutAt: at };
+  });
 
   const report = {
     version: 1,

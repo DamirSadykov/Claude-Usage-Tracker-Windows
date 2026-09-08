@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { boardPath, loadBoard, saveBoard } from "./todos.mjs";
+import { withBoardLock } from "./board-lock.mjs";
 
 export const CHANGE_REF = /^c\s*#?\s*(\d+)$/i;
 
@@ -254,23 +255,26 @@ function cmdNew(args) {
   const title = String(positional[0] ?? flags.title ?? "").trim();
   if (!title) fail(USAGE);
   const file = boardPath();
-  const data = loadBoard(file);
-  const project = flags.global ? null : String(flags.project ?? currentProject());
-  const twin = findChangeByTitle(data, title, project);
-  if (twin)
-    fail(
-      `refusing: ${changeAddress(twin)} on this board already carries that title.\n` +
-        `  point the task at it instead: todos set change <task> ${changeAddress(twin)}`,
-    );
-  const change = createChange(data, {
-    title,
-    delta: flags.delta === true ? "" : (flags.delta ?? ""),
-    project,
-    spec: flags.spec && flags.spec !== true ? String(flags.spec).split(",").map((s) => s.trim()).filter(Boolean) : [],
-    budget_usd: numberFlag(flags.budget, "budget"),
-    parallel_limit: numberFlag(flags.parallel, "parallel"),
+  const change = withBoardLock(file, () => {
+    const data = loadBoard(file);
+    const project = flags.global ? null : String(flags.project ?? currentProject());
+    const twin = findChangeByTitle(data, title, project);
+    if (twin)
+      fail(
+        `refusing: ${changeAddress(twin)} on this board already carries that title.\n` +
+          `  point the task at it instead: todos set change <task> ${changeAddress(twin)}`,
+      );
+    const c = createChange(data, {
+      title,
+      delta: flags.delta === true ? "" : (flags.delta ?? ""),
+      project,
+      spec: flags.spec && flags.spec !== true ? String(flags.spec).split(",").map((s) => s.trim()).filter(Boolean) : [],
+      budget_usd: numberFlag(flags.budget, "budget"),
+      parallel_limit: numberFlag(flags.parallel, "parallel"),
+    });
+    saveBoard(file, data);
+    return c;
   });
-  saveBoard(file, data);
   process.stdout.write(`ok: ${changeAddress(change)} "${change.title}"\n`);
 }
 
@@ -347,27 +351,31 @@ function cmdClose(args) {
   const { positional } = parseArgs(args);
   if (!positional[0]) fail(USAGE);
   const file = boardPath();
-  const data = loadBoard(file);
-  const change = resolveOrFail(data, positional[0]);
-  if (change.legacy)
-    fail(
-      `refusing: ${changeAddress(change)} is still a root task — close it as a task, or migrate the board first.`,
-    );
-  const { done, total } = changeProgress(data, change);
-  if (total === 0)
-    fail(`refusing: ${changeAddress(change)} has no tasks — nothing it could have finished.`);
-  if (done < total)
-    fail(
-      `refusing: ${changeAddress(change)} still has ${total - done} open task(s).\n` +
-        `  its status is derived, so closing it means closing them: cli change show ${changeAddress(change)}`,
-    );
-  if (change.closed_at) {
+  const { change, total, already } = withBoardLock(file, () => {
+    const data = loadBoard(file);
+    const c = resolveOrFail(data, positional[0]);
+    if (c.legacy)
+      fail(
+        `refusing: ${changeAddress(c)} is still a root task — close it as a task, or migrate the board first.`,
+      );
+    const { done, total: t } = changeProgress(data, c);
+    if (t === 0)
+      fail(`refusing: ${changeAddress(c)} has no tasks — nothing it could have finished.`);
+    if (done < t)
+      fail(
+        `refusing: ${changeAddress(c)} still has ${t - done} open task(s).\n` +
+          `  its status is derived, so closing it means closing them: cli change show ${changeAddress(c)}`,
+      );
+    if (c.closed_at) return { change: c, total: t, already: true };
+    c.closed_at = new Date().toISOString();
+    c.updated_at = c.closed_at;
+    saveBoard(file, data);
+    return { change: c, total: t, already: false };
+  });
+  if (already) {
     process.stdout.write(`ok: ${changeAddress(change)} already closed at ${change.closed_at}\n`);
     return;
   }
-  change.closed_at = new Date().toISOString();
-  change.updated_at = change.closed_at;
-  saveBoard(file, data);
   process.stdout.write(`ok: ${changeAddress(change)} closed — ${total} task(s) done\n`);
 }
 
@@ -420,15 +428,18 @@ function cmdSet(args) {
     fail(`usage: cli change set <${Object.keys(SET_FIELDS).join("|")}> <c#N> <value>`);
   if (!ref) fail(`usage: cli change set ${field} <c#N> <value>`);
   const file = boardPath();
-  const data = loadBoard(file);
-  const change = resolveOrFail(data, ref);
-  if (change.legacy)
-    fail(
-      `refusing: ${changeAddress(change)} is still a root task — set the field on the task, or migrate the board first.`,
-    );
-  const shown = SET_FIELDS[field](change, value);
-  change.updated_at = new Date().toISOString();
-  saveBoard(file, data);
+  const { change, shown } = withBoardLock(file, () => {
+    const data = loadBoard(file);
+    const c = resolveOrFail(data, ref);
+    if (c.legacy)
+      fail(
+        `refusing: ${changeAddress(c)} is still a root task — set the field on the task, or migrate the board first.`,
+      );
+    const s = SET_FIELDS[field](c, value);
+    c.updated_at = new Date().toISOString();
+    saveBoard(file, data);
+    return { change: c, shown: s };
+  });
   process.stdout.write(`ok: ${changeAddress(change)} ${field} -> ${shown}\n`);
 }
 
@@ -436,23 +447,25 @@ async function cmdMigrate(args) {
   const { flags } = parseArgs(args);
   const { describe: describeMigration, migrate } = await import("./change-migrate.mjs");
   const file = boardPath();
-  const data = loadBoard(file);
-  const lines = describeMigration(data);
-  if (!lines.length) {
-    process.stdout.write("нечего мигрировать: ни одного корня с флагом на доске\n");
-    return;
-  }
-  process.stdout.write(lines.join("\n") + "\n");
-  if (!flags.go) {
-    process.stdout.write("\nсухой прогон, ничего не записано — повтори с --go\n");
-    return;
-  }
-  const result = migrate(data);
-  saveBoard(file, data);
-  for (const note of result.notes) process.stdout.write(`note: ${note}\n`);
-  process.stdout.write(
-    `ok: ${result.created.length} запис(и) заведено, ${result.roots} корней снято с доски\n`,
-  );
+  withBoardLock(file, () => {
+    const data = loadBoard(file);
+    const lines = describeMigration(data);
+    if (!lines.length) {
+      process.stdout.write("нечего мигрировать: ни одного корня с флагом на доске\n");
+      return;
+    }
+    process.stdout.write(lines.join("\n") + "\n");
+    if (!flags.go) {
+      process.stdout.write("\nсухой прогон, ничего не записано — повтори с --go\n");
+      return;
+    }
+    const result = migrate(data);
+    saveBoard(file, data);
+    for (const note of result.notes) process.stdout.write(`note: ${note}\n`);
+    process.stdout.write(
+      `ok: ${result.created.length} запис(и) заведено, ${result.roots} корней снято с доски\n`,
+    );
+  });
 }
 
 export function run(args) {

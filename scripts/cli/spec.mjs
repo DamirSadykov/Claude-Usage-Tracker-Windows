@@ -22,6 +22,7 @@ import path from "node:path";
 
 import { parseYamlSubset } from "./yaml-subset.mjs";
 import { specRoot as specRootSetting, specRepoPath } from "./settings.mjs";
+import { withBoardLock } from "./board-lock.mjs";
 
 const PARTS = ["требования", "устройство", "инварианты"];
 export const SECTION_LINE_CEILING = 120;
@@ -982,166 +983,168 @@ async function cmdAnswer(args) {
   if (!token || !VERDICTS.includes(verdict)) fail(ANSWER_USAGE);
 
   const file = boardPath();
-  const data = loadBoard(file);
-  const todo = resolveTask(data, token);
-  if (!todo) fail(`refusing: no task matches "${token}"`);
+  withBoardLock(file, () => {
+    const data = loadBoard(file);
+    const todo = resolveTask(data, token);
+    if (!todo) fail(`refusing: no task matches "${token}"`);
 
-  const roots = changeRootsFor(data, todo);
-  const link = specAddressesForManual(todo, roots);
-  if (!link.addresses.length)
-    fail(
-      `refusing: #${todo.number} "${todo.subject}" carries no spec link (neither its own nor its change root's) — ` +
-        `nothing to answer for. Link it first: todos set spec ${todo.number} <домен>#<слаг>`,
-    );
-
-  let targets;
-  if (flags.address) {
-    if (!link.addresses.includes(flags.address))
+    const roots = changeRootsFor(data, todo);
+    const link = specAddressesForManual(todo, roots);
+    if (!link.addresses.length)
       fail(
-        `refusing: #${todo.number} does not address "${flags.address}" — it addresses ${link.addresses.join(", ")}`,
+        `refusing: #${todo.number} "${todo.subject}" carries no spec link (neither its own nor its change root's) — ` +
+          `nothing to answer for. Link it first: todos set spec ${todo.number} <домен>#<слаг>`,
       );
-    targets = [flags.address];
-  } else if (link.addresses.length === 1) {
-    targets = link.addresses;
-  } else {
-    // One note stretched over several sections IS the template answer §9 calls
-    // the same rot on a new layer. Make the caller say which section it is
-    // about, one at a time.
-    fail(
-      `refusing: #${todo.number} addresses ${link.addresses.length} sections (${link.addresses.join(", ")}) — ` +
-        `answer them one at a time with --address, a section each, not one verdict for all`,
-    );
-  }
 
-  const note = String(flags.text ?? "").trim();
-  if (note.length < MIN_ANSWER_CHARS)
-    fail(
-      `refusing: --text is ${note.length} chars — an answer about a section is at least ${MIN_ANSWER_CHARS} ` +
-        `(${verdict === "unchanged" ? "why the section still holds after this work" : "what in the section moved"})`,
-    );
-
-  const root = resolveRoot();
-  const answers = Array.isArray(todo.spec_answers) ? todo.spec_answers.slice() : [];
-  const clash = answers.find(
-    (a) => a && a.address !== targets[0] && String(a.note || "").trim() === note,
-  );
-  if (clash)
-    fail(
-      `refusing: this is word-for-word the answer already given for ${clash.address} — ` +
-        `two sections answered with one sentence is the template answer README §9 counts as rot`,
-    );
-
-  // BOTH verdicts resolve the address first. The link was validated when it was
-  // written, but a slug can be renamed or dropped afterwards — and an answer
-  // about a section that no longer exists clears the guard while saying nothing.
-  // Leaving this to the `updated` branch alone (which resolves on its way to
-  // stamping) made `unchanged` the one unguarded path: no edit, no check, no
-  // stamp — exactly the shape a session under pressure drifts towards.
-  for (const address of targets) {
-    const r = resolveAddress(address, root);
-    if (!r.ok)
+    let targets;
+    if (flags.address) {
+      if (!link.addresses.includes(flags.address))
+        fail(
+          `refusing: #${todo.number} does not address "${flags.address}" — it addresses ${link.addresses.join(", ")}`,
+        );
+      targets = [flags.address];
+    } else if (link.addresses.length === 1) {
+      targets = link.addresses;
+    } else {
+      // One note stretched over several sections IS the template answer §9 calls
+      // the same rot on a new layer. Make the caller say which section it is
+      // about, one at a time.
       fail(
-        `refusing: ${r.reason}\n  Раздел мог быть переименован или удалён уже после того, как ссылка ` +
-          `записана.\n  Поправь ссылку задачи (todos set spec ${todo.number} <домен>#<слаг>) и отвечай по ` +
-          `тому разделу, который есть.`,
+        `refusing: #${todo.number} addresses ${link.addresses.length} sections (${link.addresses.join(", ")}) — ` +
+          `answer them one at a time with --address, a section each, not one verdict for all`,
       );
-  }
+    }
 
-  const stamps = [];
-  const unverified = [];
-  if (verdict === "updated") {
-    const ref = stampRefFor(roots, todo);
+    const note = String(flags.text ?? "").trim();
+    if (note.length < MIN_ANSWER_CHARS)
+      fail(
+        `refusing: --text is ${note.length} chars — an answer about a section is at least ${MIN_ANSWER_CHARS} ` +
+          `(${verdict === "unchanged" ? "why the section still holds after this work" : "what in the section moved"})`,
+      );
+
+    const root = resolveRoot();
+    const answers = Array.isArray(todo.spec_answers) ? todo.spec_answers.slice() : [];
+    const clash = answers.find(
+      (a) => a && a.address !== targets[0] && String(a.note || "").trim() === note,
+    );
+    if (clash)
+      fail(
+        `refusing: this is word-for-word the answer already given for ${clash.address} — ` +
+          `two sections answered with one sentence is the template answer README §9 counts as rot`,
+      );
+
+    // BOTH verdicts resolve the address first. The link was validated when it was
+    // written, but a slug can be renamed or dropped afterwards — and an answer
+    // about a section that no longer exists clears the guard while saying nothing.
+    // Leaving this to the `updated` branch alone (which resolves on its way to
+    // stamping) made `unchanged` the one unguarded path: no edit, no check, no
+    // stamp — exactly the shape a session under pressure drifts towards.
     for (const address of targets) {
-      // "The section moved" is a claim about the TEXT, and until now it cost
-      // exactly as much as "it did not": the stamp went on without comparing
-      // anything. The baseline is the fingerprint taken when the section was
-      // injected at in_progress (todos.mjs::recordSpecBaseline).
+      const r = resolveAddress(address, root);
+      if (!r.ok)
+        fail(
+          `refusing: ${r.reason}\n  Раздел мог быть переименован или удалён уже после того, как ссылка ` +
+            `записана.\n  Поправь ссылку задачи (todos set spec ${todo.number} <домен>#<слаг>) и отвечай по ` +
+            `тому разделу, который есть.`,
+        );
+    }
+
+    const stamps = [];
+    const unverified = [];
+    if (verdict === "updated") {
+      const ref = stampRefFor(roots, todo);
+      for (const address of targets) {
+        // "The section moved" is a claim about the TEXT, and until now it cost
+        // exactly as much as "it did not": the stamp went on without comparing
+        // anything. The baseline is the fingerprint taken when the section was
+        // injected at in_progress (todos.mjs::recordSpecBaseline).
+        const seen = (Array.isArray(todo.spec_seen) ? todo.spec_seen : []).find(
+          (x) => x && x.address === address,
+        );
+        if (!seen) {
+          // No baseline — the task never passed through the injection anchor.
+          // Say so instead of pretending the claim was checked.
+          unverified.push(address);
+        } else if (seen.hash === sectionFingerprint(address, root)) {
+          fail(
+            `refusing: ${address} байт в байт тот же текст, что был показан при взятии задачи — ` +
+              `"updated" утверждает, что раздел разошёлся, но он не двигался.\n` +
+              `  Либо правь раздел, либо отвечай unchanged: cli spec answer ${todo.number} unchanged ` +
+              `--text "…" --address ${address}`,
+          );
+        }
+        // The moment a delta is recorded is the moment to refuse a task link:
+        // the section was just rewritten, so whoever is here can fix it, and the
+        // stamp about to be written is the ONE sanctioned reference to a task.
+        // `unchanged` is deliberately not gated — you did not move the section,
+        // and lint already reports the link.
+        const r = resolveAddress(address, root);
+        const links = taskLinksIn(proseFor(r));
+        if (links.length)
+          fail(
+            `refusing: ${address} несёт ссылк(у/и) на задачу в тексте — ` +
+              links.map((l) => `${l.ref} (строка ${l.line})`).join(", ") +
+              `\n  Спека — состояние, которое переживает задачи; номер задачи в ней протухает вместе с ней.` +
+              `\n  Убери номер из прозы: что сделано — без ссылки, кто и когда — git blame и строка` +
+              `\n  метаданных change, которую эта же команда и проставит.`,
+          );
+        const res = stampSection(address, { ref, root });
+        if (!res.ok) fail(`refusing: ${res.reason}`);
+        stamps.push(res);
+      }
+    }
+
+    const at = new Date().toISOString();
+    for (const address of targets) {
+      const idx = answers.findIndex((a) => a && a.address === address);
+      // Which BLOCKS this task moved: the ones present now that were not in the
+      // baseline taken when the section was shown. Stored on the answer, so the
+      // section can be read later with each bullet carrying the task that wrote
+      // it — the question "which change is this bullet about" is the one a
+      // section-level link could never answer.
       const seen = (Array.isArray(todo.spec_seen) ? todo.spec_seen : []).find(
         (x) => x && x.address === address,
       );
-      if (!seen) {
-        // No baseline — the task never passed through the injection anchor.
-        // Say so instead of pretending the claim was checked.
-        unverified.push(address);
-      } else if (seen.hash === sectionFingerprint(address, root)) {
-        fail(
-          `refusing: ${address} байт в байт тот же текст, что был показан при взятии задачи — ` +
-            `"updated" утверждает, что раздел разошёлся, но он не двигался.\n` +
-            `  Либо правь раздел, либо отвечай unchanged: cli spec answer ${todo.number} unchanged ` +
-            `--text "…" --address ${address}`,
-        );
-      }
-      // The moment a delta is recorded is the moment to refuse a task link:
-      // the section was just rewritten, so whoever is here can fix it, and the
-      // stamp about to be written is the ONE sanctioned reference to a task.
-      // `unchanged` is deliberately not gated — you did not move the section,
-      // and lint already reports the link.
-      const r = resolveAddress(address, root);
-      const links = taskLinksIn(proseFor(r));
-      if (links.length)
-        fail(
-          `refusing: ${address} несёт ссылк(у/и) на задачу в тексте — ` +
-            links.map((l) => `${l.ref} (строка ${l.line})`).join(", ") +
-            `\n  Спека — состояние, которое переживает задачи; номер задачи в ней протухает вместе с ней.` +
-            `\n  Убери номер из прозы: что сделано — без ссылки, кто и когда — git blame и строка` +
-            `\n  метаданных change, которую эта же команда и проставит.`,
-        );
-      const res = stampSection(address, { ref, root });
-      if (!res.ok) fail(`refusing: ${res.reason}`);
-      stamps.push(res);
+      const before = new Set(Array.isArray(seen?.blocks) ? seen.blocks : []);
+      const now = verdict === "updated" ? blocksOf(address, root) : [];
+      const blocks = before.size ? now.map((b) => b.hash).filter((h) => !before.has(h)) : [];
+      // The section as it stands the moment the delta is claimed. Together with
+      // the baseline on `spec_seen` this is the pair a diff needs, and it is
+      // frozen here on purpose: the spec keeps moving after this task closes, so
+      // reading "what did #341 change" off the live file would answer a different
+      // question every week. Only `updated` carries one — `unchanged` asserts
+      // there is no delta, and a diff of nothing against nothing is noise.
+      const after = seen?.text != null && now.length ? now.map((b) => b.text).join("\n") : "";
+      const entry = {
+        address,
+        verdict,
+        note,
+        at,
+        ...(blocks.length ? { blocks } : {}),
+        ...(after ? { after } : {}),
+      };
+      if (idx >= 0) answers[idx] = entry;
+      else answers.push(entry);
     }
-  }
+    todo.spec_answers = answers;
+    todo.updated_at = at;
+    saveBoard(file, data);
 
-  const at = new Date().toISOString();
-  for (const address of targets) {
-    const idx = answers.findIndex((a) => a && a.address === address);
-    // Which BLOCKS this task moved: the ones present now that were not in the
-    // baseline taken when the section was shown. Stored on the answer, so the
-    // section can be read later with each bullet carrying the task that wrote
-    // it — the question "which change is this bullet about" is the one a
-    // section-level link could never answer.
-    const seen = (Array.isArray(todo.spec_seen) ? todo.spec_seen : []).find(
-      (x) => x && x.address === address,
-    );
-    const before = new Set(Array.isArray(seen?.blocks) ? seen.blocks : []);
-    const now = verdict === "updated" ? blocksOf(address, root) : [];
-    const blocks = before.size ? now.map((b) => b.hash).filter((h) => !before.has(h)) : [];
-    // The section as it stands the moment the delta is claimed. Together with
-    // the baseline on `spec_seen` this is the pair a diff needs, and it is
-    // frozen here on purpose: the spec keeps moving after this task closes, so
-    // reading "what did #341 change" off the live file would answer a different
-    // question every week. Only `updated` carries one — `unchanged` asserts
-    // there is no delta, and a diff of nothing against nothing is noise.
-    const after = seen?.text != null && now.length ? now.map((b) => b.text).join("\n") : "";
-    const entry = {
-      address,
-      verdict,
-      note,
-      at,
-      ...(blocks.length ? { blocks } : {}),
-      ...(after ? { after } : {}),
-    };
-    if (idx >= 0) answers[idx] = entry;
-    else answers.push(entry);
-  }
-  todo.spec_answers = answers;
-  todo.updated_at = at;
-  saveBoard(file, data);
-
-  if (flags.json) {
-    process.stdout.write(
-      JSON.stringify({ ok: true, task: todo.number, answers, stamps, unverified }, null, 2) + "\n",
-    );
-    return;
-  }
-  for (const address of targets)
-    process.stdout.write(`ok: #${todo.number} — ${address} ${verdict}\n`);
-  for (const s of stamps) process.stdout.write(`   ${s.file}: ${s.stamp}\n`);
-  for (const a of unverified)
-    process.stdout.write(
-      `   ⚠ ${a}: правку подтвердить нечем — раздел не проходил через впрыск при взятии задачи,\n` +
-        `     поэтому слепка "как было" нет. Записано на слово.\n`,
-    );
+    if (flags.json) {
+      process.stdout.write(
+        JSON.stringify({ ok: true, task: todo.number, answers, stamps, unverified }, null, 2) + "\n",
+      );
+      return;
+    }
+    for (const address of targets)
+      process.stdout.write(`ok: #${todo.number} — ${address} ${verdict}\n`);
+    for (const s of stamps) process.stdout.write(`   ${s.file}: ${s.stamp}\n`);
+    for (const a of unverified)
+      process.stdout.write(
+        `   ⚠ ${a}: правку подтвердить нечем — раздел не проходил через впрыск при взятии задачи,\n` +
+          `     поэтому слепка "как было" нет. Записано на слово.\n`,
+      );
+  });
 }
 
 const ANSWER_USAGE =

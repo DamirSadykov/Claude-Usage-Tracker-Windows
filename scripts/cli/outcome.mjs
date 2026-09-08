@@ -47,7 +47,6 @@
 import {
   readFileSync,
   writeFileSync,
-  renameSync,
   readdirSync,
   existsSync,
   statSync,
@@ -56,7 +55,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { resolveTask, readTaskSessionEvents } from "./todos.mjs";
-import { withBoardLock } from "./board-lock.mjs";
+import { withBoardLock, renameWithRetry } from "./board-lock.mjs";
 
 // Tools that CHANGE a file — the only evidence that something was produced.
 // `Read` carries a `file_path` too and is deliberately NOT here: reading a file
@@ -94,7 +93,7 @@ function loadTodos(file) {
 function saveTodos(file, data) {
   const tmp = `${file}.${process.pid}.tmp`;
   writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n");
-  renameSync(tmp, file);
+  renameWithRetry(tmp, file);
 }
 
 // ── paths ────────────────────────────────────────────────────────────────────

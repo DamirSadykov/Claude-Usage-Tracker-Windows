@@ -40,7 +40,7 @@
 // Exit code is non-zero on any error (bad status, unknown id, usage), so a
 // caller can tell success from failure.
 
-import { readFileSync, writeFileSync, renameSync, appendFileSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, appendFileSync, mkdirSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { spawn, execFileSync } from "node:child_process";
 import path from "node:path";
@@ -48,7 +48,7 @@ import { fileURLToPath } from "node:url";
 import { matchPlanCli, specsEnabled } from "./settings.mjs";
 import { resolveAddress, showSection, sectionFingerprint, blocksOf } from "./spec.mjs";
 import { findChange, changeAddress } from "./change.mjs";
-import { withBoardLock } from "./board-lock.mjs";
+import { withBoardLock, renameWithRetry } from "./board-lock.mjs";
 
 // Kanban columns, in board order. Keep in lockstep with todos.rs::STATUSES.
 export const STATUSES = ["backlog", "queue", "in_progress", "review", "done"];
@@ -197,7 +197,7 @@ function save(file, data) {
   }
   const tmp = `${file}.${process.pid}.tmp`;
   writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n");
-  renameSync(tmp, file);
+  renameWithRetry(tmp, file);
 }
 
 // A command that writes ONE row saves after it and is atomic by construction.
