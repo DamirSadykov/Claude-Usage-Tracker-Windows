@@ -2597,6 +2597,37 @@ mod tests {
         (dir, path)
     }
 
+    fn json_values_match(a: &Value, b: &Value) -> bool {
+        match (a, b) {
+            (Value::Array(xs), Value::Null) | (Value::Null, Value::Array(xs)) => xs.is_empty(),
+            (Value::Number(x), Value::Number(y)) => x.as_f64() == y.as_f64(),
+            (Value::Array(xs), Value::Array(ys)) => {
+                xs.len() == ys.len() && xs.iter().zip(ys).all(|(x, y)| json_values_match(x, y))
+            }
+            (Value::Object(xs), Value::Object(ys)) => {
+                let keys: std::collections::BTreeSet<_> = xs.keys().chain(ys.keys()).collect();
+                keys.into_iter().all(|k| {
+                    json_values_match(
+                        xs.get(k).unwrap_or(&Value::Null),
+                        ys.get(k).unwrap_or(&Value::Null),
+                    )
+                })
+            }
+            _ => a == b,
+        }
+    }
+
+    fn assert_known_fields_match(context: &str, original: &Value, saved: &Value) {
+        let orig_obj = original.as_object().expect("original must be an object");
+        for (key, orig_val) in orig_obj {
+            let saved_val = saved.get(key).cloned().unwrap_or(Value::Null);
+            assert!(
+                json_values_match(orig_val, &saved_val),
+                "{context}: key {key:?} differs — original {orig_val:?}, saved {saved_val:?}"
+            );
+        }
+    }
+
     #[test]
     fn corrupt_fixtures_are_unreadable() {
         for relative in [
@@ -2833,6 +2864,308 @@ mod tests {
         let path = dir.join("todos.json");
         std::fs::write(&path, r#"{"todos":[]}"#).unwrap();
         assert!(resolves_to_same_path(&path, &path));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+
+    #[test]
+    fn v1_empty_fixtures_round_trips_to_v2() {
+        let (dir, path) = staged_fixture("v1-empty-fixtures", "v1/empty.json");
+        let file = match load_checked(&path) {
+            LoadOutcome::Ok(f) => f,
+            other => panic!("v1/empty.json: expected Ok, got {other:?}"),
+        };
+        assert_eq!(file.version, 2);
+        assert!(file.todos.is_empty());
+
+        let save_path = dir.join("saved.json");
+        save(&save_path, &file).unwrap();
+        let reloaded = match load_checked(&save_path) {
+            LoadOutcome::Ok(f) => f,
+            other => panic!("saved v1/empty.json: expected Ok, got {other:?}"),
+        };
+        assert_eq!(reloaded.version, 2);
+        assert!(reloaded.todos.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn v1_full_fixtures_migrates_plan_roles_and_status_on_load() {
+        let (dir, path) = staged_fixture("v1-full-fixtures", "v1/full.json");
+        let file = match load_checked(&path) {
+            LoadOutcome::Ok(f) => f,
+            other => panic!("v1/full.json: expected Ok, got {other:?}"),
+        };
+        assert_eq!(file.version, 2);
+        assert_eq!(file.todos.len(), 3);
+
+        let t1 = &file.todos[0];
+        assert_eq!(t1.status, "backlog", "pending is canonicalized on every load");
+        assert!(t1.plan.is_empty());
+        assert!(t1.comments.is_empty());
+
+        let t2 = &file.todos[1];
+        assert_eq!(t2.status, "done");
+        assert!(t2.plan.is_empty(), "phases-pointer plan is archived and cleared");
+        assert_eq!(t2.comments.len(), 1);
+        assert_eq!(
+            t2.comments[0].body,
+            "Архив поля plan (миграция v2): .claude/phases/my-feature"
+        );
+        assert!(!t2.comments[0].id.is_empty());
+
+        let t3 = &file.todos[2];
+        assert_eq!(t3.status, "in_progress");
+        assert!(t3.description.contains("решили Y"));
+        assert!(!t3.description.contains("## Steps"));
+        assert!(t3.plan.starts_with("## Steps"));
+        assert!(t3.plan.contains("Порядок: 1"));
+
+        let save_path = dir.join("saved.json");
+        save(&save_path, &file).unwrap();
+        let reloaded = match load_checked(&save_path) {
+            LoadOutcome::Ok(f) => f,
+            other => panic!("saved v1/full.json: expected Ok, got {other:?}"),
+        };
+        assert_eq!(reloaded.version, 2);
+        assert_eq!(
+            serde_json::to_value(&reloaded.todos).unwrap(),
+            serde_json::to_value(&file.todos).unwrap(),
+            "the already-migrated shape must survive its own write/read cycle unchanged"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn v2_empty_fixtures_round_trips() {
+        let (dir, path) = staged_fixture("v2-empty-fixtures", "v2/empty.json");
+        let file = match load_checked(&path) {
+            LoadOutcome::Ok(f) => f,
+            other => panic!("v2/empty.json: expected Ok, got {other:?}"),
+        };
+        assert_eq!(file.version, 2);
+        assert!(file.todos.is_empty());
+
+        let save_path = dir.join("saved.json");
+        save(&save_path, &file).unwrap();
+        let reloaded = match load_checked(&save_path) {
+            LoadOutcome::Ok(f) => f,
+            other => panic!("saved v2/empty.json: expected Ok, got {other:?}"),
+        };
+        assert_eq!(reloaded.version, 2);
+        assert!(reloaded.todos.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn v2_full_fixtures_known_fields_round_trip_losslessly() {
+        let (dir, path) = staged_fixture("v2-full-fixtures", "v2/full.json");
+        let original = match load_checked(&path) {
+            LoadOutcome::Ok(f) => f,
+            other => panic!("v2/full.json: expected Ok, got {other:?}"),
+        };
+        assert_eq!(original.version, 2);
+        assert_eq!(original.todos.len(), 5);
+        assert_eq!(original.changes.len(), 2);
+
+        let save_path = dir.join("saved.json");
+        save(&save_path, &original).unwrap();
+        let reloaded = match load_checked(&save_path) {
+            LoadOutcome::Ok(f) => f,
+            other => panic!("saved v2/full.json: expected Ok, got {other:?}"),
+        };
+
+        assert_eq!(
+            serde_json::to_value(&reloaded.todos).unwrap(),
+            serde_json::to_value(&original.todos).unwrap(),
+            "every known todo field must survive a write/read cycle"
+        );
+        assert_eq!(
+            serde_json::to_value(&reloaded.changes).unwrap(),
+            serde_json::to_value(&original.changes).unwrap(),
+            "every known change field must survive a write/read cycle"
+        );
+
+        let orig_raw: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let saved_raw: Value = serde_json::from_str(&std::fs::read_to_string(&save_path).unwrap()).unwrap();
+        assert_known_fields_match("todos[0]", &orig_raw["todos"][0], &saved_raw["todos"][0]);
+        for (i, change) in orig_raw["changes"].as_array().unwrap().iter().enumerate() {
+            assert_known_fields_match(&format!("changes[{i}]"), change, &saved_raw["changes"][i]);
+        }
+
+        let t0 = &reloaded.todos[0];
+        assert_eq!(t0.id, "b2222222-0000-4000-8000-000000000001");
+        assert_eq!(t0.number, 42);
+        assert_eq!(t0.subject, "Свести схему CSV-экспорта с дашбордом");
+        assert_eq!(
+            t0.description,
+            "Экспорт и дашборд расходятся в именах колонок — свести перед тем, как добавлять новую."
+        );
+        assert_eq!(t0.status, "in_progress");
+        assert_eq!(t0.project.as_deref(), Some("usage-tracker"));
+        assert_eq!(t0.from.as_deref(), Some("claude-usage-tracker-windows"));
+        assert_eq!(t0.plan, "1. сверить список колонок\n2. написать миграцию для устаревших файлов");
+        assert_eq!(t0.priority, "high");
+        assert_eq!(t0.kind, "auto");
+        assert_eq!(t0.change_id.as_deref(), Some("c3333333-0000-4000-8000-000000000001"));
+        assert_eq!(t0.scheduled_for.as_deref(), Some("2026-02-10"));
+        assert_eq!(t0.comments.len(), 1);
+        assert_eq!(t0.comments[0].author, "user");
+        assert_eq!(t0.comments[0].body, "давай сначала сверим формат с дашбордом");
+        assert_eq!(t0.links, vec!["b2222222-0000-4000-8000-000000000002".to_string()]);
+        assert_eq!(t0.depends_on, vec!["b2222222-0000-4000-8000-000000000003".to_string()]);
+        assert_eq!(t0.produces, vec!["docs/specs/tasks/spec.md#board-file".to_string()]);
+        assert_eq!(t0.spec, vec!["tasks#board-file".to_string()]);
+        assert_eq!(t0.spec_answers.len(), 1);
+        assert_eq!(t0.spec_answers[0].verdict, "updated");
+        assert_eq!(t0.spec_answers[0].address, "tasks#board-file");
+        assert_eq!(t0.spec_answers[0].blocks, vec!["3f9a1c2b".to_string()]);
+        assert_eq!(t0.spec_seen.len(), 1);
+        assert_eq!(t0.spec_seen[0].hash, "1a2b3c4d");
+        assert_eq!(t0.status_history.first().unwrap().status, "backlog");
+        assert_eq!(t0.status_history.first().unwrap().at, "2026-02-01T09:00:00.000Z");
+        assert_eq!(t0.status_history.last().unwrap().status, "in_progress");
+        assert_eq!(t0.status_history.last().unwrap().at, "2026-02-03T09:00:00.000Z");
+        assert_eq!(t0.verify, "npx vitest run scripts/cli/spec.test.mjs");
+        assert_eq!(t0.retry_limit, Some(2));
+        assert_eq!(t0.on_issue.as_deref(), Some("b2222222-0000-4000-8000-000000000002"));
+        assert_eq!(t0.budget_usd, Some(5.0));
+        assert_eq!(t0.parallel_limit, Some(2));
+        assert_eq!(t0.outcome, "ok");
+        assert_eq!(t0.outcome_reason, "ok");
+        assert_eq!(t0.outcome_at, "2026-02-03T11:00:00.000Z");
+        assert_eq!(t0.handoff, "Спека и фикстуры записаны, следующий шаг — Node-замок.");
+        assert_eq!(t0.handoff_at.as_deref(), Some("2026-02-03T11:00:00.000Z"));
+        assert_eq!(t0.handout_at.as_deref(), Some("2026-02-03T08:00:00.000Z"));
+        assert_eq!(t0.imported_at.as_deref(), Some("2026-02-01T08:00:00.000Z"));
+        assert_eq!(t0.created_by, "claude");
+        assert_eq!(t0.created_at, "2026-02-01T09:00:00.000Z");
+        assert_eq!(t0.updated_at, "2026-02-03T11:00:00.000Z");
+
+        let t3 = &reloaded.todos[3];
+        assert!(t3.change, "legacy change-root flag must survive");
+        assert_eq!(t3.change_id, None, "old and new membership never mix on one node");
+
+        let t4 = &reloaded.todos[4];
+        assert_eq!(t4.scheduled_for, None, "explicit null round-trips as None, same as absent");
+        assert_eq!(t4.plan, "", "explicit empty string round-trips as empty, same as absent");
+
+        let c0 = &reloaded.changes[0];
+        assert_eq!(c0.title, "контракт файла доски — замок fail-closed, recovery, фикстуры и версии");
+        assert_eq!(
+            c0.delta,
+            "Записать контракт файла доски в спеку и положить фикстуры по версиям, затем реализовать замок и recovery на обеих сторонах."
+        );
+        assert_eq!(c0.budget_usd, Some(20.0));
+        assert_eq!(c0.parallel_limit, Some(1));
+        assert_eq!(c0.spec, vec!["tasks#board-file".to_string()]);
+
+        let c1 = &reloaded.changes[1];
+        assert_eq!(c1.title, "пример завершённого change'а");
+        assert_eq!(
+            c1.delta,
+            "Демонстрационная запись со всеми полями Change, включая закрытие и происхождение из старого root'а."
+        );
+        assert_eq!(c1.migrated_from, Some(208));
+        assert_eq!(c1.closed_at.as_deref(), Some("2026-01-20T09:00:00.000Z"));
+        assert_eq!(c1.spec, Vec::<String>::new());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn v2_unknown_field_fixtures_ext_and_reviewer_note_are_dropped_on_write() {
+        let (dir, path) = staged_fixture("v2-unknown-fixtures", "v2/unknown-field.json");
+        let file = match load_checked(&path) {
+            LoadOutcome::Ok(f) => f,
+            other => panic!("v2/unknown-field.json: expected Ok, got {other:?}"),
+        };
+        assert_eq!(file.todos.len(), 1);
+        assert_eq!(file.todos[0].subject, "Узел с незнакомыми писателю полями");
+        assert_eq!(file.todos[0].status, "backlog");
+
+        let save_path = dir.join("saved.json");
+        save(&save_path, &file).unwrap();
+        let raw = std::fs::read_to_string(&save_path).unwrap();
+        assert!(!raw.contains("reviewer_note"), "unknown field must be dropped on write: {raw}");
+        assert!(!raw.contains("\"ext\""), "reserved-but-unimplemented ext must be dropped on write: {raw}");
+
+        let saved: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(saved["todos"][0]["status"], Value::from("backlog"));
+        assert_eq!(saved["todos"][0]["number"], Value::from(50));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn v2_future_version_fixtures_refuses_write_and_leaves_file_untouched() {
+        let (dir, path) = staged_fixture("v2-future-fixtures", "v2/future-version.json");
+        let before = std::fs::read(&path).unwrap();
+
+        assert!(load_for_write(&path).is_err());
+
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(before, after, "a refused write must not mutate the file");
+        assert!(
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .all(|e| !e.file_name().to_string_lossy().contains(".corrupt-")),
+            "a future-version file is not corrupt and gets no backup"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn missing_array_and_explicit_empty_array_fixtures_are_equivalent() {
+        let (dir, path) = staged_fixture("v2-full-empty-arrays", "v2/full.json");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let mut modified: Value = serde_json::from_str(&raw).unwrap();
+        {
+            let node = modified["todos"][1].as_object_mut().unwrap();
+            node.insert("depends_on".to_string(), Value::Array(vec![]));
+            node.insert("links".to_string(), Value::Array(vec![]));
+            node.insert("comments".to_string(), Value::Array(vec![]));
+        }
+        let modified_path = dir.join("modified.json");
+        std::fs::write(&modified_path, serde_json::to_string_pretty(&modified).unwrap()).unwrap();
+
+        let original = match load_checked(&path) {
+            LoadOutcome::Ok(f) => f,
+            other => panic!("v2/full.json: expected Ok, got {other:?}"),
+        };
+        let with_explicit_empty = match load_checked(&modified_path) {
+            LoadOutcome::Ok(f) => f,
+            other => panic!("modified v2/full.json: expected Ok, got {other:?}"),
+        };
+
+        assert_eq!(
+            serde_json::to_value(&with_explicit_empty.todos[1]).unwrap(),
+            serde_json::to_value(&original.todos[1]).unwrap(),
+            "an explicit empty array must load identically to an absent one"
+        );
+
+        let save_path = dir.join("saved.json");
+        save(&save_path, &with_explicit_empty).unwrap();
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&save_path).unwrap()).unwrap();
+        let saved_node = &saved["todos"][1];
+        assert!(saved_node.get("depends_on").is_none(), "empty arrays are omitted on write, same as before");
+        assert!(saved_node.get("links").is_none());
+        assert!(saved_node.get("comments").is_none());
+
+        let original_save_path = dir.join("saved-original.json");
+        save(&original_save_path, &original).unwrap();
+        let original_saved: Value =
+            serde_json::from_str(&std::fs::read_to_string(&original_save_path).unwrap()).unwrap();
+        assert_eq!(
+            original_saved["todos"][1], *saved_node,
+            "a fixture with explicit empty arrays must save byte-for-byte the same as the original, absent-field fixture"
+        );
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }
