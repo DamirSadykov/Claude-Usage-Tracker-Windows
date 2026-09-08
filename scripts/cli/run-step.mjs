@@ -23,6 +23,8 @@
 
 import { spawn, execFileSync } from "node:child_process";
 import path from "node:path";
+import { homedir } from "node:os";
+import { existsSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
@@ -33,7 +35,30 @@ import {
   changeRootsFor,
   formatChangeVision,
   isChangeRoot,
+  readTaskSessionEvents,
 } from "./todos.mjs";
+import { resolveDuty } from "./agents.mjs";
+import { specsEnabled } from "./settings.mjs";
+import {
+  READ_ONLY_TOOLS,
+  observeCodexThread,
+  parseClaudeResult,
+  parseCodexResult,
+  parseProviderResult,
+  providerArgv,
+} from "./providers.mjs";
+
+// Re-exported: the parsers moved to the provider seam, their callers and
+// tests did not.
+export { parseClaudeResult, parseCodexResult };
+
+function brainSessionEnv(env, execution, fallbackRole) {
+  return {
+    ...envWithoutSession(env || process.env),
+    TRACKER_DUTY: execution?.role || execution?.duty || fallbackRole,
+    TRACKER_SESSION_KIND: "runner",
+  };
+}
 
 // A step is a whole unit of work, not a question — it gets minutes, not
 // seconds. A check is bounded by what it runs (`npm test` on this repo is ~5s;
@@ -159,9 +184,19 @@ function killTree(child) {
   if (!child || child.exitCode !== null || child.killed) return;
   try {
     if (process.platform === "win32") {
-      spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], {
+      const killer = spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], {
         stdio: "ignore",
-      }).on("error", () => child.kill("SIGKILL"));
+        windowsHide: true,
+      });
+      const fallback = setTimeout(() => {
+        if (child.exitCode === null && !child.killed) {
+          try { child.kill("SIGKILL"); } catch {}
+        }
+      }, 250);
+      killer.on("error", () => {
+        clearTimeout(fallback);
+        try { child.kill("SIGKILL"); } catch {}
+      });
     } else {
       process.kill(-child.pid, "SIGKILL");
     }
@@ -178,7 +213,7 @@ function killTree(child) {
 function spawnCaptured(
   file,
   args,
-  { cwd, timeoutMs, input = null, maxChars = MAX_CAPTURE_CHARS, env, spawnOpts } = {},
+  { cwd, timeoutMs, input = null, maxChars = MAX_CAPTURE_CHARS, env, spawnOpts, onStdout } = {},
 ) {
   return new Promise((resolve) => {
     const target = resolveSpawn(file, args);
@@ -210,7 +245,10 @@ function spawnCaptured(
     let spawnError = "";
     let settled = false;
 
-    child.stdout.on("data", (c) => out.push(c));
+    child.stdout.on("data", (c) => {
+      out.push(c);
+      try { onStdout?.(String(c)); } catch {}
+    });
     child.stderr.on("data", (c) => err.push(c));
 
     const timer = setTimeout(() => {
@@ -223,7 +261,7 @@ function spawnCaptured(
       settled = true;
       clearTimeout(timer);
       resolve({
-        code,
+        code: timedOut ? null : code,
         stdout: out.value(),
         stderr: err.value(),
         timedOut,
@@ -276,6 +314,82 @@ function inheritedBaton(task, { cwd } = {}) {
   } catch {
     return "";
   }
+}
+
+// Where a finished step's own transcript sits on disk. Claude Code files a
+// session under a directory named after the cwd it ran in, with every separator
+// flattened to a dash — the step ran in the same cwd as this one, so the name is
+// derivable rather than searched for.
+export function transcriptDirFor(cwd) {
+  const slug = String(cwd || "").replace(/[\\/:]/g, "-");
+  return path.join(homedir(), ".claude", "projects", slug);
+}
+
+export function transcriptPathFor(session, cwd) {
+  if (!session) return "";
+  const p = path.join(transcriptDirFor(cwd), `${session}.jsonl`);
+  return existsSync(p) ? p : "";
+}
+
+// The RECORD block (t#562): where the prerequisites' own transcripts are, so
+// this step can go and look instead of being handed their context.
+//
+// The baton above is what the previous step SAID it did — prose it wrote about
+// itself, and prose can carry a mistake forward as a fact (t#556: a step
+// declared a 16-character word to be 17, and the step after it inherited the
+// claim and repeated it while holding the file open). The transcript is what
+// the step actually DID: the tool calls, their results, the exit codes. One is
+// testimony, the other is record, and a step that cannot tell them apart has no
+// way to check the first against the second.
+//
+// Nothing is injected here but paths — the point is precisely NOT to pour the
+// ancestor's context into this window (that is `--inherit`, and it is what
+// carried the mistake). Read/Grep are already in the step's tool list.
+function lastSessionByTask() {
+  const map = new Map();
+  let events = [];
+  try {
+    events = readTaskSessionEvents();
+  } catch {
+    return map;
+  }
+  for (const e of events) {
+    if (!e || !e.task || !e.session) continue;
+    map.set(String(e.task), String(e.session));
+  }
+  return map;
+}
+
+export function ancestorRecords(task, all, cwd) {
+  const byId = new Map((all || []).map((t) => [t.id, t]));
+  const sessions = lastSessionByTask();
+  const out = [];
+  for (const id of Array.isArray(task?.depends_on) ? task.depends_on : []) {
+    const p = byId.get(id);
+    if (!p) continue;
+    const session = sessions.get(String(p.id)) || "";
+    const file = transcriptPathFor(session, cwd);
+    if (!file) continue;
+    out.push({ task: p, session, file });
+  }
+  return out;
+}
+
+export function formatRecords(records) {
+  if (!records.length)
+    return "(no prerequisite transcript on disk — the baton above is all there is)\n";
+  const out = records.map(
+    (r) => `  t#${r.task.number} "${r.task.subject}"\n    ${r.file}\n`,
+  );
+  out.push(
+    "The baton is what that step SAID; this file is what it DID — its tool calls,\n" +
+      "their results, their exit codes. Read or grep it when the baton makes a claim\n" +
+      "your work depends on: a number, a name, a path, a command that supposedly\n" +
+      "passed. Prefer the record over the claim where they disagree, and say so in\n" +
+      "your handoff. Do not read it out of curiosity — it costs tokens you are\n" +
+      "spending on this node.\n",
+  );
+  return out.join("");
 }
 
 // The change's vision, read UP the dep edges the way the interactive path
@@ -331,7 +445,7 @@ function formatAwaiting(nodes) {
 // What is deliberately NOT here: the history of previous steps, the transcript
 // of an earlier attempt. Context crosses the seam as the baton or not at all —
 // that is the whole reason the seam exists (§13).
-export function buildStepPrompt({ task, board, cwd, alongside = [] } = {}) {
+export function buildStepPrompt({ task, board, cwd, alongside = [], execution } = {}) {
   if (!task) throw new Error("buildStepPrompt: task is required");
   const all = Array.isArray(board?.todos) ? board.todos : [];
   const index = new Map(all.map((t) => [t.id, t]));
@@ -339,6 +453,13 @@ export function buildStepPrompt({ task, board, cwd, alongside = [] } = {}) {
   let out =
     "You are executing ONE step of an autonomous run over a task graph.\n" +
     "Everything you need is below; there is no earlier conversation to recall.\n\n";
+
+  if (execution?.role || execution?.instructions) {
+    out += "── ROLE ──\n";
+    if (execution.role) out += `You are the ${execution.role}.\n`;
+    if (execution.instructions) out += String(execution.instructions).trim() + "\n";
+    out += "This role changes how you approach the work, not the task boundary below.\n\n";
+  }
 
   out += `── WORK ──\nt#${task.number} ${task.subject || "(no subject)"}\n`;
   if (task.description && task.description.trim())
@@ -358,6 +479,10 @@ export function buildStepPrompt({ task, board, cwd, alongside = [] } = {}) {
     (baton
       ? baton + "\n"
       : "(the baton could not be read — proceed on the declarations alone, and do not invent what upstream did)\n");
+
+  out +=
+    "\n── RECORD — where the steps before you left their own transcripts ──\n" +
+    formatRecords(ancestorRecords(task, all, cwd));
 
   out +=
     "\n── WHAT WAITS ON YOU — nodes that unblock when this one closes ──\n" +
@@ -391,10 +516,14 @@ export function buildStepPrompt({ task, board, cwd, alongside = [] } = {}) {
   if (typeof task.budget_usd === "number")
     out += `Spend ceiling for this node: $${task.budget_usd}.\n`;
 
+  const toolRule = execution?.provider === "openai"
+    ? "1. Do the work in the files. You may use the shell inside the workspace, but the harness\n" +
+      "   owns and runs the declared check after you stop; do not edit or bypass that check.\n"
+    : "1. Do the work in the files. You have no shell: the harness runs every command,\n" +
+      "   including the check above — do not ask for one and do not simulate it.\n";
   out +=
     "\n── RULES ──\n" +
-    "1. Do the work in the files. You have no shell: the harness runs every command,\n" +
-    "   including the check above — do not ask for one and do not simulate it.\n" +
+    toolRule +
     "2. Do not touch the task board, the task status or the graph. The runner closes\n" +
     "   the node after the check passes; claiming it done yourself does not close it.\n" +
     "3. Stay inside this node. Work the next step is meant to do is not yours to start.\n" +
@@ -449,37 +578,79 @@ export function extractHandoff(text) {
 // the runner makes just before would write a second one, under the session the
 // RUNNER was started in — run.mjs keeps that id out of the CLI children it
 // spawns for exactly this reason (t#312).
-export function bindSession({ session, task, event = "start" }) {
+export function bindSession({ session, task, event = "start", ts, execution }) {
   return appendTaskSessionEvent({
     session,
     task: task && task.id,
     event,
     source: "run-step",
     project: (task && task.project) || null,
+    ts,
+    provider: execution?.provider,
+    agent: execution?.name,
+    model: execution?.model,
   });
+}
+
+export function buildReviewPrompt({ task, workerResult = "", execution, appData } = {}) {
+  const parts = [
+    `produces: ${(Array.isArray(task?.produces) ? task.produces : []).join(", ") || "(none)"}`,
+    `verify: ${task?.verify || "(none — human gate)"}`,
+  ];
+  if (specsEnabled(appData))
+    parts.push(`spec: ${(Array.isArray(task?.spec) ? task.spec : []).join(", ") || "(none)"}`);
+  const declarations = parts.join("\n");
+  return [
+    "You are the review stage of an autonomous task lifecycle.",
+    execution?.instructions || "Review correctness, scope, regressions and the declared obligations.",
+    "Inspect the workspace read-only. Do not edit files and do not change the task board.",
+    "The deterministic verify command runs after you; assess whether the implementation is ready for it.",
+    "",
+    `TASK: t#${task?.number ?? "?"} ${task?.subject || ""}`,
+    task?.description ? `DESCRIPTION: ${task.description}` : "",
+    task?.plan ? `PLAN: ${task.plan}` : "",
+    "OBLIGATIONS:",
+    declarations,
+    workerResult ? `WORKER REPORT:\n${clampOutput(workerResult, 8000)}` : "WORKER REPORT: (none)",
+    "",
+    "End with exactly one decision line: `VERDICT: approve` or `VERDICT: issue`.",
+    "Before it, list concrete findings with file paths. Missing evidence is an issue, not an approval.",
+  ].filter(Boolean).join("\n");
+}
+
+export function parseReviewVerdict(text) {
+  const matches = [...String(text || "").matchAll(/^\s*VERDICT:\s*(approve|issue)\s*$/gim)];
+  const verdict = matches.at(-1)?.[1]?.toLowerCase() || "issue";
+  return { approved: verdict === "approve", verdict };
 }
 
 // ── the step ────────────────────────────────────────────────────────────────
 
-// `claude -p --output-format json` ends with one result object; older/edge
-// builds may print other JSON before it, so the LAST parseable object wins.
-export function parseClaudeResult(stdout) {
-  const s = String(stdout ?? "").trim();
-  if (!s) return null;
-  try {
-    const whole = JSON.parse(s);
-    if (whole && typeof whole === "object") return whole;
-  } catch {}
-  const lines = s.split("\n");
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const l = lines[i].trim();
-    if (!l.startsWith("{")) continue;
-    try {
-      const rec = JSON.parse(l);
-      if (rec && typeof rec === "object") return rec;
-    } catch {}
-  }
-  return null;
+const OPENAI_PRICES = [
+  [/gpt-5\.6-terra/i, [2, 0.2, 12]],
+  [/gpt-5\.6-luna/i, [0.2, 0.02, 1.2]],
+  [/^gpt-5\.6(?:-sol)?$/i, [4, 0.4, 20]],
+  [/gpt-5\.3-codex/i, [1.75, 0.175, 14]],
+  [/gpt-5\.2(?:-codex)?/i, [1.75, 0.175, 14]],
+];
+
+export function openAiCost(model, usage, profile = {}) {
+  if (!usage) return null;
+  const configured = [
+    profile.input_cost_per_million,
+    profile.cached_input_cost_per_million,
+    profile.output_cost_per_million,
+  ];
+  const rates = configured.every((n) => typeof n === "number")
+    ? configured
+    : OPENAI_PRICES.find(([re]) => re.test(String(model || "")))?.[1];
+  if (!rates) return null;
+  const input = Number(usage.input_tokens ?? usage.input ?? 0);
+  const cached = Number(usage.cached_input_tokens ?? usage.cached_input ?? 0);
+  const cacheWrite = Number(usage.cache_write_input_tokens ?? usage.cache_write_input ?? 0);
+  const output = Number(usage.output_tokens ?? usage.output ?? 0);
+  const fresh = Math.max(0, input - cached - cacheWrite);
+  return ((fresh * rates[0]) + (cached * rates[1]) + (cacheWrite * rates[0] * 1.25) + (output * rates[2])) / 1_000_000;
 }
 
 // Run one step: bind, work, unbind. Resolves `{ sessionId, ok, error }` (plus
@@ -503,38 +674,94 @@ export async function executeStep({
   cwd,
   timeoutMs = DEFAULT_STEP_TIMEOUT_MS,
   claudeBin = process.env.CLAUDE_BIN || "claude",
+  codexBin = process.env.CODEX_BIN || "codex",
   allowedTools = DEFAULT_ALLOWED_TOOLS,
   permissionMode = "acceptEdits",
-  model,
   env,
   bind = true,
   alongside = [],
+  // The session id of a finished step whose context this one should inherit,
+  // or "" for a cold start. The DECISION belongs to whoever spawns the step —
+  // this function only carries it out (t#543).
+  inherit = "",
 } = {}) {
   if (!task) return { sessionId: "", ok: false, error: "executeStep: task is required" };
 
+  let execution;
+  try {
+    execution = resolveDuty("worker");
+  } catch (e) {
+    return { sessionId: "", ok: false, error: `routing: ${e && e.message ? e.message : e}` };
+  }
   let prompt;
   try {
-    prompt = buildStepPrompt({ task, board, cwd, alongside });
+    prompt = buildStepPrompt({ task, board, cwd, alongside, execution });
   } catch (e) {
     return { sessionId: "", ok: false, error: `prompt: ${e && e.message ? e.message : e}` };
   }
 
-  const sessionId = randomUUID();
-  const [file, ...prefix] = Array.isArray(claudeBin) ? claudeBin : [claudeBin];
-  const args = [
-    ...prefix,
-    "-p",
-    "--session-id",
-    sessionId,
-    "--output-format",
-    "json",
-    "--permission-mode",
-    permissionMode,
-  ];
-  if (allowedTools && allowedTools.length) args.push("--allowedTools", ...allowedTools);
-  if (model) args.push("--model", model);
+  if (execution.provider === "openai") {
+    const { file, args } = providerArgv(execution, { bin: codexBin, sandbox: "workspace-write" });
+    const startedAt = new Date().toISOString();
+    let boundSession = "";
+    const onStdout = observeCodexThread((session) => {
+      if (bind && !boundSession) {
+        boundSession = session;
+        bindSession({ session, task, event: "start", ts: startedAt, execution });
+      }
+    });
+    const run = await spawnCaptured(file, args, {
+      cwd,
+      timeoutMs,
+      input: prompt,
+      maxChars: MAX_STEP_CAPTURE_CHARS,
+      env: brainSessionEnv(env, execution, "worker"),
+      onStdout,
+    });
+    const endedAt = new Date().toISOString();
+    const parsed = parseCodexResult(run.stdout);
+    const actual = parsed?.sessionId || "";
+    if (bind && actual) {
+      if (boundSession !== actual)
+        bindSession({ session: actual, task, event: "start", ts: startedAt, execution });
+      bindSession({ session: actual, task, event: "end", ts: endedAt, execution });
+    }
+    let error = run.error || parsed?.error || "";
+    if (!error && run.code !== 0)
+      error = `codex exited ${run.code}${run.stderr.trim() ? `: ${clampOutput(run.stderr.trim(), 2000)}` : ""}`;
+    if (!error && !parsed) error = "codex produced no parseable JSONL result — cannot confirm the step ran";
+    if (!error && !actual) error = "codex did not report a thread id — usage cannot be attributed to the task";
+    const answer = parsed?.answer || "";
+    return {
+      provider: "openai",
+      agent: execution.name,
+      model: execution.model,
+      sessionId: actual,
+      ok: !error,
+      error,
+      timedOut: !!run.timedOut,
+      code: run.code,
+      result: answer,
+      handoff: extractHandoff(answer),
+      costUsd: openAiCost(execution.model, parsed?.usage, execution),
+      usage: parsed?.usage || null,
+      stderr: clampOutput(run.stderr, MAX_CAPTURE_CHARS),
+      prompt,
+    };
+  }
 
-  if (bind) bindSession({ session: sessionId, task, event: "start" });
+  const sessionId = randomUUID();
+  const { file, args } = providerArgv(execution, {
+    bin: claudeBin,
+    session: sessionId,
+    inherit,
+    permissionMode,
+    allowedTools,
+  });
+
+  // A fork's id is minted by the CLI, so there is nothing honest to bind until
+  // it reports one; the binding below, off the REPORTED id, is the only one.
+  if (bind && !inherit) bindSession({ session: sessionId, task, event: "start", execution });
 
   // The step is its own session (`--session-id` above), so it must not carry the
   // id of the session that launched the runner: whatever inside it reads
@@ -545,19 +772,19 @@ export async function executeStep({
     timeoutMs,
     input: prompt,
     maxChars: MAX_STEP_CAPTURE_CHARS,
-    env: envWithoutSession(env || process.env),
+    env: brainSessionEnv(env, execution, "worker"),
   });
 
   const parsed = parseClaudeResult(run.stdout);
   const reported =
     parsed && typeof parsed.session_id === "string" ? parsed.session_id.trim() : "";
   const actual = reported || sessionId;
-  if (bind && reported && reported !== sessionId)
-    bindSession({ session: reported, task, event: "start" });
+  if (bind && reported && (inherit || reported !== sessionId))
+    bindSession({ session: reported, task, event: "start", execution });
   // The block closes either way. A step that timed out or crashed still spent
   // what it spent, and §15 forbids rewriting that after the fact — an unclosed
   // block would silently swallow the next step's messages instead.
-  if (bind) bindSession({ session: actual, task, event: "end" });
+  if (bind) bindSession({ session: actual, task, event: "end", execution });
 
   let error = "";
   if (run.error) error = run.error;
@@ -572,6 +799,9 @@ export async function executeStep({
 
   const answer = parsed && typeof parsed.result === "string" ? parsed.result : "";
   return {
+    provider: "anthropic",
+    agent: execution.name,
+    model: execution.model,
     sessionId: actual,
     ok: !error,
     error,
@@ -584,6 +814,73 @@ export async function executeStep({
     stderr: clampOutput(run.stderr, MAX_CAPTURE_CHARS),
     prompt,
   };
+}
+
+// Model review is a lifecycle obligation, not a task setting. When the review
+// hook is enabled, this runs the globally mapped reviewer in a read-only session
+// after the worker and before the deterministic verify command.
+export async function executeReview({
+  task,
+  workerResult = "",
+  cwd,
+  timeoutMs = DEFAULT_STEP_TIMEOUT_MS,
+  claudeBin = process.env.CLAUDE_BIN || "claude",
+  codexBin = process.env.CODEX_BIN || "codex",
+  env,
+  bind = true,
+  appData,
+} = {}) {
+  if (!task) return { approved: false, ok: false, error: "executeReview: task is required" };
+  let execution;
+  try { execution = resolveDuty("review"); }
+  catch (e) { return { approved: false, ok: false, error: `routing: ${e?.message || e}` }; }
+  if (!execution.enabled || !execution.model)
+    return { approved: true, ok: true, skipped: true, duty: "review", costUsd: 0 };
+  const prompt = buildReviewPrompt({ task, workerResult, execution, appData });
+
+  if (execution.provider === "openai") {
+    const { file, args } = providerArgv(execution, { bin: codexBin, sandbox: "read-only" });
+    const startedAt = new Date().toISOString();
+    let boundSession = "";
+    const onStdout = observeCodexThread((session) => {
+      if (bind && !boundSession) {
+        boundSession = session;
+        bindSession({ session, task, event: "start", ts: startedAt, execution });
+      }
+    });
+    const run = await spawnCaptured(file, args, { cwd, timeoutMs, input: prompt, maxChars: MAX_STEP_CAPTURE_CHARS, env: brainSessionEnv(env, execution, "reviewer"), onStdout });
+    const parsed = parseCodexResult(run.stdout);
+    const session = parsed?.sessionId || "";
+    if (bind && session) {
+      if (boundSession !== session)
+        bindSession({ session, task, event: "start", ts: startedAt, execution });
+      bindSession({ session, task, event: "end", execution });
+    }
+    const answer = parsed?.answer || "";
+    const decision = parseReviewVerdict(answer);
+    const error = run.error || parsed?.error || (run.code !== 0 ? `codex review exited ${run.code}` : "");
+    return { ...decision, ok: !error, error, result: answer, sessionId: session,
+      duty: "review", provider: "openai", model: execution.model,
+      costUsd: openAiCost(execution.model, parsed?.usage, execution) };
+  }
+
+  const session = randomUUID();
+  const { file, args } = providerArgv(execution, {
+    bin: claudeBin,
+    session,
+    allowedTools: READ_ONLY_TOOLS,
+  });
+  if (bind) bindSession({ session, task, event: "start", execution });
+  const run = await spawnCaptured(file, args, { cwd, timeoutMs, input: prompt, maxChars: MAX_STEP_CAPTURE_CHARS, env: brainSessionEnv(env, execution, "reviewer") });
+  const parsed = parseClaudeResult(run.stdout);
+  const actual = typeof parsed?.session_id === "string" && parsed.session_id.trim() ? parsed.session_id.trim() : session;
+  if (bind) bindSession({ session: actual, task, event: "end", execution });
+  const answer = typeof parsed?.result === "string" ? parsed.result : "";
+  const decision = parseReviewVerdict(answer);
+  const error = run.error || (run.code !== 0 ? `claude review exited ${run.code}` : "") || (parsed?.is_error ? "review model reported an error" : "");
+  return { ...decision, ok: !error, error, result: answer, sessionId: actual,
+    duty: "review", provider: "anthropic", model: execution.model,
+    costUsd: typeof parsed?.total_cost_usd === "number" ? parsed.total_cost_usd : null };
 }
 
 // ── the check ───────────────────────────────────────────────────────────────

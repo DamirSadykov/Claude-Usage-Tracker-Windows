@@ -24,14 +24,23 @@ import {
 import os from "node:os";
 import path from "node:path";
 import { readTaskSessionEvents } from "./todos.mjs";
+import { saveAgentConfig } from "./agents.mjs";
 import {
   buildStepPrompt,
+  buildReviewPrompt,
   executeStep,
+  executeReview,
   runVerify,
   clampOutput,
   parseClaudeResult,
+  parseCodexResult,
+  parseReviewVerdict,
+  openAiCost,
   extractHandoff,
   MAX_CAPTURE_CHARS,
+  ancestorRecords,
+  formatRecords,
+  transcriptPathFor,
 } from "./run-step.mjs";
 
 // ── fixtures ─────────────────────────────────────────────────────────────────
@@ -100,13 +109,28 @@ const at = (f) => { const i = argv.indexOf(f); return i >= 0 ? argv[i + 1] : "";
 const sid = at("--session-id");
 let stdin = "";
 try { stdin = readFileSync(0, "utf8"); } catch {}
-if (process.env.FAKE_ECHO) writeFileSync(process.env.FAKE_ECHO, JSON.stringify({ argv, stdin, parentSession: process.env.CLAUDE_CODE_SESSION_ID ?? null }));
+if (process.env.FAKE_ECHO) writeFileSync(process.env.FAKE_ECHO, JSON.stringify({ argv, stdin, parentSession: process.env.CLAUDE_CODE_SESSION_ID ?? null, brainRole: process.env.TRACKER_DUTY ?? null, brainKind: process.env.TRACKER_SESSION_KIND ?? null }));
 if (mode === "hang") { setTimeout(() => { try { writeFileSync(process.env.FAKE_ALIVE, "survived"); } catch {} }, 2000); }
 else if (mode === "crash") { process.stderr.write("boom: model unavailable\\n"); process.exit(1); }
 else if (mode === "garbage") { process.stdout.write("not json at all\\n"); }
 else if (mode === "is_error") { process.stdout.write(JSON.stringify({ type: "result", is_error: true, subtype: "error_max_turns", result: "hit the turn cap", session_id: sid }) + "\\n"); }
+else if (mode === "review-approve") { process.stdout.write(JSON.stringify({ type: "result", is_error: false, result: "No findings.\\nVERDICT: approve", session_id: sid, total_cost_usd: 0.01 }) + "\\n"); }
 else if (mode === "other-session") { process.stdout.write(JSON.stringify({ type: "result", is_error: false, result: "done", session_id: "11111111-2222-3333-4444-555555555555" }) + "\\n"); }
 else { process.stdout.write(JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "step finished\\n## HANDOFF\\nwrote it", session_id: sid, total_cost_usd: 0.042, num_turns: 7 }) + "\\n"); }
+`;
+
+const FAKE_CODEX = `
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import path from "node:path";
+const argv = process.argv.slice(2);
+let stdin = "";
+try { stdin = readFileSync(0, "utf8"); } catch {}
+process.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "codex-thread-7" }) + "\\n");
+await new Promise((resolve) => setTimeout(resolve, 100));
+const journal = path.join(process.env.APPDATA, "com.claude-usage-tracker.app", "task-sessions.jsonl");
+if (process.env.FAKE_ECHO) writeFileSync(process.env.FAKE_ECHO, JSON.stringify({ argv, stdin, journalBeforeWork: existsSync(journal), brainRole: process.env.TRACKER_DUTY ?? null, brainKind: process.env.TRACKER_SESSION_KIND ?? null }));
+process.stdout.write(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "implemented\\n## HANDOFF\\ncodex baton" } }) + "\\n");
+process.stdout.write(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 100, cached_input_tokens: 60, cache_write_input_tokens: 10, output_tokens: 20 } }) + "\\n");
 `;
 
 // A stand-in for a declared check: exit code and output are argv-driven.
@@ -120,6 +144,7 @@ if (mode === "sleep") { setTimeout(() => { writeFileSync(arg, "survived"); }, 20
 `;
 
 let fakeClaude;
+let fakeCodex;
 let fakeVerify;
 
 beforeEach(() => {
@@ -131,8 +156,10 @@ beforeEach(() => {
   prevSession = process.env.CLAUDE_CODE_SESSION_ID;
   delete process.env.CLAUDE_CODE_SESSION_ID;
   fakeClaude = path.join(tmp, "fake-claude.mjs");
+  fakeCodex = path.join(tmp, "fake-codex.mjs");
   fakeVerify = path.join(tmp, "fake-verify.mjs");
   writeFileSync(fakeClaude, FAKE_CLAUDE);
+  writeFileSync(fakeCodex, FAKE_CODEX);
   writeFileSync(fakeVerify, FAKE_VERIFY);
 });
 
@@ -270,6 +297,51 @@ describe("buildStepPrompt", () => {
     expect(prompt).toContain("no shell");
     expect(prompt).toContain("Do not touch the task board");
   });
+
+  it("gives the Codex executor its workspace shell while reserving verification for the harness", () => {
+    const data = chain();
+    const prompt = buildStepPrompt({
+      task: taskOf(data, "id-3"),
+      board: data,
+      execution: { provider: "openai", role: "architect" },
+    });
+    expect(prompt).toContain("may use the shell inside the workspace");
+    expect(prompt).toContain("harness");
+    expect(prompt).not.toContain("You have no shell");
+  });
+
+  it("never carries the task's spec link — formatDeclarations has no such field", () => {
+    const data = chain();
+    taskOf(data, "id-3").spec = ["tasks#model"];
+    writeFileSync(boardFile(), JSON.stringify(data));
+    const prompt = buildStepPrompt({ task: taskOf(data, "id-3"), board: data });
+    expect(prompt).not.toContain("tasks#model");
+    expect(prompt).not.toMatch(/spec:/);
+  });
+});
+
+describe("buildReviewPrompt", () => {
+  const task = {
+    number: 3,
+    subject: "third step",
+    produces: ["src/parser.rs"],
+    verify: "npm test",
+    spec: ["tasks#model"],
+  };
+
+  it("omits the spec obligation while specsEnabled is off (default)", () => {
+    const prompt = buildReviewPrompt({ task, appData: tmp });
+    expect(prompt).toContain("produces: src/parser.rs");
+    expect(prompt).toContain("verify: npm test");
+    expect(prompt).not.toMatch(/spec:/);
+    expect(prompt).not.toContain("tasks#model");
+  });
+
+  it("states the spec obligation once specsEnabled is true", () => {
+    writeFileSync(path.join(appDir, "settings.json"), JSON.stringify({ specsEnabled: true }));
+    const prompt = buildReviewPrompt({ task, appData: tmp });
+    expect(prompt).toMatch(/spec: tasks#model/);
+  });
 });
 
 // ── the check ────────────────────────────────────────────────────────────────
@@ -357,6 +429,7 @@ describe("executeStep", () => {
     expect(r.result).toContain("## HANDOFF");
     const seen = JSON.parse(String(readFileSync(echo, "utf8")));
     expect(seen.argv).toContain("--session-id");
+    expect(seen).toMatchObject({ brainRole: "worker", brainKind: "runner" });
     expect(seen.argv[seen.argv.indexOf("--session-id") + 1]).toBe(r.sessionId);
     expect(seen.stdin).toContain("third step");
     expect(seen.stdin).toContain("BATON-TWO");
@@ -461,6 +534,55 @@ describe("executeStep", () => {
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
+describe("executeStep · OpenAI routing", () => {
+  it("uses the global worker map and binds the Codex thread before work", async () => {
+    const data = chain();
+    writeFileSync(boardFile(), JSON.stringify(data));
+    saveAgentConfig({
+      version: 2,
+      duties: { worker: { provider: "openai", model: "gpt-5.6-terra", role: "worker", reasoning_effort: "high" } },
+      hooks: { architect: true, review: true },
+    });
+    const echo = path.join(tmp, "codex-echo.json");
+    process.env.FAKE_ECHO = echo;
+    const r = await executeStep({
+      task: taskOf(data, "id-3"), board: data, cwd: tmp,
+      codexBin: [process.execPath, fakeCodex], model: "opus",
+    });
+    expect(r).toMatchObject({ ok: true, provider: "openai", model: "gpt-5.6-terra", sessionId: "codex-thread-7" });
+    expect(r.handoff).toBe("codex baton");
+    const seen = JSON.parse(readFileSync(echo, "utf8"));
+    expect(seen.argv).toContain("workspace-write");
+    expect(seen).toMatchObject({ brainRole: "worker", brainKind: "runner" });
+    expect(seen.argv[seen.argv.indexOf("--model") + 1]).toBe("gpt-5.6-terra");
+    expect(seen.argv).not.toContain("opus");
+    expect(seen.journalBeforeWork).toBe(true);
+    const events = readTaskSessionEvents(journal());
+    expect(events.map((e) => e.event)).toEqual(["start", "end"]);
+    expect(events.every((e) => e.session === "codex-thread-7" && e.provider === "openai" && e.model === "gpt-5.6-terra")).toBe(true);
+  });
+});
+
+describe("executeReview", () => {
+  it("runs the mapped reviewer read-only and requires its explicit verdict", async () => {
+    const data = chain();
+    writeFileSync(boardFile(), JSON.stringify(data));
+    process.env.FAKE_MODE = "review-approve";
+    const echo = path.join(tmp, "review-echo.json");
+    process.env.FAKE_ECHO = echo;
+    const r = await executeReview({
+      task: taskOf(data, "id-3"), workerResult: "implemented", cwd: tmp,
+      claudeBin: [process.execPath, fakeClaude],
+    });
+    expect(r).toMatchObject({ ok: true, approved: true, provider: "anthropic", model: "opus" });
+    const seen = JSON.parse(readFileSync(echo, "utf8"));
+    expect(seen.argv).toContain("Read");
+    expect(seen.argv).not.toContain("Edit");
+    expect(seen).toMatchObject({ brainRole: "reviewer", brainKind: "runner" });
+    expect(seen.stdin).toContain("implemented");
+  });
+});
+
 describe("clampOutput / parseClaudeResult", () => {
   it("keeps head and tail and marks what it dropped", () => {
     const s = "A".repeat(100) + "B".repeat(1000) + "C".repeat(100);
@@ -482,6 +604,34 @@ describe("clampOutput / parseClaudeResult", () => {
     expect(parseClaudeResult("")).toBe(null);
   });
 
+  it("reads a Codex exec JSONL thread, final message and usage", () => {
+    const raw = [
+      JSON.stringify({ type: "thread.started", thread_id: "thread-7" }),
+      JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "## HANDOFF\nwrote it" } }),
+      JSON.stringify({ type: "turn.completed", usage: { input_tokens: 100, cached_input_tokens: 60, output_tokens: 20 } }),
+    ].join("\n");
+    const parsed = parseCodexResult(raw);
+    expect(parsed.sessionId).toBe("thread-7");
+    expect(parsed.answer).toContain("HANDOFF");
+    expect(parsed.usage.output_tokens).toBe(20);
+  });
+
+  it("requires an explicit approving review verdict", () => {
+    expect(parseReviewVerdict("looks good\nVERDICT: approve")).toEqual({ approved: true, verdict: "approve" });
+    expect(parseReviewVerdict("finding\nVERDICT: issue")).toEqual({ approved: false, verdict: "issue" });
+    expect(parseReviewVerdict("looks good but omitted the contract line"))
+      .toEqual({ approved: false, verdict: "issue" });
+  });
+
+  it("prices OpenAI fresh input, cached input and output separately", () => {
+    expect(openAiCost("gpt-5.6-sol", {
+      input_tokens: 100,
+      cached_input_tokens: 60,
+      cache_write_input_tokens: 10,
+      output_tokens: 20,
+    })).toBeCloseTo((30 * 4 + 60 * 0.4 + 10 * 4 * 1.25 + 20 * 20) / 1_000_000);
+  });
+
   it("cuts the baton at the HANDOFF heading and keeps everything under it", () => {
     const answer = "narration nobody asked for\n\n## HANDOFF\nwrote src/a.mjs\nGOTCHA: два вьюпорта";
     expect(extractHandoff(answer)).toBe("wrote src/a.mjs\nGOTCHA: два вьюпорта");
@@ -494,5 +644,94 @@ describe("clampOutput / parseClaudeResult", () => {
     expect(extractHandoff(null)).toBe("");
     // A mention inside prose is not the section — a heading stands alone.
     expect(extractHandoff("see the ## HANDOFF section of the spec for the shape")).toBe("");
+  });
+});
+
+// ── the RECORD block ─────────────────────────────────────────────────────────
+
+// t#562. The baton is what the previous step SAID; its transcript is what it
+// DID. Handing over the path lets a step check one against the other without
+// pouring the ancestor's context into this window — which is `--inherit`, and
+// which is how a wrong claim travelled once already (t#556).
+describe("buildStepPrompt · RECORD", () => {
+  const projectsDir = (cwd) =>
+    path.join(os.homedir(), ".claude", "projects", String(cwd).replace(/[\\/:]/g, "-"));
+
+  const plantTranscript = (cwd, session) => {
+    const dir = projectsDir(cwd);
+    mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `${session}.jsonl`);
+    writeFileSync(file, JSON.stringify({ type: "user", message: { role: "user", content: "x" } }) + "\n");
+    return file;
+  };
+
+  const bind = (task, session) => {
+    mkdirSync(path.dirname(journal()), { recursive: true });
+    writeFileSync(
+      journal(),
+      JSON.stringify({ ts: new Date().toISOString(), session, task, event: "end", source: "runner" }) + "\n",
+      { flag: "a" },
+    );
+  };
+
+  it("derives a transcript path from the cwd the step ran in", () => {
+    const cwd = path.join(tmp, "work-dir");
+    const session = "11111111-2222-3333-4444-555555555555";
+    const file = plantTranscript(cwd, session);
+    try {
+      expect(transcriptPathFor(session, cwd)).toBe(file);
+    } finally {
+      rmSync(projectsDir(cwd), { recursive: true, force: true });
+    }
+  });
+
+  it("returns nothing when the transcript is not on disk", () => {
+    expect(transcriptPathFor("no-such-session", path.join(tmp, "work-dir"))).toBe("");
+    expect(transcriptPathFor("", path.join(tmp, "work-dir"))).toBe("");
+  });
+
+  it("lists a direct prerequisite's transcript and nothing further up the chain", () => {
+    const data = chain();
+    writeFileSync(boardFile(), JSON.stringify(data));
+    const cwd = path.join(tmp, "work-dir");
+    const direct = "aaaaaaaa-0000-0000-0000-000000000002";
+    const grand = "aaaaaaaa-0000-0000-0000-000000000001";
+    plantTranscript(cwd, direct);
+    plantTranscript(cwd, grand);
+    bind("id-2", direct);
+    bind("id-1", grand);
+    try {
+      const records = ancestorRecords(taskOf(data, "id-3"), data.todos, cwd);
+      expect(records.map((r) => r.task.number)).toEqual([2]);
+      expect(records[0].session).toBe(direct);
+
+      const prompt = buildStepPrompt({ task: taskOf(data, "id-3"), board: data, cwd });
+      expect(prompt).toContain("RECORD");
+      expect(prompt).toContain(direct);
+      expect(prompt).not.toContain(grand);
+    } finally {
+      rmSync(projectsDir(cwd), { recursive: true, force: true });
+    }
+  });
+
+  it("says there is no record rather than pointing at a file that is not there", () => {
+    const data = chain();
+    writeFileSync(boardFile(), JSON.stringify(data));
+    const prompt = buildStepPrompt({
+      task: taskOf(data, "id-3"),
+      board: data,
+      cwd: path.join(tmp, "empty-dir"),
+    });
+    expect(prompt).toContain("no prerequisite transcript on disk");
+  });
+
+  it("tells the step to prefer the record over the claim, and not to browse", () => {
+    const text = formatRecords([
+      { task: { number: 2, subject: "second step" }, session: "s", file: "C:\\x\\s.jsonl" },
+    ]);
+    expect(text).toContain("C:\\x\\s.jsonl");
+    expect(text).toMatch(/what it DID/);
+    expect(text).toMatch(/Prefer the record over the claim/);
+    expect(text).toMatch(/not read it out of curiosity/);
   });
 });

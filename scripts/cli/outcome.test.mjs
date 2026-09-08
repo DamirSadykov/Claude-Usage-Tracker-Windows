@@ -22,6 +22,9 @@ import {
   buildOutcomeReport,
   pathMatches,
   isPathLike,
+  attemptStartOf,
+  handoutStartOf,
+  evidenceWindowStartOf,
 } from "./outcome.mjs";
 
 // ── fixtures ─────────────────────────────────────────────────────────────────
@@ -270,6 +273,260 @@ describe("buildOutcomeReport", () => {
   });
 });
 
+describe("attemptStartOf", () => {
+  it("is the LATEST entry into in_progress, the same field attemptsSoFar counts", () => {
+    const t = {
+      status_history: [
+        { status: "backlog", at: "T0" },
+        { status: "in_progress", at: "T1" },
+        { status: "review", at: "T2" },
+        { status: "in_progress", at: "T3" },
+      ],
+    };
+    expect(attemptStartOf(t)).toBe("T3");
+  });
+
+  it("is null with no status_history and no in_progress entry", () => {
+    expect(attemptStartOf({})).toBeNull();
+    expect(attemptStartOf({ status_history: [{ status: "backlog", at: "T0" }] })).toBeNull();
+  });
+});
+
+describe("buildOutcomeReport — weak file evidence (t#520)", () => {
+  const withHistory = (attemptAt) =>
+    board([
+      1,
+      {
+        produces: ["out/words.txt"],
+        status_history: [{ status: "in_progress", at: attemptAt }],
+      },
+    ]).todos[0];
+
+  const neverStat = () => {
+    throw new Error("weak evidence must not be consulted when the transcript already answered");
+  };
+
+  it("transcript evidence alone decides -> unchanged verdict, weak source never touched", () => {
+    const todo = withHistory("2026-01-01T00:00:00.000Z");
+    const report = buildOutcomeReport({
+      data: board([1]),
+      todo,
+      blocks: [at("id-1", "s1", "T1", "T2")],
+      touches: touchesOf(["s1", [wrote("D:/p/out/words.txt", "T1")]]),
+      root: "D:/p",
+      statFile: neverStat,
+    });
+    expect(report.produces[0]).toMatchObject({
+      produced: true,
+      evidence: "transcript",
+      produced_by: "Edit",
+      produced_in_session: "s1",
+    });
+    expect(report.missing).toEqual([]);
+    expect(report.outcome).toBe("ok");
+  });
+
+  it("file evidence alone, mtime after the attempt start -> produced, marked as the weaker source", () => {
+    const todo = withHistory("2026-01-01T00:00:00.000Z");
+    const report = buildOutcomeReport({
+      data: board([1]),
+      todo,
+      blocks: [],
+      touches: touchesOf(),
+      root: "D:/p",
+      statFile: () => "2026-01-02T00:00:00.000Z",
+    });
+    expect(report.produces[0]).toMatchObject({
+      produced: true,
+      evidence: "file",
+      produced_by: null,
+      produced_in_session: null,
+      produced_at: "2026-01-02T00:00:00.000Z",
+    });
+    expect(report.missing).toEqual([]);
+    expect(report.outcome).toBe("ok");
+  });
+
+  it("file present but mtime BEFORE the attempt start -> NOT produced (no rubber stamp)", () => {
+    const todo = withHistory("2026-01-05T00:00:00.000Z");
+    const report = buildOutcomeReport({
+      data: board([1]),
+      todo,
+      blocks: [],
+      touches: touchesOf(),
+      root: "D:/p",
+      statFile: () => "2026-01-01T00:00:00.000Z",
+    });
+    expect(report.produces[0]).toMatchObject({ produced: false, evidence: null });
+    expect(report.missing).toEqual(["out/words.txt"]);
+    expect(report.outcome).toBe("issue");
+    expect(report.outcome_reason).toBe("missing:out/words.txt");
+  });
+
+  it("both sources present -> strong wins, evidence says transcript", () => {
+    const todo = withHistory("2026-01-01T00:00:00.000Z");
+    const report = buildOutcomeReport({
+      data: board([1]),
+      todo,
+      blocks: [at("id-1", "s1", "T1", "T2")],
+      touches: touchesOf(["s1", [wrote("D:/p/out/words.txt", "T1")]]),
+      root: "D:/p",
+      statFile: neverStat,
+    });
+    expect(report.produces[0].evidence).toBe("transcript");
+  });
+
+  it("a stat that throws is NOT evidence and never escapes", () => {
+    const todo = withHistory("2026-01-01T00:00:00.000Z");
+    const report = buildOutcomeReport({
+      data: board([1]),
+      todo,
+      blocks: [],
+      touches: touchesOf(),
+      root: "D:/p",
+      statFile: () => {
+        throw new Error("EPERM: permission denied");
+      },
+    });
+    expect(report.produces[0]).toMatchObject({ produced: false, evidence: null });
+    expect(report.outcome).toBe("issue");
+  });
+
+  it("no status_history at all -> no attempt start -> weak evidence never applies", () => {
+    const d = board([1, { produces: ["out/words.txt"] }]);
+    const report = buildOutcomeReport({
+      data: d,
+      todo: d.todos[0],
+      blocks: [],
+      touches: touchesOf(),
+      root: "D:/p",
+      statFile: () => "2099-01-01T00:00:00.000Z",
+    });
+    expect(report.produces[0]).toMatchObject({ produced: false, evidence: null });
+    expect(report.outcome).toBe("issue");
+  });
+
+  it("a non-path declaration stays checkable:false, weak evidence never touched", () => {
+    const d = board([
+      1,
+      {
+        produces: ["поле outcome на задаче"],
+        status_history: [{ status: "in_progress", at: "2026-01-01T00:00:00.000Z" }],
+        verify: "npm test",
+      },
+    ]);
+    const report = buildOutcomeReport({
+      data: d,
+      todo: d.todos[0],
+      blocks: [],
+      touches: touchesOf(),
+      verify: "ok",
+      root: "D:/p",
+      statFile: neverStat,
+    });
+    expect(report.unchecked).toEqual(["поле outcome на задаче"]);
+    expect(report.produces[0].checkable).toBe(false);
+    expect(report.produces[0].evidence).toBeNull();
+  });
+});
+
+describe("handoutStartOf / evidenceWindowStartOf (t#520)", () => {
+  it("handoutStartOf reads handout_at, trimmed, or null", () => {
+    expect(handoutStartOf({ handout_at: "2026-01-01T00:00:00.000Z" })).toBe(
+      "2026-01-01T00:00:00.000Z",
+    );
+    expect(handoutStartOf({ handout_at: "  " })).toBeNull();
+    expect(handoutStartOf({})).toBeNull();
+  });
+
+  it("evidenceWindowStartOf prefers handout_at over the in_progress floor", () => {
+    const t = {
+      handout_at: "2026-01-02T00:00:00.000Z",
+      status_history: [{ status: "in_progress", at: "2026-01-05T00:00:00.000Z" }],
+    };
+    expect(evidenceWindowStartOf(t)).toEqual({ at: "2026-01-02T00:00:00.000Z", source: "handout" });
+  });
+
+  it("evidenceWindowStartOf falls back to the in_progress floor when there is no handout_at — the --go path", () => {
+    const t = { status_history: [{ status: "in_progress", at: "2026-01-05T00:00:00.000Z" }] };
+    expect(evidenceWindowStartOf(t)).toEqual({ at: "2026-01-05T00:00:00.000Z", source: "in_progress" });
+  });
+
+  it("evidenceWindowStartOf is at:null, source:null with neither", () => {
+    expect(evidenceWindowStartOf({})).toEqual({ at: null, source: null });
+  });
+});
+
+// The live collision (t#520): `--next` hands a node out WITHOUT moving status,
+// so a node worked this way can reach `--report` — and this reconciliation —
+// having NEVER entered `in_progress`. The old boundary (status_history alone)
+// could then never fire; these pin the fix, `withHistory`'s tests above pin
+// that the --go path (no handout_at at all) is completely unchanged.
+describe("buildOutcomeReport — the handout boundary (t#520)", () => {
+  const withHandout = (handoutAt, extra = {}) =>
+    board([1, { produces: ["out/words.txt"], handout_at: handoutAt, ...extra }]).todos[0];
+
+  it("fires on a node --next handed out that never entered in_progress at all", () => {
+    const todo = withHandout("2026-01-01T00:00:00.000Z", { status_history: [] });
+    const report = buildOutcomeReport({
+      data: board([1]),
+      todo,
+      blocks: [],
+      touches: touchesOf(),
+      root: "D:/p",
+      statFile: () => "2026-01-01T00:00:10.000Z",
+    });
+    expect(report.produces[0]).toMatchObject({ produced: true, evidence: "file" });
+    expect(report.evidence_window).toEqual({ at: "2026-01-01T00:00:00.000Z", source: "handout" });
+    expect(report.outcome).toBe("ok");
+  });
+
+  it("does NOT fire when the mtime predates the handout stamp", () => {
+    const todo = withHandout("2026-01-05T00:00:00.000Z");
+    const report = buildOutcomeReport({
+      data: board([1]),
+      todo,
+      blocks: [],
+      touches: touchesOf(),
+      root: "D:/p",
+      statFile: () => "2026-01-01T00:00:00.000Z",
+    });
+    expect(report.produces[0]).toMatchObject({ produced: false, evidence: null });
+    expect(report.outcome).toBe("issue");
+  });
+
+  it("a re-handed node measures from the NEW stamp — a write before the second hand-out does not count", () => {
+    const todo = withHandout("2026-01-10T00:00:00.000Z");
+    const report = buildOutcomeReport({
+      data: board([1]),
+      todo,
+      blocks: [],
+      touches: touchesOf(),
+      root: "D:/p",
+      statFile: () => "2026-01-05T00:00:00.000Z",
+    });
+    expect(report.produces[0].produced).toBe(false);
+  });
+
+  it("handout_at wins over status_history when both are present, older or not", () => {
+    const todo = withHandout("2026-01-01T00:00:00.000Z", {
+      status_history: [{ status: "in_progress", at: "2026-01-10T00:00:00.000Z" }],
+    });
+    const report = buildOutcomeReport({
+      data: board([1]),
+      todo,
+      blocks: [],
+      touches: touchesOf(),
+      root: "D:/p",
+      // After the hand-out but before the later in_progress stamp: the boundary
+      // this task fixes would have rejected this exact file.
+      statFile: () => "2026-01-02T00:00:00.000Z",
+    });
+    expect(report.produces[0].produced).toBe(true);
+    expect(report.evidence_window).toEqual({ at: "2026-01-01T00:00:00.000Z", source: "handout" });
+  });
+});
+
 describe("outcome --write (end to end)", () => {
   const cli = path.join(fileURLToPath(new URL(".", import.meta.url)), "..", "cli.mjs");
   let dir;
@@ -359,5 +616,78 @@ describe("outcome --write (end to end)", () => {
     expect(byId).toContain("#1");
     expect(run("t#1")).toContain("#1");
     expect(refuse("1", "--verify", "maybe")).toContain('--verify takes "ok" or "issue"');
+  });
+});
+
+describe("outcome weak file evidence (end to end, t#520)", () => {
+  const cli = path.join(fileURLToPath(new URL(".", import.meta.url)), "..", "cli.mjs");
+  let dir;
+  let file;
+  let proj;
+
+  const seed = (todos) => {
+    dir = mkdtempSync(path.join(os.tmpdir(), "cut-outcome-appdata-"));
+    const appDir = path.join(dir, "com.claude-usage-tracker.app");
+    mkdirSync(appDir, { recursive: true });
+    file = path.join(appDir, "todos.json");
+    writeFileSync(file, JSON.stringify({ version: 1, todos }, null, 2));
+    proj = mkdtempSync(path.join(os.tmpdir(), "cut-outcome-proj-"));
+  };
+
+  const todo = (number, extra = {}) => ({
+    id: `id-${number}`,
+    number,
+    subject: `task ${number}`,
+    description: "",
+    status: "in_progress",
+    plan: "",
+    created_by: "claude",
+    created_at: "2026-07-01T00:00:00.000Z",
+    updated_at: "2026-07-01T00:00:00.000Z",
+    ...extra,
+  });
+
+  const run = (...args) =>
+    execFileSync(process.execPath, [cli, "todos", "outcome", ...args], {
+      env: { ...process.env, APPDATA: dir },
+      cwd: proj,
+      encoding: "utf8",
+    });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(proj, { recursive: true, force: true });
+  });
+
+  it("no session bound, but the file is on disk after this attempt's start -> ok, weaker source", () => {
+    seed([
+      todo(1, {
+        produces: ["words.txt"],
+        status_history: [{ status: "in_progress", at: "2020-01-01T00:00:00.000Z" }],
+      }),
+    ]);
+    writeFileSync(path.join(proj, "words.txt"), "ум\n");
+    const out = run("1");
+    expect(out).toContain("produced (file evidence only, mtime");
+    expect(out).toContain("weaker than a transcript hit");
+    expect(out).toContain("outcome: ok");
+    const json = JSON.parse(run("1", "--json"));
+    expect(json.produces[0].evidence).toBe("file");
+  });
+
+  it("no session bound, file predates this attempt's start -> still NOT produced", () => {
+    seed([
+      todo(1, {
+        produces: ["words.txt"],
+        status_history: [{ status: "in_progress", at: "2099-01-01T00:00:00.000Z" }],
+      }),
+    ]);
+    writeFileSync(path.join(proj, "words.txt"), "ум\n");
+    const out = run("1");
+    expect(out).toContain("NOT produced");
+    expect(out).toContain("outcome: issue");
+    const json = JSON.parse(run("1", "--json"));
+    expect(json.produces[0].evidence).toBeNull();
+    expect(json.missing).toEqual(["words.txt"]);
   });
 });

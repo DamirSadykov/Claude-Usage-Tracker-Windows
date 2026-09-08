@@ -209,6 +209,17 @@ pub struct Todo {
     /// fresh. Set by whoever writes the field (the cc-todos CLI and [`upsert`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff_at: Option<String>,
+    /// When `todos run <change> --next` (scripts/cli/run.mjs, t#520) last handed
+    /// this node out to a caller driving the loop itself, RFC3339; None = never
+    /// handed out this way. NOT a status move — the node still enters
+    /// `in_progress` only on `--report` — it exists so `outcome.mjs`'s weak file
+    /// evidence has a boundary to measure an mtime against that is not the
+    /// executor's own word about when it started. Overwritten on every
+    /// re-hand-out, so a re-run's window starts fresh. The app has no UI field
+    /// for it and never reads it; it must still live here (see `spec`, above) or
+    /// a save from the UI would drop it silently. Empty → omitted from the file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handout_at: Option<String>,
     /// When this todo arrived via an import (#181), RFC3339; None = created here.
     /// Set by [`merge_import`] on every task it brings in, so the board can mark
     /// them and the user can tell an imported row from a local one — in particular
@@ -622,6 +633,11 @@ pub fn upsert(file: &mut TodoFile, mut todo: Todo, now: &str) {
         } else {
             existing.handoff_at.clone()
         };
+        // Same no-UI-field carry as `spec`/`produces` above: the frontend never
+        // sends `handout_at`, so a UI edit must not erase what `--next` stamped.
+        if todo.handout_at.is_none() {
+            todo.handout_at = existing.handout_at.clone();
+        }
         *existing = todo;
     } else {
         if todo.created_at.is_empty() {

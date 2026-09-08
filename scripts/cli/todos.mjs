@@ -271,16 +271,19 @@ export function envWithoutSession(env = process.env) {
   return out;
 }
 
-export function appendTaskSessionEvent({ session, task, event, source, project }) {
+export function appendTaskSessionEvent({ session, task, event, source, project, ts, provider, agent, model }) {
   if (!session || !task || !event) return false;
   const rec = {
-    ts: new Date().toISOString(),
+    ts: typeof ts === "string" && ts ? ts : new Date().toISOString(),
     session: String(session),
     task: String(task),
     event: String(event),
     source: String(source || ""),
   };
   if (project) rec.project = String(project);
+  if (provider) rec.provider = String(provider);
+  if (agent) rec.agent = String(agent);
+  if (model) rec.model = String(model);
   try {
     const file = taskSessionsPath();
     mkdirSync(path.dirname(file), { recursive: true });
