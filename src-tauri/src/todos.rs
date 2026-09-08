@@ -501,17 +501,34 @@ fn split_vision(plan: &str) -> Option<(String, String)> {
     Some((intro.to_string(), plan[at..].trim().to_string()))
 }
 
-/// Persist the store atomically: write a sibling temp file, then rename over the
-/// target (std rename replaces the destination on Windows for files).
+fn tmp_path_for(path: &Path) -> PathBuf {
+    let mut tmp_name = path.file_name().map(|f| f.to_os_string()).unwrap_or_default();
+    tmp_name.push(format!(".{}.tmp", std::process::id()));
+    path.with_file_name(tmp_name)
+}
+
+fn is_transient_rename_error(e: &std::io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(5) | Some(32) | Some(33))
+}
+
 pub fn save(path: &Path, file: &TodoFile) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
-    let json = serde_json::to_string_pretty(file).map_err(|e| e.to_string())?;
-    let tmp = path.with_extension("json.tmp");
+    let mut json = serde_json::to_string_pretty(file).map_err(|e| e.to_string())?;
+    json.push('\n');
+    let tmp = tmp_path_for(path);
     std::fs::write(&tmp, json.as_bytes()).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, path).map_err(|e| e.to_string())?;
-    Ok(())
+    for _ in 0..5 {
+        match std::fs::rename(&tmp, path) {
+            Ok(()) => return Ok(()),
+            Err(e) if is_transient_rename_error(&e) => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
 }
 
 /// The largest task number currently assigned (0 if none).
@@ -1316,6 +1333,96 @@ mod tests {
 
     fn known(nums: &[u32]) -> HashSet<u32> {
         nums.iter().copied().collect()
+    }
+
+    #[test]
+    fn save_tmp_path_contains_pid() {
+        let path = Path::new("/some/dir/todos.json");
+        let tmp = tmp_path_for(path);
+        let name = tmp.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("todos.json."));
+        assert!(name.ends_with(".tmp"));
+        assert!(name.contains(&std::process::id().to_string()));
+    }
+
+    #[test]
+    fn save_appends_trailing_newline() {
+        let dir = std::env::temp_dir().join(format!(
+            "todos_save_nl_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("todos.json");
+        save(&path, &TodoFile::default()).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(*bytes.last().unwrap(), b'\n');
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn save_retries_past_a_transient_sharing_violation() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "todos_save_retry_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("todos.json");
+        std::fs::write(&path, b"{}").unwrap();
+
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            drop(handle);
+        });
+
+        let result = save(&path, &TodoFile::default());
+        closer.join().unwrap();
+        assert!(result.is_ok(), "save should recover once the handle closes: {result:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn save_gives_up_after_retry_budget_is_exhausted() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "todos_save_giveup_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("todos.json");
+        std::fs::write(&path, b"{}").unwrap();
+
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+
+        let result = save(&path, &TodoFile::default());
+        assert!(result.is_err());
+        drop(handle);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

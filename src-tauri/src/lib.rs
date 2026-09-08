@@ -1,4 +1,5 @@
 pub mod alerts;
+pub mod board_lock;
 pub mod cc;
 pub mod codex;
 pub mod corrections;
@@ -2549,6 +2550,7 @@ fn write_todos_locked(
     let path = todos_path(app)?;
     let snap = app.state::<TodoSnapshot>();
     let mut guard = snap.0.lock().unwrap();
+    let _board_lock = board_lock::acquire(&path).map_err(|e| e.to_string())?;
     let mut file = todos::load(&path);
     // Backfill task numbers for any legacy/hand-edited rows before mutating, so
     // every persisted file has stable `#N` references (upsert numbers new tasks).
@@ -2654,6 +2656,8 @@ fn migrate_todo_refs(app: &AppHandle) -> Result<MigrationReport, String> {
     if dry.refs == 0 {
         return Ok(MigrationReport { refs: 0, tasks: 0, backup: String::new() });
     }
+    let _board_lock = board_lock::acquire_with_timeout(&path, Duration::from_secs(2))
+        .map_err(|e| e.to_string())?;
     let backup = todos::backup(&path)?;
     // Re-run under the write lock so the snapshot stays in lockstep and the count
     // reflects exactly what was persisted.
@@ -2728,7 +2732,9 @@ fn apply_todo_import(app: AppHandle, path: String) -> Result<todos::ImportReport
     if incoming.todos.is_empty() {
         return Ok(todos::ImportReport::default());
     }
-    let backup = todos::backup(&todos_path(&app)?)?;
+    let board_path = todos_path(&app)?;
+    let _board_lock = board_lock::acquire(&board_path).map_err(|e| e.to_string())?;
+    let backup = todos::backup(&board_path)?;
     let now = chrono::Utc::now().to_rfc3339();
     let mut report = todos::ImportReport::default();
     write_todos_locked(&app, |file| {
@@ -2799,11 +2805,19 @@ fn spawn_todos_watch(app: AppHandle) {
         {
             let snap = app.state::<TodoSnapshot>();
             let mut guard = snap.0.lock().unwrap();
-            let mut file = todos::load(&path);
-            if todos::ensure_numbers(&mut file) {
-                let _ = todos::save(&path, &file);
+            match board_lock::acquire(&path) {
+                Ok(_board_lock) => {
+                    let mut file = todos::load(&path);
+                    if todos::ensure_numbers(&mut file) {
+                        let _ = todos::save(&path, &file);
+                    }
+                    *guard = todo_status_map(&file);
+                }
+                Err(e) => {
+                    warn!("todos watcher startup: board lock unavailable, skipping number backfill: {e}");
+                    *guard = todo_status_map(&todos::load(&path));
+                }
             }
-            *guard = todo_status_map(&file);
         }
         let mut last: Option<SystemTime> = modified(&path);
         loop {
