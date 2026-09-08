@@ -1276,7 +1276,14 @@ fn todos_path(app: &AppHandle) -> Result<PathBuf, String> {
 
 #[tauri::command]
 fn get_todos(app: AppHandle) -> Result<Vec<todos::Todo>, String> {
-    Ok(todos::load(&todos_path(&app)?).todos)
+    let path = todos_path(&app)?;
+    Ok(match todos::load_checked(&path) {
+        todos::LoadOutcome::Ok(file) => file.todos,
+        todos::LoadOutcome::Missing => Vec::new(),
+        todos::LoadOutcome::Unreadable { .. } | todos::LoadOutcome::FutureVersion { .. } => {
+            todos::load(&path).todos
+        }
+    })
 }
 
 /// The change records of the board (t#360). Separate from [`get_todos`] because
@@ -1284,15 +1291,16 @@ fn get_todos(app: AppHandle) -> Result<Vec<todos::Todo>, String> {
 /// has not been migrated yet simply answers with an empty list.
 #[tauri::command]
 fn get_changes(app: AppHandle) -> Result<Vec<todos::Change>, String> {
-    Ok(todos::load(&todos_path(&app)?).changes)
+    let path = todos_path(&app)?;
+    Ok(match todos::load_checked(&path) {
+        todos::LoadOutcome::Ok(file) => file.changes,
+        todos::LoadOutcome::Missing => Vec::new(),
+        todos::LoadOutcome::Unreadable { .. } | todos::LoadOutcome::FutureVersion { .. } => {
+            todos::load(&path).changes
+        }
+    })
 }
 
-/// Recovery state of the board file (t#576, spec `board-file#recovery`/`versions`).
-/// `get_todos`/`get_changes` above stay forgiving (empty list on a broken board,
-/// via [`todos::load`]) so reading never fails; the Todo window calls this
-/// SEPARATELY to know whether to show a recovery banner. `state` is one of
-/// `"ok"` | `"unreadable"` | `"future-version"`; `Missing` counts as `"ok"` — a
-/// missing file is an empty CURRENT board, not corruption.
 #[derive(Serialize)]
 struct BoardState {
     state: &'static str,
@@ -1302,7 +1310,7 @@ struct BoardState {
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    version: Option<u32>,
+    version: Option<u64>,
 }
 
 #[tauri::command]
@@ -2590,9 +2598,6 @@ fn write_todos_locked(
     let snap = app.state::<TodoSnapshot>();
     let mut guard = snap.0.lock().unwrap();
     let _board_lock = board_lock::acquire(&path).map_err(|e| e.to_string())?;
-    // Verified load (t#576, spec `board-file#recovery`/`versions`): an unreadable
-    // or future-version board refuses the whole cycle rather than being treated
-    // as empty and overwritten — see `todos::load_for_write`.
     let mut file = todos::load_for_write(&path)?;
     // Backfill task numbers for any legacy/hand-edited rows before mutating, so
     // every persisted file has stable `#N` references (upsert numbers new tasks).
@@ -2603,11 +2608,6 @@ fn write_todos_locked(
     Ok(file.todos)
 }
 
-/// Install a board wholesale under the write lock, bypassing [`todos::load_for_write`]'s
-/// readability gate entirely — used ONLY by [`restore_todo_backup`], the one
-/// documented way out of an unreadable/future-version board (`board-file#recovery`:
-/// "восстановление из бэкапа — вручную"). `write_todos_locked` refusing to even
-/// READ a broken board would otherwise make that recovery path unreachable.
 fn write_todos_locked_replace(
     app: &AppHandle,
     mut file: todos::TodoFile,
@@ -2711,17 +2711,13 @@ struct MigrationReport {
 /// backup and the restore button stay — the report is told after the fact.
 fn migrate_todo_refs(app: &AppHandle) -> Result<MigrationReport, String> {
     let path = todos_path(&app)?;
-    // Dry pass on a clone so we don't back up (or churn the file) for a no-op.
-    let mut probe = todos::load(&path);
+    let _board_lock = board_lock::acquire(&path).map_err(|e| e.to_string())?;
+    let mut probe = todos::load_for_write(&path)?;
     let dry = todos::migrate_refs(&mut probe);
     if dry.refs == 0 {
         return Ok(MigrationReport { refs: 0, tasks: 0, backup: String::new() });
     }
-    let _board_lock = board_lock::acquire_with_timeout(&path, Duration::from_secs(2))
-        .map_err(|e| e.to_string())?;
-    let backup = todos::backup(&path)?;
-    // Re-run under the write lock so the snapshot stays in lockstep and the count
-    // reflects exactly what was persisted.
+    let backup = todos::backup_after_verified_load(&path)?;
     let mut stats = todos::MigrationStats::default();
     write_todos_locked(&app, |file| {
         stats = todos::migrate_refs(file);
@@ -2760,10 +2756,15 @@ fn restore_todo_backup(
 /// exported board always carries stable `#N` references. Returns the task count.
 #[tauri::command]
 fn export_todos(app: AppHandle, path: String) -> Result<usize, String> {
-    let mut file = todos::load(&todos_path(&app)?);
+    let board_path = todos_path(&app)?;
+    let target_path = std::path::Path::new(&path);
+    if todos::resolves_to_same_path(&board_path, target_path) {
+        return Err("export target is the working board itself".to_string());
+    }
+    let mut file = todos::load_checked_for_read(&board_path)?;
     todos::ensure_numbers(&mut file);
     let count = file.todos.len();
-    todos::save(std::path::Path::new(&path), &file)?;
+    todos::save(target_path, &file)?;
     Ok(count)
 }
 
@@ -2793,7 +2794,7 @@ fn apply_todo_import(app: AppHandle, path: String) -> Result<todos::ImportReport
     }
     let board_path = todos_path(&app)?;
     let _board_lock = board_lock::acquire(&board_path).map_err(|e| e.to_string())?;
-    let backup = todos::backup(&board_path)?;
+    let backup = todos::backup_after_verified_load(&board_path)?;
     let now = chrono::Utc::now().to_rfc3339();
     let mut report = todos::ImportReport::default();
     write_todos_locked(&app, |file| {
@@ -2865,9 +2866,6 @@ fn spawn_todos_watch(app: AppHandle) {
             let snap = app.state::<TodoSnapshot>();
             let mut guard = snap.0.lock().unwrap();
             match board_lock::acquire(&path) {
-                // Verified load (t#576): same rule as `write_todos_locked` — an
-                // unreadable or future-version board is not overwritten by this
-                // startup normalization either (spec `board-file#recovery`).
                 Ok(_board_lock) => match todos::load_for_write(&path) {
                     Ok(mut file) => {
                         if todos::ensure_numbers(&mut file) {

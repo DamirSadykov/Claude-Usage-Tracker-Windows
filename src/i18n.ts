@@ -447,8 +447,10 @@ const messages = {
       "The board file is unreadable ({reason}). Reading continues with an empty board — nothing is written until this is fixed.",
     boardFutureVersion:
       "The board file is version {version}, newer than this app (current {current}). Reading works; nothing is written.",
-    boardBackupAt: "Corrupt copy saved to: {path}",
+    boardBackupAt: "Forensic copy saved at: {path}",
     boardNoBackup: "Corrupt copy could not be saved.",
+    boardRestorePeriodicBackup:
+      "Restore rolls back to the last periodic backup: backups/{path}.",
     todoComments: "Comments",
     todoCommentPlaceholder: "Write a comment…",
     todoCommentAdd: "Comment",
@@ -1268,8 +1270,10 @@ const messages = {
       "Файл доски не читается ({reason}). Чтение продолжает работать с пустой доской — запись отключена, пока это не исправлено.",
     boardFutureVersion:
       "Файл доски версии {version}, новее приложения (текущая {current}). Чтение работает, запись отключена.",
-    boardBackupAt: "Копия повреждённого файла сохранена: {path}",
+    boardBackupAt: "Судебная копия сохранена: {path}",
     boardNoBackup: "Не удалось сохранить копию повреждённого файла.",
+    boardRestorePeriodicBackup:
+      "Кнопка «Восстановить» откатит доску к последней периодической резервной копии: {path}.",
     todoComments: "Комментарии",
     todoCommentPlaceholder: "Написать комментарий…",
     todoCommentAdd: "Отправить",

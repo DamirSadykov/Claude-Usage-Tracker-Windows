@@ -14,7 +14,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use log::warn;
 use serde::{Deserialize, Serialize};
@@ -320,9 +320,6 @@ fn default_version() -> u32 {
     1
 }
 
-/// The schema version this writer produces (docs/specs/tasks/spec.md#board-file,
-/// `versions`). [`save`] always stamps this on every write; a file whose `version`
-/// is greater is read (known fields only) but never written — see [`load_checked`].
 pub const CURRENT_VERSION: u32 = 2;
 
 /// A CHANGE as a RECORD rather than a task (t#360): the delta of one round, the
@@ -438,53 +435,26 @@ pub fn load(path: &Path) -> TodoFile {
     file
 }
 
-// --- Verified load (t#576): recovery + versions -------------------------------
-//
-// docs/specs/tasks/spec.md#board-file, `recovery`/`versions`. `load` above stays
-// the forgiving reader (missing/broken → empty board) for call sites that are
-// read-only and where that silent fallback is fine (the SessionStart-style
-// "always show something" case). Every WRITER must instead go through
-// [`load_checked`] (or its thin wrapper [`load_for_write`]), because a writer
-// that silently treats a corrupt or future-version file as empty would overwrite
-// it with an empty board — exactly the data loss `recovery` exists to prevent.
-
-/// Outcome of loading `todos.json` under the shared recovery/versions contract.
-/// `Missing` is deliberately distinct from `Ok` even though both hand back an
-/// empty CURRENT-version board: a missing file is not corruption (`recovery`:
-/// "отсутствующий файл — не порча"), so callers that report state (`board_state`)
-/// must not conflate the two.
 #[derive(Debug, Clone)]
 pub enum LoadOutcome {
     Ok(TodoFile),
     Missing,
-    /// `backup` is the corrupt-copy path written on first detection (`recovery`:
-    /// `todos.json.corrupt-<stamp>`), or `None` when the backup attempt itself
-    /// failed — a failed backup never turns a read into an error.
     Unreadable { reason: String, backup: Option<PathBuf> },
-    /// No backup is ever taken for this case (`versions`: "для будущей версии
-    /// бэкапа нет") — the file isn't broken, just newer than this writer.
-    FutureVersion { version: u32 },
+    FutureVersion { version: u64 },
 }
 
 fn is_object(v: &Value) -> bool {
     v.is_object()
 }
 
-/// `version` present-and-not-integer is normalized to 1, NOT treated as
-/// unreadable (`versions`: "отсутствующий `version` или значение не-целого типа
-/// читается как 1"). A JSON number with a zero fractional part (`2.0`) counts as
-/// integer, mirroring JS `Number.isInteger`.
-fn normalize_version(v: Option<&Value>) -> u32 {
+fn normalize_version(v: Option<&Value>) -> u64 {
     let Some(Value::Number(n)) = v else { return 1 };
     if let Some(i) = n.as_u64() {
-        if i <= u32::MAX as u64 {
-            return i as u32;
-        }
-        return 1;
+        return i;
     }
     if let Some(f) = n.as_f64() {
-        if f.fract() == 0.0 && f >= 0.0 && f <= u32::MAX as f64 {
-            return f as u32;
+        if f.is_finite() && f.fract() == 0.0 && f >= 0.0 {
+            return if f >= u64::MAX as f64 { u64::MAX } else { f as u64 };
         }
     }
     1
@@ -492,14 +462,10 @@ fn normalize_version(v: Option<&Value>) -> u32 {
 
 enum Issue {
     Ok(Value),
-    FutureVersion(u32),
+    FutureVersion(u64),
     Unreadable(&'static str),
 }
 
-/// The structural minimum shared by both writers (`recovery`): not JSON; root not
-/// an object; `todos` not an array; a `todos` element not an object; `changes`
-/// present and not an array. `version` is handled separately (see
-/// [`normalize_version`]) — it is a version concern, not a corruption one.
 fn detect_issue(raw: &str) -> Issue {
     let mut parsed: Value = match serde_json::from_str(raw) {
         Ok(v) => v,
@@ -521,15 +487,13 @@ fn detect_issue(raw: &str) -> Issue {
         }
     }
     let version = normalize_version(obj.get("version"));
-    if version > CURRENT_VERSION {
+    if version > CURRENT_VERSION as u64 {
         return Issue::FutureVersion(version);
     }
-    parsed["version"] = Value::from(version);
+    parsed["version"] = Value::from(version as u32);
     Issue::Ok(parsed)
 }
 
-/// Where the corrupt-copy backup for `path` would live: `todos.json.corrupt-
-/// <YYYYMMDDTHHMMSSZ>` beside it (`recovery`).
 fn corrupt_backup_path(path: &Path) -> PathBuf {
     let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
     let mut name = path.file_name().map(|f| f.to_os_string()).unwrap_or_default();
@@ -537,14 +501,8 @@ fn corrupt_backup_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
-/// Back up an unreadable board's raw bytes, once. Runs under the board lock
-/// (reentrant within the same thread, so a writer already holding it does not
-/// deadlock on itself); exclusive creation makes a busy name mean "already
-/// backed up" without comparing contents (`recovery`). A failed lock, create, or
-/// write is logged and yields `None` — never an error, since a failed backup
-/// must not turn a read into a failure.
-fn ensure_corrupt_backup(path: &Path, raw: &str) -> Option<PathBuf> {
-    let _lock = match board_lock::acquire(path) {
+fn ensure_corrupt_backup(path: &Path, raw: &str, timeout: Duration) -> Option<PathBuf> {
+    let _lock = match board_lock::acquire_with_timeout(path, timeout) {
         Ok(l) => l,
         Err(e) => {
             warn!("board recovery: backup skipped, lock unavailable: {e}");
@@ -569,11 +527,7 @@ fn ensure_corrupt_backup(path: &Path, raw: &str) -> Option<PathBuf> {
     }
 }
 
-/// Load `todos.json` under the shared recovery/versions contract. Every WRITER
-/// must gate its load through this (or [`load_for_write`]) — see the module note
-/// above. Applies the same `canonical_status`/`migrate_plan_roles` normalization
-/// [`load`] does, so a caller that swaps one for the other sees identical data.
-pub fn load_checked(path: &Path) -> LoadOutcome {
+fn load_checked_with_timeout(path: &Path, backup_timeout: Duration) -> LoadOutcome {
     let raw = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return LoadOutcome::Missing,
@@ -584,7 +538,7 @@ pub fn load_checked(path: &Path) -> LoadOutcome {
     match detect_issue(&raw) {
         Issue::FutureVersion(version) => LoadOutcome::FutureVersion { version },
         Issue::Unreadable(reason) => {
-            let backup = ensure_corrupt_backup(path, &raw);
+            let backup = ensure_corrupt_backup(path, &raw, backup_timeout);
             LoadOutcome::Unreadable { reason: reason.to_string(), backup }
         }
         Issue::Ok(patched) => match serde_json::from_value::<TodoFile>(patched) {
@@ -595,24 +549,20 @@ pub fn load_checked(path: &Path) -> LoadOutcome {
                 migrate_plan_roles(&mut file);
                 LoadOutcome::Ok(file)
             }
-            // Known asymmetry (`recovery`): the typed schema also fails on a
-            // field-type mismatch inside a node (e.g. `number` as a string) that
-            // Node's structural-only check would accept.
             Err(e) => {
-                let backup = ensure_corrupt_backup(path, &raw);
+                let backup = ensure_corrupt_backup(path, &raw, backup_timeout);
                 LoadOutcome::Unreadable { reason: format!("schema: {e}"), backup }
             }
         },
     }
 }
 
-/// Thin wrapper over [`load_checked`] for writers: a verified board, or the
-/// exact refusal message `write_todos_locked` (and the app's startup number
-/// backfill) surfaces — `board unreadable (<reason>): <file> — backup:
-/// <path|none>` / `board version N is newer than this writer (CURRENT 2):
-/// <file>`. Never writes anything itself; the caller decides whether to save.
-pub fn load_for_write(path: &Path) -> Result<TodoFile, String> {
-    match load_checked(path) {
+pub fn load_checked(path: &Path) -> LoadOutcome {
+    load_checked_with_timeout(path, Duration::ZERO)
+}
+
+fn file_or_refusal(path: &Path, outcome: LoadOutcome) -> Result<TodoFile, String> {
+    match outcome {
         LoadOutcome::Ok(file) => Ok(file),
         LoadOutcome::Missing => Ok(TodoFile::default()),
         LoadOutcome::Unreadable { reason, backup } => Err(format!(
@@ -625,6 +575,14 @@ pub fn load_for_write(path: &Path) -> Result<TodoFile, String> {
             path.display()
         )),
     }
+}
+
+pub fn load_checked_for_read(path: &Path) -> Result<TodoFile, String> {
+    file_or_refusal(path, load_checked(path))
+}
+
+pub fn load_for_write(path: &Path) -> Result<TodoFile, String> {
+    file_or_refusal(path, load_checked_with_timeout(path, Duration::from_secs(15)))
 }
 
 /// v1 → v2: the field-role split (t#253 field review) — `description` carries
@@ -713,9 +671,6 @@ pub fn save(path: &Path, file: &TodoFile) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
-    // `versions`: the writer ALWAYS stamps CURRENT on save, so a downgrade never
-    // survives a write — even a caller that loaded (and forgot to bump) an old
-    // file gets CURRENT back out.
     let mut stamped = file.clone();
     stamped.version = CURRENT_VERSION;
     let mut json = serde_json::to_string_pretty(&stamped).map_err(|e| e.to_string())?;
@@ -1110,6 +1065,22 @@ pub fn backup(todos_path: &Path) -> Result<String, String> {
     let name = format!("todos-{stamp}.json");
     std::fs::write(dir.join(&name), &content).map_err(|e| e.to_string())?;
     Ok(name)
+}
+
+pub fn backup_after_verified_load(todos_path: &Path) -> Result<String, String> {
+    load_for_write(todos_path)?;
+    backup(todos_path)
+}
+
+pub fn resolves_to_same_path(left: &Path, right: &Path) -> bool {
+    let (Ok(left), Ok(right)) = (std::fs::canonicalize(left), std::fs::canonicalize(right)) else {
+        return false;
+    };
+    if cfg!(windows) {
+        left.to_string_lossy().eq_ignore_ascii_case(&right.to_string_lossy())
+    } else {
+        left == right
+    }
 }
 
 /// The most recent backup (by file mtime), or None if none exist.
@@ -2603,17 +2574,10 @@ mod tests {
         assert!(parse_import("not json").is_err());
     }
 
-    // --- t#576: board-file recovery + versions ------------------------------
-    // docs/specs/tasks/spec.md#board-file, `recovery`/`versions`/`fixtures`.
-
     fn fixtures_dir() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/board-fixtures")
     }
 
-    /// A scratch directory a test owns exclusively, so `load_checked`'s
-    /// corrupt-backup write (and the board lock it takes) never touches the
-    /// repo's shared `tests/board-fixtures/` — only a copy of a fixture's bytes
-    /// does.
     fn scratch_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "todos_recovery_{tag}_{}_{}",
@@ -2624,8 +2588,6 @@ mod tests {
         dir
     }
 
-    /// Copy a fixture's bytes into a fresh scratch dir as `todos.json`, returning
-    /// that dir (the caller removes it) and the board path inside it.
     fn staged_fixture(tag: &str, relative: &str) -> (PathBuf, PathBuf) {
         let content = std::fs::read(fixtures_dir().join(relative))
             .unwrap_or_else(|e| panic!("fixture {relative}: {e}"));
@@ -2658,6 +2620,18 @@ mod tests {
         let (dir, path) = staged_fixture("future", "v2/future-version.json");
         match load_checked(&path) {
             LoadOutcome::FutureVersion { version } => assert_eq!(version, 99),
+            other => panic!("expected FutureVersion, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn version_above_u32_max_is_future_version() {
+        let dir = scratch_dir("future-u64");
+        let path = dir.join("todos.json");
+        std::fs::write(&path, r#"{"version":4294967296,"todos":[]}"#).unwrap();
+        match load_checked(&path) {
+            LoadOutcome::FutureVersion { version } => assert_eq!(version, 4_294_967_296),
             other => panic!("expected FutureVersion, got {other:?}"),
         }
         std::fs::remove_dir_all(&dir).ok();
@@ -2706,6 +2680,20 @@ mod tests {
     }
 
     #[test]
+    fn inline_corrupt_shapes_are_unreadable() {
+        for raw in [
+            r#"{"todos":[null]}"#,
+            r#"{"todos":[],"changes":{}}"#,
+        ] {
+            let dir = scratch_dir("inline-corrupt");
+            let path = dir.join("todos.json");
+            std::fs::write(&path, raw).unwrap();
+            assert!(matches!(load_checked(&path), LoadOutcome::Unreadable { .. }));
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    #[test]
     fn corrupt_backup_is_written_once_across_two_loads() {
         let (dir, path) = staged_fixture("backup-once", "corrupt/truncated.json");
 
@@ -2728,6 +2716,52 @@ mod tests {
             .collect();
         assert_eq!(corrupt_backups.len(), 1, "exactly one backup file, not one per load");
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn backup_failure_does_not_fail_read() {
+        let dir = scratch_dir("backup-failure");
+        let missing = dir.join("missing").join("todos.json");
+        assert!(ensure_corrupt_backup(&missing, "{", Duration::ZERO).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn future_version_produces_no_backup() {
+        let dir = scratch_dir("future-no-backup");
+        let path = dir.join("todos.json");
+        std::fs::write(&path, r#"{"version":99,"todos":[]}"#).unwrap();
+        assert!(matches!(load_checked(&path), LoadOutcome::FutureVersion { .. }));
+        assert!(std::fs::read_dir(&dir).unwrap().flatten().all(|entry| !entry
+            .file_name()
+            .to_string_lossy()
+            .contains(".corrupt-")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn busy_lock_skips_backup_without_waiting() {
+        let dir = scratch_dir("busy-lock");
+        let path = dir.join("todos.json");
+        std::fs::write(&path, "{").unwrap();
+        let locked_path = path.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let _lock = board_lock::acquire(&locked_path).unwrap();
+            ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        ready_rx.recv().unwrap();
+        let started = std::time::Instant::now();
+        match load_checked(&path) {
+            LoadOutcome::Unreadable { backup, .. } => assert!(backup.is_none()),
+            other => panic!("expected Unreadable, got {other:?}"),
+        }
+        assert!(started.elapsed() < Duration::from_secs(1));
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2778,5 +2812,27 @@ mod tests {
 
         std::fs::remove_dir_all(&unreadable_dir).ok();
         std::fs::remove_dir_all(&future_dir).ok();
+    }
+
+    #[test]
+    fn periodic_backup_requires_a_verified_board() {
+        let dir = scratch_dir("backup-gate");
+        let path = dir.join("todos.json");
+        std::fs::write(&path, "{").unwrap();
+        assert!(backup_after_verified_load(&path).is_err());
+        assert!(!backup_dir(&path).exists());
+        std::fs::write(&path, r#"{"version":99,"todos":[]}"#).unwrap();
+        assert!(backup_after_verified_load(&path).is_err());
+        assert!(!backup_dir(&path).exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn same_resolved_path_is_detected() {
+        let dir = scratch_dir("same-path");
+        let path = dir.join("todos.json");
+        std::fs::write(&path, r#"{"todos":[]}"#).unwrap();
+        assert!(resolves_to_same_path(&path, &path));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

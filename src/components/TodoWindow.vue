@@ -134,10 +134,6 @@ const changes = ref<BoardChange[]>([]);
 const loading = ref(true);
 const errorMsg = ref("");
 
-// Board recovery state (t#576, docs/specs/tasks/spec.md#board-file `recovery`/
-// `versions`). Separate from `errorMsg`: `get_todos`/`get_changes` stay
-// forgiving (empty list on a broken board) so the board keeps rendering, while
-// this drives a standing banner rather than a one-shot error toast.
 interface BoardStateInfo {
   state: "ok" | "unreadable" | "future-version";
   file: string;
@@ -150,25 +146,18 @@ const boardRecovering = computed(
   () => boardState.value !== null && boardState.value.state !== "ok",
 );
 
-// Mirrors todos.rs::CURRENT_VERSION — this app's writer version, shown in the
-// future-version banner so the user sees "newer than N" with a real number.
 const BOARD_CURRENT_VERSION = 2;
 
 async function loadBoardState() {
   try {
     boardState.value = await invoke<BoardStateInfo>("board_state");
   } catch {
-    // Command missing/not under Tauri — no banner, `errorMsg` already covers it.
     boardState.value = null;
     return;
   }
   if (boardState.value.state !== "ok") void loadLatestBoardBackup();
 }
 
-// The restore-from-backup control the recovery banner offers, reusing the same
-// backend commands SettingsPanel's "Restore" button does — the periodic
-// `backups/todos-*.json` snapshot (NOT the forensic `todos.json.corrupt-*`
-// copy `board_state.backup` points at, which is never auto-restored).
 interface TodoBackupInfo {
   name: string;
   when_ms: number;
@@ -1838,10 +1827,14 @@ onUnmounted(() => {
         <template v-else-if="boardState?.state === 'future-version'">
           {{ t("boardFutureVersion", { version: boardState.version, current: BOARD_CURRENT_VERSION }) }}
         </template>
+        <template v-if="latestBoardBackup">
+          {{ t("boardRestorePeriodicBackup", { path: latestBoardBackup.name }) }}
+        </template>
       </span>
       <button
+        v-if="latestBoardBackup"
         class="tw-recovery-restore"
-        :disabled="restoringBoard || !latestBoardBackup"
+        :disabled="restoringBoard"
         @click="restoreBoardFromBackup"
       >
         {{ restoringBoard ? t("migrateRestoring") : t("migrateRestore") }}
