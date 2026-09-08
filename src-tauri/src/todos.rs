@@ -501,6 +501,17 @@ fn corrupt_backup_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
+fn existing_corrupt_backup(path: &Path, raw: &str) -> Option<PathBuf> {
+    let parent = path.parent()?;
+    let prefix = format!("{}.corrupt-", path.file_name()?.to_string_lossy());
+    std::fs::read_dir(parent).ok()?.flatten().find_map(|entry| {
+        let name = entry.file_name();
+        let matches = name.to_string_lossy().starts_with(&prefix);
+        (matches && std::fs::read(entry.path()).ok().as_deref() == Some(raw.as_bytes()))
+            .then(|| entry.path())
+    })
+}
+
 fn ensure_corrupt_backup(path: &Path, raw: &str, timeout: Duration) -> Option<PathBuf> {
     let _lock = match board_lock::acquire_with_timeout(path, timeout) {
         Ok(l) => l,
@@ -509,6 +520,9 @@ fn ensure_corrupt_backup(path: &Path, raw: &str, timeout: Duration) -> Option<Pa
             return None;
         }
     };
+    if let Some(backup_path) = existing_corrupt_backup(path, raw) {
+        return Some(backup_path);
+    }
     let backup_path = corrupt_backup_path(path);
     match std::fs::OpenOptions::new().write(true).create_new(true).open(&backup_path) {
         Ok(mut f) => {
@@ -2729,16 +2743,17 @@ mod tests {
         let (dir, path) = staged_fixture("backup-once", "corrupt/truncated.json");
 
         let first = match load_checked(&path) {
-            LoadOutcome::Unreadable { backup, .. } => backup,
+            LoadOutcome::Unreadable { backup: Some(backup), .. } => backup,
             other => panic!("expected Unreadable, got {other:?}"),
         };
-        assert!(first.is_some(), "first detection must back up the corrupt file");
+        let older = path.with_file_name("todos.json.corrupt-20000101T000000Z");
+        std::fs::rename(first, &older).unwrap();
 
         let second = match load_checked(&path) {
             LoadOutcome::Unreadable { backup, .. } => backup,
             other => panic!("expected Unreadable, got {other:?}"),
         };
-        assert_eq!(first, second, "same backup path both times");
+        assert_eq!(second, Some(older), "reuses the older matching backup");
 
         let corrupt_backups: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()

@@ -74,7 +74,7 @@ function writeCorruptBackup(file, raw) {
 
 function ensureCorruptBackup(file, raw) {
   try {
-    return withBoardLock(file, () => writeCorruptBackup(file, raw));
+    return withBoardLock(file, () => writeCorruptBackup(file, raw), { waitMs: 0 });
   } catch (e) {
     return { path: null, error: e };
   }
@@ -88,7 +88,7 @@ export function readBoardTolerant(file) {
     if (e && e.code === "ENOENT") return { data: { version: CURRENT, todos: [] }, issue: null };
     return {
       data: { version: CURRENT, todos: [] },
-      issue: { kind: "unreadable", reason: "read-error", file, backup: null, backupError: e },
+      issue: { kind: "unreadable", reason: `read-error: ${e.message}`, file, backup: null, backupError: e },
     };
   }
 

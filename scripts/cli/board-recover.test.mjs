@@ -11,6 +11,7 @@ import {
   recoveryLine,
   refusalFor,
 } from "./board-recover.mjs";
+import { boardLockPath } from "./board-lock.mjs";
 
 const FIXTURES = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -131,6 +132,25 @@ describe("readBoardTolerant — the forgiving read + backup", () => {
     expect(after).toEqual(before);
 
     expect(readFileSync(file, "utf8")).toBe("{ not json");
+  });
+
+  it("does not wait for a live lock before skipping a corrupt backup", () => {
+    writeFileSync(file, "{ not json");
+    const lock = boardLockPath(file);
+    writeFileSync(lock, JSON.stringify({ pid: process.pid, writer: "cli", at: new Date().toISOString() }));
+
+    const started = performance.now();
+    const { issue } = readBoardTolerant(file);
+
+    expect(performance.now() - started).toBeLessThan(1_000);
+    expect(issue.backup).toBeNull();
+    expect(issue.backupError.message).toContain(lock);
+    expect(readdirSync(dir).some((name) => name.includes(".corrupt-"))).toBe(false);
+  });
+
+  it("includes the OS error in a read failure reason", () => {
+    const { issue } = readBoardTolerant(dir);
+    expect(issue.reason).toMatch(/^read-error: /);
   });
 
   it("returns the parsed data (not a synthetic empty board) for a future version", () => {

@@ -63,11 +63,15 @@ fn registry() -> &'static Mutex<HashMap<String, (ThreadId, usize)>> {
     REG.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn normalize_key(board: &Path) -> String {
+fn normalized_board_path(board: &Path) -> PathBuf {
     let parent = board.parent().unwrap_or_else(|| Path::new("."));
     let canon_parent = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
     let file_name = board.file_name().map(|f| f.to_os_string()).unwrap_or_default();
-    let combined = canon_parent.join(file_name);
+    canon_parent.join(file_name)
+}
+
+fn normalize_key(board: &Path) -> String {
+    let combined = normalized_board_path(board);
     let s = combined.to_string_lossy().into_owned();
     if cfg!(windows) {
         s.to_lowercase()
@@ -77,9 +81,10 @@ fn normalize_key(board: &Path) -> String {
 }
 
 fn lock_path_for(board: &Path) -> PathBuf {
-    let mut name = board.file_name().map(|f| f.to_os_string()).unwrap_or_default();
+    let normalized = normalized_board_path(board);
+    let mut name = normalized.file_name().map(|f| f.to_os_string()).unwrap_or_default();
     name.push(".lock");
-    board.with_file_name(name)
+    normalized.with_file_name(name)
 }
 
 struct LockHolder {
@@ -397,6 +402,20 @@ mod tests {
     }
 
     #[test]
+    fn equivalent_board_path_uses_same_lock_file() {
+        let board = unique_board();
+        let alternate = board.path().parent().unwrap().join(".").join("todos.json");
+
+        let plain_lock = acquire_impl(board.path(), Duration::ZERO).unwrap();
+        assert_eq!(lock_path_for(board.path()), lock_path_for(&alternate));
+        let alternate_lock = acquire_impl(&alternate, Duration::ZERO).unwrap();
+        assert_eq!(plain_lock.lock_path, alternate_lock.lock_path);
+
+        drop(alternate_lock);
+        drop(plain_lock);
+    }
+
+    #[test]
     fn busy_when_holder_is_alive() {
         let board = unique_board();
         let lock_path = lock_path_for(board.path());
@@ -550,9 +569,10 @@ mod tests {
         let lock = acquire_impl(board.path(), Duration::from_millis(200)).unwrap();
 
         let expected_path = {
-            let mut p = board.path().as_os_str().to_os_string();
-            p.push(".lock");
-            PathBuf::from(p)
+            let normalized = std::fs::canonicalize(board.path().parent().unwrap()).unwrap();
+            let mut name = board.path().file_name().unwrap().to_os_string();
+            name.push(".lock");
+            normalized.join(name)
         };
         assert_eq!(lock_path_for(board.path()), expected_path);
 
