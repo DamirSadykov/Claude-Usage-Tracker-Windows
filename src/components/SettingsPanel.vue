@@ -14,7 +14,11 @@ import type { AlertTiers, AlertTierKey, AlertTypes, AlertTypeKey } from "../thre
 import { useUpdater } from "../updater";
 import { INSIGHT_KINDS } from "../insightKinds";
 import { FONT_OPTIONS, applyFont } from "../fontSwitch";
+import { modelFamilyClass } from "../modelFamily";
 import EnrollmentPanel from "./EnrollmentPanel.vue";
+import WorkflowGraph from "./WorkflowGraph.vue";
+import agentProviderManifest from "../../scripts/cli/agent-providers.json";
+import { dutyModeReader } from "../../scripts/cli/duty-mode.mjs";
 
 const TIER_LABELS: Record<AlertTierKey, string> = {
   five_hour: "session5h",
@@ -295,6 +299,122 @@ function toggleRuntime(kind: string) {
 
 onMounted(loadIgnoredInsights);
 
+// --- Global responsibility -> provider/model lifecycle map ---
+// agents.json is also consumed by the Node CLI. Tasks never select a model.
+interface AgentProfileForm {
+  duty: "critic" | "architect" | "worker" | "review";
+  provider: "anthropic" | "openai";
+  model: string;
+  mode: string;
+  role: string;
+  reasoning_effort: string;
+  instructions: string;
+}
+const agentProfiles = ref<AgentProfileForm[]>([]);
+const agentConfigMsg = ref("");
+const dutyModes = agentProviderManifest.modes as Record<AgentProfileForm["duty"], string[]>;
+const providerNames = Object.keys(agentProviderManifest.providers) as AgentProfileForm["provider"][];
+const providerModels = Object.fromEntries(
+  providerNames.map((provider) => [provider, [...agentProviderManifest.providers[provider].models]]),
+) as Record<AgentProfileForm["provider"], string[]>;
+const providerLabels = Object.fromEntries(
+  providerNames.map((provider) => [provider, agentProviderManifest.providers[provider].label]),
+) as Record<AgentProfileForm["provider"], string>;
+const agentDuties: AgentProfileForm["duty"][] = ["critic", "architect", "worker", "review"];
+const starterAgents: AgentProfileForm[] = agentDuties.map((duty) => {
+  const profile = agentProviderManifest.duties[duty];
+  return { duty, ...profile, provider: profile.provider as AgentProfileForm["provider"] };
+});
+
+const dutyMode = dutyModeReader(agentProviderManifest);
+const cleanMode = dutyMode.cleanMode as (duty: AgentProfileForm["duty"], value: unknown) => string;
+
+function normalizeAgentProfile(value: Record<string, unknown> | undefined, fallback: AgentProfileForm): AgentProfileForm {
+  if (!value) return { ...fallback };
+  const provider = String(value.provider ?? "").trim().toLowerCase();
+  const model = String(value.model ?? "").trim();
+  if ((provider !== "anthropic" && provider !== "openai") || !providerModels[provider].includes(model)) {
+    return { ...fallback };
+  }
+  return {
+    duty: fallback.duty,
+    provider,
+    model,
+    mode: fallback.mode,
+    role: String(value.role ?? fallback.role).trim(),
+    reasoning_effort: provider === "openai" ? String(value.reasoning_effort ?? "").trim() : "",
+    instructions: String(value.instructions ?? fallback.instructions).trim(),
+  };
+}
+
+async function loadAgentProfiles() {
+  try {
+    const { load: loadStore } = await import("@tauri-apps/plugin-store");
+    const store = await loadStore("agents.json");
+    const duties = await store.get<Record<string, Record<string, unknown>>>("duties");
+    const legacy = await store.get<Record<string, Record<string, unknown>>>("profiles");
+    const raw = duties ?? (legacy ? {
+      architect: legacy.architect,
+      worker: legacy.worker,
+      review: legacy.review ?? legacy.reviewer,
+    } : undefined);
+    const hooks = await store.get<Record<string, boolean>>("hooks");
+    const storedCriticMode = await store.get<string>("criticMode");
+    agentProfiles.value = starterAgents.map((fallback) => {
+      const value = raw?.[fallback.duty];
+      const profile = normalizeAgentProfile(value, fallback);
+      profile.mode = dutyMode.resolveMode(fallback.duty, value, { hooks, criticMode: storedCriticMode });
+      return profile;
+    });
+  } catch { installStarterAgents(); }
+}
+
+function installStarterAgents() {
+  agentProfiles.value = starterAgents.map((p) => ({ ...p }));
+  agentConfigMsg.value = "";
+}
+
+function dutyState(duty: AgentProfileForm["duty"]) {
+  const p = agentProfiles.value.find((profile) => profile.duty === duty);
+  return { mode: p?.mode ?? "off", provider: p?.provider ?? "anthropic", model: p?.model ?? "" };
+}
+
+function changeAgentProvider(p: AgentProfileForm, provider: AgentProfileForm["provider"]) {
+  p.provider = provider;
+  if (!providerModels[provider].includes(p.model)) p.model = providerModels[provider][0];
+  if (provider !== "openai") p.reasoning_effort = "";
+}
+
+async function saveAgentProfiles() {
+  agentConfigMsg.value = "";
+  const duties: Record<string, Record<string, string>> = {};
+  for (const p of agentProfiles.value) {
+    const model = p.model.trim();
+    if (!providerModels[p.provider].includes(model)) {
+      agentConfigMsg.value = t("agentProfilesInvalid");
+      return;
+    }
+    duties[p.duty] = { mode: cleanMode(p.duty, p.mode) || p.mode, provider: p.provider, model };
+    for (const k of ["role", "reasoning_effort", "instructions"] as const) {
+      const value = p[k].trim();
+      if (value) duties[p.duty][k] = value;
+    }
+  }
+  try {
+    const { load: loadStore } = await import("@tauri-apps/plugin-store");
+    const store = await loadStore("agents.json");
+    await store.set("version", 4);
+    await store.set("duties", duties);
+    await store.delete("hooks");
+    await store.delete("criticMode");
+    await store.save();
+    agentConfigMsg.value = t("agentProfilesSaved");
+  } catch (e) {
+    agentConfigMsg.value = String(e);
+  }
+}
+onMounted(loadAgentProfiles);
+
 // --- cc-todos CLI + Claude Code hook installer ---
 // The installer wires two hooks: SessionStart (task context) and Stop (the
 // HANDOFF freshness guard). `stop_installed` is false for an install made before
@@ -302,6 +422,10 @@ onMounted(loadIgnoredInsights);
 interface CcHookStatus {
   installed: boolean;
   stop_installed: boolean;
+  /// The whole plan-mode wiring (EnterPlanMode/ExitPlanMode/UserPromptSubmit
+  /// hooks plus the PreToolUse · ExitPlanMode format guard) — see the Rust
+  /// struct of the same name for what each entry checks.
+  plan_installed: boolean;
   script_path: string;
   /// What settings.json points at right now, and whether that file still exists.
   /// A wired-but-missing script is the silent failure mode: Claude Code runs
@@ -1464,6 +1588,70 @@ function handleSave() {
 
       <!-- ===== Tasks ===== -->
       <template v-if="tab === 'tasks'">
+      <div class="card">
+        <div class="card-row" style="align-items: center">
+          <div style="flex: 1; min-width: 0">
+            <div class="card-title">{{ t('agentProfilesTitle') }}</div>
+            <div class="card-sub">{{ t('agentProfilesDesc') }}</div>
+          </div>
+          <button type="button" class="suggest-btn" @click="installStarterAgents">{{ t('agentProfilesStarter') }}</button>
+        </div>
+
+        <div v-for="p in agentProfiles" :key="p.duty" class="agent-profile">
+          <div class="agent-profile-head">
+            <div class="agent-duty">
+              <strong>{{ t(`agentDuty_${p.duty}`) }}</strong>
+              <span>{{ t(`agentTrigger_${p.duty}`) }}</span>
+            </div>
+            <span class="model-chip" :class="modelFamilyClass(p.model, p.provider)">{{ p.model || t('agentModel') }}</span>
+          </div>
+          <div class="agent-profile-grid">
+            <label>
+              <span class="field-label">{{ t('agentMode') }}</span>
+              <select v-model="p.mode" class="field-input" :disabled="dutyModes[p.duty].length <= 1">
+                <option v-for="m in dutyModes[p.duty]" :key="m" :value="m">{{ t(`agentMode_${m}`) }}</option>
+              </select>
+            </label>
+            <label>
+              <span class="field-label">{{ t('agentProvider') }}</span>
+              <select :value="p.provider" class="field-input" @change="changeAgentProvider(p, ($event.target as HTMLSelectElement).value as AgentProfileForm['provider'])">
+                <option v-for="provider in providerNames" :key="provider" :value="provider">{{ providerLabels[provider] }}</option>
+              </select>
+            </label>
+            <label>
+              <span class="field-label">{{ t('agentModel') }}</span>
+              <select v-model="p.model" class="field-input">
+                <option v-for="model in providerModels[p.provider]" :key="model" :value="model">{{ model }}</option>
+              </select>
+            </label>
+            <label>
+              <span class="field-label">{{ t('agentReasoning') }}</span>
+              <select v-model="p.reasoning_effort" class="field-input" :disabled="p.provider !== 'openai'">
+                <option value="">—</option>
+                <option v-for="r in ['low','medium','high','xhigh','max','ultra']" :key="r" :value="r">{{ r }}</option>
+              </select>
+            </label>
+          </div>
+          <div class="field-hint">{{ t(`agentModeHint_${p.mode}`) }}</div>
+          <label>
+            <span class="field-label">{{ t('agentInstructions') }}</span>
+            <textarea v-model="p.instructions" class="field-input" rows="2"></textarea>
+          </label>
+        </div>
+        <div class="budget-suggest">
+          <span class="field-hint" style="margin: 0">{{ agentConfigMsg }}</span>
+          <button type="button" class="suggest-btn" @click="saveAgentProfiles">{{ t('save') }}</button>
+        </div>
+      </div>
+
+      <WorkflowGraph
+        :critic="dutyState('critic')"
+        :architect="dutyState('architect')"
+        :worker="dutyState('worker')"
+        :review="dutyState('review')"
+        :plan-installed="!!ccHookStatus?.plan_installed"
+      />
+
       <!-- Install the cc-todos CLI + the SessionStart/Stop hooks into ~/.claude/settings.json -->
       <div class="card" style="display: flex; align-items: center; gap: 12px">
         <div style="flex: 1; min-width: 0">
@@ -1985,6 +2173,59 @@ function handleSave() {
   color: var(--text-4);
   margin-top: 6px;
 }
+
+.agent-profile-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.agent-profile-head .field-input {
+  flex: 1;
+}
+.agent-profile {
+  display: grid;
+  gap: 9px;
+  margin-top: 10px;
+  padding: 10px;
+  border: 1px solid var(--stroke-strong);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.025);
+}
+.agent-profile-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+.agent-duty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.agent-duty strong { font-size: 13px; color: var(--text); }
+.agent-duty span { font-size: 12px; color: var(--text-4); }
+.agent-profile .field-label {
+  display: block;
+  margin-bottom: 4px;
+}
+
+.model-chip {
+  flex: 0 0 auto;
+  padding: 2px 8px;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  font: 600 11px ui-monospace, Consolas, monospace;
+  background: color-mix(in srgb, currentColor 12%, transparent);
+}
+.model-openai-sol { color: #34d399; }
+.model-openai-terra { color: #60a5fa; }
+.model-openai-luna { color: #22d3ee; }
+.model-openai { color: #10b981; }
+.model-anthropic-opus { color: #d97757; }
+.model-anthropic-sonnet { color: #6ccb5f; }
+.model-anthropic-haiku { color: #5b9bd5; }
+.model-anthropic { color: #e879f9; }
+.model-unknown { color: var(--text-4); }
 
 .field-range {
   -webkit-appearance: none;

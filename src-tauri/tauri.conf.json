@@ -116,6 +116,10 @@
       "../scripts/cli/plan-hook.mjs": "scripts/cli/plan-hook.mjs",
       "../scripts/cli/plan-guard.mjs": "scripts/cli/plan-guard.mjs",
       "../scripts/cli/settings.mjs": "scripts/cli/settings.mjs",
+      "../scripts/cli/agents.mjs": "scripts/cli/agents.mjs",
+      "../scripts/cli/duty-mode.mjs": "scripts/cli/duty-mode.mjs",
+      "../scripts/cli/providers.mjs": "scripts/cli/providers.mjs",
+      "../scripts/cli/agent-providers.json": "scripts/cli/agent-providers.json",
       "../docs/plan-format.md": "docs/plan-format.md"
     },
     "icon": [

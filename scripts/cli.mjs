@@ -24,6 +24,7 @@ const AREAS = {
   triage: "./cli/triage.mjs",
   corrections: "./cli/corrections.mjs",
   "task-cost": "./cli/task-cost.mjs",
+  agents: "./cli/agents.mjs",
   spec: "./cli/spec.mjs",
   hook: "./cli/hook.mjs",
   "stop-hook": "./cli/stop-hook.mjs",
@@ -71,6 +72,7 @@ function usage(code) {
       "  triage  <…>   publish/read the nightly-triage digest (publish / show / clear)\n" +
       "  corrections <…> user-corrections outcome metric, layer 1 (scan / label-template / eval)\n" +
       "  task-cost <…> session->task attribution for tokens-per-task (scan / publish)\n" +
+      "  agents  <…>   model/provider profiles used by autonomous task runs\n" +
       "  spec    <…>   spec registry (t#339): domains / show / refs / lint over docs/specs\n" +
       "  hook          SessionStart hook (wired into ~/.claude/settings.json)\n" +
       "  stop-hook     Stop hook — blocks a stop that leaves a worked task without a handoff baton\n" +
