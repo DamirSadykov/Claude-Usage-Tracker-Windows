@@ -1440,7 +1440,7 @@ function handleSave() {
 
       <!-- ===== Budget & analytics ===== -->
       <template v-if="tab === 'budget'">
-      <!-- Claude Code analytics (opt-in, off by default) -->
+      <!-- Local Claude Code + Codex analytics (opt-in, off by default) -->
       <div class="card toggle-card" @click="localCc = !localCc">
         <div style="flex: 1; min-width: 0">
           <div class="card-title" style="font-size: 13px">{{ t('ccAnalytics') }}</div>

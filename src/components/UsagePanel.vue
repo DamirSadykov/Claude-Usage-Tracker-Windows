@@ -2,7 +2,9 @@
 import { computed, ref, onMounted, onUnmounted } from "vue";
 import { useI18n } from "vue-i18n";
 import type { UsageData, UsageLevels, ForecastData } from "../App.vue";
+import type { CodexRateLimits } from "../App.vue";
 import { formatEta } from "../alertFormat";
+import CodexUsageCards from "./CodexUsageCards.vue";
 
 const { t, locale } = useI18n();
 
@@ -10,6 +12,7 @@ const props = defineProps<{
   usage: UsageData;
   levels: UsageLevels;
   forecast: ForecastData | null;
+  codexLimits: CodexRateLimits | null;
   loading: boolean;
   autoStartEnabled: boolean;
   autoStartStatus: string;
@@ -172,6 +175,7 @@ const prepaidBalance = computed(() => props.usage.prepaid_balance);
 
 <template>
   <div class="cards">
+    <CodexUsageCards v-if="codexLimits" :limits="codexLimits" />
     <!-- Daily budget -->
     <div v-if="dailyBudgetEnabled && dailyBudget > 0" class="card">
       <div class="card-row">

@@ -1,5 +1,6 @@
 pub mod alerts;
 pub mod cc;
+pub mod codex;
 pub mod corrections;
 pub mod domain;
 pub mod enroll;
@@ -1114,16 +1115,35 @@ async fn ingest_cc_usage(
     stats: tauri::State<'_, Arc<StatsDb>>,
     config: tauri::State<'_, Mutex<AppConfig>>,
 ) -> Result<usize, String> {
-    // Privacy gate: never touch ~/.claude unless the user opted in.
+    // Privacy gate: never touch local Claude/Codex logs unless the user opted in.
     if !config.lock().unwrap().cc_analytics_enabled {
         return Ok(0);
     }
-    let base = cc::claude_dir().ok_or("Cannot resolve Claude config directory")?;
+    let claude = cc::claude_dir();
+    let codex = codex::codex_dir();
     let db = stats.inner().clone();
     // Disk-heavy walk/parse — keep it off the async runtime threads.
-    tauri::async_runtime::spawn_blocking(move || cc::ingest(&base, &db))
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut inserted = 0;
+        if let Some(base) = claude { inserted += cc::ingest(&base, &db)?; }
+        if let Some(base) = codex { inserted += codex::ingest(&base, &db)?; }
+        Ok(inserted)
+    })
         .await
         .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn get_codex_limits(enabled: bool) -> Result<Option<codex::CodexRateLimits>, String> {
+    if !enabled {
+        return Ok(None);
+    }
+    let Some(base) = codex::codex_dir() else {
+        return Ok(None);
+    };
+    tauri::async_runtime::spawn_blocking(move || codex::latest_limits(&base))
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -3114,6 +3134,7 @@ pub fn run() {
             get_usage_snapshots,
             get_latest_snapshots,
             ingest_cc_usage,
+            get_codex_limits,
             get_forecast,
             get_analytics,
             get_analytics_compare,

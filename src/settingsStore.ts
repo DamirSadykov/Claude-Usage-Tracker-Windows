@@ -113,6 +113,15 @@ export async function readSettingsSnapshot(): Promise<SettingsSnapshot> {
         const store = await load("settings.json");
         const get = <T>(key: string) => store.get<T>(key);
 
+        // The pre-release Organization Usage integration stored a privileged
+        // Admin API key here. Codex subscription limits now come only from local
+        // rollout events, so remove that obsolete secret and its companion keys.
+        let removedOpenAiAdminSetting = false;
+        for (const key of ["openAiAdminEnabled", "openAiAdminKey", "openAiUsageDays"]) {
+            removedOpenAiAdminSetting = (await store.delete(key)) || removedOpenAiAdminSetting;
+        }
+        if (removedOpenAiAdminSetting) await store.save();
+
         s.sessionKey = (await get<string>("sessionKey")) ?? s.sessionKey;
         s.orgId = (await get<string>("orgId")) ?? s.orgId;
         s.refreshInterval = (await get<number>("refreshInterval")) ?? s.refreshInterval;
