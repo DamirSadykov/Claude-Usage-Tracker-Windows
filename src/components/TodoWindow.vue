@@ -134,6 +134,70 @@ const changes = ref<BoardChange[]>([]);
 const loading = ref(true);
 const errorMsg = ref("");
 
+// Board recovery state (t#576, docs/specs/tasks/spec.md#board-file `recovery`/
+// `versions`). Separate from `errorMsg`: `get_todos`/`get_changes` stay
+// forgiving (empty list on a broken board) so the board keeps rendering, while
+// this drives a standing banner rather than a one-shot error toast.
+interface BoardStateInfo {
+  state: "ok" | "unreadable" | "future-version";
+  file: string;
+  backup?: string | null;
+  reason?: string | null;
+  version?: number | null;
+}
+const boardState = ref<BoardStateInfo | null>(null);
+const boardRecovering = computed(
+  () => boardState.value !== null && boardState.value.state !== "ok",
+);
+
+// Mirrors todos.rs::CURRENT_VERSION — this app's writer version, shown in the
+// future-version banner so the user sees "newer than N" with a real number.
+const BOARD_CURRENT_VERSION = 2;
+
+async function loadBoardState() {
+  try {
+    boardState.value = await invoke<BoardStateInfo>("board_state");
+  } catch {
+    // Command missing/not under Tauri — no banner, `errorMsg` already covers it.
+    boardState.value = null;
+    return;
+  }
+  if (boardState.value.state !== "ok") void loadLatestBoardBackup();
+}
+
+// The restore-from-backup control the recovery banner offers, reusing the same
+// backend commands SettingsPanel's "Restore" button does — the periodic
+// `backups/todos-*.json` snapshot (NOT the forensic `todos.json.corrupt-*`
+// copy `board_state.backup` points at, which is never auto-restored).
+interface TodoBackupInfo {
+  name: string;
+  when_ms: number;
+}
+const latestBoardBackup = ref<TodoBackupInfo | null>(null);
+const restoringBoard = ref(false);
+
+async function loadLatestBoardBackup() {
+  try {
+    latestBoardBackup.value = await invoke<TodoBackupInfo | null>("latest_todo_backup");
+  } catch {
+    latestBoardBackup.value = null;
+  }
+}
+
+async function restoreBoardFromBackup() {
+  if (restoringBoard.value || !latestBoardBackup.value) return;
+  if (typeof window !== "undefined" && !window.confirm(t("migrateRestoreConfirm"))) return;
+  restoringBoard.value = true;
+  try {
+    await invoke("restore_todo_backup", {});
+    await loadTodos();
+  } catch (e) {
+    errorMsg.value = String(e);
+  } finally {
+    restoringBoard.value = false;
+  }
+}
+
 // Filters
 const projectFilter = ref<string>(""); // "" = all
 const showDone = ref(false);
@@ -251,6 +315,7 @@ async function loadTodos(silent = false) {
   } catch {
     changes.value = [];
   }
+  void loadBoardState();
 }
 
 // Reload now if it's safe; otherwise mark it pending until the drag/form ends.
@@ -1764,6 +1829,25 @@ onUnmounted(() => {
 
     <div v-if="errorMsg" class="tw-error">{{ errorMsg }}</div>
 
+    <div v-if="boardRecovering" class="tw-recovery">
+      <span class="tw-recovery-text">
+        <template v-if="boardState?.state === 'unreadable'">
+          {{ t("boardUnreadable", { reason: boardState.reason }) }}
+          {{ boardState.backup ? t("boardBackupAt", { path: boardState.backup }) : t("boardNoBackup") }}
+        </template>
+        <template v-else-if="boardState?.state === 'future-version'">
+          {{ t("boardFutureVersion", { version: boardState.version, current: BOARD_CURRENT_VERSION }) }}
+        </template>
+      </span>
+      <button
+        class="tw-recovery-restore"
+        :disabled="restoringBoard || !latestBoardBackup"
+        @click="restoreBoardFromBackup"
+      >
+        {{ restoringBoard ? t("migrateRestoring") : t("migrateRestore") }}
+      </button>
+    </div>
+
     <div v-if="loading" class="tw-empty">{{ t("loading") }}</div>
 
     <!-- Task graph, new rendering: lanes by theme, artifacts on wires, ref rings -->
@@ -2599,6 +2683,41 @@ onUnmounted(() => {
   word-break: break-word;
   padding: 8px 16px 0;
   flex-shrink: 0;
+}
+.tw-recovery {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: #f2b90c;
+  background: rgba(242, 185, 12, 0.1);
+  border: 1px solid rgba(242, 185, 12, 0.3);
+  border-radius: 6px;
+  font-size: 12px;
+  word-break: break-word;
+  margin: 8px 16px 0;
+  padding: 8px 10px;
+  flex-shrink: 0;
+}
+.tw-recovery-text {
+  flex: 1;
+}
+.tw-recovery-restore {
+  flex-shrink: 0;
+  border: 1px solid rgba(242, 185, 12, 0.4);
+  background: transparent;
+  color: inherit;
+  border-radius: 4px;
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  font-family: var(--segoe);
+}
+.tw-recovery-restore:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.tw-recovery-restore:not(:disabled):hover {
+  background: rgba(242, 185, 12, 0.15);
 }
 .tw-empty {
   color: var(--text-3);

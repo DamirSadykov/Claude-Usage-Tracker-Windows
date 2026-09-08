@@ -1287,6 +1287,45 @@ fn get_changes(app: AppHandle) -> Result<Vec<todos::Change>, String> {
     Ok(todos::load(&todos_path(&app)?).changes)
 }
 
+/// Recovery state of the board file (t#576, spec `board-file#recovery`/`versions`).
+/// `get_todos`/`get_changes` above stay forgiving (empty list on a broken board,
+/// via [`todos::load`]) so reading never fails; the Todo window calls this
+/// SEPARATELY to know whether to show a recovery banner. `state` is one of
+/// `"ok"` | `"unreadable"` | `"future-version"`; `Missing` counts as `"ok"` — a
+/// missing file is an empty CURRENT board, not corruption.
+#[derive(Serialize)]
+struct BoardState {
+    state: &'static str,
+    file: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backup: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<u32>,
+}
+
+#[tauri::command]
+fn board_state(app: AppHandle) -> Result<BoardState, String> {
+    let path = todos_path(&app)?;
+    let file = path.display().to_string();
+    Ok(match todos::load_checked(&path) {
+        todos::LoadOutcome::Ok(_) | todos::LoadOutcome::Missing => {
+            BoardState { state: "ok", file, backup: None, reason: None, version: None }
+        }
+        todos::LoadOutcome::Unreadable { reason, backup } => BoardState {
+            state: "unreadable",
+            file,
+            backup: backup.map(|p| p.display().to_string()),
+            reason: Some(reason),
+            version: None,
+        },
+        todos::LoadOutcome::FutureVersion { version } => {
+            BoardState { state: "future-version", file, backup: None, reason: None, version: Some(version) }
+        }
+    })
+}
+
 #[tauri::command]
 async fn close_change(app: AppHandle, change: String) -> Result<String, String> {
     let cli = cc_hook_script_path(&app)?;
@@ -2551,11 +2590,33 @@ fn write_todos_locked(
     let snap = app.state::<TodoSnapshot>();
     let mut guard = snap.0.lock().unwrap();
     let _board_lock = board_lock::acquire(&path).map_err(|e| e.to_string())?;
-    let mut file = todos::load(&path);
+    // Verified load (t#576, spec `board-file#recovery`/`versions`): an unreadable
+    // or future-version board refuses the whole cycle rather than being treated
+    // as empty and overwritten — see `todos::load_for_write`.
+    let mut file = todos::load_for_write(&path)?;
     // Backfill task numbers for any legacy/hand-edited rows before mutating, so
     // every persisted file has stable `#N` references (upsert numbers new tasks).
     todos::ensure_numbers(&mut file);
     mutate(&mut file);
+    todos::save(&path, &file)?;
+    *guard = todo_status_map(&file);
+    Ok(file.todos)
+}
+
+/// Install a board wholesale under the write lock, bypassing [`todos::load_for_write`]'s
+/// readability gate entirely — used ONLY by [`restore_todo_backup`], the one
+/// documented way out of an unreadable/future-version board (`board-file#recovery`:
+/// "восстановление из бэкапа — вручную"). `write_todos_locked` refusing to even
+/// READ a broken board would otherwise make that recovery path unreachable.
+fn write_todos_locked_replace(
+    app: &AppHandle,
+    mut file: todos::TodoFile,
+) -> Result<Vec<todos::Todo>, String> {
+    let path = todos_path(app)?;
+    let snap = app.state::<TodoSnapshot>();
+    let mut guard = snap.0.lock().unwrap();
+    let _board_lock = board_lock::acquire(&path).map_err(|e| e.to_string())?;
+    todos::ensure_numbers(&mut file);
     todos::save(&path, &file)?;
     *guard = todo_status_map(&file);
     Ok(file.todos)
@@ -2690,9 +2751,7 @@ fn restore_todo_backup(
         _ => todos::latest_backup(&path).ok_or("Нет доступного бэкапа для отката")?.name,
     };
     let restored = todos::read_backup(&path, &name)?;
-    write_todos_locked(&app, move |file| {
-        *file = restored;
-    })
+    write_todos_locked_replace(&app, restored)
 }
 
 /// Write the whole board to a file the user picked (#181). The frontend only opens
@@ -2806,13 +2865,21 @@ fn spawn_todos_watch(app: AppHandle) {
             let snap = app.state::<TodoSnapshot>();
             let mut guard = snap.0.lock().unwrap();
             match board_lock::acquire(&path) {
-                Ok(_board_lock) => {
-                    let mut file = todos::load(&path);
-                    if todos::ensure_numbers(&mut file) {
-                        let _ = todos::save(&path, &file);
+                // Verified load (t#576): same rule as `write_todos_locked` — an
+                // unreadable or future-version board is not overwritten by this
+                // startup normalization either (spec `board-file#recovery`).
+                Ok(_board_lock) => match todos::load_for_write(&path) {
+                    Ok(mut file) => {
+                        if todos::ensure_numbers(&mut file) {
+                            let _ = todos::save(&path, &file);
+                        }
+                        *guard = todo_status_map(&file);
                     }
-                    *guard = todo_status_map(&file);
-                }
+                    Err(e) => {
+                        warn!("todos watcher startup: board not writable, skipping number backfill: {e}");
+                        *guard = todo_status_map(&todos::load(&path));
+                    }
+                },
                 Err(e) => {
                     warn!("todos watcher startup: board lock unavailable, skipping number backfill: {e}");
                     *guard = todo_status_map(&todos::load(&path));
@@ -3167,6 +3234,7 @@ pub fn run() {
             export_analytics_json,
             get_todos,
             get_changes,
+            board_state,
             close_change,
             get_corrections_metrics,
             refresh_corrections_metrics,

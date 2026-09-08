@@ -443,6 +443,12 @@ const messages = {
     todoSearch: "Search",
     todoDropHere: "Drop here",
     todoColEmpty: "No tasks",
+    boardUnreadable:
+      "The board file is unreadable ({reason}). Reading continues with an empty board — nothing is written until this is fixed.",
+    boardFutureVersion:
+      "The board file is version {version}, newer than this app (current {current}). Reading works; nothing is written.",
+    boardBackupAt: "Corrupt copy saved to: {path}",
+    boardNoBackup: "Corrupt copy could not be saved.",
     todoComments: "Comments",
     todoCommentPlaceholder: "Write a comment…",
     todoCommentAdd: "Comment",
@@ -1258,6 +1264,12 @@ const messages = {
     todoSearch: "Поиск",
     todoDropHere: "Отпустите здесь",
     todoColEmpty: "Нет задач",
+    boardUnreadable:
+      "Файл доски не читается ({reason}). Чтение продолжает работать с пустой доской — запись отключена, пока это не исправлено.",
+    boardFutureVersion:
+      "Файл доски версии {version}, новее приложения (текущая {current}). Чтение работает, запись отключена.",
+    boardBackupAt: "Копия повреждённого файла сохранена: {path}",
+    boardNoBackup: "Не удалось сохранить копию повреждённого файла.",
     todoComments: "Комментарии",
     todoCommentPlaceholder: "Написать комментарий…",
     todoCommentAdd: "Отправить",
