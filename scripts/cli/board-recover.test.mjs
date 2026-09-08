@@ -56,20 +56,20 @@ describe("detectBoardIssue — the common unreadable minimum", () => {
     expect(r.reason).toBe("changes-not-array");
   });
 
-  it("reads a missing version as 1 rather than as unreadable", () => {
+  it("treats a missing version as stale version 1 rather than as unreadable", () => {
     const r = detectBoardIssue(JSON.stringify({ todos: [] }));
-    expect(r.kind).toBe("ok");
-    expect(r.data.version).toBe(1);
+    expect(r.kind).toBe("stale-version");
+    expect(r.version).toBe(1);
   });
 
-  it("reads a non-integer version as 1 rather than as unreadable", () => {
+  it("treats a non-integer version as stale version 1 rather than as unreadable", () => {
     const r = detectBoardIssue(JSON.stringify({ version: "2", todos: [] }));
-    expect(r.kind).toBe("ok");
-    expect(r.data.version).toBe(1);
+    expect(r.kind).toBe("stale-version");
+    expect(r.version).toBe(1);
 
     const r2 = detectBoardIssue(JSON.stringify({ version: 1.5, todos: [] }));
-    expect(r2.kind).toBe("ok");
-    expect(r2.data.version).toBe(1);
+    expect(r2.kind).toBe("stale-version");
+    expect(r2.version).toBe(1);
   });
 
   it("does not flag a mismatched field type on a todo node (Node vs Rust asymmetry)", () => {
@@ -82,6 +82,13 @@ describe("detectBoardIssue — the common unreadable minimum", () => {
     const r = detectBoardIssue(JSON.stringify({ version: 99, todos: [{ id: "a" }] }));
     expect(r.kind).toBe("future-version");
     expect(r.version).toBe(99);
+    expect(r.data.todos).toHaveLength(1);
+  });
+
+  it("flags a version below CURRENT as stale, not unreadable, and keeps the data", () => {
+    const r = detectBoardIssue(JSON.stringify({ version: 1, todos: [{ id: "a" }] }));
+    expect(r.kind).toBe("stale-version");
+    expect(r.version).toBe(1);
     expect(r.data.todos).toHaveLength(1);
   });
 
@@ -134,6 +141,15 @@ describe("readBoardTolerant — the forgiving read + backup", () => {
     expect(data.todos).toHaveLength(1);
     expect(readdirSync(dir).some((f) => f.includes(".corrupt-"))).toBe(false);
   });
+
+  it("returns the parsed data without a backup for a stale version", () => {
+    writeFileSync(file, JSON.stringify({ version: 1, todos: [{ id: "a", number: 1 }] }));
+    const { data, issue } = readBoardTolerant(file);
+    expect(issue.kind).toBe("stale-version");
+    expect(issue.version).toBe(1);
+    expect(data.todos).toHaveLength(1);
+    expect(readdirSync(dir).some((f) => f.includes(".corrupt-"))).toBe(false);
+  });
 });
 
 describe("recoveryLine / refusalFor — message shapes", () => {
@@ -160,6 +176,15 @@ describe("recoveryLine / refusalFor — message shapes", () => {
     expect(err.exitCode).toBe(4);
   });
 
+  it("formats the stale-version refusal exactly per spec", () => {
+    const err = refusalFor({ kind: "stale-version", file: "C:\\x\\todos.json", version: 1 });
+    expect(err.message).toBe(
+      `board version 1 is older than this writer (CURRENT ${CURRENT}) and needs migration: C:\\x\\todos.json — open the tracker's task window, then retry`,
+    );
+    expect(err.reason).toBe("stale-version");
+    expect(err.exitCode).toBe(4);
+  });
+
   it("recoveryLine names the source file and the backup for an unreadable board", () => {
     const line = recoveryLine({
       kind: "unreadable",
@@ -175,5 +200,12 @@ describe("recoveryLine / refusalFor — message shapes", () => {
     const line = recoveryLine({ kind: "future-version", file: "C:\\x\\todos.json", version: 99 });
     expect(line).toContain("99");
     expect(line).toContain(String(CURRENT));
+  });
+
+  it("formats the stale-version recovery line exactly per spec", () => {
+    const line = recoveryLine({ kind: "stale-version", file: "C:\\x\\todos.json", version: 1 });
+    expect(line).toBe(
+      `board recovery: C:\\x\\todos.json is version 1 (CURRENT ${CURRENT}) — reading known fields, not writing; open the tracker's task window to migrate, then retry`,
+    );
   });
 });

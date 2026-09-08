@@ -60,7 +60,7 @@ const auto = (number, extra = {}) => task(number, { kind: "auto", verify: "npm t
 const changeRoot = (number, children, extra = {}) =>
   task(number, { change: true, depends_on: children.map((n) => `id-${n}`), ...extra });
 
-const board = (...todos) => ({ version: 1, todos });
+const board = (...todos) => ({ version: 2, todos });
 const deps = (...ns) => ns.map((n) => `id-${n}`);
 
 const tick = () => new Promise((r) => setTimeout(r, 0));
@@ -702,7 +702,7 @@ describe("liveEffects — the board seam", () => {
     writeFileSync(
       path.join(appDir, "todos.json"),
       JSON.stringify({
-        version: 1,
+        version: 2,
         todos: [{ id: "id-2", number: 2, subject: "task 2", status: "queue" }],
       }),
     );

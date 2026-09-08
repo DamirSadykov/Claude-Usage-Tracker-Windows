@@ -395,7 +395,7 @@ describe("board lock — concurrent CLI writers", () => {
   it("two children racing to steal one stale lock leave exactly one holder and no .stale- file", async () => {
     dir = mkdtempSync(path.join(os.tmpdir(), "lock-cli-"));
     mkdirSync(path.join(dir, "com.claude-usage-tracker.app"), { recursive: true });
-    writeFileSync(boardFile(), JSON.stringify({ version: 1, todos: [] }));
+    writeFileSync(boardFile(), JSON.stringify({ version: 2, todos: [] }));
     writeFileSync(
       boardLockPath(boardFile()),
       JSON.stringify({ pid: DEAD_PID, writer: "cli", at: new Date().toISOString() }),

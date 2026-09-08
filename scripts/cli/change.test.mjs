@@ -273,7 +273,7 @@ describe("cli change", () => {
     writeFileSync(
       board,
       JSON.stringify({
-        version: 1,
+        version: 2,
         todos: [
           { id: "t-1", number: 1, subject: "первая", status: "backlog", project: "board" },
           { id: "t-2", number: 2, subject: "вторая", status: "done", project: "board" },

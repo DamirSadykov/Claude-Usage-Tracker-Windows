@@ -29,6 +29,7 @@ import {
   isChangeRoot,
   formatDeclarations,
   normalizeLimit,
+  setFieldNames,
   resolveTask,
   taskSessionsPath,
   currentSessionId,
@@ -64,7 +65,7 @@ describe("todos list scope and pagination", () => {
         project: currentProject,
       })),
     ];
-    writeFileSync(path.join(appDir, "todos.json"), JSON.stringify({ version: 1, todos }));
+    writeFileSync(path.join(appDir, "todos.json"), JSON.stringify({ version: 2, todos }));
   });
   afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
@@ -545,7 +546,7 @@ describe("todos take without a session id", () => {
     writeFileSync(
       path.join(appDir, "todos.json"),
       JSON.stringify({
-        version: 1,
+        version: 2,
         todos: [{ id: "task-uuid", number: 1, subject: "s", status: "in_progress", project: "p" }],
       }),
     );
@@ -562,7 +563,9 @@ describe("todos take without a session id", () => {
   });
 
   it("fails with a message naming the variable and the --session escape", () => {
-    const env = { ...process.env };
+    const dir = mkdtempSync(path.join(os.tmpdir(), "cut-take-no-session-"));
+    mkdirSync(path.join(dir, "com.claude-usage-tracker.app"), { recursive: true });
+    const env = { ...process.env, APPDATA: dir };
     delete env.CLAUDE_CODE_SESSION_ID;
     let stderr = "";
     let failed = false;
@@ -572,6 +575,7 @@ describe("todos take without a session id", () => {
       failed = true;
       stderr = String(e.stderr || "");
     }
+    rmSync(dir, { recursive: true, force: true });
     expect(failed).toBe(true);
     expect(stderr).toContain("CLAUDE_CODE_SESSION_ID");
     expect(stderr).toContain("--session");
@@ -678,7 +682,7 @@ describe("declaration commands", () => {
     const appDir = path.join(dir, "com.claude-usage-tracker.app");
     mkdirSync(appDir, { recursive: true });
     file = path.join(appDir, "todos.json");
-    writeFileSync(file, JSON.stringify({ version: 1, todos }, null, 2));
+    writeFileSync(file, JSON.stringify({ version: 2, todos }, null, 2));
   };
 
   const todo = (number, extra = {}) => ({
@@ -910,7 +914,7 @@ describe("todos pipeline declarations", () => {
     dir = mkdtempSync(path.join(os.tmpdir(), "cut-pipe-"));
     const appDir = path.join(dir, "com.claude-usage-tracker.app");
     mkdirSync(appDir, { recursive: true });
-    writeFileSync(path.join(appDir, "todos.json"), JSON.stringify({ version: 1, todos }, null, 2));
+    writeFileSync(path.join(appDir, "todos.json"), JSON.stringify({ version: 2, todos }, null, 2));
   };
 
   const pipeline = (...args) =>
@@ -1036,7 +1040,7 @@ describe("todos set", () => {
     const appDir = path.join(dir, "com.claude-usage-tracker.app");
     mkdirSync(appDir, { recursive: true });
     file = path.join(appDir, "todos.json");
-    writeFileSync(file, JSON.stringify({ version: 1, todos }, null, 2));
+    writeFileSync(file, JSON.stringify({ version: 2, todos }, null, 2));
   };
 
   const todo = (number, extra = {}) => ({
@@ -1227,7 +1231,7 @@ describe("todos add: subject cap", () => {
     const appDir = path.join(dir, "com.claude-usage-tracker.app");
     mkdirSync(appDir, { recursive: true });
     file = path.join(appDir, "todos.json");
-    writeFileSync(file, JSON.stringify({ version: 1, todos: [] }, null, 2));
+    writeFileSync(file, JSON.stringify({ version: 2, todos: [] }, null, 2));
   });
   afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
@@ -1282,7 +1286,7 @@ describe("rules the CLI enforces instead of explaining", () => {
     const appDir = path.join(dir, "com.claude-usage-tracker.app");
     mkdirSync(appDir, { recursive: true });
     file = path.join(appDir, "todos.json");
-    writeFileSync(file, JSON.stringify({ version: 1, todos }, null, 2));
+    writeFileSync(file, JSON.stringify({ version: 2, todos }, null, 2));
   };
 
   const todo = (number, extra = {}) => ({
@@ -1454,23 +1458,7 @@ describe("the text and the CLI agree", () => {
       windowsHide: true,
     });
 
-  const fields = (() => {
-    let out = "";
-    try {
-      execFileSync(process.execPath, [cli, "todos", "set"], {
-        encoding: "utf8",
-        stdio: "pipe",
-        windowsHide: true,
-      });
-    } catch (e) {
-      out = String(e.stderr || "");
-    }
-    return out
-      .split("fields:")[1]
-      .split("\n")
-      .map((l) => l.trim().split(/\s/)[0])
-      .filter(Boolean);
-  })();
+  const fields = setFieldNames();
 
   it("names in `pipeline` no command or field the CLI does not have", () => {
     const help = say("--help");
@@ -1653,9 +1641,33 @@ describe("todos — board recovery & versions (t#575)", () => {
     });
   });
 
-  it("stamps version 2 on save even when the file never carried one", () => {
+  describe("fixture v1/full.json", () => {
+    beforeEach(() => putFixture("v1/full.json"));
+
+    it("refuses a mutating command with exit 4 and leaves the file untouched", () => {
+      const before = readFileSync(boardFile);
+      const { code, err } = run("add", "x");
+      expect(code).toBe(4);
+      expect(err).toContain("board version 1 is older than this writer (CURRENT 2) and needs migration");
+      expect(readFileSync(boardFile).equals(before)).toBe(true);
+      expect(corruptBackups()).toHaveLength(0);
+    });
+
+    it("lets a reading command through and names both versions in the recovery line", () => {
+      const { code, out, err } = run("list", "--all", "--json");
+      expect(code).toBe(0);
+      expect(err).toMatch(/board recovery:.*version 1.*CURRENT 2/);
+      expect(JSON.parse(out)).toHaveLength(3);
+    });
+  });
+
+  it("treats a missing version as version 1 and refuses a write", () => {
     writeFileSync(boardFile, JSON.stringify({ todos: [] }));
-    expect(run("add", "no version on disk yet").code).toBe(0);
-    expect(JSON.parse(readFileSync(boardFile, "utf8")).version).toBe(2);
+    const before = readFileSync(boardFile);
+    const { code, err } = run("add", "no version on disk yet");
+    expect(code).toBe(4);
+    expect(err).toContain("board version 1 is older than this writer (CURRENT 2) and needs migration");
+    expect(readFileSync(boardFile).equals(before)).toBe(true);
+    expect(corruptBackups()).toHaveLength(0);
   });
 });

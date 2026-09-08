@@ -592,7 +592,7 @@ describe("cli todos set spec — validated against the registry at write time", 
   const savedAppData = process.env.APPDATA;
 
   const task = (n, extra = {}) => ({ id: `t${n}`, number: n, subject: `узел ${n}`, status: "queue", ...extra });
-  const board = (...todos) => writeFileSync(boardFile, JSON.stringify({ version: 1, todos }, null, 2));
+  const board = (...todos) => writeFileSync(boardFile, JSON.stringify({ version: 2, todos }, null, 2));
 
   const todosCli = (...args) => {
     try {
@@ -734,7 +734,7 @@ describe("cli spec answer — the structural closing answer (t#341)", () => {
     status: "review",
     ...extra,
   });
-  const board = (...todos) => writeFileSync(boardFile, JSON.stringify({ version: 1, todos }, null, 2));
+  const board = (...todos) => writeFileSync(boardFile, JSON.stringify({ version: 2, todos }, null, 2));
   const saved = (n = 0) => JSON.parse(readFileSync(boardFile, "utf8")).todos[n];
 
   const specCli = (...args) => {
@@ -948,7 +948,7 @@ describe("cli spec answer updated — refuses to stamp a section holding a task 
       boardFile,
       JSON.stringify(
         {
-          version: 1,
+          version: 2,
           todos: [{ id: "t1", number: 1, subject: "узел 1", status: "review", spec: ["tasks#model"] }],
         },
         null,
@@ -1065,7 +1065,7 @@ describe("answering about an address the registry lost (audit 1.2)", () => {
       boardFile,
       JSON.stringify(
         {
-          version: 1,
+          version: 2,
           todos: [{ id: "t1", number: 1, subject: "узел 1", status: "review", spec: ["tasks#model"] }],
         },
         null,
@@ -1131,7 +1131,7 @@ describe("cli todos set spec none — refused on a closing task (audit 1.1)", ()
       boardFile,
       JSON.stringify(
         {
-          version: 1,
+          version: 2,
           todos: [{ id: "t1", number: 1, subject: "узел 1", status, spec: ["tasks#model"] }],
         },
         null,
@@ -1290,7 +1290,7 @@ describe("`updated` must be backed by an actual edit (t#352)", () => {
       boardFile,
       JSON.stringify(
         {
-          version: 1,
+          version: 2,
           todos: [{ id: "t1", number: 1, subject: "узел 1", status: "queue", spec: ["tasks#model"] }],
         },
         null,
@@ -1406,7 +1406,7 @@ describe("attributing a single bullet to the task that wrote it (t#353)", () => 
       boardFile,
       JSON.stringify(
         {
-          version: 1,
+          version: 2,
           todos: [{ id: "t1", number: 7, subject: "узел", status: "queue", spec: ["tasks#model"] }],
         },
         null,
@@ -1663,7 +1663,7 @@ describe("cli spec match — command wiring (t#342)", () => {
       boardFile,
       JSON.stringify(
         {
-          version: 1,
+          version: 2,
           todos: [
             {
               id: "t1",

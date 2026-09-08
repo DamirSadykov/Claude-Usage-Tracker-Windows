@@ -258,7 +258,7 @@ describe("cli.mjs hook (stdin payload)", () => {
     writeFileSync(
       path.join(appDir, "todos.json"),
       JSON.stringify({
-        version: 1,
+        version: 2,
         todos: [
           {
             id: "task-uuid",

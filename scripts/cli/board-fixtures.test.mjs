@@ -30,40 +30,44 @@ const stage = (relative) => {
 const corruptBackups = () => readdirSync(dir).filter((f) => f.includes(".corrupt-"));
 
 describe("matrix row: v1/*.json (version 1) — CLI v2 writer", () => {
-  it("v1/empty.json migrates version to 2 with an empty board", () => {
+  it("v1/empty.json is readable but a CLI write refuses without changing it or creating a backup", () => {
     stage("v1/empty.json");
+    const before = readFileSync(file);
     const data = loadBoard(file);
     expect(data.version).toBe(1);
     expect(data.todos).toEqual([]);
 
-    saveBoard(file, data);
-    const reread = loadBoard(file);
-    expect(reread.version).toBe(CURRENT);
-    expect(reread.todos).toEqual([]);
+    let caught;
+    try {
+      saveBoard(file, data);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(BoardUnreadableError);
+    expect(caught.exitCode).toBe(4);
+    expect(caught.message).toContain(`board version 1 is older than this writer (CURRENT ${CURRENT})`);
+    expect(readFileSync(file).equals(before)).toBe(true);
+    expect(corruptBackups()).toHaveLength(0);
   });
 
-  it("v1 board keeps its plan fields as-is on a CLI write (no field-role migration on Node)", () => {
+  it("v1/full.json is readable but a CLI write refuses without changing it or creating a backup", () => {
     stage("v1/full.json");
+    const before = readFileSync(file);
     const data = loadBoard(file);
     expect(data.version).toBe(1);
     expect(data.todos).toHaveLength(3);
 
-    saveBoard(file, data);
-    const reread = loadBoard(file);
-    expect(reread.version).toBe(2);
-
-    const [t1, t2, t3] = reread.todos;
-    expect(t1.status).toBe("pending");
-    expect(t1.plan).toBe("");
-
-    expect(t2.status).toBe("done");
-    expect(t2.plan).toBe(".claude/phases/my-feature");
-    expect(t2.comments).toBeUndefined();
-
-    expect(t3.status).toBe("in_progress");
-    expect(t3.plan).toContain("# План: фича");
-    expect(t3.plan).toContain("## Steps");
-    expect(t3.description).toBeUndefined();
+    let caught;
+    try {
+      saveBoard(file, data);
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(BoardUnreadableError);
+    expect(caught.exitCode).toBe(4);
+    expect(caught.message).toContain(`board version 1 is older than this writer (CURRENT ${CURRENT})`);
+    expect(readFileSync(file).equals(before)).toBe(true);
+    expect(corruptBackups()).toHaveLength(0);
   });
 });
 

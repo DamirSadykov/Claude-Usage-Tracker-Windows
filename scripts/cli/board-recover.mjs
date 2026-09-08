@@ -35,6 +35,7 @@ export function detectBoardIssue(raw) {
 
   const version = Number.isInteger(parsed.version) ? parsed.version : 1;
   if (version > CURRENT) return { kind: "future-version", data: parsed, version };
+  if (version < CURRENT) return { kind: "stale-version", data: parsed, version };
   return { kind: "ok", data: { ...parsed, version } };
 }
 
@@ -95,6 +96,8 @@ export function readBoardTolerant(file) {
   if (result.kind === "ok") return { data: result.data, issue: null };
   if (result.kind === "future-version")
     return { data: result.data, issue: { kind: "future-version", file, version: result.version } };
+  if (result.kind === "stale-version")
+    return { data: result.data, issue: { kind: "stale-version", file, version: result.version } };
 
   const backup = ensureCorruptBackup(file, raw);
   return {
@@ -112,6 +115,8 @@ export function readBoardTolerant(file) {
 export function recoveryLine(issue) {
   if (issue.kind === "future-version")
     return `board recovery: ${issue.file} is version ${issue.version} (CURRENT ${CURRENT}) — reading known fields, not writing`;
+  if (issue.kind === "stale-version")
+    return `board recovery: ${issue.file} is version ${issue.version} (CURRENT ${CURRENT}) — reading known fields, not writing; open the tracker's task window to migrate, then retry`;
   const backupPart = issue.backup
     ? `backup: ${issue.backup}`
     : `backup: none${issue.backupError ? ` (${issue.backupError.message || issue.backupError})` : ""}`;
@@ -123,6 +128,11 @@ export function refusalFor(issue) {
     return new BoardUnreadableError(
       `board version ${issue.version} is newer than this writer (CURRENT ${CURRENT}): ${issue.file}`,
       { file: issue.file, backup: null, reason: "future-version" },
+    );
+  if (issue.kind === "stale-version")
+    return new BoardUnreadableError(
+      `board version ${issue.version} is older than this writer (CURRENT ${CURRENT}) and needs migration: ${issue.file} — open the tracker's task window, then retry`,
+      { file: issue.file, backup: null, reason: "stale-version" },
     );
   return new BoardUnreadableError(
     `board unreadable (${issue.reason}): ${issue.file} — backup: ${issue.backup || "none"}`,

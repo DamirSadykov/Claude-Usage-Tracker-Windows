@@ -43,7 +43,7 @@ const errorResult = (id) =>
 
 // A board of tasks; rows are [number, extra].
 const board = (...rows) => ({
-  version: 1,
+  version: 2,
   todos: rows.map(([number, extra = {}]) => ({
     id: `id-${number}`,
     number,
@@ -537,7 +537,7 @@ describe("outcome --write (end to end)", () => {
     const appDir = path.join(dir, "com.claude-usage-tracker.app");
     mkdirSync(appDir, { recursive: true });
     file = path.join(appDir, "todos.json");
-    writeFileSync(file, JSON.stringify({ version: 1, todos }, null, 2));
+    writeFileSync(file, JSON.stringify({ version: 2, todos }, null, 2));
   };
 
   // No journal and no transcripts under this APPDATA → no blocks, so a declared
@@ -652,7 +652,7 @@ describe("outcome weak file evidence (end to end, t#520)", () => {
     const appDir = path.join(dir, "com.claude-usage-tracker.app");
     mkdirSync(appDir, { recursive: true });
     file = path.join(appDir, "todos.json");
-    writeFileSync(file, JSON.stringify({ version: 1, todos }, null, 2));
+    writeFileSync(file, JSON.stringify({ version: 2, todos }, null, 2));
     proj = mkdtempSync(path.join(os.tmpdir(), "cut-outcome-proj-"));
   };
 

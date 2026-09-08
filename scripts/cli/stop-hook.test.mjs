@@ -407,7 +407,7 @@ describe("cli stop-hook — the spec guard end to end", () => {
   const board = (...todos) =>
     writeFileSync(
       path.join(dir, "com.claude-usage-tracker.app", "todos.json"),
-      JSON.stringify({ version: 1, todos }, null, 2),
+      JSON.stringify({ version: 2, todos }, null, 2),
     );
 
   // A transcript whose first record dates the session, and whose Bash tool_use
