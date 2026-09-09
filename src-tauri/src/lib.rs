@@ -2889,12 +2889,20 @@ fn spawn_todos_watch(app: AppHandle) {
         {
             let snap = app.state::<TodoSnapshot>();
             let mut guard = snap.0.lock().unwrap();
-            match todos::transact(&path, |file| Ok(todos::ensure_numbers(file))) {
-                Ok((file, _changed)) => {
+            match todos::transact_if(&path, |file| Ok((todos::ensure_numbers(file), ()))) {
+                Ok((file, ())) => {
                     *guard = todo_status_map(&file);
                 }
-                Err(e) => {
-                    warn!("todos watcher startup: skipping number backfill: {e}");
+                Err(todos::TransactError::Lock(e)) => {
+                    warn!("todos watcher startup: board lock unavailable, skipping number backfill: {e}");
+                    *guard = todo_status_map(&todos::load(&path));
+                }
+                Err(todos::TransactError::Unwritable(e)) => {
+                    warn!("todos watcher startup: board not writable, skipping number backfill: {e}");
+                    *guard = todo_status_map(&todos::load(&path));
+                }
+                Err(todos::TransactError::Failed(e)) => {
+                    warn!("todos watcher startup: number backfill failed: {e}");
                     *guard = todo_status_map(&todos::load(&path));
                 }
             }

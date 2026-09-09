@@ -721,15 +721,49 @@ pub fn write_export(path: &Path, file: &TodoFile) -> Result<(), String> {
     save(path, file)
 }
 
+#[derive(Debug)]
+pub enum TransactError {
+    Lock(String),
+    Unwritable(String),
+    Failed(String),
+}
+
+impl std::fmt::Display for TransactError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TransactError::Lock(e) | TransactError::Unwritable(e) | TransactError::Failed(e) => {
+                write!(f, "{e}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TransactError {}
+
+impl From<TransactError> for String {
+    fn from(e: TransactError) -> String {
+        e.to_string()
+    }
+}
+
+pub fn transact_if<T>(
+    path: &Path,
+    mutate: impl FnOnce(&mut TodoFile) -> Result<(bool, T), String>,
+) -> Result<(TodoFile, T), TransactError> {
+    let lock = board_lock::acquire(path).map_err(|e| TransactError::Lock(e.to_string()))?;
+    let mut file = load_for_write(path).map_err(TransactError::Unwritable)?;
+    let (changed, out) = mutate(&mut file).map_err(TransactError::Failed)?;
+    if changed {
+        save_locked(path, &file, &lock).map_err(TransactError::Failed)?;
+    }
+    Ok((file, out))
+}
+
 pub fn transact<T>(
     path: &Path,
     mutate: impl FnOnce(&mut TodoFile) -> Result<T, String>,
-) -> Result<(TodoFile, T), String> {
-    let lock = board_lock::acquire(path).map_err(|e| e.to_string())?;
-    let mut file = load_for_write(path)?;
-    let out = mutate(&mut file)?;
-    save_locked(path, &file, &lock)?;
-    Ok((file, out))
+) -> Result<(TodoFile, T), TransactError> {
+    transact_if(path, |file| mutate(file).map(|out| (true, out)))
 }
 
 pub fn replace_locked(path: &Path, mut file: TodoFile) -> Result<TodoFile, String> {
@@ -3012,6 +3046,54 @@ mod tests {
             assert!(!name.ends_with(".tmp"), "leftover tmp file: {name}");
         }
         assert_eq!(entries.len(), 1, "expected exactly the final todos.json, got {entries:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn transact_if_leaves_mtime_untouched_when_every_task_already_has_a_number() {
+        let dir = scratch_dir("transact-if-no-change");
+        let path = dir.join("todos.json");
+        let mut seed = TodoFile::default();
+        let mut t = todo("t1", "backlog");
+        t.number = 1;
+        seed.todos.push(t);
+        save(&path, &seed).unwrap();
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let (file, ()) = transact_if(&path, |file| Ok((ensure_numbers(file), ()))).unwrap();
+        assert_eq!(file.todos.len(), 1);
+
+        let after = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(before, after, "a no-op backfill must not rewrite the file");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn transact_if_writes_when_mutate_reports_a_change() {
+        let dir = scratch_dir("transact-if-change");
+        let path = dir.join("todos.json");
+        let mut seed = TodoFile::default();
+        seed.todos.push(todo("t1", "backlog"));
+        save(&path, &seed).unwrap();
+
+        let (file, ()) = transact_if(&path, |file| Ok((ensure_numbers(file), ()))).unwrap();
+        assert_eq!(file.todos[0].number, 1);
+
+        let reloaded = load(&path);
+        assert_eq!(reloaded.todos[0].number, 1, "a real change must be persisted");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn transact_reports_unwritable_board_as_its_own_error_kind() {
+        let dir = scratch_dir("transact-error-kinds");
+        let path = dir.join("todos.json");
+        std::fs::write(&path, "not json").unwrap();
+        match transact(&path, |file| Ok(ensure_numbers(file))) {
+            Err(TransactError::Unwritable(_)) => {}
+            other => panic!("expected Unwritable, got {other:?}"),
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
