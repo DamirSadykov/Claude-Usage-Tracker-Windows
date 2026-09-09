@@ -691,6 +691,9 @@ pub fn save(path: &Path, file: &TodoFile) -> Result<(), String> {
     json.push('\n');
     let tmp = tmp_path_for(path);
     std::fs::write(&tmp, json.as_bytes()).map_err(|e| e.to_string())?;
+    if board_lock::is_held_by_us(path) {
+        board_lock::reaffirm(path).map_err(|e| e.to_string())?;
+    }
     for _ in 0..5 {
         match std::fs::rename(&tmp, path) {
             Ok(()) => return Ok(()),
@@ -2824,6 +2827,29 @@ mod tests {
         let reloaded: TodoFile = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(reloaded.version, CURRENT_VERSION);
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_refuses_when_the_lock_it_holds_is_stolen_before_rename() {
+        let dir = scratch_dir("save-stolen-lock");
+        let path = dir.join("todos.json");
+        let lock = board_lock::acquire(&path).unwrap();
+        let lock_path = board_lock::lock_path_for(&path);
+        let thief_pid = std::process::id().wrapping_add(999_999).max(1);
+        std::fs::write(
+            &lock_path,
+            serde_json::json!({ "pid": thief_pid, "writer": "app", "at": chrono::Utc::now().to_rfc3339() })
+                .to_string(),
+        )
+        .unwrap();
+
+        let err = save(&path, &TodoFile::default()).unwrap_err();
+        assert!(err.contains("board locked"), "unexpected error: {err}");
+        assert!(!path.exists(), "the theft must block the rename, not just the message");
+
+        std::fs::remove_file(&lock_path).ok();
+        drop(lock);
         std::fs::remove_dir_all(&dir).ok();
     }
 
