@@ -131,6 +131,9 @@ function stealStaleLock(lock) {
 
 export function acquireBoardLock(file, { waitMs = BOARD_LOCK_WAIT_MS, writer = "cli" } = {}) {
   const lock = boardLockPath(file);
+  try {
+    fs.mkdirSync(path.dirname(lock), { recursive: true });
+  } catch {}
   const deadline = Date.now() + waitMs;
   for (;;) {
     const err = tryCreate(lock, writer);

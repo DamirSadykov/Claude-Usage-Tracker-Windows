@@ -53,6 +53,16 @@ describe("board lock — the primitive", () => {
     releaseBoardLock(third.lock);
   });
 
+  it("creates the board directory when it does not exist yet", () => {
+    dir = mkdtempSync(path.join(os.tmpdir(), "lock-"));
+    const file = path.join(dir, "fresh", "todos.json");
+    const got = acquireBoardLock(file, { waitMs: 0 });
+    expect(got.ok).toBe(true);
+    expect(existsSync(boardLockPath(file))).toBe(true);
+    releaseBoardLock(got.lock);
+    expect(existsSync(boardLockPath(file))).toBe(false);
+  });
+
   it("is re-entrant inside one process", () => {
     dir = mkdtempSync(path.join(os.tmpdir(), "lock-"));
     const file = path.join(dir, "todos.json");

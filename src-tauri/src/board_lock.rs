@@ -244,6 +244,9 @@ fn read_lock(lock_path: &Path) -> ReadOutcome {
 fn acquire_impl(board: &Path, timeout: Duration) -> Result<BoardLock, LockError> {
     let key = normalize_key(board);
     let lock_path = lock_path_for(board);
+    if let Some(dir) = lock_path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
     let pid = std::process::id();
     let me = std::thread::current().id();
     let deadline = Instant::now() + timeout;
@@ -399,6 +402,16 @@ mod tests {
         let dir = board.path().parent().unwrap();
         let entries: Vec<_> = std::fs::read_dir(dir).unwrap().flatten().collect();
         assert!(entries.is_empty(), "directory not clean: {:?}", entries);
+    }
+
+    #[test]
+    fn acquire_creates_missing_board_dir() {
+        let board = unique_board();
+        let nested = board.path().parent().unwrap().join("fresh").join("todos.json");
+        let lock = acquire_impl(&nested, Duration::from_millis(200)).unwrap();
+        assert!(lock_path_for(&nested).exists());
+        drop(lock);
+        assert!(!lock_path_for(&nested).exists());
     }
 
     #[test]
