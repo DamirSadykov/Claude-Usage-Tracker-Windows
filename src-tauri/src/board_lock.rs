@@ -174,10 +174,6 @@ fn write_lock_file(lock_path: &Path, pid: u32) -> std::io::Result<()> {
     f.write_all(lock_content(pid, "app").as_bytes())
 }
 
-fn write_lock_content(lock_path: &Path, pid: u32, writer: &str) -> std::io::Result<()> {
-    std::fs::write(lock_path, lock_content(pid, writer).as_bytes())
-}
-
 fn remove_stale(lock_path: &Path) {
     let pid = std::process::id();
     let mut stale_name = lock_path.file_name().map(|f| f.to_os_string()).unwrap_or_default();
@@ -321,10 +317,7 @@ fn reaffirm_at(lock_path: &Path) -> Result<(), LockError> {
     let pid = std::process::id();
     match read_lock(lock_path) {
         ReadOutcome::Content(content) => match parse_holder(&content) {
-            Some(holder) if holder.pid == pid => {
-                let _ = write_lock_content(lock_path, pid, &holder.writer);
-                Ok(())
-            }
+            Some(holder) if holder.pid == pid => Ok(()),
             Some(holder) => Err(LockError::Busy {
                 pid: holder.pid,
                 writer: holder.writer,
@@ -671,7 +664,7 @@ mod tests {
     }
 
     #[test]
-    fn reaffirm_refreshes_at_while_still_ours() {
+    fn reaffirm_leaves_the_lock_file_untouched_while_still_ours() {
         let board = unique_board();
         let lock = acquire_impl(board.path(), Duration::from_millis(200)).unwrap();
         let lock_path = lock_path_for(board.path());
@@ -681,7 +674,7 @@ mod tests {
         assert!(reaffirm(board.path()).is_ok());
 
         let after = std::fs::read_to_string(&lock_path).unwrap();
-        assert_ne!(before, after, "reaffirm must bump `at`");
+        assert_eq!(before, after, "reaffirm only re-reads ownership — it must not rewrite the file");
         drop(lock);
     }
 

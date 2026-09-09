@@ -181,9 +181,6 @@ export function reaffirmBoardLock(lock) {
       at: owner ? owner.at : null,
     });
   }
-  try {
-    fs.writeFileSync(lock, JSON.stringify({ pid: owner.pid, writer: owner.writer, at: new Date().toISOString() }));
-  } catch {}
 }
 
 export function renameWithRetry(tmp, file, { retries = 5, delayMs = 50 } = {}) {

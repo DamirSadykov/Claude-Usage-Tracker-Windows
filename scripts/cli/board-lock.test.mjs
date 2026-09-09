@@ -271,20 +271,20 @@ describe("board lock — the rename guard (t#598)", () => {
     dir = null;
   });
 
-  it("refreshes `at` and lets the rename through while the lock is still ours", () => {
+  it("leaves the lock file untouched and lets the rename through while the lock is still ours", () => {
     dir = mkdtempSync(path.join(os.tmpdir(), "lock-"));
     const file = path.join(dir, "todos.json");
     const held = acquireBoardLock(file, { waitMs: 0 });
     expect(held.ok).toBe(true);
-    const before = JSON.parse(readFileSync(held.lock, "utf8")).at;
+    const before = readFileSync(held.lock, "utf8");
 
     const tmp = `${file}.${process.pid}.tmp`;
     writeFileSync(tmp, "content");
     renameWithRetry(tmp, file);
 
     expect(readFileSync(file, "utf8")).toBe("content");
-    const after = JSON.parse(readFileSync(held.lock, "utf8")).at;
-    expect(after >= before).toBe(true);
+    const after = readFileSync(held.lock, "utf8");
+    expect(after).toBe(before);
     releaseBoardLock(held.lock);
   });
 
