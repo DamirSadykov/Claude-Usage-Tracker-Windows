@@ -2768,8 +2768,10 @@ mod tests {
     #[test]
     fn backup_failure_does_not_fail_read() {
         let dir = scratch_dir("backup-failure");
-        let missing = dir.join("missing").join("todos.json");
-        assert!(ensure_corrupt_backup(&missing, "{", Duration::ZERO).is_none());
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, "not a directory").unwrap();
+        let unwritable = blocker.join("todos.json");
+        assert!(ensure_corrupt_backup(&unwritable, "{", Duration::ZERO).is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 
