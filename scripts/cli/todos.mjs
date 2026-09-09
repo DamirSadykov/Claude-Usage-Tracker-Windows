@@ -40,7 +40,7 @@
 // Exit code is non-zero on any error (bad status, unknown id, usage), so a
 // caller can tell success from failure.
 
-import { readFileSync, writeFileSync, renameSync, appendFileSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, appendFileSync, mkdirSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { spawn, execFileSync } from "node:child_process";
 import path from "node:path";
@@ -48,7 +48,10 @@ import { fileURLToPath } from "node:url";
 import { matchPlanCli, specsEnabled } from "./settings.mjs";
 import { resolveAddress, showSection, sectionFingerprint, blocksOf } from "./spec.mjs";
 import { findChange, changeAddress } from "./change.mjs";
-import { withBoardLock } from "./board-lock.mjs";
+import { withBoardLock, renameWithRetry } from "./board-lock.mjs";
+import { CURRENT, BoardUnreadableError, readBoardTolerant, recoveryLine, refusalFor } from "./board-recover.mjs";
+
+export { CURRENT, BoardUnreadableError };
 
 // Kanban columns, in board order. Keep in lockstep with todos.rs::STATUSES.
 export const STATUSES = ["backlog", "queue", "in_progress", "review", "done"];
@@ -145,15 +148,19 @@ function todosPath() {
 
 // A missing/corrupt file yields an empty store rather than throwing — same
 // forgiving contract as todos.rs::load.
+const printedRecovery = new Set();
+
 function load(file) {
-  try {
-    const data = JSON.parse(readFileSync(file, "utf8"));
-    if (!data || !Array.isArray(data.todos)) return { version: 1, todos: [] };
-    if (typeof data.version !== "number") data.version = 1;
-    return data;
-  } catch {
-    return { version: 1, todos: [] };
+  const { data, issue } = readBoardTolerant(file);
+  if (issue) {
+    const key = `${issue.kind}:${file}`;
+    if (!printedRecovery.has(key)) {
+      printedRecovery.add(key);
+      process.stderr.write(recoveryLine(issue) + "\n");
+    }
+    Object.defineProperty(data, "__boardIssue", { value: issue, enumerable: false, configurable: true });
   }
+  return data;
 }
 
 // Association groups live next to todos.json (project-groups.json), written by
@@ -191,13 +198,16 @@ function relatedProjects(project) {
 // (rename replaces the destination on Windows). 2-space pretty-print matches the
 // tracker's serde output so hand-readable diffs stay stable.
 function save(file, data) {
+  const issue = data && data.__boardIssue;
+  if (issue) throw refusalFor(issue);
   if (deferred) {
     deferred.dirty = true;
     return;
   }
+  data.version = CURRENT;
   const tmp = `${file}.${process.pid}.tmp`;
   writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n");
-  renameSync(tmp, file);
+  renameWithRetry(tmp, file);
 }
 
 // A command that writes ONE row saves after it and is atomic by construction.
@@ -240,6 +250,12 @@ function fail(msg) {
 // the path and the JSON contract on their own.
 export const boardPath = () => todosPath();
 export const loadBoard = (file = todosPath()) => load(file);
+export function assertBoardWritable(data) {
+  const issue = data && data.__boardIssue;
+  if (issue) throw refusalFor(issue);
+  return data;
+}
+export const loadBoardForWrite = (file = todosPath()) => assertBoardWritable(load(file));
 export const saveBoard = (file, data) => save(file, data);
 
 export function taskSessionsPath() {
@@ -334,7 +350,7 @@ function cmdTake(args) {
     );
   }
   const file = todosPath();
-  const data = load(file);
+  const data = loadBoardForWrite(file);
   const todo = resolveTask(data, id);
   if (!todo) fail(`no todo with id ${id}`);
   const written = appendTaskSessionEvent({
@@ -622,7 +638,7 @@ const PRODUCES_USAGE =
 function cmdProduces(args) {
   const [sub, ...rest] = args;
   const file = todosPath();
-  const data = load(file);
+  const data = loadBoardForWrite(file);
   if (sub === "add" || sub === "rm") {
     const t = resolveTask(data, rest[0]);
     const item = String(rest[1] ?? "").trim();
@@ -1116,7 +1132,7 @@ function cmdSet(args) {
   if (typeof value !== "string")
     fail(`usage: cli todos set ${field} <task> ${spec.values}`);
   const file = todosPath();
-  const data = load(file);
+  const data = loadBoardForWrite(file);
   const todo = resolveTask(data, task);
   if (!todo) fail(`no todo with id ${task}`);
   setField({ data, file, todo, field, value, flags });
@@ -1174,7 +1190,7 @@ function cmdAdd(args) {
     kind = k;
   }
   const file = todosPath();
-  const data = load(file);
+  const data = loadBoardForWrite(file);
   const cwdProject = path.basename(process.cwd().replace(/[\\/]+$/, ""));
   // Project resolution (issue #54): a bare `add` defaults to the CURRENT project
   // (cwd basename), mirroring `todos list` and the SessionStart hook — a follow-up
@@ -1277,7 +1293,7 @@ const RM_USAGE =
 function cmdRemove(args) {
   const { positional, flags } = parseArgs(args);
   const file = todosPath();
-  const data = load(file);
+  const data = loadBoardForWrite(file);
   const todo = resolveTask(data, positional[0]);
   if (!todo) fail(RM_USAGE);
 
@@ -1360,7 +1376,7 @@ function cmdComment(args) {
     if (!id || !body.trim()) fail(COMMENT_USAGE);
     const author = flags.by === "user" ? "user" : "claude";
     const file = todosPath();
-    const data = load(file);
+    const data = loadBoardForWrite(file);
     const todo = resolveTask(data, id); // id | N | #N, as the help promises
     if (!todo) fail(`no todo with id ${id}`);
     if (!Array.isArray(todo.comments)) todo.comments = [];
@@ -1624,7 +1640,7 @@ const DEP_USAGE =
 function cmdDep(args) {
   const [sub, ...rest] = args;
   const file = todosPath();
-  const data = load(file);
+  const data = loadBoardForWrite(file);
   if (sub === "add" || sub === "rm") {
     const from = resolveTask(data, rest[0]);
     const on = resolveTask(data, rest[1]);
@@ -1702,7 +1718,7 @@ const REF_USAGE =
 function cmdRef(args) {
   const [sub, ...rest] = args;
   const file = todosPath();
-  const data = load(file);
+  const data = loadBoardForWrite(file);
   if (sub === "add" || sub === "rm") {
     const from = resolveTask(data, rest[0]);
     const to = resolveTask(data, rest[1]);
@@ -2038,7 +2054,7 @@ const HANDOFF_USAGE =
 function cmdHandoff(args) {
   const [sub, ...rest] = args;
   const file = todosPath();
-  const data = load(file);
+  const data = loadBoardForWrite(file);
 
   // WRITE — set / clear this task's own handoff.
   if (sub === "set" || sub === "clear") {

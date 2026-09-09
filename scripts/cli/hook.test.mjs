@@ -6,7 +6,7 @@
 // Ambiguity (two in_progress) and repeat hook runs must NOT produce records.
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -258,7 +258,7 @@ describe("cli.mjs hook (stdin payload)", () => {
     writeFileSync(
       path.join(appDir, "todos.json"),
       JSON.stringify({
-        version: 1,
+        version: 2,
         todos: [
           {
             id: "task-uuid",
@@ -505,5 +505,22 @@ describe("cli.mjs hook (stdin payload)", () => {
     const resumeOut = runHook(undefined, "resume");
     expect(resumeOut).toContain("c#7");
     expect(resumeOut).toContain("что меняем в этом заходе");
+  });
+
+  it("does not fail on an unreadable board — prints one recovery line and still injects context", () => {
+    setup(null);
+    writeFileSync(path.join(appDir, "todos.json"), "{ not json");
+    const env = { ...process.env, APPDATA: dir };
+    delete env.CLAUDE_CODE_SESSION_ID;
+    const r = spawnSync(process.execPath, [cli, "hook"], {
+      env,
+      encoding: "utf8",
+      input: JSON.stringify({ cwd: "D:\\work\\proj", session_id: "sess-e2e" }),
+      windowsHide: true,
+    });
+    expect(r.status).toBe(0);
+    expect(r.stderr).toMatch(/board recovery:.*unreadable/);
+    expect(r.stdout).toContain("The Claude Usage Tracker is available");
+    expect(written()).toHaveLength(0);
   });
 });

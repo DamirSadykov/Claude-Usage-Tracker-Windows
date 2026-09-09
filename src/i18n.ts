@@ -443,6 +443,14 @@ const messages = {
     todoSearch: "Search",
     todoDropHere: "Drop here",
     todoColEmpty: "No tasks",
+    boardUnreadable:
+      "The board file is unreadable ({reason}). Reading continues with an empty board — nothing is written until this is fixed.",
+    boardFutureVersion:
+      "The board file is version {version}, newer than this app (current {current}). Reading works; nothing is written.",
+    boardBackupAt: "Forensic copy saved at: {path}",
+    boardNoBackup: "Corrupt copy could not be saved.",
+    boardRestorePeriodicBackup:
+      "Restore rolls back to the last periodic backup: backups/{path}.",
     todoComments: "Comments",
     todoCommentPlaceholder: "Write a comment…",
     todoCommentAdd: "Comment",
@@ -1258,6 +1266,14 @@ const messages = {
     todoSearch: "Поиск",
     todoDropHere: "Отпустите здесь",
     todoColEmpty: "Нет задач",
+    boardUnreadable:
+      "Файл доски не читается ({reason}). Чтение продолжает работать с пустой доской — запись отключена, пока это не исправлено.",
+    boardFutureVersion:
+      "Файл доски версии {version}, новее приложения (текущая {current}). Чтение работает, запись отключена.",
+    boardBackupAt: "Судебная копия сохранена: {path}",
+    boardNoBackup: "Не удалось сохранить копию повреждённого файла.",
+    boardRestorePeriodicBackup:
+      "Кнопка «Восстановить» откатит доску к последней периодической резервной копии: {path}.",
     todoComments: "Комментарии",
     todoCommentPlaceholder: "Написать комментарий…",
     todoCommentAdd: "Отправить",

@@ -6,7 +6,7 @@
 // `vision <task>` and the in_progress anchor print.
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import {
   mkdtempSync,
   mkdirSync,
@@ -29,6 +29,7 @@ import {
   isChangeRoot,
   formatDeclarations,
   normalizeLimit,
+  setFieldNames,
   resolveTask,
   taskSessionsPath,
   currentSessionId,
@@ -64,7 +65,7 @@ describe("todos list scope and pagination", () => {
         project: currentProject,
       })),
     ];
-    writeFileSync(path.join(appDir, "todos.json"), JSON.stringify({ version: 1, todos }));
+    writeFileSync(path.join(appDir, "todos.json"), JSON.stringify({ version: 2, todos }));
   });
   afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
@@ -545,7 +546,7 @@ describe("todos take without a session id", () => {
     writeFileSync(
       path.join(appDir, "todos.json"),
       JSON.stringify({
-        version: 1,
+        version: 2,
         todos: [{ id: "task-uuid", number: 1, subject: "s", status: "in_progress", project: "p" }],
       }),
     );
@@ -562,7 +563,9 @@ describe("todos take without a session id", () => {
   });
 
   it("fails with a message naming the variable and the --session escape", () => {
-    const env = { ...process.env };
+    const dir = mkdtempSync(path.join(os.tmpdir(), "cut-take-no-session-"));
+    mkdirSync(path.join(dir, "com.claude-usage-tracker.app"), { recursive: true });
+    const env = { ...process.env, APPDATA: dir };
     delete env.CLAUDE_CODE_SESSION_ID;
     let stderr = "";
     let failed = false;
@@ -572,6 +575,7 @@ describe("todos take without a session id", () => {
       failed = true;
       stderr = String(e.stderr || "");
     }
+    rmSync(dir, { recursive: true, force: true });
     expect(failed).toBe(true);
     expect(stderr).toContain("CLAUDE_CODE_SESSION_ID");
     expect(stderr).toContain("--session");
@@ -678,7 +682,7 @@ describe("declaration commands", () => {
     const appDir = path.join(dir, "com.claude-usage-tracker.app");
     mkdirSync(appDir, { recursive: true });
     file = path.join(appDir, "todos.json");
-    writeFileSync(file, JSON.stringify({ version: 1, todos }, null, 2));
+    writeFileSync(file, JSON.stringify({ version: 2, todos }, null, 2));
   };
 
   const todo = (number, extra = {}) => ({
@@ -910,7 +914,7 @@ describe("todos pipeline declarations", () => {
     dir = mkdtempSync(path.join(os.tmpdir(), "cut-pipe-"));
     const appDir = path.join(dir, "com.claude-usage-tracker.app");
     mkdirSync(appDir, { recursive: true });
-    writeFileSync(path.join(appDir, "todos.json"), JSON.stringify({ version: 1, todos }, null, 2));
+    writeFileSync(path.join(appDir, "todos.json"), JSON.stringify({ version: 2, todos }, null, 2));
   };
 
   const pipeline = (...args) =>
@@ -1036,7 +1040,7 @@ describe("todos set", () => {
     const appDir = path.join(dir, "com.claude-usage-tracker.app");
     mkdirSync(appDir, { recursive: true });
     file = path.join(appDir, "todos.json");
-    writeFileSync(file, JSON.stringify({ version: 1, todos }, null, 2));
+    writeFileSync(file, JSON.stringify({ version: 2, todos }, null, 2));
   };
 
   const todo = (number, extra = {}) => ({
@@ -1227,7 +1231,7 @@ describe("todos add: subject cap", () => {
     const appDir = path.join(dir, "com.claude-usage-tracker.app");
     mkdirSync(appDir, { recursive: true });
     file = path.join(appDir, "todos.json");
-    writeFileSync(file, JSON.stringify({ version: 1, todos: [] }, null, 2));
+    writeFileSync(file, JSON.stringify({ version: 2, todos: [] }, null, 2));
   });
   afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
@@ -1282,7 +1286,7 @@ describe("rules the CLI enforces instead of explaining", () => {
     const appDir = path.join(dir, "com.claude-usage-tracker.app");
     mkdirSync(appDir, { recursive: true });
     file = path.join(appDir, "todos.json");
-    writeFileSync(file, JSON.stringify({ version: 1, todos }, null, 2));
+    writeFileSync(file, JSON.stringify({ version: 2, todos }, null, 2));
   };
 
   const todo = (number, extra = {}) => ({
@@ -1454,23 +1458,7 @@ describe("the text and the CLI agree", () => {
       windowsHide: true,
     });
 
-  const fields = (() => {
-    let out = "";
-    try {
-      execFileSync(process.execPath, [cli, "todos", "set"], {
-        encoding: "utf8",
-        stdio: "pipe",
-        windowsHide: true,
-      });
-    } catch (e) {
-      out = String(e.stderr || "");
-    }
-    return out
-      .split("fields:")[1]
-      .split("\n")
-      .map((l) => l.trim().split(/\s/)[0])
-      .filter(Boolean);
-  })();
+  const fields = setFieldNames();
 
   it("names in `pipeline` no command or field the CLI does not have", () => {
     const help = say("--help");
@@ -1528,5 +1516,158 @@ describe("no call site left on an old setter name", () => {
       if (shell.test(text) || argv.test(text)) offenders.push(f);
     }
     expect(offenders).toEqual([]);
+  });
+});
+
+describe("todos — board recovery & versions (t#575)", () => {
+  const cli = path.join(fileURLToPath(new URL(".", import.meta.url)), "..", "cli.mjs");
+  const FIXTURES = path.join(fileURLToPath(new URL(".", import.meta.url)), "..", "..", "tests", "board-fixtures");
+  let dir;
+  let boardFile;
+
+  const run = (...args) => {
+    const r = spawnSync(process.execPath, [cli, "todos", ...args], {
+      encoding: "utf8",
+      env: { ...process.env, APPDATA: dir },
+      windowsHide: true,
+    });
+    return { code: r.status, out: r.stdout || "", err: r.stderr || "" };
+  };
+
+  const putFixture = (relPath) => {
+    writeFileSync(boardFile, readFileSync(path.join(FIXTURES, relPath)));
+  };
+
+  const corruptBackups = () =>
+    readdirSync(path.join(dir, "com.claude-usage-tracker.app")).filter((f) => f.includes(".corrupt-"));
+
+  beforeEach(() => {
+    dir = mkdtempSync(path.join(os.tmpdir(), "cut-recover-"));
+    mkdirSync(path.join(dir, "com.claude-usage-tracker.app"), { recursive: true });
+    boardFile = path.join(dir, "com.claude-usage-tracker.app", "todos.json");
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  for (const name of ["truncated.json", "not-object.json", "todos-not-array.json", "empty-file.json"]) {
+    describe(`fixture corrupt/${name}`, () => {
+      beforeEach(() => putFixture(`corrupt/${name}`));
+
+      it("refuses twice, preserves the file, and creates one byte-identical backup", () => {
+        const before = readFileSync(boardFile);
+        const first = run("add", "x");
+        const second = run("add", "x");
+        expect(first.code).toBe(4);
+        expect(second.code).toBe(4);
+        expect(first.err).toMatch(/board unreadable \(/);
+        expect(readFileSync(boardFile).equals(before)).toBe(true);
+        const backups = corruptBackups();
+        expect(backups).toHaveLength(1);
+        expect(readFileSync(path.join(dir, "com.claude-usage-tracker.app", backups[0])).equals(before)).toBe(true);
+      });
+
+      it("lets a reading command through with exit 0, printing the recovery state", () => {
+        const { code, out, err } = run("list");
+        expect(code).toBe(0);
+        expect(err).toMatch(/board recovery:.*unreadable/);
+        expect(err).toContain(boardFile);
+        expect(out).not.toMatch(/board unreadable/);
+      });
+
+      it("does not touch the board file on a reading command either", () => {
+        const before = readFileSync(boardFile);
+        run("list");
+        expect(readFileSync(boardFile).equals(before)).toBe(true);
+      });
+    });
+  }
+
+  for (const [name, value] of [
+    ["todo-not-object", { todos: [{}, 1] }],
+    ["changes-not-array", { todos: [], changes: {} }],
+  ]) {
+    it(`refuses ${name} through the CLI`, () => {
+      writeFileSync(boardFile, JSON.stringify(value));
+      const before = readFileSync(boardFile);
+      const first = run("add", "x");
+      const second = run("add", "x");
+      expect(first.code).toBe(4);
+      expect(second.code).toBe(4);
+      expect(readFileSync(boardFile).equals(before)).toBe(true);
+      expect(corruptBackups()).toHaveLength(1);
+    });
+  }
+
+  it("Node still reads a todo whose field has the wrong type (asymmetry with Rust)", () => {
+    putFixture("corrupt/todo-field-type.json");
+    const { code, out, err } = run("list", "--all", "--json");
+    expect(code).toBe(0);
+    expect(err).not.toMatch(/board recovery/);
+    const printed = JSON.parse(out);
+    expect(printed.some((t) => t.subject.includes("число записано строкой"))).toBe(true);
+  });
+
+  it("treats a missing file as an empty CURRENT board, not corruption", () => {
+    const { code, out, err } = run("list");
+    expect(code).toBe(0);
+    expect(err).toBe("");
+    expect(existsSync(boardFile)).toBe(false);
+
+    const added = run("add", "first task on a fresh board");
+    expect(added.code).toBe(0);
+    expect(corruptBackups()).toHaveLength(0);
+    expect(JSON.parse(readFileSync(boardFile, "utf8")).version).toBe(2);
+  });
+
+  describe("fixture v2/future-version.json", () => {
+    beforeEach(() => putFixture("v2/future-version.json"));
+
+    it("is readable: a reading command sees the task and prints the recovery state", () => {
+      const { code, out, err } = run("list", "--all", "--json");
+      expect(code).toBe(0);
+      expect(err).toMatch(/version 99.*CURRENT 2/);
+      expect(JSON.parse(out).some((t) => t.number === 60)).toBe(true);
+    });
+
+    it("refuses all early-write paths with exit 4 and leaves journals absent", () => {
+      const before = readFileSync(boardFile);
+      const take = run("take", "60", "--session", "test-session");
+      const status = run("set", "status", "60", "backlog");
+      expect(take.code).toBe(4);
+      expect(status.code).toBe(4);
+      expect(take.err).toContain("board version 99 is newer than this writer (CURRENT 2)");
+      expect(corruptBackups()).toHaveLength(0);
+      expect(readFileSync(boardFile).equals(before)).toBe(true);
+      expect(existsSync(path.join(dir, "com.claude-usage-tracker.app", "task-sessions.jsonl"))).toBe(false);
+    });
+  });
+
+  describe("fixture v1/full.json", () => {
+    beforeEach(() => putFixture("v1/full.json"));
+
+    it("refuses a mutating command with exit 4 and leaves the file untouched", () => {
+      const before = readFileSync(boardFile);
+      const { code, err } = run("add", "x");
+      expect(code).toBe(4);
+      expect(err).toContain("board version 1 is older than this writer (CURRENT 2) and needs migration");
+      expect(readFileSync(boardFile).equals(before)).toBe(true);
+      expect(corruptBackups()).toHaveLength(0);
+    });
+
+    it("lets a reading command through and names both versions in the recovery line", () => {
+      const { code, out, err } = run("list", "--all", "--json");
+      expect(code).toBe(0);
+      expect(err).toMatch(/board recovery:.*version 1.*CURRENT 2/);
+      expect(JSON.parse(out)).toHaveLength(3);
+    });
+  });
+
+  it("treats a missing version as version 1 and refuses a write", () => {
+    writeFileSync(boardFile, JSON.stringify({ todos: [] }));
+    const before = readFileSync(boardFile);
+    const { code, err } = run("add", "no version on disk yet");
+    expect(code).toBe(4);
+    expect(err).toContain("board version 1 is older than this writer (CURRENT 2) and needs migration");
+    expect(readFileSync(boardFile).equals(before)).toBe(true);
+    expect(corruptBackups()).toHaveLength(0);
   });
 });

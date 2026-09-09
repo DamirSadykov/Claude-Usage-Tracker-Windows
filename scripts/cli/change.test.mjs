@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, readdirSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -273,7 +273,7 @@ describe("cli change", () => {
     writeFileSync(
       board,
       JSON.stringify({
-        version: 1,
+        version: 2,
         todos: [
           { id: "t-1", number: 1, subject: "первая", status: "backlog", project: "board" },
           { id: "t-2", number: 2, subject: "вторая", status: "done", project: "board" },
@@ -359,6 +359,23 @@ describe("cli change", () => {
     expect(out).toContain("t#3");
     expect(out).toContain("не мигрирован");
     expect(refuse(["change", "close", "t#3"])).toContain("still a root task");
+  });
+
+  it("отказывает кодом 4 на нечитаемой доске, бэкап делает один раз", () => {
+    writeFileSync(board, "{ not json");
+    const before = readFileSync(board);
+    let status = 0;
+    let stderr = "";
+    try {
+      run(["change", "new", "Перевод на записи", "--project", "board"]);
+    } catch (e) {
+      status = e.status;
+      stderr = String(e.stderr || "");
+    }
+    expect(status).toBe(4);
+    expect(stderr).toContain("board unreadable (");
+    expect(readFileSync(board).equals(before)).toBe(true);
+    expect(readdirSync(appDir).filter((f) => f.includes(".corrupt-"))).toHaveLength(1);
   });
 });
 

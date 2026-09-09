@@ -11,7 +11,7 @@ import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const cli = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "cli.mjs");
@@ -407,7 +407,7 @@ describe("cli stop-hook — the spec guard end to end", () => {
   const board = (...todos) =>
     writeFileSync(
       path.join(dir, "com.claude-usage-tracker.app", "todos.json"),
-      JSON.stringify({ version: 1, todos }, null, 2),
+      JSON.stringify({ version: 2, todos }, null, 2),
     );
 
   // A transcript whose first record dates the session, and whose Bash tool_use
@@ -541,6 +541,19 @@ describe("cli stop-hook — the spec guard end to end", () => {
   it("stays completely silent by default when only the spec answer is missing", () => {
     board(closing());
     expect(runHook().code).toBe(0);
+  });
+
+  it("does not crash on an unreadable board — prints one recovery line and stands down clean", () => {
+    writeFileSync(path.join(dir, "com.claude-usage-tracker.app", "todos.json"), "{ not json");
+    const r = spawnSync(process.execPath, [cli, "stop-hook"], {
+      encoding: "utf8",
+      cwd: dir,
+      env: { ...process.env, APPDATA: dir },
+      input: JSON.stringify({ cwd: dir, transcript_path: transcript }),
+      windowsHide: true,
+    });
+    expect(r.status).toBe(0);
+    expect(r.stderr).toMatch(/board recovery:.*unreadable/);
   });
 });
 

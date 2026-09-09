@@ -12,6 +12,9 @@ const LOOPBACK = "127.0.0.1";
 export default defineConfig({
   plugins: [vue()],
   clearScreen: false,
+  test: {
+    exclude: ["**/node_modules/**", "**/dist/**", "**/.claude/**"],
+  },
   server: {
     port: 1420,
     strictPort: true,

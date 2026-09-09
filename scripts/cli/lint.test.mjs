@@ -24,7 +24,7 @@ describe("todos lint checks the recorded graph", () => {
   });
 
   const board = (...todos) =>
-    writeFileSync(boardFile, JSON.stringify({ version: 1, todos }, null, 2));
+    writeFileSync(boardFile, JSON.stringify({ version: 2, todos }, null, 2));
 
   const lint = (...args) => {
     try {

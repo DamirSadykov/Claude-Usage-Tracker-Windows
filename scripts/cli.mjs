@@ -114,5 +114,5 @@ try {
   // surfaces the error with a non-zero exit.
   if (HOOK_AREAS.has(area)) process.exit(0);
   process.stderr.write(String((err && err.message) || err) + "\n");
-  process.exit(1);
+  process.exit(Number.isInteger(err?.exitCode) ? err.exitCode : 1);
 }

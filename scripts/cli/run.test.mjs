@@ -12,10 +12,13 @@ import {
   rmSync,
   writeFileSync,
   readFileSync,
+  readdirSync,
   existsSync,
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import {
   runChange,
   isGate,
@@ -57,7 +60,7 @@ const auto = (number, extra = {}) => task(number, { kind: "auto", verify: "npm t
 const changeRoot = (number, children, extra = {}) =>
   task(number, { change: true, depends_on: children.map((n) => `id-${n}`), ...extra });
 
-const board = (...todos) => ({ version: 1, todos });
+const board = (...todos) => ({ version: 2, todos });
 const deps = (...ns) => ns.map((n) => `id-${n}`);
 
 const tick = () => new Promise((r) => setTimeout(r, 0));
@@ -699,7 +702,7 @@ describe("liveEffects — the board seam", () => {
     writeFileSync(
       path.join(appDir, "todos.json"),
       JSON.stringify({
-        version: 1,
+        version: 2,
         todos: [{ id: "id-2", number: 2, subject: "task 2", status: "queue" }],
       }),
     );
@@ -789,6 +792,55 @@ describe("stampHandout — the one thing --next writes (t#520)", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("run --next on a future-version board (t#575)", () => {
+  const cli = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "cli.mjs");
+  const fixtures = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "tests", "board-fixtures");
+  let dir;
+  let appDir;
+  let boardFile;
+
+  beforeEach(() => {
+    dir = mkdtempSync(path.join(os.tmpdir(), "cut-run-future-"));
+    appDir = path.join(dir, "com.claude-usage-tracker.app");
+    mkdirSync(appDir, { recursive: true });
+    boardFile = path.join(appDir, "todos.json");
+    writeFileSync(boardFile, readFileSync(path.join(fixtures, "v2", "future-version.json")));
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  it("refuses the hand-out with exit 4, no backup, board untouched", () => {
+    const before = readFileSync(boardFile);
+    const r = spawnSync(process.execPath, [cli, "todos", "run", "1", "--next"], {
+      encoding: "utf8",
+      env: { ...process.env, APPDATA: dir },
+      windowsHide: true,
+    });
+    expect(r.status).toBe(4);
+    expect(r.stderr).toContain("is newer than this writer");
+    expect(readFileSync(boardFile).equals(before)).toBe(true);
+    expect(readdirSync(appDir).some((f) => f.includes(".corrupt-"))).toBe(false);
+  });
+
+  it("refuses --go and --report before creating the run journal", () => {
+    const before = readFileSync(boardFile);
+    const env = { ...process.env, APPDATA: dir };
+    const go = spawnSync(process.execPath, [cli, "todos", "run", "60", "--go"], {
+      encoding: "utf8",
+      env,
+      windowsHide: true,
+    });
+    const report = spawnSync(process.execPath, [cli, "todos", "run", "60", "--report", "60", "--result", "ok"], {
+      encoding: "utf8",
+      env,
+      windowsHide: true,
+    });
+    expect(go.status).toBe(4);
+    expect(report.status).toBe(4);
+    expect(readFileSync(boardFile).equals(before)).toBe(true);
+    expect(existsSync(path.join(appDir, "runs.jsonl"))).toBe(false);
   });
 });
 

@@ -31,6 +31,7 @@ import {
   currentSessionId,
   appendTaskSessionEvent,
   lastTaskSessionEvent,
+  loadBoard,
   STATUSES,
 } from "./todos.mjs";
 import { taskContextMinRank, hookContextEnabled, workflowContextEnabled } from "./settings.mjs";
@@ -282,11 +283,12 @@ function main(args = []) {
 
   let data = null;
   try {
-    data = JSON.parse(readFileSync(file, "utf8"));
+    data = loadBoard(file);
   } catch {
     // Tracker never run / file missing → treat as an empty list. We still want
     // to surface that the tracker + CLI exist (the CLI creates the file on its
     // first write), so don't bail here — always tell the session it's available.
+    data = null;
   }
   const todos = Array.isArray(data && data.todos) ? data.todos : [];
   const changes = Array.isArray(data && data.changes) ? data.changes : [];

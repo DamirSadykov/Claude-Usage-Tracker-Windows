@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, readdirSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
@@ -592,7 +592,7 @@ describe("cli todos set spec — validated against the registry at write time", 
   const savedAppData = process.env.APPDATA;
 
   const task = (n, extra = {}) => ({ id: `t${n}`, number: n, subject: `узел ${n}`, status: "queue", ...extra });
-  const board = (...todos) => writeFileSync(boardFile, JSON.stringify({ version: 1, todos }, null, 2));
+  const board = (...todos) => writeFileSync(boardFile, JSON.stringify({ version: 2, todos }, null, 2));
 
   const todosCli = (...args) => {
     try {
@@ -734,7 +734,7 @@ describe("cli spec answer — the structural closing answer (t#341)", () => {
     status: "review",
     ...extra,
   });
-  const board = (...todos) => writeFileSync(boardFile, JSON.stringify({ version: 1, todos }, null, 2));
+  const board = (...todos) => writeFileSync(boardFile, JSON.stringify({ version: 2, todos }, null, 2));
   const saved = (n = 0) => JSON.parse(readFileSync(boardFile, "utf8")).todos[n];
 
   const specCli = (...args) => {
@@ -856,6 +856,20 @@ describe("cli spec answer — the structural closing answer (t#341)", () => {
     expect(specCli("answer", "1", "unchanged", "--text", NOTE).code).toBe(0);
     expect(saved().spec_answers[0].address).toBe("tasks#model");
   });
+
+  it("refuses on a future-version board with exit 4 and no backup", () => {
+    const data = JSON.parse(readFileSync(boardFile, "utf8"));
+    data.version = 99;
+    writeFileSync(boardFile, JSON.stringify(data));
+    const before = readFileSync(boardFile);
+    const { code, out } = specCli("answer", "1", "unchanged", "--text", NOTE);
+    expect(code).toBe(4);
+    expect(out).toContain("is newer than this writer");
+    expect(readFileSync(boardFile).equals(before)).toBe(true);
+    expect(
+      readdirSync(path.dirname(boardFile)).some((f) => f.includes(".corrupt-")),
+    ).toBe(false);
+  });
 });
 
 describe("no task links in a spec's prose (t#341)", () => {
@@ -934,7 +948,7 @@ describe("cli spec answer updated — refuses to stamp a section holding a task 
       boardFile,
       JSON.stringify(
         {
-          version: 1,
+          version: 2,
           todos: [{ id: "t1", number: 1, subject: "узел 1", status: "review", spec: ["tasks#model"] }],
         },
         null,
@@ -1051,7 +1065,7 @@ describe("answering about an address the registry lost (audit 1.2)", () => {
       boardFile,
       JSON.stringify(
         {
-          version: 1,
+          version: 2,
           todos: [{ id: "t1", number: 1, subject: "узел 1", status: "review", spec: ["tasks#model"] }],
         },
         null,
@@ -1117,7 +1131,7 @@ describe("cli todos set spec none — refused on a closing task (audit 1.1)", ()
       boardFile,
       JSON.stringify(
         {
-          version: 1,
+          version: 2,
           todos: [{ id: "t1", number: 1, subject: "узел 1", status, spec: ["tasks#model"] }],
         },
         null,
@@ -1276,7 +1290,7 @@ describe("`updated` must be backed by an actual edit (t#352)", () => {
       boardFile,
       JSON.stringify(
         {
-          version: 1,
+          version: 2,
           todos: [{ id: "t1", number: 1, subject: "узел 1", status: "queue", spec: ["tasks#model"] }],
         },
         null,
@@ -1392,7 +1406,7 @@ describe("attributing a single bullet to the task that wrote it (t#353)", () => 
       boardFile,
       JSON.stringify(
         {
-          version: 1,
+          version: 2,
           todos: [{ id: "t1", number: 7, subject: "узел", status: "queue", spec: ["tasks#model"] }],
         },
         null,
@@ -1649,7 +1663,7 @@ describe("cli spec match — command wiring (t#342)", () => {
       boardFile,
       JSON.stringify(
         {
-          version: 1,
+          version: 2,
           todos: [
             {
               id: "t1",

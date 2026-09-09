@@ -49,6 +49,7 @@ let tmp;
 let appDir;
 let prevAppData;
 let prevSession;
+let prevUserProfile;
 
 const boardFile = () => path.join(appDir, "todos.json");
 const journal = () => path.join(appDir, "task-sessions.jsonl");
@@ -56,7 +57,7 @@ const journal = () => path.join(appDir, "task-sessions.jsonl");
 // A chain step-1 -> step-2 -> step-3: step-3 is the node under test, step-2 its
 // DIRECT prerequisite, step-1 the history that must NOT cross the seam.
 const chain = () => ({
-  version: 1,
+  version: 2,
   todos: [
     {
       id: "id-1",
@@ -153,6 +154,8 @@ beforeEach(() => {
   mkdirSync(appDir, { recursive: true });
   prevAppData = process.env.APPDATA;
   process.env.APPDATA = tmp;
+  prevUserProfile = process.env.USERPROFILE;
+  process.env.USERPROFILE = tmp;
   prevSession = process.env.CLAUDE_CODE_SESSION_ID;
   delete process.env.CLAUDE_CODE_SESSION_ID;
   fakeClaude = path.join(tmp, "fake-claude.mjs");
@@ -166,6 +169,8 @@ beforeEach(() => {
 afterEach(() => {
   if (prevAppData === undefined) delete process.env.APPDATA;
   else process.env.APPDATA = prevAppData;
+  if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+  else process.env.USERPROFILE = prevUserProfile;
   if (prevSession === undefined) delete process.env.CLAUDE_CODE_SESSION_ID;
   else process.env.CLAUDE_CODE_SESSION_ID = prevSession;
   delete process.env.FAKE_MODE;

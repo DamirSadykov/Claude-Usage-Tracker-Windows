@@ -800,7 +800,7 @@ describe("the exit journal", () => {
   beforeEach(() => {
     dir = mkdtempSync(path.join(os.tmpdir(), "plan-events-"));
     mkdirSync(path.join(dir, "com.claude-usage-tracker.app"), { recursive: true });
-    writeFileSync(path.join(dir, "com.claude-usage-tracker.app", "todos.json"), JSON.stringify({ version: 1, todos: [] }));
+    writeFileSync(path.join(dir, "com.claude-usage-tracker.app", "todos.json"), JSON.stringify({ version: 2, todos: [] }));
   });
   afterEach(() => rmSync(dir, { recursive: true, force: true }));
 

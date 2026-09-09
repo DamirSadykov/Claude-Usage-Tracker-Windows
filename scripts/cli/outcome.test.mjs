@@ -12,7 +12,7 @@
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, readdirSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -43,7 +43,7 @@ const errorResult = (id) =>
 
 // A board of tasks; rows are [number, extra].
 const board = (...rows) => ({
-  version: 1,
+  version: 2,
   todos: rows.map(([number, extra = {}]) => ({
     id: `id-${number}`,
     number,
@@ -537,7 +537,7 @@ describe("outcome --write (end to end)", () => {
     const appDir = path.join(dir, "com.claude-usage-tracker.app");
     mkdirSync(appDir, { recursive: true });
     file = path.join(appDir, "todos.json");
-    writeFileSync(file, JSON.stringify({ version: 1, todos }, null, 2));
+    writeFileSync(file, JSON.stringify({ version: 2, todos }, null, 2));
   };
 
   // No journal and no transcripts under this APPDATA → no blocks, so a declared
@@ -617,6 +617,28 @@ describe("outcome --write (end to end)", () => {
     expect(run("t#1")).toContain("#1");
     expect(refuse("1", "--verify", "maybe")).toContain('--verify takes "ok" or "issue"');
   });
+
+  it("refuses --write on a future-version board with exit 4 and no backup", () => {
+    seed([todo(1, { produces: ["scripts/cli/outcome.mjs"] })]);
+    writeFileSync(file, JSON.stringify({ version: 99, todos: JSON.parse(readFileSync(file, "utf8")).todos }));
+    const before = readFileSync(file);
+    let status = 0;
+    let stderr = "";
+    try {
+      execFileSync(process.execPath, [cli, "todos", "outcome", "1", "--write"], {
+        env: { ...process.env, APPDATA: dir },
+        encoding: "utf8",
+        stdio: "pipe",
+      });
+    } catch (e) {
+      status = e.status;
+      stderr = String(e.stderr || "");
+    }
+    expect(status).toBe(4);
+    expect(stderr).toContain("is newer than this writer");
+    expect(readFileSync(file).equals(before)).toBe(true);
+    expect(readdirSync(path.dirname(file)).some((f) => f.includes(".corrupt-"))).toBe(false);
+  });
 });
 
 describe("outcome weak file evidence (end to end, t#520)", () => {
@@ -630,7 +652,7 @@ describe("outcome weak file evidence (end to end, t#520)", () => {
     const appDir = path.join(dir, "com.claude-usage-tracker.app");
     mkdirSync(appDir, { recursive: true });
     file = path.join(appDir, "todos.json");
-    writeFileSync(file, JSON.stringify({ version: 1, todos }, null, 2));
+    writeFileSync(file, JSON.stringify({ version: 2, todos }, null, 2));
     proj = mkdtempSync(path.join(os.tmpdir(), "cut-outcome-proj-"));
   };
 

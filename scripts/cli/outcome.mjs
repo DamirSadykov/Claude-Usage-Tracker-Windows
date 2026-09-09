@@ -46,8 +46,6 @@
 
 import {
   readFileSync,
-  writeFileSync,
-  renameSync,
   readdirSync,
   existsSync,
   statSync,
@@ -55,7 +53,7 @@ import {
 import os from "node:os";
 import path from "node:path";
 
-import { resolveTask, readTaskSessionEvents } from "./todos.mjs";
+import { resolveTask, readTaskSessionEvents, loadBoard, loadBoardForWrite, saveBoard } from "./todos.mjs";
 import { withBoardLock } from "./board-lock.mjs";
 
 // Tools that CHANGE a file — the only evidence that something was produced.
@@ -76,25 +74,6 @@ function appDataFile(name) {
     process.env.APPDATA ||
     path.join(process.env.USERPROFILE || "", "AppData", "Roaming");
   return path.join(appData, "com.claude-usage-tracker.app", name);
-}
-
-// Forgiving load / atomic save — the same contract as todos.mjs::load/save, so a
-// concurrent tracker write is never half-read or clobbered.
-function loadTodos(file) {
-  try {
-    const data = JSON.parse(readFileSync(file, "utf8"));
-    if (!data || !Array.isArray(data.todos)) return { version: 1, todos: [] };
-    if (typeof data.version !== "number") data.version = 1;
-    return data;
-  } catch {
-    return { version: 1, todos: [] };
-  }
-}
-
-function saveTodos(file, data) {
-  const tmp = `${file}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n");
-  renameSync(tmp, file);
 }
 
 // ── paths ────────────────────────────────────────────────────────────────────
@@ -491,9 +470,9 @@ function parseFlags(args) {
   return f;
 }
 
-function reconcile(ref, verify) {
+function reconcile(ref, verify, write = false) {
   const file = appDataFile("todos.json");
-  const data = loadTodos(file);
+  const data = write ? loadBoardForWrite(file) : loadBoard(file);
   const todo = resolveTask(data, ref);
   if (!todo) fail(`no such task: ${ref}`);
 
@@ -541,7 +520,7 @@ function applyOutcome(file, data, todo, report) {
   t.outcome = report.outcome;
   t.outcome_reason = report.outcome_reason;
   t.outcome_at = new Date().toISOString();
-  saveTodos(file, data);
+  saveBoard(file, data);
   return true;
 }
 
@@ -628,7 +607,7 @@ function reconcileAndReport(f) {
     verify = v;
   }
 
-  const { file, data, todo, report } = reconcile(ref, verify);
+  const { file, data, todo, report } = reconcile(ref, verify, f.write);
   if (f.write && report.finalized) report.written = applyOutcome(file, data, todo, report);
 
   if (f.json) process.stdout.write(JSON.stringify(report, null, 2) + "\n");

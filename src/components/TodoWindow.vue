@@ -134,6 +134,59 @@ const changes = ref<BoardChange[]>([]);
 const loading = ref(true);
 const errorMsg = ref("");
 
+interface BoardStateInfo {
+  state: "ok" | "unreadable" | "future-version";
+  file: string;
+  backup?: string | null;
+  reason?: string | null;
+  version?: number | null;
+}
+const boardState = ref<BoardStateInfo | null>(null);
+const boardRecovering = computed(
+  () => boardState.value !== null && boardState.value.state !== "ok",
+);
+
+const BOARD_CURRENT_VERSION = 2;
+
+async function loadBoardState() {
+  try {
+    boardState.value = await invoke<BoardStateInfo>("board_state");
+  } catch {
+    boardState.value = null;
+    return;
+  }
+  if (boardState.value.state !== "ok") void loadLatestBoardBackup();
+}
+
+interface TodoBackupInfo {
+  name: string;
+  when_ms: number;
+}
+const latestBoardBackup = ref<TodoBackupInfo | null>(null);
+const restoringBoard = ref(false);
+
+async function loadLatestBoardBackup() {
+  try {
+    latestBoardBackup.value = await invoke<TodoBackupInfo | null>("latest_todo_backup");
+  } catch {
+    latestBoardBackup.value = null;
+  }
+}
+
+async function restoreBoardFromBackup() {
+  if (restoringBoard.value || !latestBoardBackup.value) return;
+  if (typeof window !== "undefined" && !window.confirm(t("migrateRestoreConfirm"))) return;
+  restoringBoard.value = true;
+  try {
+    await invoke("restore_todo_backup", {});
+    await loadTodos();
+  } catch (e) {
+    errorMsg.value = String(e);
+  } finally {
+    restoringBoard.value = false;
+  }
+}
+
 // Filters
 const projectFilter = ref<string>(""); // "" = all
 const showDone = ref(false);
@@ -251,6 +304,7 @@ async function loadTodos(silent = false) {
   } catch {
     changes.value = [];
   }
+  void loadBoardState();
 }
 
 // Reload now if it's safe; otherwise mark it pending until the drag/form ends.
@@ -1764,6 +1818,29 @@ onUnmounted(() => {
 
     <div v-if="errorMsg" class="tw-error">{{ errorMsg }}</div>
 
+    <div v-if="boardRecovering" class="tw-recovery">
+      <span class="tw-recovery-text">
+        <template v-if="boardState?.state === 'unreadable'">
+          {{ t("boardUnreadable", { reason: boardState.reason }) }}
+          {{ boardState.backup ? t("boardBackupAt", { path: boardState.backup }) : t("boardNoBackup") }}
+        </template>
+        <template v-else-if="boardState?.state === 'future-version'">
+          {{ t("boardFutureVersion", { version: boardState.version, current: BOARD_CURRENT_VERSION }) }}
+        </template>
+        <template v-if="latestBoardBackup">
+          {{ t("boardRestorePeriodicBackup", { path: latestBoardBackup.name }) }}
+        </template>
+      </span>
+      <button
+        v-if="latestBoardBackup"
+        class="tw-recovery-restore"
+        :disabled="restoringBoard"
+        @click="restoreBoardFromBackup"
+      >
+        {{ restoringBoard ? t("migrateRestoring") : t("migrateRestore") }}
+      </button>
+    </div>
+
     <div v-if="loading" class="tw-empty">{{ t("loading") }}</div>
 
     <!-- Task graph, new rendering: lanes by theme, artifacts on wires, ref rings -->
@@ -2599,6 +2676,41 @@ onUnmounted(() => {
   word-break: break-word;
   padding: 8px 16px 0;
   flex-shrink: 0;
+}
+.tw-recovery {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: #f2b90c;
+  background: rgba(242, 185, 12, 0.1);
+  border: 1px solid rgba(242, 185, 12, 0.3);
+  border-radius: 6px;
+  font-size: 12px;
+  word-break: break-word;
+  margin: 8px 16px 0;
+  padding: 8px 10px;
+  flex-shrink: 0;
+}
+.tw-recovery-text {
+  flex: 1;
+}
+.tw-recovery-restore {
+  flex-shrink: 0;
+  border: 1px solid rgba(242, 185, 12, 0.4);
+  background: transparent;
+  color: inherit;
+  border-radius: 4px;
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  font-family: var(--segoe);
+}
+.tw-recovery-restore:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.tw-recovery-restore:not(:disabled):hover {
+  background: rgba(242, 185, 12, 0.15);
 }
 .tw-empty {
   color: var(--text-3);

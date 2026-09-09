@@ -156,6 +156,23 @@ describe("apply records the graph", () => {
     expect(() => board()).toThrow();
   });
 
+  it("--go refuses code 4 on an unreadable board and writes nothing", () => {
+    const boardFile = path.join(dir, "com.claude-usage-tracker.app", "todos.json");
+    writeFileSync(boardFile, "{ not json");
+    const before = readFileSync(boardFile);
+    let status = 0;
+    let stderr = "";
+    try {
+      say(path.join(dir, "graph.yaml"), "--go");
+    } catch (e) {
+      status = e.status;
+      stderr = String(e.stderr || "");
+    }
+    expect(status).toBe(4);
+    expect(stderr).toContain("board unreadable (");
+    expect(readFileSync(boardFile).equals(before)).toBe(true);
+  });
+
   it("records tasks, dep edges and every declaration in one pass", () => {
     say(path.join(dir, "graph.yaml"), "--go");
     const { todos, changes } = board();
