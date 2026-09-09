@@ -69,7 +69,7 @@ fn normalized_board_path(board: &Path) -> PathBuf {
     canon_parent.join(file_name)
 }
 
-fn normalize_key(board: &Path) -> String {
+pub(crate) fn normalize_key(board: &Path) -> String {
     let combined = normalized_board_path(board);
     let s = combined.to_string_lossy().into_owned();
     if cfg!(windows) {
@@ -317,24 +317,35 @@ pub fn is_held_by_us(board: &Path) -> bool {
     matches!(registry().lock().unwrap().get(&key), Some((owner, _)) if *owner == me)
 }
 
-pub fn reaffirm(board: &Path) -> Result<(), LockError> {
-    let lock_path = lock_path_for(board);
+fn reaffirm_at(lock_path: &Path) -> Result<(), LockError> {
     let pid = std::process::id();
-    match read_lock(&lock_path) {
+    match read_lock(lock_path) {
         ReadOutcome::Content(content) => match parse_holder(&content) {
             Some(holder) if holder.pid == pid => {
-                let _ = write_lock_content(&lock_path, pid, &holder.writer);
+                let _ = write_lock_content(lock_path, pid, &holder.writer);
                 Ok(())
             }
             Some(holder) => Err(LockError::Busy {
                 pid: holder.pid,
                 writer: holder.writer,
                 at: holder.at,
-                path: lock_path,
+                path: lock_path.to_path_buf(),
             }),
-            None => Err(LockError::Unreadable { path: lock_path }),
+            None => Err(LockError::Unreadable { path: lock_path.to_path_buf() }),
         },
-        ReadOutcome::Missing | ReadOutcome::Unreadable => Err(LockError::Unreadable { path: lock_path }),
+        ReadOutcome::Missing | ReadOutcome::Unreadable => {
+            Err(LockError::Unreadable { path: lock_path.to_path_buf() })
+        }
+    }
+}
+
+pub fn reaffirm(board: &Path) -> Result<(), LockError> {
+    reaffirm_at(&lock_path_for(board))
+}
+
+impl BoardLock {
+    pub(crate) fn reaffirm(&self) -> Result<(), LockError> {
+        reaffirm_at(&self.lock_path)
     }
 }
 

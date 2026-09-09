@@ -2625,27 +2625,23 @@ fn write_todos_locked(
     let path = todos_path(app)?;
     let snap = app.state::<TodoSnapshot>();
     let mut guard = snap.0.lock().unwrap();
-    let _board_lock = board_lock::acquire(&path).map_err(|e| e.to_string())?;
-    let mut file = todos::load_for_write(&path)?;
-    // Backfill task numbers for any legacy/hand-edited rows before mutating, so
-    // every persisted file has stable `#N` references (upsert numbers new tasks).
-    todos::ensure_numbers(&mut file);
-    mutate(&mut file);
-    todos::save(&path, &file)?;
+    let (file, ()) = todos::transact(&path, |file| {
+        todos::ensure_numbers(file);
+        mutate(file);
+        Ok(())
+    })?;
     *guard = todo_status_map(&file);
     Ok(file.todos)
 }
 
 fn write_todos_locked_replace(
     app: &AppHandle,
-    mut file: todos::TodoFile,
+    file: todos::TodoFile,
 ) -> Result<Vec<todos::Todo>, String> {
     let path = todos_path(app)?;
     let snap = app.state::<TodoSnapshot>();
     let mut guard = snap.0.lock().unwrap();
-    let _board_lock = board_lock::acquire(&path).map_err(|e| e.to_string())?;
-    todos::ensure_numbers(&mut file);
-    todos::save(&path, &file)?;
+    let file = todos::replace_locked(&path, file)?;
     *guard = todo_status_map(&file);
     Ok(file.todos)
 }
@@ -2792,7 +2788,7 @@ fn export_todos(app: AppHandle, path: String) -> Result<usize, String> {
     let mut file = todos::load_checked_for_read(&board_path)?;
     todos::ensure_numbers(&mut file);
     let count = file.todos.len();
-    todos::save(target_path, &file)?;
+    todos::write_export(target_path, &file)?;
     Ok(count)
 }
 
@@ -2893,21 +2889,12 @@ fn spawn_todos_watch(app: AppHandle) {
         {
             let snap = app.state::<TodoSnapshot>();
             let mut guard = snap.0.lock().unwrap();
-            match board_lock::acquire(&path) {
-                Ok(_board_lock) => match todos::load_for_write(&path) {
-                    Ok(mut file) => {
-                        if todos::ensure_numbers(&mut file) {
-                            let _ = todos::save(&path, &file);
-                        }
-                        *guard = todo_status_map(&file);
-                    }
-                    Err(e) => {
-                        warn!("todos watcher startup: board not writable, skipping number backfill: {e}");
-                        *guard = todo_status_map(&todos::load(&path));
-                    }
-                },
+            match todos::transact(&path, |file| Ok(todos::ensure_numbers(file))) {
+                Ok((file, _changed)) => {
+                    *guard = todo_status_map(&file);
+                }
                 Err(e) => {
-                    warn!("todos watcher startup: board lock unavailable, skipping number backfill: {e}");
+                    warn!("todos watcher startup: skipping number backfill: {e}");
                     *guard = todo_status_map(&todos::load(&path));
                 }
             }

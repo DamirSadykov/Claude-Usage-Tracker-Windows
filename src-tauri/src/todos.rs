@@ -14,6 +14,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use log::warn;
@@ -672,8 +673,10 @@ fn split_vision(plan: &str) -> Option<(String, String)> {
 }
 
 fn tmp_path_for(path: &Path) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let mut tmp_name = path.file_name().map(|f| f.to_os_string()).unwrap_or_default();
-    tmp_name.push(format!(".{}.tmp", std::process::id()));
+    tmp_name.push(format!(".{}{n}.tmp", std::process::id()));
     path.with_file_name(tmp_name)
 }
 
@@ -681,7 +684,7 @@ fn is_transient_rename_error(e: &std::io::Error) -> bool {
     matches!(e.raw_os_error(), Some(5) | Some(32) | Some(33))
 }
 
-pub fn save(path: &Path, file: &TodoFile) -> Result<(), String> {
+fn write_atomic(path: &Path, file: &TodoFile, lock: Option<&board_lock::BoardLock>) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
@@ -691,8 +694,8 @@ pub fn save(path: &Path, file: &TodoFile) -> Result<(), String> {
     json.push('\n');
     let tmp = tmp_path_for(path);
     std::fs::write(&tmp, json.as_bytes()).map_err(|e| e.to_string())?;
-    if board_lock::is_held_by_us(path) {
-        board_lock::reaffirm(path).map_err(|e| e.to_string())?;
+    if let Some(lock) = lock {
+        lock.reaffirm().map_err(|e| e.to_string())?;
     }
     for _ in 0..5 {
         match std::fs::rename(&tmp, path) {
@@ -704,6 +707,36 @@ pub fn save(path: &Path, file: &TodoFile) -> Result<(), String> {
         }
     }
     std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+}
+
+fn save(path: &Path, file: &TodoFile) -> Result<(), String> {
+    write_atomic(path, file, None)
+}
+
+fn save_locked(path: &Path, file: &TodoFile, lock: &board_lock::BoardLock) -> Result<(), String> {
+    write_atomic(path, file, Some(lock))
+}
+
+pub fn write_export(path: &Path, file: &TodoFile) -> Result<(), String> {
+    save(path, file)
+}
+
+pub fn transact<T>(
+    path: &Path,
+    mutate: impl FnOnce(&mut TodoFile) -> Result<T, String>,
+) -> Result<(TodoFile, T), String> {
+    let lock = board_lock::acquire(path).map_err(|e| e.to_string())?;
+    let mut file = load_for_write(path)?;
+    let out = mutate(&mut file)?;
+    save_locked(path, &file, &lock)?;
+    Ok((file, out))
+}
+
+pub fn replace_locked(path: &Path, mut file: TodoFile) -> Result<TodoFile, String> {
+    let lock = board_lock::acquire(path).map_err(|e| e.to_string())?;
+    ensure_numbers(&mut file);
+    save_locked(path, &file, &lock)?;
+    Ok(file)
 }
 
 /// The largest task number currently assigned (0 if none).
@@ -1090,14 +1123,7 @@ pub fn backup_after_verified_load(todos_path: &Path) -> Result<String, String> {
 }
 
 pub fn resolves_to_same_path(left: &Path, right: &Path) -> bool {
-    let (Ok(left), Ok(right)) = (std::fs::canonicalize(left), std::fs::canonicalize(right)) else {
-        return false;
-    };
-    if cfg!(windows) {
-        left.to_string_lossy().eq_ignore_ascii_case(&right.to_string_lossy())
-    } else {
-        left == right
-    }
+    board_lock::normalize_key(left) == board_lock::normalize_key(right)
 }
 
 /// The most recent backup (by file mtime), or None if none exist.
@@ -2844,12 +2870,51 @@ mod tests {
         )
         .unwrap();
 
-        let err = save(&path, &TodoFile::default()).unwrap_err();
+        let err = save_locked(&path, &TodoFile::default(), &lock).unwrap_err();
         assert!(err.contains("board locked"), "unexpected error: {err}");
         assert!(!path.exists(), "the theft must block the rename, not just the message");
 
         std::fs::remove_file(&lock_path).ok();
         drop(lock);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_locked_reaffirms_regardless_of_which_thread_acquired_the_lock() {
+        let dir = scratch_dir("save-locked-cross-thread");
+        let path = dir.join("todos.json");
+
+        let acquire_path = path.clone();
+        let lock = std::thread::spawn(move || board_lock::acquire(&acquire_path).unwrap())
+            .join()
+            .unwrap();
+
+        let write_path = path.clone();
+        let write_result = std::thread::spawn(move || save_locked(&write_path, &TodoFile::default(), &lock))
+            .join()
+            .unwrap();
+        assert!(write_result.is_ok(), "legitimate cross-thread write must succeed: {write_result:?}");
+
+        let acquire_path = path.clone();
+        let lock = std::thread::spawn(move || board_lock::acquire(&acquire_path).unwrap())
+            .join()
+            .unwrap();
+        let lock_path = board_lock::lock_path_for(&path);
+        let thief_pid = std::process::id().wrapping_add(999_999).max(1);
+        std::fs::write(
+            &lock_path,
+            serde_json::json!({ "pid": thief_pid, "writer": "app", "at": chrono::Utc::now().to_rfc3339() })
+                .to_string(),
+        )
+        .unwrap();
+
+        let write_path = path.clone();
+        let err = std::thread::spawn(move || save_locked(&write_path, &TodoFile::default(), &lock).unwrap_err())
+            .join()
+            .unwrap();
+        assert!(err.contains("board locked"), "theft from a foreign thread must still be caught: {err}");
+
+        std::fs::remove_file(&lock_path).ok();
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2910,6 +2975,45 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn export_target_that_is_the_not_yet_created_board_is_rejected() {
+        let dir = scratch_dir("export-missing-board");
+        let board_path = dir.join("todos.json");
+        assert!(!board_path.exists(), "the board must not exist yet — that's the bug this guards against");
+        assert!(resolves_to_same_path(&board_path, &board_path));
+        assert!(resolves_to_same_path(&board_path, &dir.join(".").join("todos.json")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn concurrent_saves_in_one_process_do_not_collide_on_tmp() {
+        let dir = scratch_dir("save-tmp-race");
+        let path = dir.join("todos.json");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..25 {
+                    save(&path, &TodoFile::default()).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            let result = h.join();
+            assert!(result.is_ok(), "a concurrent save panicked/errored: {result:?}");
+        }
+
+        let entries: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
+        for entry in &entries {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            assert!(!name.ends_with(".tmp"), "leftover tmp file: {name}");
+        }
+        assert_eq!(entries.len(), 1, "expected exactly the final todos.json, got {entries:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn v1_empty_fixtures_round_trips_to_v2() {
