@@ -18,9 +18,13 @@
 //! the tracker while coding. See `mean_hourly_rate` for the gory details and
 //! the web/API caveat.
 //!
-//! The short-window rate is still used by `alerts::engine` for "your 5h
-//! session is about to end" — a different question — and is computed there
-//! directly from `compute_delta`.
+//! The short-window rate ALSO drives the 5h card: its displayed rate is
+//! `max(weekly mean, recent short-window burn)`, so a live spike is reflected
+//! immediately and then decays back to the weekly mean once activity stops
+//! (see `recent_hourly_rate`). The same short-window burn is what
+//! `alerts::engine` uses for "your 5h session is about to end" — computed there
+//! directly from `compute_delta`, over the same `forecast_window_min`. Only the
+//! 5h tier blends it in; the 7-day tiers stay on the pure weekly mean.
 
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::params;
@@ -43,6 +47,11 @@ const LOOKBACK_HOURS: i64 = 7 * 24;
 /// snapshots no more than this far apart. 3h covers normal usage gaps (a
 /// lunch break, a meeting) without inventing data for genuine off-periods.
 const MAX_INTERP_GAP_MIN: i64 = 180;
+
+/// A recent-burn window shorter than this (in minutes) is too noisy to trust
+/// as the 5h card's spike signal — mirrors `alerts::engine::MIN_SPAN_MIN`,
+/// which gates the same short-window delta for the exhaustion alert.
+const RECENT_MIN_SPAN_MIN: f64 = 10.0;
 
 /// Forward-fill window for the "right edge of the most recent bucket". The
 /// loop's h=1 bucket ends at `now`, but the latest snapshot is always tens of
@@ -198,13 +207,47 @@ fn has_activity_in_range(
     hi > lo
 }
 
+/// Recent burn as %/h over the last `window_min` of snapshots — the same
+/// short-window question `alerts::engine::eval_forecast` asks (first→last delta
+/// across the window). Blended into the 5h card's rate so the card reacts to a
+/// live spike instead of amortising it across the week. Returns `None` when the
+/// window holds less than `RECENT_MIN_SPAN_MIN` of history (too little to
+/// trust) or the endpoints straddle a reset (`delta < 0` — not real burn); the
+/// caller then falls back to the weekly mean.
+fn recent_hourly_rate(
+    series: &Series,
+    now: DateTime<Utc>,
+    window_min: i64,
+) -> Option<f64> {
+    if window_min <= 0 {
+        return None;
+    }
+    let window_start = now - Duration::minutes(window_min);
+    let idx = series.partition_point(|s| s.0 < window_start);
+    let recent = series.get(idx..)?;
+    let first = recent.first()?;
+    let last = recent.last()?;
+    let span_min = (last.0 - first.0).num_milliseconds() as f64 / 60000.0;
+    if span_min < RECENT_MIN_SPAN_MIN {
+        return None;
+    }
+    let delta = last.1 - first.1;
+    if delta < 0.0 {
+        return None; // endpoints straddle a reset — not real burn
+    }
+    Some(delta / span_min * 60.0)
+}
+
 /// Build the per-tier forecast from the latest snapshot + the precomputed
-/// mean rate. `reset_at` drives the allowed pace (independent of history);
-/// the mean rate drives the ETA.
+/// mean rate. `reset_at` drives the allowed pace (independent of history). The
+/// ETA is driven by `max(mean, recent)`: `recent_rate_per_hour` is `Some` only
+/// for the 5h tier (its spike-reactive short-window burn) and `None` for the
+/// 7-day tiers, which stay on the pure weekly mean.
 fn tier_forecast(
     current: f64,
     reset_at: Option<&str>,
     mean_rate_per_hour: Option<f64>,
+    recent_rate_per_hour: Option<f64>,
     coverage_hours: u32,
     now: DateTime<Utc>,
 ) -> TierForecast {
@@ -218,14 +261,21 @@ fn tier_forecast(
         _ => None,
     };
 
-    let rate_per_hour = mean_rate_per_hour.unwrap_or(0.0).max(0.0);
+    // Worst (fastest) of the weekly mean and the recent short-window burn. A
+    // spike lifts the ETA immediately; once it passes, `recent` decays toward 0
+    // and the mean — never below the honest weekly projection — takes over.
+    let mean = mean_rate_per_hour.unwrap_or(0.0).max(0.0);
+    let recent = recent_rate_per_hour.unwrap_or(0.0).max(0.0);
+    let rate_per_hour = mean.max(recent);
+    let rate_known = mean_rate_per_hour.is_some() || recent_rate_per_hour.is_some();
+
     let eta_minutes = if rate_per_hour > 0.0 && current < 100.0 {
         Some((100.0 - current) / (rate_per_hour / 60.0))
     } else {
         None
     };
 
-    let pace = if mean_rate_per_hour.is_none() {
+    let pace = if !rate_known {
         "unknown"
     } else if let (Some(eta), Some(ttr)) = (eta_minutes, time_to_reset_min) {
         if eta < ttr {
@@ -247,14 +297,14 @@ fn tier_forecast(
 }
 
 impl StatsDb {
-    /// Exhaustion forecast per tier. `window_min` is accepted for API stability
-    /// (it used to bound the burn-rate sample) but is ignored — the rate is now
-    /// the arithmetic mean of hourly burn over the past 7 days. `now` is
-    /// injected so the math (lookback bound + time-to-reset) is deterministic
-    /// under test.
+    /// Exhaustion forecast per tier. `window_min` bounds the *recent* burn
+    /// sample that makes the 5h tier's rate spike-reactive (see
+    /// `recent_hourly_rate`); the 7-day tiers ignore it and use the weekly
+    /// mean. `now` is injected so the math (lookback bound + time-to-reset) is
+    /// deterministic under test.
     pub fn forecast(
         &self,
-        _window_min: i64,
+        window_min: i64,
         now: DateTime<Utc>,
     ) -> Result<ForecastData, rusqlite::Error> {
         // Current state = the most recent snapshot (recorded just before the
@@ -337,6 +387,10 @@ impl StatsDb {
         let (ex_med, ex_cov) =
             mean_hourly_rate(&extra_series, &cc_activity, now, LOOKBACK_HOURS);
 
+        // 5h-only: the recent short-window burn that makes the card react to a
+        // live spike. Blended as `max(mean, recent)` inside `tier_forecast`.
+        let fh_recent = recent_hourly_rate(&five_series, now, window_min);
+
         // Allowed-pace pre-touches `latest` which is also needed below; avoid
         // re-querying by reusing it.
         let latest_ref = &latest;
@@ -346,6 +400,7 @@ impl StatsDb {
                 latest_ref.five_hour_pct,
                 latest_ref.five_hour_reset.as_deref(),
                 fh_med,
+                fh_recent,
                 fh_cov,
                 now,
             ),
@@ -353,12 +408,13 @@ impl StatsDb {
                 latest_ref.seven_day_pct,
                 latest_ref.seven_day_reset.as_deref(),
                 sd_med,
+                None,
                 sd_cov,
                 now,
             ),
             extra_usage: latest_ref
                 .extra_pct
-                .map(|cur| tier_forecast(cur, None, ex_med, ex_cov, now)),
+                .map(|cur| tier_forecast(cur, None, ex_med, None, ex_cov, now)),
         })
     }
 }

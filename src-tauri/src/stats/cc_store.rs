@@ -25,6 +25,10 @@ pub struct CcUsageRow {
     /// Subagent label exposed by the transcript (`agentName`/`attributionAgent`),
     /// when present — useful for grouping subagent spend by agent type.
     pub agent_name: Option<String>,
+    /// Agent INSTANCE id (`agentId`), unique per spawned Task() child — unlike
+    /// `agent_name`, which is only the type. This is what tells two concurrent
+    /// `general-purpose` agents apart, so a block can be split per agent.
+    pub agent_id: Option<String>,
     /// Tool-use blocks in this message, grouped by tool name (e.g. ("Edit", 3),
     /// ("Bash", 1)). Empty when the message had no tool calls.
     pub tool_uses: Vec<(String, i64)>,
@@ -37,6 +41,23 @@ pub struct CcUsageRow {
     pub git_commits: i64,
     /// `git push` invocations seen in this message's Bash tool_use blocks.
     pub git_pushes: i64,
+}
+
+/// One spawned subagent, read from `<session>/subagents/agent-<id>.meta.json`.
+/// The manifest is written by Claude Code when the Task() child starts, so it
+/// exists even for agents that produced no billable message.
+#[derive(Debug, Clone)]
+pub struct CcAgentRow {
+    pub agent_id: String,
+    pub session_id: Option<String>,
+    /// Agent type as launched ("general-purpose", "Explore", …).
+    pub agent_type: Option<String>,
+    /// The short description the agent was launched with. It names the WORK,
+    /// which is what lets a block be attributed to the right task.
+    pub description: Option<String>,
+    /// `tool_use_id` of the parent's Task() call that spawned this agent.
+    pub tool_use_id: Option<String>,
+    pub spawn_depth: Option<i64>,
 }
 
 /// One tool-call outcome parsed from a `type:"user"` transcript line. We store
@@ -109,8 +130,8 @@ impl StatsDb {
                 "INSERT OR IGNORE INTO cc_usage
                  (message_id, ts, model, input, output, cache_create, cache_read, cost,
                   session_id, project, is_subagent, agent_name,
-                  service_tier, git_commits, git_pushes)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                  service_tier, git_commits, git_pushes, agent_id)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
             )?;
             // Backfill `project` / `is_subagent` / `agent_name` / `service_tier` /
             // git counters onto rows stored before those columns existed. INSERT
@@ -124,7 +145,8 @@ impl StatsDb {
                         agent_name   = COALESCE(agent_name, ?4),
                         service_tier = COALESCE(service_tier, ?5),
                         git_commits  = MAX(git_commits, ?6),
-                        git_pushes   = MAX(git_pushes, ?7)
+                        git_pushes   = MAX(git_pushes, ?7),
+                        agent_id     = COALESCE(agent_id, ?8)
                   WHERE message_id = ?1",
             )?;
             // Per-message tool-use rows are inserted once per (message_id, tool).
@@ -150,6 +172,7 @@ impl StatsDb {
                     r.service_tier,
                     r.git_commits,
                     r.git_pushes,
+                    r.agent_id,
                 ])?;
                 backfill.execute(params![
                     r.message_id,
@@ -159,10 +182,56 @@ impl StatsDb {
                     r.service_tier,
                     r.git_commits,
                     r.git_pushes,
+                    r.agent_id,
                 ])?;
                 for (tool, n) in &r.tool_uses {
                     tool_stmt.execute(params![r.message_id, tool, n])?;
                 }
+            }
+        }
+        tx.commit()?;
+        Ok(inserted)
+    }
+
+    /// Dedup-insert a batch of subagent manifests, keyed by `agent_id`. Re-running
+    /// ingest over an unchanged transcript is a no-op; a manifest that gained
+    /// fields since it was first stored is back-filled (COALESCE, never overwrite).
+    pub fn cc_agent_upsert(&self, rows: &[CcAgentRow]) -> Result<usize, rusqlite::Error> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let mut inserted = 0;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO cc_agent
+                 (agent_id, session_id, agent_type, description, tool_use_id, spawn_depth)
+                 VALUES (?1,?2,?3,?4,?5,?6)",
+            )?;
+            let mut backfill = tx.prepare(
+                "UPDATE cc_agent
+                    SET session_id  = COALESCE(session_id, ?2),
+                        agent_type  = COALESCE(agent_type, ?3),
+                        description = COALESCE(description, ?4),
+                        tool_use_id = COALESCE(tool_use_id, ?5),
+                        spawn_depth = COALESCE(spawn_depth, ?6)
+                  WHERE agent_id = ?1",
+            )?;
+            for r in rows {
+                inserted += stmt.execute(params![
+                    r.agent_id,
+                    r.session_id,
+                    r.agent_type,
+                    r.description,
+                    r.tool_use_id,
+                    r.spawn_depth,
+                ])?;
+                backfill.execute(params![
+                    r.agent_id,
+                    r.session_id,
+                    r.agent_type,
+                    r.description,
+                    r.tool_use_id,
+                    r.spawn_depth,
+                ])?;
             }
         }
         tx.commit()?;

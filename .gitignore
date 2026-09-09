@@ -18,3 +18,4 @@ settings.local.json
 .idea/
 .vscode/
 *.swp
+.claude/phases/

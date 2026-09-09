@@ -22,6 +22,8 @@
     "notification:allow-request-permission",
     "updater:default",
     "process:allow-restart",
-    "log:default"
+    "log:default",
+    "dialog:allow-open",
+    "dialog:allow-save"
   ]
 }

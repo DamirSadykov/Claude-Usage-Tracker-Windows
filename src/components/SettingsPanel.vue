@@ -2,6 +2,7 @@
 import { ref, watch, onMounted, onUnmounted } from "vue";
 import type { Ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
+import { open as openFileDialog, save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 import { useI18n } from "vue-i18n";
 import {
   ALERT_TIER_KEYS,
@@ -13,7 +14,11 @@ import type { AlertTiers, AlertTierKey, AlertTypes, AlertTypeKey } from "../thre
 import { useUpdater } from "../updater";
 import { INSIGHT_KINDS } from "../insightKinds";
 import { FONT_OPTIONS, applyFont } from "../fontSwitch";
+import { modelFamilyClass } from "../modelFamily";
 import EnrollmentPanel from "./EnrollmentPanel.vue";
+import WorkflowGraph from "./WorkflowGraph.vue";
+import agentProviderManifest from "../../scripts/cli/agent-providers.json";
+import { dutyModeReader } from "../../scripts/cli/duty-mode.mjs";
 
 const TIER_LABELS: Record<AlertTierKey, string> = {
   five_hour: "session5h",
@@ -294,10 +299,140 @@ function toggleRuntime(kind: string) {
 
 onMounted(loadIgnoredInsights);
 
-// --- cc-todos CLI + SessionStart hook installer ---
+// --- Global responsibility -> provider/model lifecycle map ---
+// agents.json is also consumed by the Node CLI. Tasks never select a model.
+interface AgentProfileForm {
+  duty: "critic" | "architect" | "worker" | "review";
+  provider: "anthropic" | "openai";
+  model: string;
+  mode: string;
+  role: string;
+  reasoning_effort: string;
+  instructions: string;
+}
+const agentProfiles = ref<AgentProfileForm[]>([]);
+const agentConfigMsg = ref("");
+const dutyModes = agentProviderManifest.modes as Record<AgentProfileForm["duty"], string[]>;
+const providerNames = Object.keys(agentProviderManifest.providers) as AgentProfileForm["provider"][];
+const providerModels = Object.fromEntries(
+  providerNames.map((provider) => [provider, [...agentProviderManifest.providers[provider].models]]),
+) as Record<AgentProfileForm["provider"], string[]>;
+const providerLabels = Object.fromEntries(
+  providerNames.map((provider) => [provider, agentProviderManifest.providers[provider].label]),
+) as Record<AgentProfileForm["provider"], string>;
+const agentDuties: AgentProfileForm["duty"][] = ["critic", "architect", "worker", "review"];
+const starterAgents: AgentProfileForm[] = agentDuties.map((duty) => {
+  const profile = agentProviderManifest.duties[duty];
+  return { duty, ...profile, provider: profile.provider as AgentProfileForm["provider"] };
+});
+
+const dutyMode = dutyModeReader(agentProviderManifest);
+const cleanMode = dutyMode.cleanMode as (duty: AgentProfileForm["duty"], value: unknown) => string;
+
+function normalizeAgentProfile(value: Record<string, unknown> | undefined, fallback: AgentProfileForm): AgentProfileForm {
+  if (!value) return { ...fallback };
+  const provider = String(value.provider ?? "").trim().toLowerCase();
+  const model = String(value.model ?? "").trim();
+  if ((provider !== "anthropic" && provider !== "openai") || !providerModels[provider].includes(model)) {
+    return { ...fallback };
+  }
+  return {
+    duty: fallback.duty,
+    provider,
+    model,
+    mode: fallback.mode,
+    role: String(value.role ?? fallback.role).trim(),
+    reasoning_effort: provider === "openai" ? String(value.reasoning_effort ?? "").trim() : "",
+    instructions: String(value.instructions ?? fallback.instructions).trim(),
+  };
+}
+
+async function loadAgentProfiles() {
+  try {
+    const { load: loadStore } = await import("@tauri-apps/plugin-store");
+    const store = await loadStore("agents.json");
+    const duties = await store.get<Record<string, Record<string, unknown>>>("duties");
+    const legacy = await store.get<Record<string, Record<string, unknown>>>("profiles");
+    const raw = duties ?? (legacy ? {
+      architect: legacy.architect,
+      worker: legacy.worker,
+      review: legacy.review ?? legacy.reviewer,
+    } : undefined);
+    const hooks = await store.get<Record<string, boolean>>("hooks");
+    const storedCriticMode = await store.get<string>("criticMode");
+    agentProfiles.value = starterAgents.map((fallback) => {
+      const value = raw?.[fallback.duty];
+      const profile = normalizeAgentProfile(value, fallback);
+      profile.mode = dutyMode.resolveMode(fallback.duty, value, { hooks, criticMode: storedCriticMode });
+      return profile;
+    });
+  } catch { installStarterAgents(); }
+}
+
+function installStarterAgents() {
+  agentProfiles.value = starterAgents.map((p) => ({ ...p }));
+  agentConfigMsg.value = "";
+}
+
+function dutyState(duty: AgentProfileForm["duty"]) {
+  const p = agentProfiles.value.find((profile) => profile.duty === duty);
+  return { mode: p?.mode ?? "off", provider: p?.provider ?? "anthropic", model: p?.model ?? "" };
+}
+
+function changeAgentProvider(p: AgentProfileForm, provider: AgentProfileForm["provider"]) {
+  p.provider = provider;
+  if (!providerModels[provider].includes(p.model)) p.model = providerModels[provider][0];
+  if (provider !== "openai") p.reasoning_effort = "";
+}
+
+async function saveAgentProfiles() {
+  agentConfigMsg.value = "";
+  const duties: Record<string, Record<string, string>> = {};
+  for (const p of agentProfiles.value) {
+    const model = p.model.trim();
+    if (!providerModels[p.provider].includes(model)) {
+      agentConfigMsg.value = t("agentProfilesInvalid");
+      return;
+    }
+    duties[p.duty] = { mode: cleanMode(p.duty, p.mode) || p.mode, provider: p.provider, model };
+    for (const k of ["role", "reasoning_effort", "instructions"] as const) {
+      const value = p[k].trim();
+      if (value) duties[p.duty][k] = value;
+    }
+  }
+  try {
+    const { load: loadStore } = await import("@tauri-apps/plugin-store");
+    const store = await loadStore("agents.json");
+    await store.set("version", 4);
+    await store.set("duties", duties);
+    await store.delete("hooks");
+    await store.delete("criticMode");
+    await store.save();
+    agentConfigMsg.value = t("agentProfilesSaved");
+  } catch (e) {
+    agentConfigMsg.value = String(e);
+  }
+}
+onMounted(loadAgentProfiles);
+
+// --- cc-todos CLI + Claude Code hook installer ---
+// The installer wires two hooks: SessionStart (task context) and Stop (the
+// HANDOFF freshness guard). `stop_installed` is false for an install made before
+// the guard existed — the UI then nudges a re-install instead of leaving it off.
 interface CcHookStatus {
   installed: boolean;
+  stop_installed: boolean;
+  /// The whole plan-mode wiring (EnterPlanMode/ExitPlanMode/UserPromptSubmit
+  /// hooks plus the PreToolUse · ExitPlanMode format guard) — see the Rust
+  /// struct of the same name for what each entry checks.
+  plan_installed: boolean;
   script_path: string;
+  /// What settings.json points at right now, and whether that file still exists.
+  /// A wired-but-missing script is the silent failure mode: Claude Code runs
+  /// `node "<gone>"` and the session just has no tasks. The app re-points the
+  /// hooks on start (heal_cc_hook); this surfaces the state in the meantime.
+  wired_path: string;
+  wired_path_exists: boolean;
   settings_path: string;
 }
 const ccHookStatus = ref<CcHookStatus | null>(null);
@@ -326,37 +461,43 @@ async function doInstallCcHook() {
 }
 onMounted(loadCcHookStatus);
 
-// --- Phases in tasks (issue #16) ---
-// Lives in the Tasks tab. A UI-only flag stored straight in settings.json (like
-// ignoredInsights above) — no backend config, so it stays out of the Save flow.
-// Default ON.
-const phasesEnabled = ref(true);
-
-async function loadPhasesEnabled() {
-  try {
-    const { load: loadStore } = await import("@tauri-apps/plugin-store");
-    const store = await loadStore("settings.json");
-    const v = await store.get<boolean>("phasesEnabled");
-    if (typeof v === "boolean") phasesEnabled.value = v;
-  } catch {}
+interface CodexHookStatus {
+  installed: boolean;
+  script_path: string;
+  wired_path: string;
+  wired_path_exists: boolean;
+  hooks_path: string;
 }
+const codexHookStatus = ref<CodexHookStatus | null>(null);
+const installCodexBusy = ref(false);
+const installCodexMsg = ref("");
 
-async function togglePhasesEnabled() {
-  phasesEnabled.value = !phasesEnabled.value;
+async function loadCodexHookStatus() {
   try {
-    const { load: loadStore } = await import("@tauri-apps/plugin-store");
-    const store = await loadStore("settings.json");
-    await store.set("phasesEnabled", phasesEnabled.value);
-    await store.save();
-  } catch {}
+    codexHookStatus.value = await invoke<CodexHookStatus>("codex_hook_status");
+  } catch {
+    codexHookStatus.value = null;
+  }
 }
-
-onMounted(loadPhasesEnabled);
+async function doInstallCodexHook() {
+  installCodexBusy.value = true;
+  installCodexMsg.value = "";
+  try {
+    const p = await invoke<string>("install_codex_hook");
+    installCodexMsg.value = t("installCodexHookDone", { path: p });
+    await loadCodexHookStatus();
+  } catch (e) {
+    installCodexMsg.value = String(e);
+  } finally {
+    installCodexBusy.value = false;
+  }
+}
+onMounted(loadCodexHookStatus);
 
 // --- Task priority in context (issue #32) ---
 // The LOWEST task priority the SessionStart hook injects into a Claude Code
 // session: all | low | medium | high. A UI-only flag in settings.json read
-// directly by the hook (like phasesEnabled above) — no backend config. Default
+// directly by the hook (like ignoredInsights above) — no backend config. Default
 // `medium`, so low/unset tasks stay out of context unless the user lowers the bar.
 const TASK_CTX_LEVELS = ["all", "low", "medium", "high"] as const;
 const taskCtxPrio = ref<string>("medium");
@@ -390,43 +531,12 @@ async function setTaskCtxPrio(v: string) {
 
 onMounted(loadTaskCtxPrio);
 
-// What a session LEADS WITH when the project is mid-plan: "phase" (the current
-// phase, focused) or "tasks" (always the task board). UI-only flag in settings.json
-// read by the SessionStart hook (like taskContextPriority). Default "phase".
-const SESSION_CTX_MODES = ["phase", "tasks"] as const;
-const sessionCtx = ref<string>("phase");
-
-function sessionCtxLabel(m: string): string {
-  return m === "tasks" ? t("sessionCtxTasks") : t("sessionCtxPhase");
-}
-
-async function loadSessionCtx() {
-  try {
-    const { load: loadStore } = await import("@tauri-apps/plugin-store");
-    const store = await loadStore("settings.json");
-    const v = await store.get<string>("sessionContext");
-    if (typeof v === "string" && (SESSION_CTX_MODES as readonly string[]).includes(v))
-      sessionCtx.value = v;
-  } catch {}
-}
-
-async function setSessionCtx(v: string) {
-  sessionCtx.value = v;
-  try {
-    const { load: loadStore } = await import("@tauri-apps/plugin-store");
-    const store = await loadStore("settings.json");
-    await store.set("sessionContext", v);
-    await store.save();
-  } catch {}
-}
-
-onMounted(loadSessionCtx);
-
 // --- Task context in sessions (master hook switch) ---
 // A UI-only flag in settings.json read by the SessionStart hook: when OFF, the
-// hook injects nothing into a session (no task board, no phase context). Default
-// ON. Same store-write pattern as phasesEnabled above.
+// hook injects nothing into a session (no task context at all). Default ON.
+// Same store-write pattern as ignoredInsights above.
 const hookContextEnabled = ref(true);
+const workflowContextEnabled = ref(false);
 
 async function loadHookContext() {
   try {
@@ -434,6 +544,8 @@ async function loadHookContext() {
     const store = await loadStore("settings.json");
     const v = await store.get<boolean>("hookContextEnabled");
     if (typeof v === "boolean") hookContextEnabled.value = v;
+    const workflow = await store.get<boolean>("workflowContextEnabled");
+    if (typeof workflow === "boolean") workflowContextEnabled.value = workflow;
   } catch {}
 }
 
@@ -447,7 +559,86 @@ async function toggleHookContext() {
   } catch {}
 }
 
+async function toggleWorkflowContext() {
+  workflowContextEnabled.value = !workflowContextEnabled.value;
+  try {
+    const { load: loadStore } = await import("@tauri-apps/plugin-store");
+    const store = await loadStore("settings.json");
+    await store.set("workflowContextEnabled", workflowContextEnabled.value);
+    await store.save();
+  } catch {}
+}
+
 onMounted(loadHookContext);
+
+// --- Spec registry channel (t#361) ---
+// Master switch for the spec registry's part in the AUTOMATIC workflow: the
+// SessionStart injection, the section printed on the move into in_progress,
+// and the Stop guard's spec half. Default OFF — with it off a change is just a
+// group of tasks sharing one goal (its description, the ★ vision), and nothing
+// asks about spec sections on its own. Manual `cli spec …` commands stay fully
+// callable either way. Emits `settings-changed` on top of the shared store
+// write so a window already open (TodoWindow's Specs tab) hides live.
+const specsEnabled = ref(false);
+
+async function loadSpecsEnabled() {
+  try {
+    const { load: loadStore } = await import("@tauri-apps/plugin-store");
+    const store = await loadStore("settings.json");
+    const v = await store.get<boolean>("specsEnabled");
+    if (typeof v === "boolean") specsEnabled.value = v;
+  } catch {}
+}
+
+async function toggleSpecsEnabled() {
+  specsEnabled.value = !specsEnabled.value;
+  try {
+    const { load: loadStore } = await import("@tauri-apps/plugin-store");
+    const store = await loadStore("settings.json");
+    await store.set("specsEnabled", specsEnabled.value);
+    await store.save();
+    const { emit } = await import("@tauri-apps/api/event");
+    await emit("settings-changed");
+  } catch {}
+}
+
+onMounted(loadSpecsEnabled);
+
+// --- HANDOFF guard (issue #59) ---
+// Which TASKS must leave a handoff before a session ends (read by the Stop
+// hook). "submitted" = moved to review/done this session; "unfinished" = worked
+// and left in_progress; "both" (default); "off".
+const TASK_GUARD_MODES = ["both", "submitted", "unfinished", "off"] as const;
+const taskHandoffGuard = ref<string>("both");
+
+function taskGuardLabel(m: string): string {
+  if (m === "off") return t("taskGuardOff");
+  if (m === "submitted") return t("taskGuardSubmitted");
+  if (m === "unfinished") return t("taskGuardUnfinished");
+  return t("taskGuardBoth");
+}
+
+async function loadTaskGuard() {
+  try {
+    const { load: loadStore } = await import("@tauri-apps/plugin-store");
+    const store = await loadStore("settings.json");
+    const v = await store.get<string>("taskHandoffGuard");
+    if (typeof v === "string" && (TASK_GUARD_MODES as readonly string[]).includes(v))
+      taskHandoffGuard.value = v;
+  } catch {}
+}
+
+async function setTaskGuard(v: string) {
+  taskHandoffGuard.value = v;
+  try {
+    const { load: loadStore } = await import("@tauri-apps/plugin-store");
+    const store = await loadStore("settings.json");
+    await store.set("taskHandoffGuard", v);
+    await store.save();
+  } catch {}
+}
+
+onMounted(loadTaskGuard);
 
 // --- Task audit schedule (#35) ---
 // Moved here from the tasks window. The in-app scheduler runs a headless
@@ -570,19 +761,14 @@ onMounted(loadTriagePrompt);
 // --- Task-ref migration & backups (#63) ---
 // Bare `#N` used to be treated as a task reference, but in prose it almost always
 // means a GitHub PR/issue — a number collision silently linked the wrong task. The
-// app now links only the explicit `t#N` form; this one-shot migration rewrites the
-// genuine `#N` task refs already in stored text to `t#N` so they keep linking. It
-// backs up todos.json first, and "Откатить" restores that backup.
+// app now links only the explicit `t#N` form, and rewrites the genuine `#N` task
+// refs in stored text on startup, since a board with both spellings is ambiguous
+// rather than merely old. What is left here is the safety net: the rewrite guesses,
+// so it backs todos.json up first and "Откатить" restores that backup.
 interface BackupInfo {
   name: string;
   when_ms: number;
 }
-interface MigrationReport {
-  refs: number;
-  tasks: number;
-  backup: string;
-}
-const migrating = ref(false);
 const restoring = ref(false);
 const migrateMsg = ref("");
 const latestBackup = ref<BackupInfo | null>(null);
@@ -600,22 +786,6 @@ function fmtBackupTime(ms: number): string {
     return new Date(ms).toLocaleString();
   } catch {
     return "";
-  }
-}
-
-async function runMigration() {
-  if (migrating.value) return;
-  migrating.value = true;
-  migrateMsg.value = "";
-  try {
-    const r = await invoke<MigrationReport>("migrate_todo_refs");
-    migrateMsg.value =
-      r.refs === 0 ? t("migrateNone") : t("migrateDone", { refs: r.refs, tasks: r.tasks });
-    await loadLatestBackup();
-  } catch (e) {
-    migrateMsg.value = String(e);
-  } finally {
-    migrating.value = false;
   }
 }
 
@@ -637,6 +807,108 @@ async function runRestore() {
 }
 
 onMounted(loadLatestBackup);
+
+// --- Board import / export (#181) ---
+// Carrying todos.json between machines by hand DESTROYS whatever the other machine
+// added: both number tasks with max+1, so the same number lands on different tasks
+// and a straight copy overwrites the board. Import here is a MERGE that never
+// overwrites — a taken number is reassigned, and an incoming task whose id already
+// exists locally is filed as a NEW task (a fork) instead of replacing the local one.
+// The user sees a preview of exactly that before anything is written.
+interface ImportItem {
+  subject: string;
+  kind: string; // "added" | "renumbered" | "forked"
+  from_number: number;
+  to_number: number;
+}
+interface ImportReport {
+  added: number;
+  renumbered: number;
+  forked: number;
+  unchanged: number; // already on the board, untouched since → skipped (import is idempotent)
+  dropped_edges: number;
+  rewritten_refs: number;
+  backup: string | null;
+  total_after: number;
+  items: ImportItem[];
+}
+const exporting = ref(false);
+const importing = ref(false);
+const ioMsg = ref("");
+// A previewed import awaiting the user's confirmation: nothing is written until then.
+const pendingImport = ref<{ path: string; report: ImportReport } | null>(null);
+
+function defaultExportName(): string {
+  const d = new Date();
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `todos-${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}.json`;
+}
+
+async function runExport() {
+  if (exporting.value) return;
+  ioMsg.value = "";
+  const path = await saveFileDialog({
+    defaultPath: defaultExportName(),
+    filters: [{ name: "JSON", extensions: ["json"] }],
+  });
+  if (!path) return; // user cancelled
+  exporting.value = true;
+  try {
+    const count = await invoke<number>("export_todos", { path });
+    ioMsg.value = t("ioExported", { count });
+  } catch (e) {
+    ioMsg.value = String(e);
+  } finally {
+    exporting.value = false;
+  }
+}
+
+async function pickImport() {
+  if (importing.value) return;
+  ioMsg.value = "";
+  pendingImport.value = null;
+  const picked = await openFileDialog({
+    multiple: false,
+    filters: [{ name: "JSON", extensions: ["json"] }],
+  });
+  const path = typeof picked === "string" ? picked : null;
+  if (!path) return; // user cancelled
+  importing.value = true;
+  try {
+    const report = await invoke<ImportReport>("preview_todo_import", { path });
+    if (report.added + report.renumbered + report.forked === 0) {
+      // Nothing to do. Distinguish "the file is empty" from "you already have all
+      // of it" — the second is the normal outcome of importing the same file twice.
+      ioMsg.value = report.unchanged > 0 ? t("ioImportNothingNew") : t("ioImportEmpty");
+      return;
+    }
+    pendingImport.value = { path, report };
+  } catch (e) {
+    ioMsg.value = String(e);
+  } finally {
+    importing.value = false;
+  }
+}
+
+async function confirmImport() {
+  if (!pendingImport.value || importing.value) return;
+  const { path } = pendingImport.value;
+  importing.value = true;
+  try {
+    const r = await invoke<ImportReport>("apply_todo_import", { path });
+    ioMsg.value = t("ioImported", {
+      added: r.added + r.renumbered,
+      forked: r.forked,
+      total: r.total_after,
+    });
+    pendingImport.value = null;
+    await loadLatestBackup(); // the import took one; "Откатить" now undoes it
+  } catch (e) {
+    ioMsg.value = String(e);
+  } finally {
+    importing.value = false;
+  }
+}
 
 // Keep each threshold triple strictly ascending with a 1% gap so the colour
 // bands can't overlap. Fixed slider scale (5..99) + clamping — dynamic min/max
@@ -1168,7 +1440,7 @@ function handleSave() {
 
       <!-- ===== Budget & analytics ===== -->
       <template v-if="tab === 'budget'">
-      <!-- Claude Code analytics (opt-in, off by default) -->
+      <!-- Local Claude Code + Codex analytics (opt-in, off by default) -->
       <div class="card toggle-card" @click="localCc = !localCc">
         <div style="flex: 1; min-width: 0">
           <div class="card-title" style="font-size: 13px">{{ t('ccAnalytics') }}</div>
@@ -1395,13 +1667,98 @@ function handleSave() {
 
       <!-- ===== Tasks ===== -->
       <template v-if="tab === 'tasks'">
-      <!-- Install the cc-todos CLI + SessionStart hook into ~/.claude/settings.json -->
+      <div class="card">
+        <div class="card-row" style="align-items: center">
+          <div style="flex: 1; min-width: 0">
+            <div class="card-title">{{ t('agentProfilesTitle') }}</div>
+            <div class="card-sub">{{ t('agentProfilesDesc') }}</div>
+          </div>
+          <button type="button" class="suggest-btn" @click="installStarterAgents">{{ t('agentProfilesStarter') }}</button>
+        </div>
+
+        <div v-for="p in agentProfiles" :key="p.duty" class="agent-profile">
+          <div class="agent-profile-head">
+            <div class="agent-duty">
+              <strong>{{ t(`agentDuty_${p.duty}`) }}</strong>
+              <span>{{ t(`agentTrigger_${p.duty}`) }}</span>
+            </div>
+            <span class="model-chip" :class="modelFamilyClass(p.model, p.provider)">{{ p.model || t('agentModel') }}</span>
+          </div>
+          <div class="agent-profile-grid">
+            <label>
+              <span class="field-label">{{ t('agentMode') }}</span>
+              <select v-model="p.mode" class="field-input" :disabled="dutyModes[p.duty].length <= 1">
+                <option v-for="m in dutyModes[p.duty]" :key="m" :value="m">{{ t(`agentMode_${m}`) }}</option>
+              </select>
+            </label>
+            <label>
+              <span class="field-label">{{ t('agentProvider') }}</span>
+              <select :value="p.provider" class="field-input" @change="changeAgentProvider(p, ($event.target as HTMLSelectElement).value as AgentProfileForm['provider'])">
+                <option v-for="provider in providerNames" :key="provider" :value="provider">{{ providerLabels[provider] }}</option>
+              </select>
+            </label>
+            <label>
+              <span class="field-label">{{ t('agentModel') }}</span>
+              <select v-model="p.model" class="field-input">
+                <option v-for="model in providerModels[p.provider]" :key="model" :value="model">{{ model }}</option>
+              </select>
+            </label>
+            <label>
+              <span class="field-label">{{ t('agentReasoning') }}</span>
+              <select v-model="p.reasoning_effort" class="field-input" :disabled="p.provider !== 'openai'">
+                <option value="">—</option>
+                <option v-for="r in ['low','medium','high','xhigh','max','ultra']" :key="r" :value="r">{{ r }}</option>
+              </select>
+            </label>
+          </div>
+          <div class="field-hint">{{ t(`agentModeHint_${p.mode}`) }}</div>
+          <label>
+            <span class="field-label">{{ t('agentInstructions') }}</span>
+            <textarea v-model="p.instructions" class="field-input" rows="2"></textarea>
+          </label>
+        </div>
+        <div class="budget-suggest">
+          <span class="field-hint" style="margin: 0">{{ agentConfigMsg }}</span>
+          <button type="button" class="suggest-btn" @click="saveAgentProfiles">{{ t('save') }}</button>
+        </div>
+      </div>
+
+      <WorkflowGraph
+        :critic="dutyState('critic')"
+        :architect="dutyState('architect')"
+        :worker="dutyState('worker')"
+        :review="dutyState('review')"
+        :plan-installed="!!ccHookStatus?.plan_installed"
+      />
+
+      <!-- Install the cc-todos CLI + the SessionStart/Stop hooks into ~/.claude/settings.json -->
       <div class="card" style="display: flex; align-items: center; gap: 12px">
         <div style="flex: 1; min-width: 0">
           <div class="card-title" style="font-size: 13px">{{ t('installCcHook') }}</div>
           <div class="card-sub">{{ t('installCcHookDesc') }}</div>
           <div v-if="ccHookStatus" class="card-sub" style="margin-top: 6px">
             {{ ccHookStatus.installed ? t('installCcHookOn') : t('installCcHookOff') }}
+            <span v-if="ccHookStatus.installed && ccHookStatus.wired_path" class="muted">
+              — {{ ccHookStatus.wired_path }}
+            </span>
+          </div>
+          <!-- Wired, but the script is gone: Claude Code has been running
+               `node "<gone>"` and getting nothing. -->
+          <div
+            v-if="ccHookStatus && ccHookStatus.installed && !ccHookStatus.wired_path_exists"
+            class="field-hint"
+            style="margin-top: 4px; color: #f87171"
+          >
+            {{ t('installCcHookBroken') }}
+          </div>
+          <!-- Installed before the Stop guard existed: the SessionStart hook runs,
+               but nothing checks the handoff at session end until a re-install. -->
+          <div
+            v-if="ccHookStatus && ccHookStatus.installed && !ccHookStatus.stop_installed"
+            class="field-hint"
+            style="margin-top: 4px; color: #fbbf24"
+          >
+            {{ t('installCcHookStopMissing') }}
           </div>
           <div v-if="installCcMsg" class="field-hint" style="margin-top: 4px">{{ installCcMsg }}</div>
         </div>
@@ -1410,7 +1767,31 @@ function handleSave() {
         </button>
       </div>
 
-      <!-- Master switch: does the SessionStart hook inject task/phase context? -->
+      <div class="card" style="display: flex; align-items: center; gap: 12px">
+        <div style="flex: 1; min-width: 0">
+          <div class="card-title" style="font-size: 13px">{{ t('installCodexHook') }}</div>
+          <div class="card-sub">{{ t('installCodexHookDesc') }}</div>
+          <div v-if="codexHookStatus" class="card-sub" style="margin-top: 6px">
+            {{ codexHookStatus.installed ? t('installCcHookOn') : t('installCcHookOff') }}
+            <span v-if="codexHookStatus.installed && codexHookStatus.wired_path" class="muted">
+              — {{ codexHookStatus.wired_path }}
+            </span>
+          </div>
+          <div
+            v-if="codexHookStatus && codexHookStatus.installed && !codexHookStatus.wired_path_exists"
+            class="field-hint"
+            style="margin-top: 4px; color: #f87171"
+          >
+            {{ t('installCodexHookBroken') }}
+          </div>
+          <div v-if="installCodexMsg" class="field-hint" style="margin-top: 4px">{{ installCodexMsg }}</div>
+        </div>
+        <button type="button" class="suggest-btn" :disabled="installCodexBusy" @click="doInstallCodexHook">
+          {{ codexHookStatus && codexHookStatus.installed ? t('installCcHookReinstall') : t('installCcHookBtn') }}
+        </button>
+      </div>
+
+      <!-- Master switch: does the SessionStart hook inject task context? -->
       <div class="card toggle-card" @click="toggleHookContext">
         <div style="flex: 1; min-width: 0">
           <div class="card-title" style="font-size: 13px">{{ t('hookContextSetting') }}</div>
@@ -1421,15 +1802,42 @@ function handleSave() {
         </div>
       </div>
 
-      <!-- Phases in tasks (issue #16) — UI-only flag in settings.json. -->
-      <div class="card toggle-card" @click="togglePhasesEnabled">
+      <div
+        class="card toggle-card"
+        :class="{ disabled: !hookContextEnabled }"
+        @click="hookContextEnabled && toggleWorkflowContext()"
+      >
         <div style="flex: 1; min-width: 0">
-          <div class="card-title" style="font-size: 13px">{{ t('phasesSetting') }}</div>
-          <div class="card-sub">{{ t('phasesSettingDesc') }}</div>
+          <div class="card-title" style="font-size: 13px">{{ t('workflowContextSetting') }}</div>
+          <div class="card-sub">{{ t('workflowContextSettingDesc') }}</div>
         </div>
-        <div class="toggle" :class="{ on: phasesEnabled }">
+        <div class="toggle" :class="{ on: workflowContextEnabled }">
           <div class="toggle-knob"></div>
         </div>
+      </div>
+
+      <!-- Master switch: does a change carry the spec registry (t#361)? -->
+      <div class="card toggle-card" @click="toggleSpecsEnabled">
+        <div style="flex: 1; min-width: 0">
+          <div class="card-title" style="font-size: 13px">{{ t('specsEnabledSetting') }}</div>
+          <div class="card-sub">{{ t('specsEnabledSettingDesc') }}</div>
+        </div>
+        <div class="toggle" :class="{ on: specsEnabled }">
+          <div class="toggle-knob"></div>
+        </div>
+      </div>
+
+      <!-- HANDOFF guard (issue #59): which tasks must leave a handoff (Stop hook). -->
+      <div class="card">
+        <div class="field-label">{{ t('taskGuardSetting') }}</div>
+        <select
+          class="field-input"
+          :value="taskHandoffGuard"
+          @change="setTaskGuard(($event.target as HTMLSelectElement).value)"
+        >
+          <option v-for="m in TASK_GUARD_MODES" :key="m" :value="m">{{ taskGuardLabel(m) }}</option>
+        </select>
+        <div class="field-hint">{{ t('taskGuardDesc') }}</div>
       </div>
 
       <!-- Task priority in context (issue #32) — UI-only flag in settings.json,
@@ -1444,20 +1852,6 @@ function handleSave() {
           <option v-for="lv in TASK_CTX_LEVELS" :key="lv" :value="lv">{{ taskCtxPrioLabel(lv) }}</option>
         </select>
         <div class="field-hint">{{ t('taskCtxPrioDesc') }}</div>
-      </div>
-
-      <!-- Session context (phase vs tasks) — UI-only flag in settings.json, read by
-           the SessionStart hook to choose what a mid-plan session leads with. -->
-      <div class="card">
-        <div class="field-label">{{ t('sessionCtxSetting') }}</div>
-        <select
-          class="field-input"
-          :value="sessionCtx"
-          @change="setSessionCtx(($event.target as HTMLSelectElement).value)"
-        >
-          <option v-for="m in SESSION_CTX_MODES" :key="m" :value="m">{{ sessionCtxLabel(m) }}</option>
-        </select>
-        <div class="field-hint">{{ t('sessionCtxDesc') }}</div>
       </div>
 
       <!-- Task audit schedule (#35) — daily headless audit of the task board.
@@ -1538,16 +1932,13 @@ function handleSave() {
         </template>
       </div>
 
-      <!-- Task-ref migration (#63): rewrite bare `#N` → `t#N`, with a backup and a
-           one-click restore. `#N` now reads as a PR/issue, only `t#N` links. -->
+      <!-- Task-ref migration (#63): bare `#N` → `t#N` runs on startup; `#N` reads as
+           a PR/issue, only `t#N` links. What is offered here is the undo. -->
       <div class="card">
         <div class="field-label">{{ t('migrateTitle') }}</div>
         <div class="field-hint" style="margin-top: 6px">{{ t('migrateDesc') }}</div>
         <div class="budget-suggest" style="margin-top: 10px">
           <span style="display: flex; gap: 8px; flex-shrink: 0">
-            <button type="button" class="suggest-btn" :disabled="migrating" @click="runMigration">
-              {{ migrating ? t('migrateRunning') : t('migrateRun') }}
-            </button>
             <button
               type="button"
               class="suggest-btn"
@@ -1561,6 +1952,76 @@ function handleSave() {
         </div>
         <div v-if="latestBackup" class="field-hint" style="margin-top: 6px">
           {{ t('migrateBackupAt', { date: fmtBackupTime(latestBackup.when_ms) }) }}
+        </div>
+      </div>
+
+      <!-- Board import / export (#181): moving a board between machines. Import is a
+           merge that never overwrites — see the script block for why a plain copy
+           of todos.json loses tasks. -->
+      <div class="card">
+        <div class="field-label">{{ t('ioTitle') }}</div>
+        <div class="field-hint" style="margin-top: 6px">{{ t('ioDesc') }}</div>
+        <div class="budget-suggest" style="margin-top: 10px">
+          <span style="display: flex; gap: 8px; flex-shrink: 0">
+            <button type="button" class="suggest-btn" :disabled="exporting" @click="runExport">
+              {{ exporting ? t('ioExporting') : t('ioExport') }}
+            </button>
+            <button
+              type="button"
+              class="suggest-btn"
+              :disabled="importing || !!pendingImport"
+              @click="pickImport"
+            >
+              {{ importing && !pendingImport ? t('ioReading') : t('ioImport') }}
+            </button>
+          </span>
+          <span v-if="ioMsg" class="field-hint" style="margin: 0">{{ ioMsg }}</span>
+        </div>
+
+        <!-- Preview: nothing has been written yet. Spell out the two non-obvious
+             outcomes (renumbered, forked) so the user knows what they're accepting. -->
+        <div v-if="pendingImport" class="io-preview">
+          <div class="io-preview-head">{{ t('ioPreviewTitle') }}</div>
+          <ul class="io-preview-stats">
+            <li v-if="pendingImport.report.added">
+              {{ t('ioStatAdded', { n: pendingImport.report.added }) }}
+            </li>
+            <li v-if="pendingImport.report.renumbered">
+              {{ t('ioStatRenumbered', { n: pendingImport.report.renumbered }) }}
+            </li>
+            <li v-if="pendingImport.report.forked">
+              {{ t('ioStatForked', { n: pendingImport.report.forked }) }}
+            </li>
+            <li v-if="pendingImport.report.unchanged">
+              {{ t('ioStatUnchanged', { n: pendingImport.report.unchanged }) }}
+            </li>
+            <li v-if="pendingImport.report.dropped_edges">
+              {{ t('ioStatDropped', { n: pendingImport.report.dropped_edges }) }}
+            </li>
+          </ul>
+          <div class="io-preview-list">
+            <div v-for="(it, i) in pendingImport.report.items.slice(0, 12)" :key="i" class="io-row">
+              <span class="io-kind" :class="'io-kind--' + it.kind">{{ t('ioKind_' + it.kind) }}</span>
+              <span class="io-num">
+                <template v-if="it.from_number !== it.to_number">
+                  #{{ it.from_number }} → #{{ it.to_number }}
+                </template>
+                <template v-else>#{{ it.to_number }}</template>
+              </span>
+              <span class="io-subj">{{ it.subject }}</span>
+            </div>
+            <div v-if="pendingImport.report.items.length > 12" class="field-hint" style="margin: 4px 0 0">
+              {{ t('ioMore', { n: pendingImport.report.items.length - 12 }) }}
+            </div>
+          </div>
+          <div style="display: flex; gap: 8px; margin-top: 10px">
+            <button type="button" class="suggest-btn" :disabled="importing" @click="confirmImport">
+              {{ importing ? t('ioApplying') : t('ioApply') }}
+            </button>
+            <button type="button" class="suggest-btn" :disabled="importing" @click="pendingImport = null">
+              {{ t('ioCancel') }}
+            </button>
+          </div>
         </div>
       </div>
       </template>
@@ -1841,6 +2302,59 @@ function handleSave() {
   margin-top: 6px;
 }
 
+.agent-profile-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.agent-profile-head .field-input {
+  flex: 1;
+}
+.agent-profile {
+  display: grid;
+  gap: 9px;
+  margin-top: 10px;
+  padding: 10px;
+  border: 1px solid var(--stroke-strong);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.025);
+}
+.agent-profile-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+.agent-duty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.agent-duty strong { font-size: 13px; color: var(--text); }
+.agent-duty span { font-size: 12px; color: var(--text-4); }
+.agent-profile .field-label {
+  display: block;
+  margin-bottom: 4px;
+}
+
+.model-chip {
+  flex: 0 0 auto;
+  padding: 2px 8px;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  font: 600 11px ui-monospace, Consolas, monospace;
+  background: color-mix(in srgb, currentColor 12%, transparent);
+}
+.model-openai-sol { color: #34d399; }
+.model-openai-terra { color: #60a5fa; }
+.model-openai-luna { color: #22d3ee; }
+.model-openai { color: #10b981; }
+.model-anthropic-opus { color: #d97757; }
+.model-anthropic-sonnet { color: #6ccb5f; }
+.model-anthropic-haiku { color: #5b9bd5; }
+.model-anthropic { color: #e879f9; }
+.model-unknown { color: var(--text-4); }
+
 .field-range {
   -webkit-appearance: none;
   appearance: none;
@@ -1877,6 +2391,11 @@ function handleSave() {
   align-items: center;
   gap: 12px;
   cursor: pointer;
+}
+
+.toggle-card.disabled {
+  cursor: default;
+  opacity: .5;
 }
 
 .toggle {
@@ -2040,6 +2559,78 @@ function handleSave() {
 
 .suggest-btn:hover {
   background: rgba(255, 255, 255, 0.06);
+}
+
+/* Import preview (#181) — shown before anything is written. */
+.io-preview {
+  margin-top: 10px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.io-preview-head {
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.io-preview-stats {
+  margin: 0 0 8px;
+  padding-left: 18px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.io-preview-list {
+  max-height: 180px;
+  overflow-y: auto;
+}
+
+.io-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12px;
+  padding: 2px 0;
+}
+
+.io-kind {
+  flex-shrink: 0;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+/* Plain add vs the two outcomes the user must actually notice. */
+.io-kind--added {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--muted);
+}
+
+.io-kind--renumbered {
+  background: rgba(88, 166, 255, 0.16);
+  color: #58a6ff;
+}
+
+.io-kind--forked {
+  background: rgba(210, 153, 34, 0.18);
+  color: #d29922;
+}
+
+.io-num {
+  flex-shrink: 0;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  color: var(--muted);
+}
+
+.io-subj {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .prompt-editor {

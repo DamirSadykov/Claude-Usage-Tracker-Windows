@@ -4,6 +4,7 @@ import { useI18n } from "vue-i18n";
 import { invoke } from "@tauri-apps/api/core";
 import SettingsWindow from "./components/SettingsWindow.vue";
 import UsagePanel from "./components/UsagePanel.vue";
+import CodexUsageCards from "./components/CodexUsageCards.vue";
 import MiniPanel from "./components/MiniPanel.vue";
 import AnalyticsPanel from "./components/AnalyticsPanel.vue";
 import AnalyticsWindow from "./components/AnalyticsWindow.vue";
@@ -11,6 +12,7 @@ import TodoWindow from "./components/TodoWindow.vue";
 import FocusControls from "./components/FocusControls.vue";
 import ServiceStatusBar from "./components/ServiceStatusBar.vue";
 import AboutPanel from "./components/AboutPanel.vue";
+import PipelineWindow from "./components/pipeline/PipelineWindow.vue";
 import { applyFont, writeCachedFontId, DEFAULT_FONT_ID } from "./fontSwitch";
 import {
     DEFAULT_THRESHOLDS,
@@ -24,11 +26,13 @@ import type { AlertTiers, AlertTypes } from "./thresholds";
 import { localizeAlert } from "./alertFormat";
 import type { AlertEvent } from "./alertFormat";
 import { useUpdater, initUpdater } from "./updater";
+import { readSettingsSnapshot } from "./settingsStore";
 
 const isMini = window.location.hash === "#mini";
 const isAnalytics = window.location.hash === "#analytics";
 const isTodos = window.location.hash === "#todos";
 const isSettings = window.location.hash === "#settings";
+const isPipeline = window.location.hash === "#pipeline";
 
 export interface UsageTier {
     percent_used: number;
@@ -62,6 +66,22 @@ export interface UsageData {
     extra_usage: ExtraUsage | null;
     prepaid_balance: number | null;
     prepaid_currency: string | null;
+}
+
+export interface CodexLimitWindow {
+    usedPercent: number;
+    windowMinutes: number;
+    resetsAt: number;
+}
+
+export interface CodexRateLimits {
+    observedAt: string;
+    limitId: string;
+    planType: string | null;
+    primary: CodexLimitWindow | null;
+    secondary: CodexLimitWindow | null;
+    credits: { hasCredits: boolean; unlimited: boolean; balance: string } | null;
+    rateLimitReachedType: string | null;
 }
 
 // Colour buckets (0..3) computed by the backend, one per tier.
@@ -218,6 +238,8 @@ const budgetUnit = computed<"usd" | "pct">(() =>
 const usage = ref<UsageData | null>(null);
 const levels = ref<UsageLevels | null>(null);
 const forecast = ref<ForecastData | null>(null);
+const codexLimits = ref<CodexRateLimits | null>(null);
+let codexLimitsTimer: ReturnType<typeof setInterval> | null = null;
 const sessionActive = computed(() => {
     const fh = usage.value?.five_hour;
     if (!fh) return false;
@@ -313,87 +335,46 @@ const unlisteners: Array<() => void> = [];
 let permissionOk: boolean | null = null;
 
 async function loadSettings() {
-    try {
-        const { load } = await import("@tauri-apps/plugin-store");
-        const store = await load("settings.json");
-        sessionKey.value = (await store.get<string>("sessionKey")) ?? "";
-        orgId.value = (await store.get<string>("orgId")) ?? "";
-        refreshInterval.value =
-            (await store.get<number>("refreshInterval")) ?? 60;
-        autoStartSession.value =
-            (await store.get<boolean>("autoStartSession")) ?? false;
-        projectId.value = (await store.get<string>("projectId")) ?? "";
-        const legacyThresholds = await store.get<number[]>("thresholds");
-        sessionThresholds.value = normalize(
-            (await store.get<number[]>("thresholdsSession")) ?? legacyThresholds,
-        );
-        weeklyThresholds.value = normalize(
-            (await store.get<number[]>("thresholdsWeekly")) ?? legacyThresholds,
-        );
-        notificationsEnabled.value =
-            (await store.get<boolean>("notificationsEnabled")) ?? false;
-        notifyForecastMinutes.value =
-            (await store.get<number>("notifyForecastMinutes")) ?? 30;
-        forecastWindowMinutes.value =
-            (await store.get<number>("forecastWindowMinutes")) ?? 60;
-        alertTiers.value = normalizeAlertTiers(
-            await store.get<Partial<AlertTiers>>("alertTiers"),
-        );
-        alertTypes.value = normalizeAlertTypes(
-            await store.get<Partial<AlertTypes>>("alertTypes"),
-        );
-        quietHoursEnabled.value =
-            (await store.get<boolean>("quietHoursEnabled")) ?? false;
-        quietHoursStart.value =
-            (await store.get<string>("quietHoursStart")) ?? "23:00";
-        quietHoursEnd.value =
-            (await store.get<string>("quietHoursEnd")) ?? "08:00";
-        ccAnalyticsEnabled.value =
-            (await store.get<boolean>("ccAnalyticsEnabled")) ?? false;
-        dailyBudgetEnabled.value =
-            (await store.get<boolean>("dailyBudgetEnabled")) ?? false;
-        dailyBudget.value = (await store.get<number>("dailyBudget")) ?? 0;
-        goalCostPerHourMax.value =
-            (await store.get<number | null>("goalCostPerHourMax")) ?? null;
-        goalErrorRateMax.value =
-            (await store.get<number | null>("goalErrorRateMax")) ?? null;
-        notificationsMutedUntil.value =
-            (await store.get<string>("notificationsMutedUntil")) ?? null;
-        serviceStatusEnabled.value =
-            (await store.get<boolean>("serviceStatusEnabled")) ?? true;
-        serviceStatusInterval.value =
-            (await store.get<number>("serviceStatusInterval")) ?? 90;
-        serviceStatusNotify.value =
-            (await store.get<boolean>("serviceStatusNotify")) ?? true;
-        memoryBloatEnabled.value =
-            (await store.get<boolean>("memoryBloatEnabled")) ?? true;
-        todoNotificationsEnabled.value =
-            (await store.get<boolean>("todoNotificationsEnabled")) ?? true;
-        runtimeInsightsEnabled.value =
-            (await store.get<boolean>("runtimeInsightsEnabled")) ?? false;
-        {
-            const rk = await store.get<string[]>("runtimeInsightKinds");
-            // Migrate the pre-release kind name idle_cache_gap → cold_rewrites so
-            // a settings.json written before the rename keeps its runtime toggle.
-            if (Array.isArray(rk)) {
-                runtimeInsightKinds.value = rk.map((k) =>
-                    k === "idle_cache_gap" ? "cold_rewrites" : k,
-                );
-            }
-        }
-        systemInfoEnabled.value =
-            (await store.get<boolean>("systemInfoEnabled")) ?? true;
-        correctionsEnabled.value =
-            (await store.get<boolean>("correctionsEnabled")) ?? false;
-        const savedLocale = await store.get<string>("locale");
-        if (savedLocale) locale.value = savedLocale;
-        uiFont.value = (await store.get<string>("uiFont")) ?? DEFAULT_FONT_ID;
-        // Apply the persisted font and refresh the fast cache main.ts reads.
-        applyFont(uiFont.value);
-        writeCachedFontId(uiFont.value);
-    } catch {
-        // First run
-    }
+    // Reads flow through the shared schema layer (one set of defaults +
+    // normalization + migrations, in settingsStore). This window stays the sole
+    // WRITER — it seeds its editable refs here, then saveSettings() persists them.
+    const s = await readSettingsSnapshot();
+    sessionKey.value = s.sessionKey;
+    orgId.value = s.orgId;
+    refreshInterval.value = s.refreshInterval;
+    autoStartSession.value = s.autoStartSession;
+    projectId.value = s.projectId;
+    sessionThresholds.value = s.sessionThresholds;
+    weeklyThresholds.value = s.weeklyThresholds;
+    notificationsEnabled.value = s.notificationsEnabled;
+    notifyForecastMinutes.value = s.notifyForecastMinutes;
+    forecastWindowMinutes.value = s.forecastWindowMinutes;
+    alertTiers.value = s.alertTiers;
+    alertTypes.value = s.alertTypes;
+    quietHoursEnabled.value = s.quietHoursEnabled;
+    quietHoursStart.value = s.quietHoursStart;
+    quietHoursEnd.value = s.quietHoursEnd;
+    ccAnalyticsEnabled.value = s.ccAnalyticsEnabled;
+    dailyBudgetEnabled.value = s.dailyBudgetEnabled;
+    dailyBudget.value = s.dailyBudget;
+    goalCostPerHourMax.value = s.goalCostPerHourMax;
+    goalErrorRateMax.value = s.goalErrorRateMax;
+    notificationsMutedUntil.value = s.notificationsMutedUntil;
+    serviceStatusEnabled.value = s.serviceStatusEnabled;
+    serviceStatusInterval.value = s.serviceStatusInterval;
+    serviceStatusNotify.value = s.serviceStatusNotify;
+    memoryBloatEnabled.value = s.memoryBloatEnabled;
+    todoNotificationsEnabled.value = s.todoNotificationsEnabled;
+    runtimeInsightsEnabled.value = s.runtimeInsightsEnabled;
+    runtimeInsightKinds.value = s.runtimeInsightKinds;
+    systemInfoEnabled.value = s.systemInfoEnabled;
+    correctionsEnabled.value = s.correctionsEnabled;
+    // An unset locale must not clobber the running one (navigator default).
+    if (s.locale) locale.value = s.locale;
+    uiFont.value = s.uiFont;
+    // Apply the persisted font and refresh the fast cache main.ts reads.
+    applyFont(uiFont.value);
+    writeCachedFontId(uiFont.value);
 }
 
 const pinned = ref(false);
@@ -611,6 +592,20 @@ async function loadForecast() {
     }
 }
 
+async function loadCodexLimits() {
+    if (!ccAnalyticsEnabled.value) {
+        codexLimits.value = null;
+        return;
+    }
+    try {
+        codexLimits.value = await invoke<CodexRateLimits | null>("get_codex_limits", {
+            enabled: ccAnalyticsEnabled.value,
+        });
+    } catch {
+        codexLimits.value = null;
+    }
+}
+
 async function setMute(until: string | null) {
     notificationsMutedUntil.value = until;
     await saveSettings();
@@ -618,6 +613,7 @@ async function setMute(until: string | null) {
 }
 
 async function refresh() {
+    void loadCodexLimits();
     if (!configured.value) return;
     beginLoading();
     await invoke("refresh_now");
@@ -763,6 +759,7 @@ async function handleSave(settings: {
     await applyConfig();
     await loadTodaySpent();
     await loadForecast();
+    await loadCodexLimits();
     // Tell the settings window (and any other listener) to refresh its form from
     // the canonical on-disk state we just wrote.
     const { emit } = await import("@tauri-apps/api/event");
@@ -829,8 +826,11 @@ onMounted(async () => {
     if (isAnalytics) return; // the analytics window has its own init flow
     if (isTodos) return; // the todos window self-initializes via TodoWindow
     if (isSettings) return; // the settings window self-initializes via SettingsWindow
+    if (isPipeline) return; // the pipeline preview renders mocked data only
 
     await loadSettings();
+    await loadCodexLimits();
+    codexLimitsTimer = setInterval(() => { void loadCodexLimits(); }, 30_000);
 
     try {
         envBadge.value = await invoke<string | null>("app_env_label");
@@ -851,6 +851,7 @@ onMounted(async () => {
                 settleLoading();
                 void loadTodaySpent();
                 void loadForecast();
+                void loadCodexLimits();
             },
         ),
         await listen<{ message: string; reportable: boolean; session_expired?: boolean }>(
@@ -953,6 +954,7 @@ onMounted(async () => {
 onUnmounted(() => {
     unlisteners.forEach((u) => u());
     if (loadWatchdog !== null) clearTimeout(loadWatchdog);
+    if (codexLimitsTimer !== null) clearInterval(codexLimitsTimer);
 });
 </script>
 
@@ -961,6 +963,7 @@ onUnmounted(() => {
     <AnalyticsWindow v-else-if="isAnalytics" />
     <TodoWindow v-else-if="isTodos" />
     <SettingsWindow v-else-if="isSettings" />
+    <PipelineWindow v-else-if="isPipeline" />
     <div v-else class="flyout accent-claude">
         <!-- Header -->
         <div class="fly-hd">
@@ -1166,21 +1169,24 @@ onUnmounted(() => {
             <div
                 v-if="!configured"
                 class="cards"
-                style="padding: 32px 14px; text-align: center"
             >
-                <p style="color: var(--text-3); font-size: 13px">
-                    {{ t("configureClaude") }}
-                </p>
-                <button
-                    class="btn-primary"
-                    @click="openSettings('account')"
-                    style="margin-top: 12px"
-                >
-                    {{ t("configure") }}
-                </button>
+                <CodexUsageCards v-if="codexLimits" :limits="codexLimits" />
+                <div style="padding: 22px 4px; text-align: center">
+                    <p style="color: var(--text-3); font-size: 13px">
+                        {{ t("configureClaude") }}
+                    </p>
+                    <button
+                        class="btn-primary"
+                        @click="openSettings('account')"
+                        style="margin-top: 12px"
+                    >
+                        {{ t("configure") }}
+                    </button>
+                </div>
             </div>
 
             <div v-else-if="error" class="cards">
+                <CodexUsageCards v-if="codexLimits" :limits="codexLimits" />
                 <div
                     class="card"
                     style="border-color: rgba(248, 113, 113, 0.3)"
@@ -1233,6 +1239,7 @@ onUnmounted(() => {
                     :usage="usage"
                     :levels="levels"
                     :forecast="forecast"
+                    :codex-limits="codexLimits"
                     :loading="loading"
                     :auto-start-enabled="autoStartSession"
                     :auto-start-status="autoStartStatus"
@@ -1253,18 +1260,20 @@ onUnmounted(() => {
             <div
                 v-else
                 class="cards"
-                style="padding: 40px 14px; text-align: center"
             >
-                <div class="spinner"></div>
-                <p
-                    style="
-                        color: var(--text-3);
-                        font-size: 13px;
-                        margin-top: 12px;
-                    "
-                >
-                    {{ t("loading") }}
-                </p>
+                <CodexUsageCards v-if="codexLimits" :limits="codexLimits" />
+                <div style="padding: 30px 4px; text-align: center">
+                    <div class="spinner"></div>
+                    <p
+                        style="
+                            color: var(--text-3);
+                            font-size: 13px;
+                            margin-top: 12px;
+                        "
+                    >
+                        {{ t("loading") }}
+                    </p>
+                </div>
             </div>
         </template>
     </div>

@@ -1,20 +1,20 @@
 // `cli.mjs hook` — Claude Code SessionStart hook for the Claude Usage Tracker.
 //
-// Two modes, by whether the current project is mid-PLAN (issue #16):
-//   • PHASE MODE — the project has a plan with an unfinished phase: surface the
-//     CURRENT phase + handoff baton + the discipline, and DON'T dump the task
-//     board (the session is aimed at the phase; the full list would just bloat
-//     context). A thin pointer keeps the plan's own task and `todos list` reachable.
-//   • TODO MODE — no active phase: surface the ACTIVE todos for the project plus
-//     the short contract for editing them. Two sub-modes:
-//       – DUE MODE (#36): if anything is scheduled for today or earlier, show ONLY
-//         those (today's focus, flagged ⏰, most overdue first) and hold the rest
-//         of the board back.
-//       – PRIORITY MODE (#32): with nothing due, fall back to the project's open
-//         tasks gated by the "task priority in context" setting (settings.json,
-//         default `medium`) — high-priority in full, the rest as one-liners.
-// It is strictly read-only and MUST never disrupt a session: a missing/unreadable
-// file, no matching todos, or any error is a silent no-op (exit 0, no output).
+// Surfaces the QUEUE — the tasks the user has lined up (status queue or
+// in_progress) that are a CURRENT ROOT of the dependency graph (every task in
+// `depends_on` is done; no deps = root). The backlog, blocked, and review tasks
+// are held back to keep the context lean. Titles only (clipped), capped at 10.
+// The CLI contract prints FIRST (above the list) so a truncated injection never
+// loses the how-to-edit instructions. An in_progress task also carries its CHANGE
+// VISION (t#252): the description of the nearest change root up the dep graph.
+// (Phase mode was removed with the phases entity, t#254 — a big task is a
+// change on the graph now, renamed from `theme` at t#345; see
+// docs/task-pipeline.md.)
+// It reads todos.json only; its single write is the session<->task binding it
+// appends to the task-sessions journal when exactly one task is in_progress
+// (t#296), so the session's token cost can be attributed to that task. It MUST
+// never disrupt a session: a missing/unreadable file, no matching todos, or any
+// error is a silent no-op (exit 0, no output).
 //
 // Wired as a global SessionStart hook in ~/.claude/settings.json (the tracker's
 // installer writes `node "<cli.mjs>" hook`) so it fires in every project; it
@@ -24,7 +24,19 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { readPlansForHook, markPlanDoneForDoneTasks } from "./phases.mjs";
+import {
+  changeRootsFor,
+  specAddressesFor,
+  formatSpecSections,
+  currentSessionId,
+  appendTaskSessionEvent,
+  lastTaskSessionEvent,
+  STATUSES,
+} from "./todos.mjs";
+import { taskContextMinRank, hookContextEnabled, workflowContextEnabled } from "./settings.mjs";
+import { resolveRoot } from "./spec.mjs";
+import { readAgentConfig } from "./agents.mjs";
+import { planGuardWired } from "./claude-hooks.mjs";
 
 // The unified CLI is this module's grandparent-relative entry (scripts/cli.mjs);
 // resolve its absolute path so the contract below can hand Claude exact,
@@ -40,65 +52,135 @@ const CLI = path.join(
 // repeated path.
 const CLI_NOTE = `<cli> = node "${CLI}"`;
 
+export function contractBlock(source, refExample = 12) {
+  if (source === "resume" || source === "compact") {
+    return [
+      `──────── TASK TRACKER · USER's todos (CLI) ────────`,
+      `${CLI_NOTE} (written <cli> below) — the full contract was shown at startup; \`<cli> todos --help\` has the complete command set if it got compacted away.`,
+    ].join("\n");
+  }
+  return [
+    `──────── TASK TRACKER · how to edit the USER's todos (CLI) ────────`,
+    `USER's todos, not yours — never hand-edit; go through the CLI (${CLI_NOTE}, written <cli> below). Full set: \`<cli> todos --help\`.`,
+    `  change a field  → <cli> todos set <field> <id> <value>   (\`<cli> todos set\` alone lists every field and its values)`,
+    `                    status takes ${STATUSES.join(" | ")}`,
+    `  add a follow-up → <cli> todos add "<subject>" [--project <name>]`,
+    `  note a finding  → <cli> todos comment add <id> --text "<body>"`,
+    `  link two tasks  → <cli> todos dep add <task> <depends-on>  (blocking, acyclic, one board)  ·  <cli> todos ref add <task> <target>  (non-blocking, cross-project ok)`,
+    `  handoff         → what a task passes to whatever depends on it: inherited notes auto-print on → in_progress; leave yours with \`<cli> todos handoff set <id> --text "<body>"\`.`,
+    `  see the board   → <cli> todos list  [--all | --status <col>[,<col>]]`,
+    `Rules: <id> = N or #N. Touch only the field you're setting; add/comment only what's asked (new tasks → backlog). Prose: t#${refExample} links a task, bare #N is a GitHub PR/issue, inline t#N draws a non-blocking ref only — use \`dep add\` for a real dependency.`,
+  ].join("\n");
+}
+
 // Priority ranks, shared with todos.rs::PRIORITIES / the cc-todos CLI. Unset = 0.
 const PRANK = { high: 3, medium: 2, low: 1 };
 const prank = (t) => (t && PRANK[t.priority]) || 0;
 
-// The "task priority in context" setting (settings.json, written by the tracker's
-// SettingsPanel) names the LOWEST priority a task must have to reach a session:
-// all | low | medium | high → a min rank. Default is `medium`, so low/unset tasks
-// stay out of context unless the user opts them in. Read-only and forgiving: a
-// missing file, bad JSON, or unknown value falls back to the default.
-function contextMinRank(appData) {
-  const MIN = { all: 0, low: 1, medium: 2, high: 3 };
-  try {
-    const raw = readFileSync(
-      path.join(appData, "com.claude-usage-tracker.app", "settings.json"),
-      "utf8",
-    );
-    const v = JSON.parse(raw).taskContextPriority;
-    if (typeof v === "string" && v in MIN) return MIN[v];
-  } catch {
-    // no settings file / bad JSON / missing key → default
-  }
-  return MIN.medium;
+// Operating context, not a command to start a model on SessionStart. The main
+// session receives this before its first user prompt, then chooses the fitting
+// stage once it has a real request. A static block cannot require auth, network,
+// or provider execution, so the optional feature cannot delay a session.
+// It is built from STATE, not printed as a constant. The map used to name a
+// critic nothing called, an architect gate whose hook was not wired, and a
+// runner/worker/review chain that belongs to `cli run` — a separate process —
+// as if this session walked all of it. Every line below is conditioned on what
+// agents.json and Claude's own settings.json actually say, and the two executors
+// are kept apart: what THIS session does, and what the auto runner does.
+export function workflowState(appData, cwd = process.cwd(), host = "claude") {
+  const cfg = readAgentConfig(appData);
+  const model = (duty) => {
+    const p = cfg.duties[duty];
+    return p && p.model ? `${p.provider}/${p.model}` : "";
+  };
+  const mode = (duty) => cfg.duties[duty]?.mode || "off";
+  return {
+    critic: mode("critic"),
+    criticModel: model("critic"),
+    architect: mode("architect") !== "off",
+    architectModel: model("architect"),
+    planGuard: host === "claude" && planGuardWired(cwd),
+    worker: model("worker"),
+    review: mode("review") !== "off",
+    reviewModel: model("review"),
+  };
 }
 
-// The "session context" setting (settings.json, written by SettingsPanel) chooses
-// what a session LEADS WITH when the project is mid-plan: "phase" (default) — the
-// current phase, focused, board held back; or "tasks" — always the task board,
-// even mid-plan. Read-only and forgiving: missing/bad/unknown falls back to "phase".
-function sessionContextMode(appData) {
-  try {
-    const raw = readFileSync(
-      path.join(appData, "com.claude-usage-tracker.app", "settings.json"),
-      "utf8",
-    );
-    const v = JSON.parse(raw).sessionContext;
-    if (v === "tasks" || v === "phase") return v;
-  } catch {
-    // no settings file / bad JSON / missing key → default
-  }
-  return "phase";
+function criticLine(state) {
+  if (state.critic === "off") return "1 critic — off; go straight to 2.";
+  if (state.critic === "agent")
+    return `1 critic — goal, assumptions, risks, alternatives. Runs as ${state.criticModel || "the configured critic model"} when plan mode opens; its reply is input to you, not orders.`;
+  return "1 critic — goal, assumptions, risks, alternatives. YOU do this pass; starting an agent for it is the wrong move.";
 }
 
-// Master switch (settings.json `hookContextEnabled`, written by SettingsPanel):
-// when false, the hook injects NOTHING into the session — no task board and no
-// phase context. Default true (inject). Read-only and forgiving: a missing file,
-// bad JSON, or absent key falls back to on.
-function hookContextEnabled(appData) {
-  try {
-    const raw = readFileSync(
-      path.join(appData, "com.claude-usage-tracker.app", "settings.json"),
-      "utf8",
-    );
-    const v = JSON.parse(raw).hookContextEnabled;
-    if (typeof v === "boolean") return v;
-  } catch {
-    // no settings file / bad JSON / missing key → default on
-  }
-  return true;
+function architectLine(state) {
+  if (!state.planGuard)
+    return "   No gate: `plan-guard` is not wired in Claude Code's settings, so nothing checks the plan — not the format, not the architect. Re-run the tracker's hook installer to get it.";
+  if (!state.architect)
+    return "   Architect gate off; the deterministic format guard still refuses a plan that is not a graph file.";
+  return `   Gate: ${state.architectModel || "the configured architect model"} refuses a plan with unmet obligations — revise and call ExitPlanMode again.`;
 }
+
+export function buildWorkflowContext(state = workflowState(), host = "claude") {
+  const runner =
+    "runner → worker" +
+    (state.worker ? ` (${state.worker})` : "") +
+    (state.review ? ` → review (${state.reviewModel || "configured"})` : "") +
+    " → verify+reconcile → next ready step; issue → retry inside the node's budget → parked for the user.";
+  if (host === "codex") {
+    const critic = state.critic === "off"
+      ? "1 critic — off; go straight to 2."
+      : state.critic === "agent"
+        ? `1 critic — goal, assumptions, risks, alternatives. The configured profile is ${state.criticModel || "the critic model"}; no separate critic call is wired for this Codex session, so YOU do this pass.`
+        : "1 critic — goal, assumptions, risks, alternatives. YOU do this pass.";
+    return [
+      "──────── WORKFLOW · this Codex session ────────",
+      "0 triage — one reversible step? do it, skip the rest. This map is for work that is neither.",
+      critic,
+      "   question still open → ask the user, then back to 1.",
+      "2 plan — frame and decompose non-trivial work before implementation; keep the plan current as evidence changes.",
+      "   No tracker ExitPlanMode gate is wired for Codex; this session owns plan quality and review.",
+      "3 implement → verify. Check fails → fix and re-verify. The PLAN was wrong → back to 2. Out of moves → ask the user.",
+      `Auto runner — \`cli run\`, its own process, NOT this session: ${runner}`,
+    ].join("\n");
+  }
+  return [
+    "──────── WORKFLOW · this session ────────",
+    "0 triage — one reversible step? do it, skip the rest. This map is for work that is neither.",
+    criticLine(state),
+    "   question still open → ask the user, then back to 1.",
+    "2 plan mode → ExitPlanMode.",
+    architectLine(state),
+    "3 implement → verify. Check fails → fix and re-verify. The PLAN was wrong → back to 2. Out of moves → ask the user.",
+    `Auto runner — \`cli run\`, its own process, NOT this session: ${runner}`,
+  ].join("\n");
+}
+
+function criticSummary(state) {
+  if (state.critic === "off") return "off";
+  if (state.critic === "agent") return `agent ${state.criticModel || "configured"}`;
+  return "you";
+}
+
+function planGateSummary(state, host) {
+  if (host === "codex") return "none (Codex)";
+  if (!state.planGuard) return "none";
+  if (!state.architect) return "format only";
+  return `architect ${state.architectModel || "configured"}`;
+}
+
+function runnerSummary(state) {
+  const review = state.review ? state.reviewModel || "configured" : "off";
+  return `worker ${state.worker || "unset"}, review ${review}`;
+}
+
+export function buildWorkflowSummary(state = workflowState(), host = "claude") {
+  return `workflow — critic: ${criticSummary(state)} · plan gate: ${planGateSummary(state, host)} · runner: ${runnerSummary(state)}`;
+}
+
+// Settings reads (taskContextPriority, hookContextEnabled) live in ./settings.mjs —
+// one place that owns the file path + each forgiving default, shared with the Stop
+// hook. See the imports above.
 
 // Local calendar date as YYYY-MM-DD — "today" is the USER's day, not UTC (a
 // scheduled_for date is a plain local date). Used to surface due/overdue tasks.
@@ -108,24 +190,95 @@ function localToday() {
   return `${d.getFullYear()}-${z(d.getMonth() + 1)}-${z(d.getDate())}`;
 }
 
-function main() {
+// Title only, whitespace-collapsed, clipped to SUBJECT_MAX (ellipsis if cut).
+const SUBJECT_MAX = 100;
+const clip = (s, max = SUBJECT_MAX) => {
+  const one = String(s || "").replace(/\s+/g, " ").trim();
+  return one.length > max ? one.slice(0, max - 1) + "…" : one;
+};
+
+// Session <-> task binding (t#296). The journal is what lets the tracker split a
+// task's cost into BLOCKS (task × session × interval), so a session that never
+// ran `todos take` still needs a binding — but only when it is unambiguous:
+// exactly one task of this project is in_progress. Two or more: don't guess, ask.
+// None: stay silent. Returns the line to inject (or "" for nothing to say);
+// writing the binding is a side effect, and any failure is a silent no-op.
+export function bindSessionToTask(session, tasks) {
+  try {
+    if (!session) return "";
+    const running = (Array.isArray(tasks) ? tasks : []).filter(
+      (t) => t && t.status === "in_progress",
+    );
+    if (!running.length) return "";
+    if (running.length > 1) {
+      const refs = running
+        .map((t) => (t.number ? `t#${t.number}` : String(t.id)))
+        .join(", ");
+      return (
+        `Session ↔ task: ${running.length} tasks are in_progress (${refs}) — this session was NOT bound to any of them. ` +
+        `Bind it with \`<cli> todos take <N>\` so its token cost lands on the right task.`
+      );
+    }
+    const todo = running[0];
+    const last = lastTaskSessionEvent(session);
+    // An EXPLICIT binding (`take` / `set status`) outranks this guess for the rest
+    // of the session: SessionStart fires again on resume/compact, and re-guessing
+    // there would silently overwrite a task the session deliberately took.
+    if (last && last.event === "start" && last.source !== "auto" && last.task !== todo.id) {
+      const held = (Array.isArray(tasks) ? tasks : []).find((t) => t && t.id === last.task);
+      const heldRef = held && held.number ? `t#${held.number}` : String(last.task);
+      return (
+        `Session ↔ task: this session stays bound to ${heldRef} — it was bound explicitly, ` +
+        `so the in_progress guess does not override it. Rebind with \`<cli> todos take <N>\`.`
+      );
+    }
+    if (!(last && last.task === todo.id && last.event === "start")) {
+      appendTaskSessionEvent({
+        session,
+        task: todo.id,
+        event: "start",
+        source: "auto",
+        project: todo.project || null,
+      });
+    }
+    const ref = todo.number ? `t#${todo.number}` : String(todo.id);
+    return (
+      `Session ↔ task: this session is bound to ${ref} "${clip(todo.subject, 60)}" (the only in_progress task) — its token cost is attributed there. ` +
+      `Working on a different task? Rebind with \`<cli> todos take <N>\`.`
+    );
+  } catch {
+    return "";
+  }
+}
+
+const KNOWN_SOURCES = new Set(["startup", "resume", "compact", "clear"]);
+
+function main(args = []) {
   // SessionStart hooks receive a JSON payload on stdin (session_id, cwd,
   // source, …). Fall back to process.cwd() if it's absent or unparseable.
   let cwd = process.cwd();
+  let session = "";
+  let source = "startup";
   try {
     const raw = readFileSync(0, "utf8");
     const j = JSON.parse(raw);
     if (j && typeof j.cwd === "string" && j.cwd) cwd = j.cwd;
+    if (j && typeof j.session_id === "string") session = j.session_id.trim();
+    if (j && typeof j.source === "string" && KNOWN_SOURCES.has(j.source)) source = j.source;
   } catch {
     // no stdin / bad JSON → keep process.cwd()
   }
+  if (!session) session = currentSessionId();
 
   const appData =
     process.env.APPDATA ||
     path.join(process.env.USERPROFILE || "", "AppData", "Roaming");
-  // Master off-switch: the user turned off task/phase context injection entirely.
-  if (!hookContextEnabled(appData)) return;
+  // Master off-switch: the user turned off task-context INJECTION — nothing is
+  // printed below it. The binding write is not context, so it still happens
+  // (cost attribution must not depend on how chatty the hook is).
+  const contextOn = hookContextEnabled(appData);
   const file = path.join(appData, "com.claude-usage-tracker.app", "todos.json");
+  const fileLine = `File (don't edit): ${file}`;
 
   let data = null;
   try {
@@ -136,14 +289,25 @@ function main() {
     // first write), so don't bail here — always tell the session it's available.
   }
   const todos = Array.isArray(data && data.todos) ? data.todos : [];
+  const changes = Array.isArray(data && data.changes) ? data.changes : [];
+  const hostIndex = args.indexOf("--host");
+  const hostValue = hostIndex >= 0 ? String(args[hostIndex + 1] || "") : "claude";
+  const host = hostValue === "codex" ? "codex" : "claude";
+  const compactSource = source === "resume" || source === "compact";
+  const workflow = workflowContextEnabled(appData)
+    ? compactSource
+      ? buildWorkflowSummary(workflowState(appData, cwd, host), host)
+      : buildWorkflowContext(workflowState(appData, cwd, host), host)
+    : "";
 
   const project = path.basename(String(cwd).replace(/[\\/]+$/, ""));
   // General cross-project note (issue #13): tasks aren't limited to the current
   // project. The hook itself stays group-agnostic — Claude discovers associations
   // on demand via `cli.mjs todos related`.
-  const crossProjectNote =
-    `Cross-project: \`--project <name>\` on add files a task against another project ` +
-    `("${project}" is saved as its "from"). \`<cli> todos related ${project}\` lists associated projects.`;
+  const crossProjectNote = compactSource
+    ? ""
+    : `Cross-project: \`--project <name>\` on add files a task against another project ` +
+      `("${project}" is saved as its "from"). \`<cli> todos related ${project}\` lists associated projects.`;
   // Kanban columns the tracker recognizes. Legacy `pending` (written before the
   // columns existed) is shown as `backlog`, matching the tracker's own load-time
   // migration, so Claude only ever sees a real column.
@@ -158,151 +322,173 @@ function main() {
       (!t.project || t.project === project),
   );
 
-  // If this project is mid-PLAN, the session is aimed at the CURRENT phase, not
-  // the task board — surface the phase (focused) and do NOT dump the task list.
-  // Read-only and guarded: any failure falls through to plain todo mode.
-  //
-  // A plan whose linked tracker task is `done` is finished work, even if some
-  // phase boxes were never ticked. We mark such plans done (markPlanDoneForDone-
-  // Tasks below) so they read complete in `phases list` too, not just here — a
-  // done task has no open plan to keep around. The task status (not the phase
-  // files) is the trigger, so this catches a status flip made in the tracker UI
-  // too — the CLI isn't the only path to done.
-  const donePlanTasks = new Set(
-    todos
-      .filter((t) => t && t.number != null && col(t.status) === "done")
-      .map((t) => t.number),
-  );
-  // Best-effort reconcile (guarded — a write failure must never break a session).
-  // After it, a done-task plan has no open phase, so the `p.current` filter drops
-  // it on its own. The extra task-status guard below is the fallback for when the
-  // write couldn't land (e.g. a read-only checkout): hide it from the hook anyway.
-  try {
-    markPlanDoneForDoneTasks(cwd, (n) => donePlanTasks.has(n));
-  } catch {
-    // ignore — fall through to the read-only display filter
-  }
-  let phasePlans = [];
-  try {
-    phasePlans = readPlansForHook(cwd).filter(
-      (p) => p.current && !(p.task != null && donePlanTasks.has(p.task)),
-    );
-  } catch {
-    phasePlans = [];
-  }
-  // Phase mode is the default lead when the project is mid-plan, but the user can
-  // force the task board instead via the "session context" setting.
-  if (phasePlans.length && sessionContextMode(appData) === "phase") {
-    process.stdout.write(
-      phaseModeContext(project, todos, active, file, phasePlans) + "\n",
-    );
-    return;
-  }
+  const bindNote = bindSessionToTask(session, active);
+  if (!contextOn) return;
 
   if (active.length) {
-    const minRank = contextMinRank(appData);
+    // NEW SELECTION (startup-context bloat + relevance): surface only the tasks
+    // worth acting on THIS session, in two layers —
+    //   1. DUE (#36): tasks scheduled for today or earlier, surfaced FIRST (they're
+    //      time-sensitive), whatever their column or block state.
+    //   2. QUEUE ROOTS: tasks the user has lined up (status queue or in_progress)
+    //      that are a CURRENT ROOT of the dependency graph — every task in their
+    //      `depends_on` is done (no deps = trivially a root).
+    // The QUEUE-ROOTS layer is gated by the "task priority in context" setting
+    // (default medium); the DUE layer bypasses it — a passed deadline matters
+    // regardless of priority. Blocked, backlog and non-due review tasks are held
+    // back; the full board stays one `<cli> todos list` away. Titles only, capped —
+    // descriptions bloated the context and pushed the CLI contract past the cutoff.
+    const CAP = 10;
+    const WORKABLE = new Set(["queue", "in_progress"]);
+    // Resolve depends_on ids → tasks to test the root condition. A dep id that no
+    // longer resolves (task deleted) can't block, so it counts as satisfied.
+    const byId = new Map(todos.filter((t) => t && t.id).map((t) => [t.id, t]));
+    const isRoot = (t) =>
+      (Array.isArray(t.depends_on) ? t.depends_on : []).every((id) => {
+        const dep = byId.get(id);
+        return !dep || col(dep.status) === "done";
+      });
+
     const today = localToday();
     const isDue = (t) =>
       !!t.scheduled_for && String(t.scheduled_for).slice(0, 10) <= today;
-    // Two modes for the todo context:
-    //  • DUE MODE (issue #36): if anything is scheduled for today or earlier, the
-    //    session focuses on THOSE — today's plan, not the whole board.
-    //  • PRIORITY MODE (issue #32): with nothing due, fall back to the project's
-    //    open tasks gated by the "task priority in context" threshold (default
-    //    medium). This is the original behaviour.
-    const dueMode = active.some(isDue);
-    const shown = dueMode
-      ? active.filter(isDue)
-      : active.filter((t) => prank(t) >= minRank);
-    const hidden = active.length - shown.length;
+    // Priority threshold for the queue-roots layer (settings.json taskContextPriority
+    // → min rank, default medium; `all` shows every priority). Due tasks bypass it.
+    const minRank = taskContextMinRank(appData);
+    const meets = (t) => prank(t) >= minRank;
 
-    if (!shown.length) {
-      // Not in due mode (nothing scheduled) and nothing clears the priority
-      // threshold: don't dump the rest, but say so rather than going silently empty.
+    // Layer 1: everything due today/overdue — any column, any block state, ANY
+    // priority (a passed deadline isn't gated by the threshold).
+    const dueTasks = active.filter(isDue);
+    // Layer 2 (priority-gated): queue tasks that are current roots + every
+    // in_progress task (already being worked, so surface it even if a dep is open),
+    // minus anything already in the due group.
+    const queueRoots = active.filter(
+      (t) =>
+        !isDue(t) &&
+        meets(t) &&
+        WORKABLE.has(col(t.status)) &&
+        (col(t.status) === "in_progress" || isRoot(t)),
+    );
+
+    if (!dueTasks.length && !queueRoots.length) {
+      // Nothing clears the bar — say so (don't dump the backlog), and point at the
+      // levers: queue, priority, the threshold setting, the full board.
       const note = [
-        `The Claude Usage Tracker has ${active.length} open task(s) for project "${project}", but none are due today and all are below the "task priority in context" threshold — none are shown here.`,
-        `See them or re-prioritize via the CLI (${CLI_NOTE}); lower the threshold in the tracker's settings to surface more:`,
-        `· list this project's tasks: <cli> todos list (defaults to this project + global; add --all for every project)`,
-        `· set a priority: <cli> todos set-priority <id> <high|medium|low|none>`,
-        crossProjectNote,
-        `File (don't edit): ${file}`,
+        `The Claude Usage Tracker has ${active.length} open task(s) for project "${project}", but none clear the bar this session — none are due today, and no queued/unblocked task meets the "task priority in context" threshold.`,
+        `Line up work, re-prioritize, or lower the threshold in the tracker's settings; via the CLI (${CLI_NOTE}):`,
+        `· move a task into the queue: <cli> todos set status <id> queue`,
+        `· raise a task's priority:    <cli> todos set priority <id> <high|medium|low|none>`,
+        `· see the whole board:        <cli> todos list  (backlog | queue | in_progress | review | done)`,
+        ...(bindNote ? [bindNote] : []),
+        ...(crossProjectNote ? [crossProjectNote] : []),
+        fileLine,
       ].join("\n");
-      process.stdout.write(note + "\n");
+      process.stdout.write((workflow ? `${note}\n\n${workflow}` : note) + "\n");
       return;
     }
 
-    // Order: the due group first and, within it, the most overdue (earliest
-    // date) first; then everything by priority desc, closest-to-finishing status,
-    // and soonest scheduled.
-    const order = { in_progress: 0, review: 1, queue: 2, backlog: 3 };
-    const rank = (s) => order[col(s)] ?? 3;
-    shown.sort(
+    // Due group: most overdue (earliest date) first, then priority desc.
+    dueTasks.sort(
       (a, b) =>
-        (isDue(a) ? 0 : 1) - (isDue(b) ? 0 : 1) ||
-        (isDue(a) && isDue(b)
-          ? String(a.scheduled_for).localeCompare(String(b.scheduled_for))
-          : 0) ||
+        String(a.scheduled_for).localeCompare(String(b.scheduled_for)) ||
+        prank(b) - prank(a),
+    );
+    // Queue roots: highest priority first, then in_progress before queue (closer to
+    // finishing), then soonest-scheduled as a tiebreaker.
+    const statusOrder = { in_progress: 0, queue: 1 };
+    queueRoots.sort(
+      (a, b) =>
         prank(b) - prank(a) ||
-        rank(a.status) - rank(b.status) ||
+        (statusOrder[col(a.status)] ?? 9) - (statusOrder[col(b.status)] ?? 9) ||
         String(a.scheduled_for || "9999-99-99").localeCompare(
           String(b.scheduled_for || "9999-99-99"),
         ),
     );
 
+    // Due first, then the queue roots.
+    const matched = [...dueTasks, ...queueRoots];
+    const shown = matched.slice(0, CAP);
+    const hidden = matched.length - shown.length;
+
     const lines = shown.map((t) => {
       const num = t.number ? `#${t.number} ` : "";
       const prio = t.priority ? ` ‹${t.priority}›` : "";
-      const date = t.scheduled_for ? String(t.scheduled_for).slice(0, 10) : "";
-      const due = isDue(t) ? (date < today ? ` ⏰ overdue (${date})` : ` ⏰ today`) : "";
-      const head = `- ${num}[${col(t.status)}]${prio}${due} ${t.subject}`;
-      // Due or high-priority tasks → LONG form (meta + first description line);
-      // everything else that cleared the threshold stays a compact one-liner.
-      if (isDue(t) || t.priority === "high") {
-        const bits = [];
-        if (t.estimate_minutes != null) bits.push(`~${t.estimate_minutes}min`);
-        // The ⏰ marker already carries a due task's date; only show a future date.
-        if (t.scheduled_for && !isDue(t)) bits.push(`by ${date}`);
-        const meta = bits.length ? ` (${bits.join(", ")})` : "";
-        const desc = t.description
-          ? ` — ${String(t.description).split("\n")[0].slice(0, 140)}`
-          : "";
-        return `${head}${meta}${desc}  ⟨id:${t.id}⟩`;
+      let due = "";
+      if (isDue(t)) {
+        const date = String(t.scheduled_for).slice(0, 10);
+        due = date < today ? ` ⏰ overdue (${date})` : ` ⏰ today`;
       }
-      return `${head}  ⟨id:${t.id}⟩`;
+      return `- ${num}[${col(t.status)}]${prio}${due} ${clip(t.subject)}`;
     });
     if (hidden) {
       lines.push(
-        dueMode
-          ? `  …plus ${hidden} other open task(s) not due today — held back to keep the focus on today; \`<cli> todos list\` shows all.`
-          : `  …plus ${hidden} lower-priority task(s) below the "task priority in context" threshold — \`<cli> todos list\` shows all.`,
+        `  …plus ${hidden} more due/queued task(s) — \`<cli> todos list\` shows all.`,
       );
     }
 
-    const refExample = shown[0] && shown[0].number ? shown[0].number : 12;
-    const headerLine = dueMode
-      ? `User's tasks DUE TODAY / overdue (⏰) (Claude Usage Tracker, project "${project}") — today's focus, shown in full. The rest of the board is held back this session:`
-      : `User's active tasks (Claude Usage Tracker, project "${project}"). High-priority shown in full, the rest as one-liners:`;
-    // Plain stdout on exit 0 is the most robust way to inject SessionStart
-    // context (no additionalContext-nesting ambiguity across CC versions).
+    // Change vision (t#252, renamed from `theme` at t#345): a task being WORKED
+    // (in_progress) inherits its north star from the nearest change root up the
+    // dep graph — surface that root's description here so the vision survives
+    // the session boundary, the way the phases hook used to carry a plan's
+    // vision into every session. Only for in_progress tasks (queued ones get it
+    // at the status-move anchor), deduped when several subtasks share a root.
+    const changeRoots = new Map();
+    for (const t of shown) {
+      if (col(t.status) !== "in_progress") continue;
+      for (const r of changeRootsFor({ todos, changes }, t)) {
+        if (r.description && r.description.trim() && !changeRoots.has(r.id)) {
+          changeRoots.set(r.id, r);
+        }
+      }
+    }
+    for (const r of changeRoots.values()) {
+      lines.push(
+        block(
+          `  ★ vision — change ${r.address ?? `t#${r.number}`} "${clip(r.subject)}" (north star for the in_progress task(s) above; keep them true to it — if one pulls away, stop and flag it):`,
+          r.description,
+        ),
+      );
+    }
+
+    // Spec channel (t#340, docs/specs/README.md §7/§8): the addressed spec
+    // section(s) for each shown in_progress task — its OWN `spec` field, or its
+    // change root's when it has none (specAddressesFor). Printed NEXT TO the
+    // vision above, never instead of it. Deduped ACROSS shown tasks (not just
+    // within one task's own list) so several subtasks sharing a root's `spec`
+    // don't repeat the same section. Silent altogether while `specsEnabled` is
+    // off (default) — specAddressesFor(appData) then yields no addresses.
+    const specRoot = resolveRoot(cwd, appData);
+    const specSeen = new Set();
+    for (const t of shown) {
+      if (col(t.status) !== "in_progress") continue;
+      const specLink = specAddressesFor(t, changeRootsFor({ todos, changes }, t), appData);
+      const fresh = specLink.addresses.filter((a) => !specSeen.has(a));
+      fresh.forEach((a) => specSeen.add(a));
+      if (fresh.length) {
+        lines.push(
+          formatSpecSections(t, { source: specLink.source, addresses: fresh }, { root: specRoot, appData }),
+        );
+      }
+    }
+
+    const refExample = (shown[0] && shown[0].number) || 12;
+    // Section order (the CLI contract must never be the part that gets truncated):
+    // the how-to-edit contract goes FIRST, the task list SECOND, each under its own
+    // banner so the two are unmistakably separate. Plain stdout on exit 0 is the
+    // most robust way to inject SessionStart context (no additionalContext nesting).
     const context = [
-      headerLine,
-      lines.join("\n"),
+      contractBlock(source, refExample),
+      ...(crossProjectNote ? [crossProjectNote] : []),
+      fileLine,
       "",
-      `These are the USER's todos, not your working task list. The tracker owns todos.json — change it ONLY through the CLI (${CLI_NOTE}, written <cli> below), never by hand (concurrent writes corrupt the shared file).`,
-      `Before your FIRST todos command this session, run \`<cli> todos --help\` — it's the authoritative command set; the legend below is only a quick reference. Pick the command by intent:`,
-      `  move a task     → <cli> todos set-status <id> <backlog|queue|in_progress|review|done>`,
-      `  set priority    → <cli> todos set-priority <id> <high|medium|low|none>   (gates which tasks reach this context)`,
-      `  add a follow-up → <cli> todos add "<subject>" [--project <name> | --global] [--priority high|medium|low] [--scheduled YYYY-MM-DD] [--description <text>]`,
-      `  note a finding  → <cli> todos comment add <id> --text "<body>"`,
-      `  link two tasks  → <cli> todos dep add <task> <depends-on>  (blocking, acyclic, one board)  ·  <cli> todos ref add <task> <target>  (non-blocking, cross-project ok)`,
-      `  handoff (context)→ a task's handoff = the notes it passes to whatever depends on it, so a task inherits extra context FROM the tasks in its depends_on. That inherited handoff auto-prints when you move a task to in_progress (\`<cli> todos handoff <task>\` re-reads it); record yours with \`<cli> todos handoff set <task> --text "<body>"\`.`,
-      `  see the board   → <cli> todos list  [--all | --status <col>[,<col>]]`,
-      `Rules: <id> is the ⟨id⟩ shown above; add/dep/ref args also accept N|#N. Each command touches only its own field — leave the rest to the user. add/comment ONLY what the user asked to track, not your scratchpad; new tasks land in backlog. Reference a task in prose as t#${refExample} ("blocked by t#${refExample}") — a bare #N means a GitHub PR/issue, NOT a task link. An inline t#N draws only a ref edge, never a blocking dep — use \`dep add\` for that; \`dep rm\`/\`ref rm\`/\`dep list\`/\`ref list\` mirror add.`,
-      crossProjectNote,
-      `File (don't edit): ${file}`,
+      `──────── TASKS · project "${project}" · ⏰ due/overdue first (any column, any priority), then queue-roots + in_progress, up to ${CAP} ────────`,
+      `Queue layer gated by "task priority in context"; backlog, blocked and below-threshold held back — \`<cli> todos list\` shows the whole board.`,
+      lines.join("\n"),
+      ...(bindNote ? [bindNote] : []),
     ].join("\n");
 
-    process.stdout.write(context + "\n");
+    process.stdout.write((workflow ? `${context}\n\n${workflow}` : context) + "\n");
     return;
   }
 
@@ -316,19 +502,18 @@ function main() {
     `Use the CLI (${CLI_NOTE}), don't hand-edit the JSON (the tracker may write it concurrently):`,
     `· add a task: <cli> todos add "<subject>" [--project <name>] [--description <text>] — lands in backlog; only what the user explicitly wants tracked.`,
     `· see tasks: <cli> todos list — statuses: backlog | queue | in_progress | review | done.`,
-    crossProjectNote,
-    `File (don't edit): ${file}`,
+    ...(crossProjectNote ? [crossProjectNote] : []),
+    fileLine,
   ].join("\n");
 
-  process.stdout.write(note + "\n");
+  process.stdout.write((workflow ? `${note}\n\n${workflow}` : note) + "\n");
 }
 
 // Render a possibly multi-line value as an indented block under a one-line label,
-// KEEPING the author's line breaks (issue #58 #1/#4). Vision and handoff are the
-// only carriers of cross-session intent; flattening a multi-section vision/handoff
-// to one line (the old behaviour) erased its structure, and the 500-char cap on
-// vision sliced off the current phase's own goal. Single-line values stay inline.
-// A generous char ceiling keeps a runaway value from flooding the session context.
+// KEEPING the author's line breaks (issue #58 #1/#4). The change vision is a
+// carrier of cross-session intent; flattening a multi-section vision to one line
+// would erase its structure. Single-line values stay inline. A generous char
+// ceiling keeps a runaway value from flooding the session context.
 function block(label, text, pad = "    ", cap = 2000) {
   let body = String(text)
     .replace(/\r\n?/g, "\n")
@@ -344,74 +529,11 @@ function block(label, text, pad = "    ", cap = 2000) {
   return `${label}\n${indented}`;
 }
 
-// PHASE MODE (issue #16): when the current project has a plan with an unfinished
-// phase, the session is aimed at that phase — so we surface the phase INSTEAD of
-// the task board (the full todo list is noise here, and bloats context). We still
-// hand Claude exactly enough to drive the plan's own task: its id + the status/
-// comment commands, plus a count of the other open tasks behind a `todos list`.
-// `plans` are the project's plans with a current phase; `active` is the open todos.
-function phaseModeContext(project, todos, active, file, plans) {
-  const byNumber = new Map(
-    todos.filter((t) => t && t.number != null).map((t) => [t.number, t]),
-  );
-  const linked = [];
-  const lines = [];
-  for (const p of plans) {
-    const todo = p.task != null ? byNumber.get(p.task) : null;
-    if (todo) linked.push(todo);
-    const idPart = todo ? `, id:${todo.id}` : "";
-    const link =
-      p.task != null
-        ? `task #${p.task}${todo ? ` "${todo.subject}"` : ""}${idPart}`
-        : "(not linked to a task)";
-    const next = p.nextSub
-      ? ` — next: ${p.current.num}.${p.nextSub.num} ${p.nextSub.title}`
-      : "";
-    // An empty phase title shows as `phase 2/2 ""` — a missing orientation anchor
-    // (issue #58 #6). Fall back to an actionable nudge instead of a bare "".
-    const titleShown = p.current.title
-      ? `"${p.current.title}"`
-      : `(untitled — set one: <cli> phases edit ${p.current.num} --title "…")`;
-    lines.push(
-      `- plan "${p.slug}" (${link}): phase ${p.current.num}/${p.total} ${titleShown}${next}`,
-    );
-    if (p.vision) {
-      lines.push(
-        block(
-          `  ★ vision (the plan's north star — keep this phase true to it; if it pulls away, stop and flag it):`,
-          p.vision,
-        ),
-      );
-    }
-    if (p.handoff) lines.push(block(`  ↪ handoff from last session:`, p.handoff));
-  }
-
-  const linkedIds = new Set(linked.map((t) => t.id));
-  const otherOpen = active.filter((t) => !linkedIds.has(t.id));
-
-  const out = [
-    `This project is mid-PLAN (skill: phases) — work the CURRENT phase only, one phase per session. The task board is NOT loaded here, to keep the session phase-focused. (${CLI_NOTE})`,
-    lines.join("\n"),
-    "Phase ops — `<cli> phases <cmd>`: done <N.k> (tick a subphase) · done <N> then verify then STOP (next phase = next session) · handoff \"<what's done; the concrete next step>\" · list.",
-  ];
-  if (linked.length) {
-    const ids = linked.map((t) => `#${t.number} (id:${t.id})`).join(", ");
-    out.push(
-      `The plan's own tracker task ${ids} — \`<cli> todos <cmd>\`: set-status <id> <status> (backlog|queue|in_progress|review|done) · comment add <id> --text "<body>". Don't hand-edit todos.json.`,
-    );
-  }
-  out.push(
-    `Other open tasks for "${project}": ${otherOpen.length} (\`<cli> todos list\`).`,
-  );
-  out.push(`File (don't edit): ${file}`);
-  return out.join("\n");
-}
-
 // Entry for the unified dispatcher: `cli.mjs hook`. A todo hook must NEVER break
 // a session, so any error is swallowed (exit 0, no output).
-export function run() {
+export function run(args = []) {
   try {
-    main();
+    main(args);
   } catch {
     process.exit(0);
   }

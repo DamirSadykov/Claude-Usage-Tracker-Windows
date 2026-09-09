@@ -1,5 +1,6 @@
 import { createApp } from "vue";
 import "./style.css";
+import "./styles/design-tokens.css";
 // Font experiment: bundle candidate UI fonts (self-hosted, offline-safe).
 // Each <weight>.css covers all subsets incl. Cyrillic via unicode-range.
 import "@fontsource/montserrat/400.css";

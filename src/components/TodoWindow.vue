@@ -8,13 +8,18 @@
 //
 // The view is a kanban board: one column per status, cards drag between columns
 // (which persists the new status). Columns mirror `todos.rs::STATUSES`.
-import { ref, computed, onMounted, onUnmounted, nextTick } from "vue";
+import { ref, computed, watch, onMounted, onUnmounted, nextTick } from "vue";
 import { useI18n, type Composer } from "vue-i18n";
 import { invoke } from "@tauri-apps/api/core";
 import ProjectAutocomplete from "./ProjectAutocomplete.vue";
 import ProjectLabel from "./ProjectLabel.vue";
 import GraphView from "./GraphView.vue";
+import SpecView from "./SpecView.vue";
+import PipelineGraph from "./pipeline/PipelineGraph.vue";
+import type { PipelineMode } from "./pipeline/modes";
+import type { BoardChange } from "./pipeline/adapt";
 import { useProjectLinks } from "../projectLinks";
+import { useHotkeys } from "../hotkeys";
 import {
   EXT_BUCKETS,
   resolveBucket,
@@ -24,6 +29,7 @@ import {
   type ExtBucketId,
 } from "../externalStatus";
 import i18n from "../i18n";
+import { useSettings } from "../settingsStore";
 import type { TriageDigest, DigestItem } from "../App.vue";
 
 const { t, locale } = useI18n();
@@ -37,24 +43,46 @@ function applyLocale(l: string | null | undefined) {
   (i18n.global as Composer).locale.value = l;
 }
 
-// Each Tauri window is a separate WebView; vue-i18n boots from navigator
-// language and doesn't see the popup's saved locale. Read it from the shared
-// store so this window opens in the same language the user picked.
-async function loadLocaleFromStore() {
-  try {
-    const { load: loadStore } = await import("@tauri-apps/plugin-store");
-    const store = await loadStore("settings.json");
-    applyLocale(await store.get<string>("locale"));
-  } catch {
-    // store missing or unreadable → keep detected default
-  }
-}
+// Each Tauri window is a separate WebView; vue-i18n boots from navigator language
+// and doesn't see the popup's saved locale. Follow the shared settings snapshot so
+// this window opens — and stays — in the language the user picked. (The main
+// window also pushes `todos-locale` on open; both paths call applyLocale.)
+const { settings, initSettings } = useSettings();
+watch(() => settings.value.locale, (l) => applyLocale(l));
 
 export interface Comment {
   id: string;
   author: string; // "user" | "claude"
   body: string;
   created_at: string;
+}
+// One task's answer about one addressed spec section at closing time (t#341).
+// Written only by `cli spec answer`; the window renders it, never edits it —
+// an answer typed into a form would be a receipt again, not a judgement made
+// against the section the guard put in front of the session.
+export interface SpecAnswer {
+  address: string;
+  verdict: string; // "unchanged" | "updated"
+  note: string;
+  at: string;
+  // Hashes of the section blocks this task moved (t#353) — content-addressed,
+  // so the Specs tab can mark the individual bullet a change is about.
+  blocks?: string[];
+  // The section's text at the moment the delta was claimed. Paired with the
+  // baseline on `spec_seen`, it is what the Specs tab diffs — frozen, because
+  // the live file keeps moving after the task closes.
+  after?: string;
+}
+// One addressed section as it was SHOWN to the session at the `in_progress`
+// anchor (t#352). `text` is the before-side of the diff; while the task is
+// still open there is no `after` yet, so the tab diffs it against the file as
+// it stands — that is the live "what is this change about to do" view.
+export interface SpecSeen {
+  address: string;
+  hash: string;
+  at: string;
+  blocks?: string[];
+  text?: string;
 }
 export interface Todo {
   id: string;
@@ -63,7 +91,9 @@ export interface Todo {
   description: string;
   status: string;
   priority?: string; // "high" | "medium" | "low" | "" (unset) — drives hook context
-  estimate_minutes?: number | null;
+  kind?: string; // "auto" | "" (manual, default) — task-graph node type (#88)
+  change?: boolean; // change-root marker (t#255): depends_on all children, description = delta
+  change_id?: string;
   scheduled_for?: string | null;
   plan: string;
   project?: string | null;
@@ -72,34 +102,13 @@ export interface Todo {
   links?: string[];
   depends_on?: string[]; // ids of tasks this one depends on — task-graph edges (#88)
   handoff?: string; // what this task hands forward to its dependents (#141)
+  spec?: string[]; // addressed spec sections, `<domain>#<slug>` (t#339)
+  spec_answers?: SpecAnswer[]; // the closing answer per addressed section (t#341)
+  spec_seen?: SpecSeen[]; // each addressed section as it was shown (t#352)
+  imported_at?: string | null; // arrived via a board import (#181); absent = created here
   created_by?: string; // "user" | "claude" ("" / absent = user, no AI badge)
   created_at: string;
   updated_at: string;
-}
-
-// Phase plans (issue #16) authored by the cc-phases CLI and read from each
-// project's `.claude/phases/<N>.md`. Read-only here: the board shows a task's
-// phases as checkboxes (done → struck through); the CLI is the only writer.
-export interface Subphase {
-  num: number;
-  title: string;
-  text: string;
-  done: boolean;
-}
-export interface Phase {
-  num: number;
-  title: string;
-  desc: string;
-  done: boolean;
-  subs: Subphase[];
-}
-export interface PhasePlan {
-  task_number: number;
-  project: string;
-  // The plan's north star (README `## Vision`), surfaced read-only above the
-  // phase checklist. null when the section is empty / still the placeholder.
-  vision: string | null;
-  phases: Phase[];
 }
 
 // Kanban columns, left to right — must match `todos.rs::STATUSES`. `dot` is the
@@ -121,6 +130,7 @@ const COL_BY_ID: Record<string, Column> = Object.fromEntries(
 );
 
 const todos = ref<Todo[]>([]);
+const changes = ref<BoardChange[]>([]);
 const loading = ref(true);
 const errorMsg = ref("");
 
@@ -142,7 +152,6 @@ const pendingReload = ref(false);
 const editingId = ref<string | null>(null);
 const fSubject = ref("");
 const fDescription = ref("");
-const fEstimate = ref<number | null>(null);
 const fScheduled = ref("");
 const fPlan = ref("");
 const fProject = ref("");
@@ -156,17 +165,13 @@ const formOpen = ref(false);
 // plus an empty option. Kept in lockstep with todos.rs / the cc-todos CLI.
 const PRIORITY_LEVELS = ["high", "medium", "low"] as const;
 
+const SUBJECT_LIMIT = 150;
+const fSubjectRemaining = computed(() => SUBJECT_LIMIT - fSubject.value.trim().length);
+const fSubjectOverLimit = computed(() => fSubjectRemaining.value < 0);
+
 // Projects the tracker has seen (from cc_usage), so the picker offers real
 // projects even before any todo uses them.
 const knownProjects = ref<string[]>([]);
-
-// Phase plans keyed by `${project}::${task_number}` for O(1) lookup per card.
-// Read-only: authored by the cc-phases CLI in each project's .claude/phases/.
-const phasePlans = ref<Map<string, PhasePlan>>(new Map());
-
-// UI toggle (Settings → Tasks, issue #16): when off, hide all phase UI. Stored
-// straight in settings.json by the settings panel; read here on mount/focus.
-const phasesEnabled = ref(true);
 
 // Merge-link badges (issue #13). A task's `project` is stored raw, so it may be a
 // canonical (absorbed others) or an alias (folded into a canonical) — need both.
@@ -195,11 +200,16 @@ const visible = computed(() => {
   if (!showDone.value) list = list.filter((t) => t.status !== "done");
   const q = search.value.trim().toLowerCase();
   if (q) {
+    // A bare number or `#N` query also matches the task NUMBER (substring, so
+    // "10" surfaces #10/#102/…) — searching by number, not just title/text.
+    const qNum = q.replace(/^#/, "");
+    const numeric = /^\d+$/.test(qNum);
     list = list.filter(
       (t) =>
         t.subject.toLowerCase().includes(q) ||
         t.description.toLowerCase().includes(q) ||
-        (t.project ?? "").toLowerCase().includes(q),
+        (t.project ?? "").toLowerCase().includes(q) ||
+        (numeric && String(t.number ?? "").includes(qNum)),
     );
   }
   return list;
@@ -236,6 +246,11 @@ async function loadTodos(silent = false) {
   } finally {
     if (!silent) loading.value = false;
   }
+  try {
+    changes.value = await invoke<BoardChange[]>("get_changes");
+  } catch {
+    changes.value = [];
+  }
 }
 
 // Reload now if it's safe; otherwise mark it pending until the drag/form ends.
@@ -254,11 +269,16 @@ function flushPendingReload() {
   }
 }
 
+function subjectCounterLabel(remaining: number): string {
+  return remaining >= 0
+    ? t("todoSubjectRemaining", { n: remaining })
+    : t("todoSubjectOverLimit", { n: -remaining });
+}
+
 function resetForm() {
   editingId.value = null;
   fSubject.value = "";
   fDescription.value = "";
-  fEstimate.value = null;
   fScheduled.value = "";
   fPlan.value = "";
   fProject.value = "";
@@ -279,7 +299,7 @@ function startNew(colId = "backlog") {
 
 async function submitForm() {
   const subject = fSubject.value.trim();
-  if (!subject) return;
+  if (!subject || subject.length > SUBJECT_LIMIT) return;
   const existing = editingId.value
     ? todos.value.find((x) => x.id === editingId.value)
     : null;
@@ -289,10 +309,6 @@ async function submitForm() {
     description: fDescription.value.trim(),
     status: existing?.status ?? formStatus.value,
     priority: fPriority.value || "",
-    estimate_minutes:
-      fEstimate.value === null || Number.isNaN(fEstimate.value)
-        ? null
-        : Math.max(0, Math.round(fEstimate.value)),
     scheduled_for: fScheduled.value || null,
     plan: fPlan.value.trim(),
     project: fProject.value.trim() || null,
@@ -376,7 +392,6 @@ interface Draft {
   plan: string;
   handoff: string;
   project: string;
-  estimate_minutes: number | null;
   scheduled_for: string;
   status: string;
   priority: string;
@@ -387,11 +402,12 @@ const draft = ref<Draft>({
   plan: "",
   handoff: "",
   project: "",
-  estimate_minutes: null,
   scheduled_for: "",
   status: "backlog",
   priority: "",
 });
+const draftSubjectRemaining = computed(() => SUBJECT_LIMIT - draft.value.subject.trim().length);
+const draftSubjectOverLimit = computed(() => draftSubjectRemaining.value < 0);
 
 function rankStatus(s: string): number {
   const i = COLUMNS.findIndex((c) => c.id === s);
@@ -434,7 +450,6 @@ function openDetail(todo: Todo) {
     plan: todo.plan ?? "",
     handoff: todo.handoff ?? "",
     project: todo.project ?? "",
-    estimate_minutes: todo.estimate_minutes ?? null,
     scheduled_for: todo.scheduled_for ?? "",
     status: todo.status,
     priority: todo.priority ?? "",
@@ -454,7 +469,7 @@ async function saveDetail() {
   const cur = detail.value;
   if (!cur) return;
   const d = draft.value;
-  if (!d.subject.trim()) return;
+  if (!d.subject.trim() || d.subject.trim().length > SUBJECT_LIMIT) return;
   const todo: Todo = {
     ...cur, // keep id / comments / links / created_at / updated_at
     subject: d.subject.trim(),
@@ -462,10 +477,6 @@ async function saveDetail() {
     plan: d.plan.trim(),
     handoff: d.handoff.trim(),
     project: d.project.trim() || null,
-    estimate_minutes:
-      d.estimate_minutes === null || Number.isNaN(d.estimate_minutes)
-        ? null
-        : Math.max(0, Math.round(d.estimate_minutes)),
     scheduled_for: d.scheduled_for || null,
     status: d.status,
     priority: d.priority || "",
@@ -665,7 +676,45 @@ async function openSettings() {
 // Board vs graph view (#88): the graph is an alternative rendering of the SAME
 // filtered board, toggled in place — not a separate window. It shares this
 // window's `todos` and `projectFilter`.
-const viewMode = ref<"board" | "graph">("board");
+// `specs` is the third rendering (t#346): not another view of the board, but
+// the level ABOVE it — the spec section a change points at, with that change's
+// graph under it.
+const viewMode = ref<"board" | "graph" | "specs">("board");
+// The graph tab has two renderings while the redesign lands: the new lane/wire
+// screens (default) and the classic force layout. The choice is remembered per
+// machine so a session that prefers the old picture keeps it.
+const graphUiNew = ref(localStorage.getItem("graph-ui") !== "classic");
+// `specsTab` is a per-machine opt-in; `settings.specsEnabled` (t#361) is the
+// master switch — the tab needs BOTH. With the switch off (its default) the
+// tab is gone even on a machine that opted in, and any view already parked on
+// `specs` (a stored state, or the switch flipped while this window is open)
+// falls back to the board rather than rendering with no tab to reach it from.
+const specsTab = ref(localStorage.getItem("specs-tab") === "on");
+const specsTabVisible = computed(() => specsTab.value && settings.value.specsEnabled);
+watch(
+  () => settings.value.specsEnabled,
+  (on) => {
+    if (!on && viewMode.value === "specs") viewMode.value = "board";
+  },
+);
+const specMode = ref<PipelineMode>("reader");
+watch(graphUiNew, (on) =>
+  localStorage.setItem("graph-ui", on ? "next" : "classic"),
+);
+// In graph view the ONE shared search box (below) highlights matching nodes instead
+// of filtering; Enter cycles to the next hit via GraphView's exposed `cycleNext`.
+const graphRef = ref<InstanceType<typeof GraphView> | null>(null);
+function onSearchEnter() {
+  if (viewMode.value === "graph") graphRef.value?.cycleNext();
+}
+
+// Keyboard shortcuts (registry in ../hotkeys): Ctrl+F → search, Ctrl+P → project.
+const searchInputRef = ref<HTMLInputElement | null>(null);
+const projectAcRef = ref<InstanceType<typeof ProjectAutocomplete> | null>(null);
+useHotkeys({
+  search: () => searchInputRef.value?.focus(),
+  project: () => projectAcRef.value?.focus(),
+});
 
 // GraphView mutates dependencies through the backend and hands back the fresh
 // list; adopt it so both views stay in lockstep without a reload round-trip.
@@ -673,11 +722,74 @@ function onGraphUpdate(list: Todo[]) {
   todos.value = list;
 }
 
+// --- the spec a task is about (t#339/t#346) ----------------------------------
+//
+// A task's `spec` is written by the CLI and, until now, was invisible here: the
+// board showed the delta and never what the delta was TO. That gap is what the
+// whole mechanic exists to close, so the link belongs on the card, not only in
+// the session's injected context.
+//
+// The walk mirrors `todos.mjs::specAddressesFor`: the task's OWN addresses win
+// outright, and only a task without any inherits its nearest change's.
+// Inheritance is REPLACEMENT, not a merge — otherwise one section would be
+// listed twice for the same task.
+function changeRootsOf(t: Todo): { spec: string[] }[] {
+  if (t.change_id) {
+    const record = changes.value.find((c) => c.id === t.change_id);
+    if (record) return [{ spec: record.spec ?? [] }];
+  }
+  const roots: Todo[] = [];
+  const seen = new Set<string>([t.id]);
+  let frontier = [t.id];
+  while (frontier.length && !roots.length) {
+    const next: string[] = [];
+    for (const parent of todos.value) {
+      if (!(parent.depends_on ?? []).some((d) => frontier.includes(d))) continue;
+      if (seen.has(parent.id)) continue;
+      seen.add(parent.id);
+      if (parent.change) roots.push(parent);
+      else next.push(parent.id);
+    }
+    frontier = next;
+  }
+  return roots.map((r) => ({ spec: r.spec ?? [] }));
+}
+
+function specLinkOf(t: Todo): { addresses: string[]; inherited: boolean } {
+  const own = (t.spec ?? []).filter(Boolean);
+  if (own.length) return { addresses: own, inherited: false };
+  const seen = new Set<string>();
+  for (const r of changeRootsOf(t)) for (const a of r.spec ?? []) seen.add(a);
+  return { addresses: [...seen], inherited: true };
+}
+
+const detailSpec = computed(() =>
+  detail.value ? specLinkOf(detail.value) : { addresses: [], inherited: false },
+);
+// The closing answers recorded for THIS task (`cli spec answer`, t#341) — the
+// board's own copy of what the guard was told.
+const detailAnswers = computed(() => detail.value?.spec_answers ?? []);
+
+// Jump from a task to the section it is about. Opening the Specs tab rather
+// than a popup keeps one place where a section is read — the tab also shows the
+// other changes on it, which is the context a reader wants next.
+const specTarget = ref<{ address: string; project: string } | null>(null);
+function openSpecSection(address: string) {
+  if (!settings.value.specsEnabled) return;
+  specTarget.value = { address, project: detail.value?.project ?? "" };
+  viewMode.value = "specs";
+  closeDetail();
+}
+
 // Clicking a graph node opens that task's card — the same detail panel the board
 // uses (it overlays the graph and returns to it on close).
-function onGraphOpen(id: string) {
-  const todo = todos.value.find((x) => x.id === id);
-  if (todo) openDetail(todo);
+// The pipeline screens address a task the way a human does — "#345" — while the
+// classic graph passes the uuid. Accept both so either can open the card.
+function onPipelineOpen(ref: string) {
+  const byRef = ref.startsWith("#")
+    ? byNumber.value.get(Number(ref.slice(1)))
+    : todos.value.find((x) => x.id === ref);
+  if (byRef) openDetail(byRef);
 }
 
 // Navigate a t#N reference to that task's detail; a @name reference back to the
@@ -1022,14 +1134,6 @@ function priorityLabel(p: string | null | undefined): string {
   return t("todoPriorityNone");
 }
 
-function fmtEstimate(min: number | null | undefined) {
-  if (min === null || min === undefined) return "";
-  if (min < 60) return `${min} ${t("minShort")}`;
-  const h = Math.floor(min / 60);
-  const m = min % 60;
-  return m ? `${h}${t("hourShort")} ${m}${t("minShort")}` : `${h}${t("hourShort")}`;
-}
-
 // --- External tasks (readonly mirror; plan External-integration-public-side, ph6) ---
 // The tracker OWNS todos (above); external tasks are a READONLY mirror folded on the
 // backend into external_tasks.json and surfaced via get_external_tasks / poll_external
@@ -1269,6 +1373,7 @@ let unlistenTodos: (() => void) | null = null;
 let unlistenFocus: (() => void) | null = null;
 let unlistenTriage: (() => void) | null = null;
 let unlistenExternal: (() => void) | null = null;
+let unlistenTaskCosts: (() => void) | null = null;
 
 // Refresh the project picker from cc_usage. The todos window is a persisted
 // webview (created once at startup, then shown/hidden), so `onMounted` runs a
@@ -1276,43 +1381,119 @@ let unlistenExternal: (() => void) | null = null;
 // reaches the picker. We also kick a background ingest (like the Analytics
 // window) so a brand-new project lands in cc_usage even if Analytics was never
 // opened this session.
-// Read the phases UI toggle from the shared settings store (Settings → Tasks).
-async function loadPhasesEnabled() {
+// ── tokens-per-task (t#87) ────────────────────────────────────────────────────
+// The backend joins the transcript-derived session→task attribution with the
+// per-session token totals (get_task_costs). Conservative by design: a session
+// counts toward a task only when the evidence names exactly one task, so a
+// missing chip means "not attributable", not "free".
+interface TaskCostRow {
+  id: string;
+  number: number;
+  sessions: number;
+  direct_sessions: number;
+  interval_sessions: number;
+  explicit_sessions: number;
+  auto_sessions: number;
+  total_tokens: number;
+  cost: number;
+}
+interface TaskCostsPayload {
+  generated_at: string;
+  tasks: TaskCostRow[];
+  ambiguous_sessions: number;
+  ambiguous_tokens: number;
+  ambiguous_cost: number;
+}
+const taskCosts = ref<Map<string, TaskCostRow>>(new Map());
+
+async function loadTaskCosts() {
   try {
-    const { load: loadStore } = await import("@tauri-apps/plugin-store");
-    const store = await loadStore("settings.json");
-    const v = await store.get<boolean>("phasesEnabled");
-    if (typeof v === "boolean") phasesEnabled.value = v;
+    const res = await invoke<TaskCostsPayload | null>("get_task_costs");
+    const m = new Map<string, TaskCostRow>();
+    for (const r of res?.tasks ?? []) m.set(r.id, r);
+    taskCosts.value = m;
   } catch {
-    // store missing / unreadable → keep default (on)
+    // keep whatever we had — the chip is best-effort decoration
   }
 }
 
-// Pull the phase plans the tracker can find (across projects) and key them for
-// per-card lookup. Best-effort: a missing command / no plans leaves cards bare.
-async function refreshPhasePlans() {
+function costOf(todo: Todo | null | undefined): TaskCostRow | null {
+  if (!todo) return null;
+  return taskCosts.value.get(todo.id) ?? null;
+}
+
+const fmtCost = (c: number) => "$" + (c >= 100 ? String(Math.round(c)) : c.toFixed(2));
+const fmtTok = (n: number) =>
+  n >= 1_000_000 ? (n / 1_000_000).toFixed(1) + "M" : n >= 1_000 ? Math.round(n / 1_000) + "k" : String(n);
+
+function costTitle(todo: Todo): string {
+  const r = costOf(todo);
+  if (!r) return "";
+  return `${t("todoCostHint")}: ${r.sessions} ${t("todoCostSessions")} · ${fmtTok(r.total_tokens)} ${t("todoCostTokens")}`;
+}
+
+// ── cost by block (t#298) ─────────────────────────────────────────────────────
+// A block = this task worked by ONE session over ONE stretch of time, from the
+// binding journal (`todos take` / a status move). The per-task total above is
+// per-SESSION and older than the journal, so the two disagree by design: work
+// between blocks belongs to no task, and pre-journal sessions have no blocks at
+// all. That difference is shown rather than hidden — see `blocksOutside`.
+interface TaskBlockRow {
+  task: string;
+  number: number;
+  subject: string;
+  session: string;
+  from: string;
+  to: string;
+  explicit: boolean;
+  source: string;
+  project?: string;
+  cost: number;
+  total_tokens: number;
+  messages: number;
+  tool_calls: number;
+  tool_errors: number;
+}
+interface TaskBlocksPayload {
+  blocks: TaskBlockRow[];
+  explicit_blocks: number;
+  auto_blocks: number;
+}
+
+const taskBlocks = ref<TaskBlockRow[]>([]);
+
+async function loadTaskBlocks(id: string | null) {
+  if (!id) {
+    taskBlocks.value = [];
+    return;
+  }
   try {
-    const plans = await invoke<PhasePlan[]>("get_phase_plans");
-    const m = new Map<string, PhasePlan>();
-    for (const p of plans) m.set(`${p.project}::${p.task_number}`, p);
-    phasePlans.value = m;
+    const res = await invoke<TaskBlocksPayload | null>("get_task_blocks", { task: id });
+    taskBlocks.value = res?.blocks ?? [];
   } catch {
-    // command unavailable / nothing to read → keep what we have
+    taskBlocks.value = [];
   }
 }
 
-// The phase plan for a task, if one exists (matched by project basename + number).
-// Accepts the nullable `detail` ref as well as a concrete card todo.
-function phasesFor(todo: Todo | null | undefined): PhasePlan | null {
-  if (!todo || !todo.project || !todo.number) return null;
-  return phasePlans.value.get(`${todo.project}::${todo.number}`) ?? null;
-}
+const blocksSum = computed(() =>
+  taskBlocks.value.reduce((acc, b) => acc + (b.cost || 0), 0),
+);
 
-// "done/total" phase count; "" when the task has no plan.
-function phaseProgress(todo: Todo | null | undefined): string {
-  const plan = phasesFor(todo);
-  if (!plan) return "";
-  return `${plan.phases.filter((p) => p.done).length}/${plan.phases.length}`;
+const blocksOutside = computed(() => {
+  const total = detail.value ? (costOf(detail.value)?.cost ?? 0) : 0;
+  return Math.max(0, total - blocksSum.value);
+});
+
+watch(detailId, (id) => {
+  void loadTaskBlocks(id);
+});
+
+function blockSpan(b: TaskBlockRow): string {
+  const ms = new Date(b.to).getTime() - new Date(b.from).getTime();
+  if (!Number.isFinite(ms) || ms <= 0) return "—";
+  const min = Math.round(ms / 60000);
+  if (min < 60) return `${min}m`;
+  return `${Math.floor(min / 60)}h ${String(min % 60).padStart(2, "0")}m`;
 }
 
 async function refreshKnownProjects() {
@@ -1333,7 +1514,8 @@ async function refreshKnownProjects() {
 }
 
 onMounted(async () => {
-  await loadLocaleFromStore();
+  await initSettings();
+  applyLocale(settings.value.locale);
   // The main window pushes its current locale here whenever it opens this
   // window — this is a separate WebView that may detect a different navigator
   // language and have no saved locale to read from the store.
@@ -1346,9 +1528,6 @@ onMounted(async () => {
   // refresh.
   unlistenTodos = await listen("todos-file-changed", () => {
     requestReload();
-    // A todos.json change often coincides with phase edits (same session);
-    // re-read plans too. There's no separate phase-file watcher yet (PR2).
-    void refreshPhasePlans();
   });
   // A fresh nightly-triage digest landed (the backend broadcasts to all
   // windows); refresh the chip so it reflects the latest run.
@@ -1360,13 +1539,17 @@ onMounted(async () => {
   unlistenExternal = await listen<ExternalTasksUpdate>("external-tasks-updated", (e) => {
     applyExternalUpdate(e.payload);
   });
+  // The background publisher re-derived the session→task attribution (t#87);
+  // re-read the joined costs so the ⚡ chips stay current.
+  unlistenTaskCosts = await listen("task-costs-updated", () => {
+    void loadTaskCosts();
+  });
   await loadTodos();
+  void loadTaskCosts();
   // Populate the "External · N" count chip even while in local mode.
   void loadExternalTasks();
   void loadStatusMap();
   await refreshKnownProjects();
-  void loadPhasesEnabled();
-  void refreshPhasePlans();
   void loadTriageDigest();
   // Persisted webview: refresh the picker each time the window is brought to
   // front, so a project used since the last view (now in cc_usage) shows up.
@@ -1374,8 +1557,6 @@ onMounted(async () => {
   unlistenFocus = await getCurrentWindow().onFocusChanged(({ payload: focused }) => {
     if (focused) {
       void refreshKnownProjects();
-      void loadPhasesEnabled();
-      void refreshPhasePlans();
       void loadTriageDigest();
       // Pick up a status remap done in the Settings → Integrations window.
       void loadStatusMap();
@@ -1390,6 +1571,7 @@ onUnmounted(() => {
   if (unlistenFocus) unlistenFocus();
   if (unlistenTriage) unlistenTriage();
   if (unlistenExternal) unlistenExternal();
+  if (unlistenTaskCosts) unlistenTaskCosts();
 });
 </script>
 
@@ -1479,9 +1661,18 @@ onUnmounted(() => {
           <circle cx="7" cy="7" r="4.5" />
           <line x1="10.5" y1="10.5" x2="14" y2="14" stroke-linecap="round" />
         </svg>
-        <input v-model="search" class="tw-search-input" :placeholder="t('todoSearch')" />
+        <input
+          ref="searchInputRef"
+          v-model="search"
+          class="tw-search-input"
+          :placeholder="viewMode === 'graph' ? t('graphSearch') : t('todoSearch')"
+          :title="viewMode === 'graph' ? t('graphSearchHint') : undefined"
+          @keydown.enter="onSearchEnter"
+          @keydown.esc="search = ''"
+        />
       </div>
       <ProjectAutocomplete
+        ref="projectAcRef"
         v-model="projectFilter"
         :options="projects"
         :placeholder="t('todoFilterAll')"
@@ -1525,7 +1716,36 @@ onUnmounted(() => {
           </svg>
           {{ t("viewGraph") }}
         </button>
+        <button
+          v-if="specsTabVisible"
+          class="tw-vt"
+          :class="{ active: viewMode === 'specs' }"
+          role="tab"
+          :aria-selected="viewMode === 'specs'"
+          :title="t('viewSpecs')"
+          @click="viewMode = 'specs'"
+        >
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 2.5h7l3 3v8H3z" />
+            <path d="M9.5 2.5v3.5H13" />
+            <path d="M5.5 8.5h5M5.5 11h3" />
+          </svg>
+          {{ t("viewSpecs") }}
+        </button>
       </div>
+      <button
+        v-if="viewMode === 'graph' || viewMode === 'specs'"
+        class="tw-guide"
+        :title="graphUiNew ? t('graphUiOld') : t('graphUiNew')"
+        @click="graphUiNew = !graphUiNew"
+      >
+        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M2.5 5.5h11M2.5 10.5h11" />
+          <circle cx="6" cy="5.5" r="1.6" />
+          <circle cx="10" cy="10.5" r="1.6" />
+        </svg>
+        {{ graphUiNew ? t("graphUiOld") : t("graphUiNew") }}
+      </button>
       <button class="tw-guide" :title="t('todoGuideHint')" @click="openGuide">
         <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
           <path d="M2.5 3.2c1.8-.6 3.7-.6 5.5.3 1.8-.9 3.7-.9 5.5-.3v8.6c-1.8-.6-3.7-.6-5.5.3-1.8-.9-3.7-.9-5.5-.3z" />
@@ -1546,13 +1766,38 @@ onUnmounted(() => {
 
     <div v-if="loading" class="tw-empty">{{ t("loading") }}</div>
 
+    <!-- Task graph, new rendering: lanes by theme, artifacts on wires, ref rings -->
+    <PipelineGraph
+      v-else-if="viewMode === 'graph' && graphUiNew"
+      @open="onPipelineOpen"
+    />
+
     <!-- Task graph: an alternative view of the same filtered board (#88) -->
     <GraphView
+      ref="graphRef"
       v-else-if="viewMode === 'graph'"
       :todos="todos"
       :project="projectFilter"
+      :query="search"
       @update="onGraphUpdate"
-      @open="onGraphOpen"
+      @open="onPipelineOpen"
+    />
+
+    <!-- Specs, new rendering: reader and review over the same registry -->
+    <PipelineGraph
+      v-else-if="viewMode === 'specs' && graphUiNew"
+      v-model:mode="specMode"
+      @open="onPipelineOpen"
+    />
+
+    <!-- Specs: the level above the board — section, its changes, their graph -->
+    <SpecView
+      v-else-if="viewMode === 'specs'"
+      :todos="todos"
+      :changes="changes"
+      :project="projectFilter"
+      :target="specTarget"
+      @open="onPipelineOpen"
     />
 
     <!-- Kanban board -->
@@ -1616,11 +1861,24 @@ onUnmounted(() => {
                 class="tw-chip tw-from"
                 :title="t('todoFromHint')"
               >↘ {{ t("todoFrom") }} {{ todo.from }}</span>
-              <span v-if="todo.estimate_minutes != null" class="tw-chip">⏱ {{ fmtEstimate(todo.estimate_minutes) }}</span>
+              <span
+                v-if="todo.imported_at"
+                class="tw-chip tw-imported"
+                :title="t('todoImportedHint')"
+              >⤓ {{ t("todoImported") }}</span>
               <span v-if="todo.scheduled_for" class="tw-chip">📅 {{ todo.scheduled_for }}</span>
               <span v-if="todo.plan" class="tw-chip" :title="todo.plan">📝</span>
-              <span v-if="phasesEnabled && phasesFor(todo)" class="tw-chip" :title="t('phasesLabel')">☑ {{ phaseProgress(todo) }}</span>
+              <!-- Only the task's OWN link on the card: an inherited one would
+                   repeat the change root's chip on every step under it. -->
+              <span
+                v-for="a in todo.spec ?? []"
+                :key="a"
+                class="tw-chip tw-spec"
+                :title="t('todoSpecHint')"
+                @click.stop="openSpecSection(a)"
+              >📘 {{ a }}</span>
               <span v-if="refCount(todo)" class="tw-chip" :title="t('todoRefs')">🔗 {{ refCount(todo) }}</span>
+              <span v-if="costOf(todo)" class="tw-chip" :title="costTitle(todo)">⚡ {{ fmtCost(costOf(todo)!.cost) }}</span>
             </div>
 
             <div class="tw-card-foot">
@@ -1674,7 +1932,7 @@ onUnmounted(() => {
             {{ t("todoSaved") }}
           </span>
         </transition>
-        <button class="tw-btn" :disabled="!draft.subject.trim()" @click="saveDetail">{{ t("save") }}</button>
+        <button class="tw-btn" :disabled="!draft.subject.trim() || draftSubjectOverLimit" @click="saveDetail">{{ t("save") }}</button>
       </header>
 
       <div v-if="errorMsg" class="tw-error">{{ errorMsg }}</div>
@@ -1699,6 +1957,11 @@ onUnmounted(() => {
           <label class="tw-field">
             <span>{{ t("todoSubject") }}</span>
             <input v-model="draft.subject" class="tw-input" maxlength="200" />
+            <span
+              v-if="draftSubjectRemaining < 30"
+              class="tw-subject-counter"
+              :class="{ crit: draftSubjectOverLimit }"
+            >{{ subjectCounterLabel(draftSubjectRemaining) }}</span>
           </label>
           <div class="tw-row">
             <label class="tw-field">
@@ -1732,10 +1995,6 @@ onUnmounted(() => {
             ↘ {{ t("todoFrom") }} <strong>{{ detail.from }}</strong>
           </div>
           <div class="tw-row">
-            <label class="tw-field">
-              <span>{{ t("todoEstimate") }}</span>
-              <input v-model.number="draft.estimate_minutes" class="tw-input" type="number" min="0" step="5" />
-            </label>
             <label class="tw-field">
               <span>{{ t("todoScheduledFor") }}</span>
               <input v-model="draft.scheduled_for" class="tw-input" type="date" />
@@ -1787,10 +2046,9 @@ onUnmounted(() => {
               <span v-else class="tw-richtext-empty">{{ t("todoNoDescription") }}</span>
             </div>
           </label>
-          <!-- The free-form plan note. Hidden once the task has a structured phase
-               plan (Vision + phases below ARE the plan) — kept only if it still holds
-               legacy text, so nothing is silently dropped. -->
-          <label v-if="!(phasesEnabled && phasesFor(detail)) || !!detail?.plan" class="tw-field">
+          <!-- The plan (t#253 field roles): HOW only — the STEPS + ORDER part of an
+               accepted plan; the vision lives in the description. -->
+          <label class="tw-field">
             <span>{{ t("todoPlan") }} <em class="tw-hint">{{ t("todoPlanHint") }}</em></span>
             <textarea v-model="draft.plan" class="tw-input tw-area" rows="5"></textarea>
           </label>
@@ -1813,38 +2071,31 @@ onUnmounted(() => {
             </div>
           </div>
 
-          <!-- Phase plan (issue #16): read-only checkboxes; done → struck through.
-               The cc-phases CLI is the only writer; here it's display-only. -->
-          <div v-if="phasesEnabled && phasesFor(detail)" class="tw-field tw-phases">
-            <div class="tw-phases-hd">
-              <span>{{ t("todoPlan") }}</span>
-              <span class="tw-phases-prog">{{ phaseProgress(detail) }}</span>
+          <!-- The spec this task is about (t#339/t#346): read-only here on
+               purpose — the link is written by `todos set spec`, which validates
+               the address against the registry, and the answers by `spec answer`.
+               A field typed here would accept an address that resolves to
+               nothing, which is the one thing the link must never be. -->
+          <div v-if="detailSpec.addresses.length || detailAnswers.length" class="tw-field tw-spec-box">
+            <span class="tw-handoff-in-hd">
+              {{ t("todoSpec") }}
+              <em v-if="detailSpec.inherited" class="tw-hint">{{ t("todoSpecInherited") }}</em>
+            </span>
+            <div class="tw-spec-links">
+              <button
+                v-for="a in detailSpec.addresses"
+                :key="a"
+                class="tw-spec-link"
+                :title="t('todoSpecHint')"
+                @click.prevent="openSpecSection(a)"
+              >📘 {{ a }}</button>
             </div>
-            <!-- The plan's north star (README ## Vision), read-only here; the
-                 cc-phases CLI / hook is the writer. Holds every phase to intent. -->
-            <div v-if="phasesFor(detail)?.vision" class="tw-vision">
-              <span class="tw-vision-label">★ {{ t("visionLabel") }}</span>
-              <p class="tw-vision-text">{{ phasesFor(detail)?.vision }}</p>
+            <div v-for="(a, i) in detailAnswers" :key="i" class="tw-spec-answer">
+              <span class="tw-spec-verdict" :class="`v-${a.verdict}`">{{ a.verdict }}</span>
+              <span class="tw-spec-answer-addr">{{ a.address }}</span>
+              <span class="tw-spec-answer-at">{{ (a.at || "").slice(0, 10) }}</span>
+              <p class="tw-spec-answer-note">{{ a.note }}</p>
             </div>
-            <ul class="tw-phase-list">
-              <li v-for="ph in phasesFor(detail)?.phases ?? []" :key="ph.num" class="tw-phase">
-                <div class="tw-phase-row" :class="{ done: ph.done }">
-                  <span class="tw-cbx" :class="{ on: ph.done }"></span>
-                  <span class="tw-phase-t">{{ ph.num }}. {{ ph.title }}<span v-if="ph.desc" class="tw-phase-d"> — {{ ph.desc }}</span></span>
-                </div>
-                <ul v-if="ph.subs.length" class="tw-sub-list">
-                  <li
-                    v-for="s in ph.subs"
-                    :key="s.num"
-                    class="tw-sub-row"
-                    :class="{ done: s.done }"
-                  >
-                    <span class="tw-cbx sm" :class="{ on: s.done }"></span>
-                    <span class="tw-sub-t">{{ ph.num }}.{{ s.num }} {{ s.title }}<span v-if="s.text" class="tw-phase-d"> — {{ s.text }}</span></span>
-                  </li>
-                </ul>
-              </li>
-            </ul>
           </div>
 
           <div class="tw-form-actions">
@@ -1855,7 +2106,38 @@ onUnmounted(() => {
               </span>
             </transition>
             <button type="button" class="tw-btn ghost" @click="closeDetail">{{ t("todoBack") }}</button>
-            <button type="button" class="tw-btn" :disabled="!draft.subject.trim()" @click="saveDetail">{{ t("save") }}</button>
+            <button type="button" class="tw-btn" :disabled="!draft.subject.trim() || draftSubjectOverLimit" @click="saveDetail">{{ t("save") }}</button>
+          </div>
+
+          <!-- Cost by block: the task's spend split by (session x interval) -->
+          <div class="tw-blocks">
+            <div class="tw-blocks-hd" :title="t('todoBlocksHint')">
+              {{ t("todoBlocks") }}
+              <span v-if="taskBlocks.length" class="tw-comments-n">{{ taskBlocks.length }}</span>
+            </div>
+            <div v-if="!taskBlocks.length" class="tw-comments-empty">{{ t("todoBlocksEmpty") }}</div>
+            <template v-else>
+              <ul class="tw-block-list">
+                <li v-for="(b, i) in taskBlocks" :key="b.session + b.from + i" class="tw-block">
+                  <span class="tw-block-when">{{ fmtTime(b.from) }}</span>
+                  <span class="tw-block-span">{{ blockSpan(b) }}</span>
+                  <span class="tw-block-cost">{{ fmtCost(b.cost) }}</span>
+                  <span class="tw-block-msgs">{{ b.tool_calls }} {{ t("todoBlocksCalls") }}</span>
+                  <span v-if="b.tool_errors" class="tw-block-errs">{{ b.tool_errors }} {{ t("todoBlocksErrors") }}</span>
+                  <span
+                    class="tw-block-kind"
+                    :class="{ auto: !b.explicit }"
+                    :title="b.explicit ? b.source : t('todoBlocksAutoHint')"
+                  >{{ b.explicit ? t("todoBlocksExplicit") : t("todoBlocksAuto") }}</span>
+                </li>
+              </ul>
+              <div class="tw-blocks-foot">
+                <span>{{ t("todoBlocksSum") }}: <b>{{ fmtCost(blocksSum) }}</b></span>
+                <span v-if="blocksOutside > 0.005" class="tw-blocks-outside" :title="t('todoBlocksOutsideHint')">
+                  {{ t("todoBlocksOutside") }}: <b>{{ fmtCost(blocksOutside) }}</b>
+                </span>
+              </div>
+            </template>
           </div>
 
           <!-- Comments thread (posted independently of the field draft) -->
@@ -2111,6 +2393,11 @@ onUnmounted(() => {
           maxlength="200"
           autofocus
         />
+        <span
+          v-if="fSubjectRemaining < 30"
+          class="tw-subject-counter"
+          :class="{ crit: fSubjectOverLimit }"
+        >{{ subjectCounterLabel(fSubjectRemaining) }}</span>
         <textarea
           v-model="fDescription"
           class="tw-input tw-area"
@@ -2134,10 +2421,6 @@ onUnmounted(() => {
         </label>
         <div class="tw-row">
           <label class="tw-field">
-            <span>{{ t("todoEstimate") }}</span>
-            <input v-model.number="fEstimate" class="tw-input" type="number" min="0" step="5" />
-          </label>
-          <label class="tw-field">
             <span>{{ t("todoScheduledFor") }}</span>
             <input v-model="fScheduled" class="tw-input" type="date" />
           </label>
@@ -2148,7 +2431,7 @@ onUnmounted(() => {
         </label>
         <div class="tw-form-actions">
           <button type="button" class="tw-btn ghost" @click="resetForm">{{ t("todoCancel") }}</button>
-          <button type="submit" class="tw-btn" :disabled="!fSubject.trim()">{{ t("save") }}</button>
+          <button type="submit" class="tw-btn" :disabled="!fSubject.trim() || fSubjectOverLimit">{{ t("save") }}</button>
         </div>
       </form>
     </div>
@@ -2719,57 +3002,71 @@ onUnmounted(() => {
   word-break: break-word;
 }
 
-/* Phase plan checklist on a card (issue #16). Read-only: the cc-phases CLI
-   writes the markdown; here a filled box + strike-through just reflects state. */
-.tw-phases {
-  border-top: 1px solid var(--stroke-strong);
-  margin-top: 6px;
-  padding-top: 12px;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
+/* The spec link (t#339/t#346) — a chip on the card, a read-only block in the
+   detail. Blue, like every other "this opens somewhere else" affordance here. */
+.tw-spec {
+  cursor: pointer;
+  color: #4cc2ff;
+  border-color: color-mix(in srgb, #4cc2ff 40%, transparent);
 }
-.tw-phases-hd {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  font-size: 11px;
-  font-weight: 600;
-  color: var(--text-3);
-  text-transform: uppercase;
-  letter-spacing: 0.03em;
+.tw-spec:hover {
+  border-color: #4cc2ff;
 }
-.tw-phases-prog {
-  font-variant-numeric: tabular-nums;
-  color: var(--text-4);
-  background: var(--track);
-  border-radius: 8px;
-  padding: 0 6px;
+.tw-spec-box {
+  display: block;
 }
-.tw-vision {
+.tw-spec-links {
   display: flex;
-  flex-direction: column;
-  gap: 3px;
-  border-left: 2px solid var(--accent);
-  background: var(--card-bg);
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 4px 0 8px;
+}
+.tw-spec-link {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 11.5px;
+  background: none;
+  border: 1px solid color-mix(in srgb, #4cc2ff 40%, transparent);
+  border-radius: 5px;
+  color: #4cc2ff;
+  cursor: pointer;
+  padding: 2px 7px;
+}
+.tw-spec-link:hover {
+  border-color: #4cc2ff;
+}
+.tw-spec-answer {
+  border-left: 2px solid var(--tw-border, #2a2f3a);
+  padding: 2px 0 2px 9px;
+  margin-bottom: 7px;
+}
+.tw-spec-verdict {
+  font-size: 9.5px;
   border-radius: 4px;
-  padding: 6px 9px;
-  margin: 2px 0 4px;
+  padding: 1px 5px;
+  background: #3a4150;
 }
-.tw-vision-label {
-  font-size: 10px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  color: var(--accent);
+.tw-spec-verdict.v-updated {
+  background: #2f5a2a;
 }
-.tw-vision-text {
-  margin: 0;
+.tw-spec-answer-addr {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 11px;
+  opacity: 0.7;
+  margin-left: 6px;
+}
+.tw-spec-answer-at {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 11px;
+  opacity: 0.45;
+  margin-left: 6px;
+}
+.tw-spec-answer-note {
+  margin: 3px 0 0;
   font-size: 12px;
   line-height: 1.45;
-  color: var(--text-2);
-  white-space: pre-wrap;
+  opacity: 0.85;
 }
+
 /* Inherited handoff (#141): read-only summary of what upstream deps left off. */
 .tw-handoff-in {
   gap: 6px;
@@ -2807,94 +3104,6 @@ onUnmounted(() => {
   font-size: 12px;
   font-style: italic;
   color: var(--text-3, #7a808a);
-}
-.tw-phase-list,
-.tw-sub-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-}
-.tw-sub-list {
-  margin: 3px 0 2px 18px;
-}
-.tw-phase-row,
-.tw-sub-row {
-  display: flex;
-  align-items: flex-start;
-  gap: 6px;
-}
-.tw-phase-row {
-  font-size: 12.5px;
-  color: var(--text);
-}
-.tw-sub-row {
-  font-size: 12px;
-  color: var(--text-2);
-}
-.tw-phase-t,
-.tw-sub-t {
-  line-height: 1.35;
-  word-break: break-word;
-}
-.tw-phase-d {
-  color: var(--text-3);
-  font-weight: 400;
-}
-/* Done item: bright text with a SEPARATE strike line drawn as a pseudo-element,
-   so the line stays subtle (its own colour) while the text reads at full
-   brightness — decoupled, unlike text-decoration which ties the line to the
-   text colour. Done text keeps the base row colour (--text / --text-2). */
-.tw-phase-row.done .tw-phase-t,
-.tw-sub-row.done .tw-sub-t {
-  position: relative;
-}
-.tw-phase-row.done .tw-phase-t::after,
-.tw-sub-row.done .tw-sub-t::after {
-  content: "";
-  position: absolute;
-  left: 0;
-  right: 0;
-  top: 50%;
-  height: 1px;
-  background: var(--text-4);
-  pointer-events: none;
-}
-/* Hover a done item to drop the strike line and read it cleanly. */
-.tw-phase-row.done:hover .tw-phase-t::after,
-.tw-sub-row.done:hover .tw-sub-t::after {
-  display: none;
-}
-.tw-cbx {
-  flex-shrink: 0;
-  width: 13px;
-  height: 13px;
-  margin-top: 1px;
-  border: 1.4px solid var(--stroke-strong);
-  border-radius: 3px;
-  box-sizing: border-box;
-  position: relative;
-}
-.tw-cbx.sm {
-  width: 12px;
-  height: 12px;
-}
-.tw-cbx.on {
-  background: var(--accent);
-  border-color: var(--accent);
-}
-.tw-cbx.on::after {
-  content: "";
-  position: absolute;
-  left: 3.5px;
-  top: 1px;
-  width: 3.5px;
-  height: 6.5px;
-  border: solid #06283b;
-  border-width: 0 1.6px 1.6px 0;
-  transform: rotate(45deg);
 }
 .tw-card-meta {
   display: flex;
@@ -2957,6 +3166,14 @@ onUnmounted(() => {
   overflow-wrap: anywhere;
 }
 /* Same provenance, shown read-only in the detail/edit view. */
+/* Task that arrived via a board import (#181) — in particular a fork, whose local
+   twin is still on the board, so the two need to be told apart at a glance. */
+.tw-imported {
+  color: #d29922;
+  background: rgba(210, 153, 34, 0.14);
+  padding: 1px 7px;
+  border-radius: 8px;
+}
 .tw-from-note {
   font-size: 13px;
   color: var(--text-3);
@@ -3069,6 +3286,15 @@ onUnmounted(() => {
   color: var(--text-4);
   font-style: italic;
   font-weight: 400;
+}
+.tw-subject-counter {
+  align-self: flex-end;
+  font-size: 11px;
+  color: var(--text-4);
+}
+.tw-subject-counter.crit {
+  color: var(--crit);
+  font-weight: 600;
 }
 .tw-form-actions {
   display: flex;
@@ -3269,6 +3495,85 @@ onUnmounted(() => {
 }
 
 /* Comments thread */
+.tw-blocks {
+  border-top: 1px solid var(--stroke-strong);
+  padding-top: 14px;
+  margin-top: 2px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.tw-blocks-hd {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-2);
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  cursor: help;
+}
+.tw-block-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.tw-block {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 12.5px;
+  color: var(--text-3);
+  padding: 4px 8px;
+  border-radius: 7px;
+  background: var(--track);
+}
+.tw-block-when {
+  min-width: 108px;
+  color: var(--text-2);
+}
+.tw-block-span {
+  min-width: 46px;
+  font-variant-numeric: tabular-nums;
+}
+.tw-block-cost {
+  min-width: 56px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-1);
+  font-weight: 600;
+}
+.tw-block-msgs {
+  min-width: 76px;
+  font-variant-numeric: tabular-nums;
+}
+.tw-block-errs {
+  color: var(--danger, #d9534f);
+}
+.tw-block-kind {
+  margin-left: auto;
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 9px;
+  background: var(--card-bg);
+  border: 1px solid var(--stroke-strong);
+  color: var(--text-3);
+}
+.tw-block-kind.auto {
+  border-style: dashed;
+  cursor: help;
+}
+.tw-blocks-foot {
+  display: flex;
+  gap: 16px;
+  font-size: 12.5px;
+  color: var(--text-3);
+  padding: 0 8px;
+}
+.tw-blocks-outside {
+  cursor: help;
+}
 .tw-comments {
   border-top: 1px solid var(--stroke-strong);
   padding-top: 14px;
