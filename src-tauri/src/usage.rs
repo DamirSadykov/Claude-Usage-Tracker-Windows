@@ -1071,6 +1071,92 @@ mod tests {
         assert!(!e.session_expired);
     }
 
+    async fn cookie_echo_server(seen: Arc<std::sync::Mutex<Vec<String>>>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let n = sock.read(&mut chunk).await.unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    let head = String::from_utf8_lossy(&buf).into_owned();
+                    let cookie = head
+                        .lines()
+                        .find(|l| l.to_ascii_lowercase().starts_with("cookie:"))
+                        .map(|l| l["cookie:".len()..].trim().to_string())
+                        .unwrap_or_default();
+                    seen.lock().unwrap().push(cookie);
+                    let body = "{}";
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nSet-Cookie: __cf_bm=cf-token; Path=/; HttpOnly\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    sock.write_all(resp.as_bytes()).await.unwrap();
+                    sock.shutdown().await.ok();
+                });
+            }
+        });
+        format!("http://{}/", addr)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cookie_store_sends_cloudflare_cookie_back_only_without_a_manual_cookie_header() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let base = cookie_echo_server(seen.clone()).await;
+        let base_url = Url::parse(&base).unwrap();
+        let jar = Arc::new(Jar::default());
+        jar.add_cookie_str("sessionKey=sk-test; Path=/", &base_url);
+        let client = reqwest::Client::builder()
+            .cookie_provider(jar.clone())
+            .no_proxy()
+            .build()
+            .unwrap();
+        let url = format!("{}api/usage", base);
+
+        client.get(&url).headers(build_headers()).send().await.unwrap();
+        client.get(&url).headers(build_headers()).send().await.unwrap();
+        client
+            .get(&url)
+            .headers(build_headers())
+            .header(reqwest::header::COOKIE, "sessionKey=sk-test")
+            .send()
+            .await
+            .unwrap();
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 3);
+        assert!(seen[0].contains("sessionKey=sk-test") && !seen[0].contains("__cf_bm"), "first visit: {}", seen[0]);
+        assert!(seen[1].contains("sessionKey=sk-test") && seen[1].contains("__cf_bm=cf-token"), "second visit: {}", seen[1]);
+        assert!(!seen[2].contains("__cf_bm"), "manual Cookie header must silence the store (0.13.1 bug): {}", seen[2]);
+    }
+
+    #[tokio::test]
+    #[ignore = "живой запрос к claude.ai: CUT_SESSION_KEY и CUT_ORG_ID из окружения"]
+    async fn live_usage_fetch_round_trips_cloudflare_cookies() {
+        let key = std::env::var("CUT_SESSION_KEY").expect("CUT_SESSION_KEY");
+        let org = std::env::var("CUT_ORG_ID").expect("CUT_ORG_ID");
+        let first = fetch_usage(&key, &org).await;
+        let after_first = cookie_names_for(&CLAUDE_URL);
+        eprintln!("first: {:?} cookies={:?}", first.as_ref().map(|_| "ok").map_err(|e| (e.verdict.code(), &e.message)), after_first);
+        let second = fetch_usage(&key, &org).await;
+        let after_second = cookie_names_for(&CLAUDE_URL);
+        eprintln!("second: {:?} cookies={:?}", second.as_ref().map(|_| "ok").map_err(|e| (e.verdict.code(), &e.message)), after_second);
+        assert!(after_first.iter().any(|n| n == "sessionKey"));
+        assert!(after_first.iter().any(|n| n == "__cf_bm"), "claude.ai sets __cf_bm on every answer; store must keep it: {:?}", after_first);
+        assert!(second.is_ok(), "second fetch: {:?}", second.err().map(|e| e.message));
+    }
+
     #[test]
     fn set_cookie_names_are_logged_without_values() {
         let mut h = HeaderMap::new();
