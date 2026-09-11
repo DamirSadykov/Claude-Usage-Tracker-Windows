@@ -50,6 +50,14 @@ const {
   saveUpdaterSettings,
 } = useUpdater();
 
+async function openLogDir() {
+  try {
+    await invoke("open_log_dir");
+  } catch (e) {
+    console.error("open_log_dir failed", e);
+  }
+}
+
 
 const props = defineProps<{
   // Which tab to show. Driven by the gear that opened the window; user clicks
@@ -1373,6 +1381,12 @@ function handleSave() {
         <div v-else-if="updateStatus === 'error'" class="field-hint" style="color: #f87171">
           {{ t('updateError') }}<template v-if="updateErrorMessage"> — {{ updateErrorMessage }}</template>
         </div>
+      </div>
+
+      <div class="card">
+        <div class="field-label">{{ t('logsTitle') }}</div>
+        <div class="field-hint" style="margin-bottom: 8px">{{ t('logsHint') }}</div>
+        <button type="button" class="btn-check" @click="openLogDir">{{ t('openLog') }}</button>
       </div>
 
       <!-- Update check interval -->

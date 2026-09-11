@@ -1218,7 +1218,6 @@ onUnmounted(() => {
                         {{ t("reportIssue") }}
                     </button>
                     <button
-                        v-if="errorReportable"
                         class="link-btn"
                         @click="openLog"
                         style="margin-top: 8px"
