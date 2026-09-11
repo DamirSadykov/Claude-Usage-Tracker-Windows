@@ -1141,22 +1141,6 @@ mod tests {
         assert!(!seen[2].contains("__cf_bm"), "manual Cookie header must silence the store (0.13.1 bug): {}", seen[2]);
     }
 
-    #[tokio::test]
-    #[ignore = "живой запрос к claude.ai: CUT_SESSION_KEY и CUT_ORG_ID из окружения"]
-    async fn live_usage_fetch_round_trips_cloudflare_cookies() {
-        let key = std::env::var("CUT_SESSION_KEY").expect("CUT_SESSION_KEY");
-        let org = std::env::var("CUT_ORG_ID").expect("CUT_ORG_ID");
-        let first = fetch_usage(&key, &org).await;
-        let after_first = cookie_names_for(&CLAUDE_URL);
-        eprintln!("first: {:?} cookies={:?}", first.as_ref().map(|_| "ok").map_err(|e| (e.verdict.code(), &e.message)), after_first);
-        let second = fetch_usage(&key, &org).await;
-        let after_second = cookie_names_for(&CLAUDE_URL);
-        eprintln!("second: {:?} cookies={:?}", second.as_ref().map(|_| "ok").map_err(|e| (e.verdict.code(), &e.message)), after_second);
-        assert!(after_first.iter().any(|n| n == "sessionKey"));
-        assert!(after_first.iter().any(|n| n == "__cf_bm"), "claude.ai sets __cf_bm on every answer; store must keep it: {:?}", after_first);
-        assert!(second.is_ok(), "second fetch: {:?}", second.err().map(|e| e.message));
-    }
-
     #[test]
     fn set_cookie_names_are_logged_without_values() {
         let mut h = HeaderMap::new();
