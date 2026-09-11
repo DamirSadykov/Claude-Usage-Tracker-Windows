@@ -612,7 +612,7 @@ dependencies = [
 
 [[package]]
 name = "claude-usage-tracker"
-version = "0.13.2"
+version = "0.13.3"
 dependencies = [
  "base64 0.22.1",
  "chrono",
