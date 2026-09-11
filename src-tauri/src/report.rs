@@ -11,6 +11,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
@@ -20,6 +21,8 @@ pub const ISSUE_NEW_URL: &str =
 
 /// Имя файла, в который пишет плагин логирования (внутри app log dir).
 pub const LOG_FILE_NAME: &str = "claude-usage-tracker.log";
+
+pub const LOG_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// Файл-маркер последней паники; читается и удаляется на следующем запуске.
 pub const PANIC_FILE_NAME: &str = "last-panic.txt";
@@ -160,6 +163,30 @@ fn read_log_tail(path: &Path) -> Option<String> {
     Some(text)
 }
 
+pub fn prune_rotated_logs(log_dir: &Path, retention: Duration) -> usize {
+    let stem = LOG_FILE_NAME.trim_end_matches(".log");
+    let Ok(entries) = std::fs::read_dir(log_dir) else {
+        return 0;
+    };
+    let now = SystemTime::now();
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let rotated = name.starts_with(&format!("{stem}_")) && name.contains(".log");
+        if !rotated {
+            continue;
+        }
+        let Some(modified) = entry.metadata().ok().and_then(|m| m.modified().ok()) else {
+            continue;
+        };
+        let age = now.duration_since(modified).unwrap_or_default();
+        if age > retention && std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 // --- GitHub issue ---
 
 /// Строит URL заранее заполненного GitHub issue. Резюме и детали короткие и идут
@@ -232,6 +259,37 @@ fn urlencode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prune_removes_only_stale_rotated_logs() {
+        let dir = std::env::temp_dir().join(format!("cut-prune-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let touch = |name: &str, age: Duration| {
+            let path = dir.join(name);
+            std::fs::write(&path, b"x").unwrap();
+            let when = SystemTime::now() - age;
+            let f = std::fs::File::options().write(true).open(&path).unwrap();
+            f.set_modified(when).unwrap();
+        };
+        let day = Duration::from_secs(86_400);
+        touch(LOG_FILE_NAME, 30 * day);
+        touch("claude-usage-tracker_2026-08-01_10-00-00.log", 30 * day);
+        touch("claude-usage-tracker_2026-08-01_11-00-00.log.bak", 30 * day);
+        touch("claude-usage-tracker_2026-09-10_10-00-00.log", 1 * day);
+        touch("panic.txt", 30 * day);
+
+        let removed = prune_rotated_logs(&dir, LOG_RETENTION);
+        assert_eq!(removed, 2);
+        let left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(left.contains(&LOG_FILE_NAME.to_string()));
+        assert!(left.contains(&"claude-usage-tracker_2026-09-10_10-00-00.log".to_string()));
+        assert!(left.contains(&"panic.txt".to_string()));
+        assert_eq!(left.len(), 3);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     fn report(detail: &str, log_tail: &str) -> DiagReport {
         DiagReport {

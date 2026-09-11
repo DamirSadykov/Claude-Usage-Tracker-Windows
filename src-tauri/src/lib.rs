@@ -286,13 +286,13 @@ async fn run_cycle(
     let usage = match usage::fetch_usage(&cfg.session_key, &cfg.org_id).await {
         Ok(u) => u,
         Err(e) => {
-            let msg = e.to_string();
+            let msg = format!("{} [{}]", e, e.verdict.code());
             let session_expired = e.session_expired;
             record_diag(
                 app,
                 "usage-fetch",
                 "Не удалось получить данные об использовании",
-                format!("fetch_usage failed: {}", msg),
+                format!("fetch_usage failed: verdict={} blame={} {}", e.verdict.code(), e.verdict.blame(), e),
             );
             let _ = app.emit(
                 "usage-error",
@@ -2882,7 +2882,7 @@ pub fn run() {
                 // diagnostics for "data won't fetch" reports.
                 .level_for("claude_usage_tracker_lib", log::LevelFilter::Debug)
                 .max_file_size(2 * 1024 * 1024)
-                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepOne)
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepAll)
                 .build(),
         )
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -2939,6 +2939,10 @@ pub fn run() {
             let diag_store = Arc::new(DiagStore::default());
             if let Ok(log_dir) = app.path().app_log_dir() {
                 std::fs::create_dir_all(&log_dir).ok();
+                let pruned = report::prune_rotated_logs(&log_dir, report::LOG_RETENTION);
+                if pruned > 0 {
+                    info!("Removed {pruned} rotated log file(s) older than {} days", report::LOG_RETENTION.as_secs() / 86_400);
+                }
                 report::set_panic_file(&log_dir);
                 if let Some(rep) = report::take_panic_report(&log_dir, &version) {
                     warn!("Recovered a crash report from the previous run");

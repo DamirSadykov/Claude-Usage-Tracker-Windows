@@ -1,8 +1,10 @@
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
-use log::{debug, warn};
-use reqwest::header::{HeaderMap, HeaderValue, COOKIE, ACCEPT, USER_AGENT, REFERER};
+use log::{debug, info, warn};
+use reqwest::cookie::{CookieStore, Jar};
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, CONTENT_TYPE, REFERER, SERVER, SET_COOKIE, USER_AGENT};
+use reqwest::{StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
@@ -13,10 +15,14 @@ use tokio::sync::Mutex;
 /// `cookie_store` — Cloudflare выдаёт `__cf_bm` в ответе и ждёт её обратно;
 /// без хранилища каждый запрос выглядит как первый визит и рано или поздно
 /// ловит страницу проверки вместо данных.
+static COOKIE_JAR: LazyLock<Arc<Jar>> = LazyLock::new(|| Arc::new(Jar::default()));
+
+static CLAUDE_URL: LazyLock<Url> = LazyLock::new(|| Url::parse("https://claude.ai/").unwrap());
+
 static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
-        .cookie_store(true)
+        .cookie_provider(COOKIE_JAR.clone())
         .build()
         .expect("failed to build shared reqwest::Client")
 });
@@ -200,18 +206,145 @@ struct ApiPrepaidCredits {
 /// разъехавшиеся строки обесценят cookie, добытую входом через webview.
 const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36";
 
-/// Заголовки как у macOS-оригинала: cookie сессии, `Accept`, браузерный
-/// `User-Agent`, `Referer` и `Origin` — и ничего сверх того. `Content-Type`
-/// на GET и `anthropic-client-*` со значением `unknown` отсюда убраны: браузер
-/// их не шлёт, а для POST `Content-Type` проставит сам `RequestBuilder::json`.
-fn build_headers(session_key: &str) -> Result<HeaderMap, Box<dyn std::error::Error + Send + Sync>> {
+/// Заголовки как у macOS-оригинала: `Accept`, браузерный `User-Agent`,
+/// `Referer` и `Origin` — и ничего сверх того. `Content-Type` на GET и
+/// `anthropic-client-*` со значением `unknown` отсюда убраны: браузер их не
+/// шлёт, а для POST `Content-Type` проставит сам `RequestBuilder::json`.
+fn build_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
-    headers.insert(COOKIE, HeaderValue::from_str(&format!("sessionKey={}", session_key))?);
     headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
     headers.insert(USER_AGENT, HeaderValue::from_static(BROWSER_UA));
     headers.insert(REFERER, HeaderValue::from_static("https://claude.ai"));
     headers.insert("Origin", HeaderValue::from_static("https://claude.ai"));
-    Ok(headers)
+    headers
+}
+
+fn session_key_is_cookie_safe(session_key: &str) -> bool {
+    !session_key.is_empty()
+        && session_key
+            .chars()
+            .all(|c| c.is_ascii_graphic() && c != ';' && c != ',' && c != '"' && c != '\\')
+}
+
+fn install_session_cookie(session_key: &str) -> Result<(), FetchError> {
+    if !session_key_is_cookie_safe(session_key) {
+        warn!(
+            "prepare_request: verdict={} blame={} session_key_len={} (символы вне ASCII, пробелы или `;`)",
+            Verdict::BadSessionKey.code(),
+            Verdict::BadSessionKey.blame(),
+            session_key.len()
+        );
+        return Err(FetchError::new(
+            Verdict::BadSessionKey,
+            message_for(Verdict::BadSessionKey, StatusCode::OK, "недопустимые символы (пробел, `;`, не-ASCII)"),
+        ));
+    }
+    COOKIE_JAR.add_cookie_str(
+        &format!("sessionKey={}; Path=/; Secure; HttpOnly", session_key),
+        &CLAUDE_URL,
+    );
+    let names = cookie_names_for(&CLAUDE_URL);
+    if !names.iter().any(|n| n == "sessionKey") {
+        warn!(
+            "prepare_request: verdict={} blame={} cookie store rejected sessionKey (cookies=[{}])",
+            Verdict::BadSessionKey.code(),
+            Verdict::BadSessionKey.blame(),
+            names.join(",")
+        );
+        return Err(FetchError::new(
+            Verdict::BadSessionKey,
+            message_for(Verdict::BadSessionKey, StatusCode::OK, "хранилище cookie его не приняло"),
+        ));
+    }
+    Ok(())
+}
+
+fn prepare_request(session_key: &str) -> Result<HeaderMap, FetchError> {
+    install_session_cookie(session_key)?;
+    Ok(build_headers())
+}
+
+fn cookie_names_for(url: &Url) -> Vec<String> {
+    COOKIE_JAR
+        .cookies(url)
+        .and_then(|v| v.to_str().map(str::to_string).ok())
+        .map(|s| {
+            s.split(';')
+                .filter_map(|pair| pair.trim().split('=').next().map(str::to_string))
+                .filter(|n| !n.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn set_cookie_names(headers: &HeaderMap) -> Vec<String> {
+    headers
+        .get_all(SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .filter_map(|s| s.split('=').next().map(|n| n.trim().to_string()))
+        .collect()
+}
+
+fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> &'a str {
+    headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or("-")
+}
+
+struct ResponseFacts {
+    status: StatusCode,
+    final_url: Url,
+    cf_ray: String,
+    cf_mitigated: bool,
+    server: String,
+    content_type: String,
+    set_cookie: Vec<String>,
+    cookies_sent: Vec<String>,
+}
+
+impl ResponseFacts {
+    fn capture(resp: &reqwest::Response, cookies_sent: Vec<String>) -> Self {
+        let h = resp.headers();
+        Self {
+            status: resp.status(),
+            final_url: resp.url().clone(),
+            cf_ray: header_str(h, "cf-ray").to_string(),
+            cf_mitigated: h.contains_key("cf-mitigated"),
+            server: header_str(h, SERVER.as_str()).to_string(),
+            content_type: header_str(h, CONTENT_TYPE.as_str()).to_string(),
+            set_cookie: set_cookie_names(h),
+            cookies_sent,
+        }
+    }
+
+    fn describe(&self, body: &str) -> String {
+        format!(
+            "status={} cf_ray={} cf_mitigated={} server={} content_type={} body={}B html={} cookies_sent=[{}] set_cookie=[{}] final_url={}",
+            self.status,
+            self.cf_ray,
+            self.cf_mitigated,
+            self.server,
+            self.content_type,
+            body.len(),
+            body.trim_start().starts_with('<'),
+            self.cookies_sent.join(","),
+            self.set_cookie.join(","),
+            self.final_url
+        )
+    }
+}
+
+fn log_verdict(verdict: Verdict, facts: &ResponseFacts, body: &str) {
+    let line = format!(
+        "fetch_usage: verdict={} blame={} {}",
+        verdict.code(),
+        verdict.blame(),
+        facts.describe(body)
+    );
+    if verdict == Verdict::Ok {
+        info!("{}", line);
+    } else {
+        warn!("{} snippet: {}", line, snippet(body));
+    }
 }
 
 fn map_tier(t: ApiTier) -> UsageTier {
@@ -230,6 +363,53 @@ const DEFAULT_TIER: UsageTier = UsageTier {
 
 // --- Fetch usage ---
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    Ok,
+    CloudflareChallenge,
+    SessionRejected,
+    LoginRedirect,
+    BadSessionKey,
+    OrgNotFound,
+    ClaudeOutage,
+    HttpOther,
+    Network,
+    BadJson,
+}
+
+impl Verdict {
+    pub fn code(self) -> &'static str {
+        match self {
+            Verdict::Ok => "ok",
+            Verdict::CloudflareChallenge => "cloudflare_challenge",
+            Verdict::SessionRejected => "session_rejected",
+            Verdict::LoginRedirect => "login_redirect",
+            Verdict::BadSessionKey => "bad_session_key",
+            Verdict::OrgNotFound => "org_not_found",
+            Verdict::ClaudeOutage => "claude_outage",
+            Verdict::HttpOther => "http_error",
+            Verdict::Network => "network",
+            Verdict::BadJson => "bad_json",
+        }
+    }
+
+    pub fn blame(self) -> &'static str {
+        match self {
+            Verdict::Ok => "none",
+            Verdict::CloudflareChallenge => "cloudflare",
+            Verdict::SessionRejected | Verdict::LoginRedirect | Verdict::BadSessionKey => "session_key",
+            Verdict::OrgNotFound => "org_id",
+            Verdict::ClaudeOutage => "claude",
+            Verdict::Network => "network",
+            Verdict::HttpOther | Verdict::BadJson => "unknown",
+        }
+    }
+
+    pub fn session_expired(self) -> bool {
+        matches!(self, Verdict::SessionRejected | Verdict::LoginRedirect)
+    }
+}
+
 /// A failed usage fetch. `session_expired` is the one bit the UI acts on: it's
 /// set only when the failure is specifically a rejected/expired session cookie
 /// — an HTTP 401/403 carrying the API's own JSON refusal, or a redirect to the
@@ -242,12 +422,12 @@ const DEFAULT_TIER: UsageTier = UsageTier {
 pub struct FetchError {
     pub message: String,
     pub session_expired: bool,
+    pub verdict: Verdict,
 }
 
 impl FetchError {
-    /// A failure that is not (or not known to be) an expired cookie.
-    fn plain(message: String) -> Self {
-        Self { message, session_expired: false }
+    fn new(verdict: Verdict, message: String) -> Self {
+        Self { message, session_expired: verdict.session_expired(), verdict }
     }
 }
 
@@ -276,7 +456,36 @@ const CLOUDFLARE_CHALLENGE_MESSAGE: &str =
     "Запрос заблокирован защитой Cloudflare — ключ сессии, скорее всего, действителен. \
      Обычно проходит при следующем обновлении; если повторяется, войдите в claude.ai в браузере.";
 
-fn looks_like_login_page(final_url: &reqwest::Url, body: &str) -> bool {
+fn classify_response(status: StatusCode, cf_mitigated: bool, final_url: &Url, body: &str) -> Verdict {
+    if cf_mitigated || is_cloudflare_challenge(body) {
+        return Verdict::CloudflareChallenge;
+    }
+    match status.as_u16() {
+        401 | 403 => Verdict::SessionRejected,
+        404 => Verdict::OrgNotFound,
+        500..=599 => Verdict::ClaudeOutage,
+        200..=299 if looks_like_login_page(final_url, body) => Verdict::LoginRedirect,
+        200..=299 => Verdict::BadJson,
+        _ => Verdict::HttpOther,
+    }
+}
+
+fn message_for(verdict: Verdict, status: StatusCode, detail: &str) -> String {
+    match verdict {
+        Verdict::CloudflareChallenge => CLOUDFLARE_CHALLENGE_MESSAGE.to_string(),
+        Verdict::SessionRejected => format!("API вернул {} — ключ сессии недействителен или истёк", status),
+        Verdict::LoginRedirect => "Ключ сессии истёк — Claude вернул страницу входа вместо данных".to_string(),
+        Verdict::OrgNotFound => format!("API вернул {} — проверьте Organization ID", status),
+        Verdict::ClaudeOutage => format!("API вернул {} — сервис Claude временно недоступен, повторите позже", status),
+        Verdict::HttpOther => format!("API вернул {}", status),
+        Verdict::BadJson => format!("Ответ usage — не ожидаемый JSON: {}", detail),
+        Verdict::Network => format!("Сетевая ошибка запроса usage: {}", detail),
+        Verdict::BadSessionKey => format!("Некорректный ключ сессии: {}", detail),
+        Verdict::Ok => String::new(),
+    }
+}
+
+fn looks_like_login_page(final_url: &Url, body: &str) -> bool {
     let path = final_url.path();
     let redirected_away = final_url.host_str() != Some("claude.ai")
         || path.contains("login")
@@ -286,8 +495,6 @@ fn looks_like_login_page(final_url: &reqwest::Url, body: &str) -> bool {
 }
 
 pub async fn fetch_usage(session_key: &str, org_id: &str) -> Result<UsageData, FetchError> {
-    // Diagnostics for the common "data won't fetch on another PC" report: we
-    // log whether the inputs are present and their lengths — never the values.
     debug!(
         "fetch_usage: org_id_len={}, session_key_len={}",
         org_id.len(),
@@ -299,106 +506,70 @@ pub async fn fetch_usage(session_key: &str, org_id: &str) -> Result<UsageData, F
 
     let _api_guard = CLAUDE_API_LOCK.lock().await;
     let client = &*HTTP_CLIENT;
-    let headers = match build_headers(session_key) {
-        Ok(h) => h,
-        Err(e) => {
-            // Most likely a session key with characters that aren't valid in an
-            // HTTP header value (stray whitespace / non-ASCII from a bad paste).
-            warn!("fetch_usage: invalid request headers (check the session key): {}", e);
-            return Err(FetchError::plain(format!(
-                "Некорректный ключ сессии (заголовок запроса): {}",
-                e
-            )));
-        }
-    };
+    let headers = prepare_request(session_key)?;
 
     let usage_url = format!("https://claude.ai/api/organizations/{}/usage", org_id);
     let credits_url = format!("https://claude.ai/api/organizations/{}/prepaid/credits", org_id);
+
+    let cookies_sent = cookie_names_for(&CLAUDE_URL);
+    debug!(
+        "fetch_usage: GET usage cookies=[{}] ua={}",
+        cookies_sent.join(","),
+        BROWSER_UA
+    );
 
     let usage_resp = client.get(&usage_url).headers(headers.clone()).send().await;
 
     let usage_resp = match usage_resp {
         Ok(r) => r,
         Err(e) => {
-            // A transport failure (no connection / TLS / timeout) — NOT the
-            // cookie. Leave session_expired false so the UI blames the network.
-            warn!("fetch_usage: usage request failed ({})", describe_net_error(&e));
-            return Err(FetchError::plain(format!(
-                "Сетевая ошибка запроса usage: {}",
-                describe_net_error(&e)
-            )));
+            let detail = describe_net_error(&e);
+            warn!(
+                "fetch_usage: verdict={} blame={} cookies_sent=[{}] error={}",
+                Verdict::Network.code(),
+                Verdict::Network.blame(),
+                cookies_sent.join(","),
+                detail
+            );
+            return Err(FetchError::new(Verdict::Network, message_for(Verdict::Network, StatusCode::OK, &detail)));
         }
     };
 
-    // Final URL after any redirects — a bounce to a login/auth page is our
-    // strongest "cookie rejected" signal on an otherwise-2xx response.
-    let final_url = usage_resp.url().clone();
-    let status = usage_resp.status();
-    if !status.is_success() {
-        let cf_mitigated = usage_resp.headers().contains_key("cf-mitigated");
-        let body = usage_resp.text().await.unwrap_or_default();
-        warn!(
-            "fetch_usage: usage API returned {} (final_url {}, body {} bytes): {}",
-            status,
-            final_url,
-            body.len(),
-            snippet(&body)
-        );
-        if cf_mitigated || is_cloudflare_challenge(&body) {
-            warn!("fetch_usage: Cloudflare challenge, not a rejected session key");
-            return Err(FetchError::plain(CLOUDFLARE_CHALLENGE_MESSAGE.to_string()));
+    let facts = ResponseFacts::capture(&usage_resp, cookies_sent);
+    let body = match usage_resp.text().await {
+        Ok(b) => b,
+        Err(e) => {
+            let detail = describe_net_error(&e);
+            warn!(
+                "fetch_usage: verdict={} blame={} {} error={}",
+                Verdict::Network.code(),
+                Verdict::Network.blame(),
+                facts.describe(""),
+                detail
+            );
+            return Err(FetchError::new(
+                Verdict::Network,
+                format!("Не удалось прочитать тело ответа usage: {}", detail),
+            ));
         }
-        let session_expired = matches!(status.as_u16(), 401 | 403);
-        let hint = match status.as_u16() {
-            401 | 403 => " — ключ сессии недействителен или истёк",
-            404 => " — проверьте Organization ID",
-            // 503 "app unavailable" / 502 / 500 etc.: claude.ai is down or in
-            // maintenance — not the user's config. Say so in plain language.
-            500..=599 => " — сервис Claude временно недоступен, повторите позже",
-            _ => "",
-        };
-        return Err(FetchError {
-            message: format!("API вернул {}{}", status, hint),
-            session_expired,
-        });
+    };
+
+    if !facts.status.is_success() {
+        let verdict = classify_response(facts.status, facts.cf_mitigated, &facts.final_url, &body);
+        log_verdict(verdict, &facts, &body);
+        return Err(FetchError::new(verdict, message_for(verdict, facts.status, "")));
     }
 
-    // Read as text first so a non-JSON response (e.g. an HTML login page when the
-    // session cookie is rejected) shows up as a readable snippet in the log
-    // instead of an opaque "decode error".
-    let body = usage_resp.text().await.map_err(|e| {
-        FetchError::plain(format!(
-            "Не удалось прочитать тело ответа usage: {}",
-            describe_net_error(&e)
-        ))
-    })?;
-    let api: ApiResponse = serde_json::from_str(&body).map_err(|e| {
-        warn!(
-            "fetch_usage: usage body is not the expected JSON (final_url {}, {} bytes): {}",
-            final_url,
-            body.len(),
-            snippet(&body)
-        );
-        // A 2xx that isn't our JSON is almost always the login page → treat it as
-        // an expired cookie so the user is sent to refresh the key, not puzzled
-        // by "unexpected JSON". Cloudflare's page is checked first: it is also
-        // HTML, but the key behind it is fine.
-        if is_cloudflare_challenge(&body) {
-            FetchError::plain(CLOUDFLARE_CHALLENGE_MESSAGE.to_string())
-        } else if looks_like_login_page(&final_url, &body) {
-            FetchError {
-                message: "Ключ сессии истёк — Claude вернул страницу входа вместо данных".into(),
-                session_expired: true,
-            }
-        } else {
-            FetchError::plain(format!("Ответ usage — не ожидаемый JSON: {}", e))
+    let api: ApiResponse = match serde_json::from_str(&body) {
+        Ok(api) => api,
+        Err(e) => {
+            let verdict = classify_response(facts.status, facts.cf_mitigated, &facts.final_url, &body);
+            log_verdict(verdict, &facts, &body);
+            return Err(FetchError::new(verdict, message_for(verdict, facts.status, &e.to_string())));
         }
-    })?;
-    debug!("fetch_usage: usage parsed OK ({} bytes)", body.len());
+    };
+    log_verdict(Verdict::Ok, &facts, &body);
 
-    // Sent only now, after usage came back: two simultaneous requests carrying
-    // one cookie are the burst the lock above exists to avoid, and a failed
-    // usage fetch makes the credits call pointless anyway.
     let credits_resp = client.get(&credits_url).headers(headers).send().await;
 
     let prepaid: Option<ApiPrepaidCredits> = match credits_resp {
@@ -515,7 +686,7 @@ pub async fn ensure_project(
 ) -> Result<ProjectInfo, Box<dyn std::error::Error + Send + Sync>> {
     let _api_guard = CLAUDE_API_LOCK.lock().await;
     let client = &*HTTP_CLIENT;
-    let headers = build_headers(session_key)?;
+    let headers = prepare_request(session_key)?;
 
     let list_url = format!(
         "https://claude.ai/api/organizations/{}/projects",
@@ -613,7 +784,7 @@ pub async fn start_session_unchecked(
 ) -> Result<SessionStartResult, Box<dyn std::error::Error + Send + Sync>> {
     let _api_guard = CLAUDE_API_LOCK.lock().await;
     let client = &*HTTP_CLIENT;
-    let headers = build_headers(session_key)?;
+    let headers = prepare_request(session_key)?;
 
     let conv_uuid = gen_uuid();
 
@@ -845,23 +1016,83 @@ mod tests {
 
     #[test]
     fn challenge_error_does_not_claim_the_key_expired() {
-        let e = FetchError::plain(CLOUDFLARE_CHALLENGE_MESSAGE.to_string());
+        let e = FetchError::new(
+            Verdict::CloudflareChallenge,
+            message_for(Verdict::CloudflareChallenge, StatusCode::FORBIDDEN, ""),
+        );
         assert!(!e.session_expired, "the UI must not ask for a new key on a challenge");
         assert!(e.message.contains("Cloudflare"));
+        assert_eq!(e.verdict.blame(), "cloudflare");
+    }
+
+    #[test]
+    fn verdict_names_the_guilty_side() {
+        let usage = Url::parse("https://claude.ai/api/organizations/x/usage").unwrap();
+        let challenge = "<!DOCTYPE html><title>Just a moment...</title>";
+        let rejected = r#"{"type":"error","error":{"details":{"error_code":"account_session_invalid"}}}"#;
+
+        assert_eq!(classify_response(StatusCode::FORBIDDEN, false, &usage, challenge), Verdict::CloudflareChallenge);
+        assert_eq!(classify_response(StatusCode::FORBIDDEN, true, &usage, "{}"), Verdict::CloudflareChallenge);
+        assert_eq!(classify_response(StatusCode::FORBIDDEN, false, &usage, rejected), Verdict::SessionRejected);
+        assert_eq!(classify_response(StatusCode::UNAUTHORIZED, false, &usage, rejected), Verdict::SessionRejected);
+        assert_eq!(classify_response(StatusCode::NOT_FOUND, false, &usage, "{}"), Verdict::OrgNotFound);
+        assert_eq!(classify_response(StatusCode::SERVICE_UNAVAILABLE, false, &usage, "down"), Verdict::ClaudeOutage);
+        assert_eq!(classify_response(StatusCode::OK, false, &usage, "<!DOCTYPE html>"), Verdict::LoginRedirect);
+        let login = Url::parse("https://claude.ai/login").unwrap();
+        assert_eq!(classify_response(StatusCode::OK, false, &login, "{}"), Verdict::LoginRedirect);
+        assert_eq!(classify_response(StatusCode::OK, false, &usage, "[]"), Verdict::BadJson);
+        assert_eq!(classify_response(StatusCode::TOO_MANY_REQUESTS, false, &usage, "{}"), Verdict::HttpOther);
+
+        assert!(Verdict::SessionRejected.session_expired());
+        assert!(Verdict::LoginRedirect.session_expired());
+        assert!(!Verdict::CloudflareChallenge.session_expired());
+        assert!(!Verdict::OrgNotFound.session_expired());
+        assert_eq!(Verdict::SessionRejected.blame(), "session_key");
+        assert_eq!(Verdict::OrgNotFound.blame(), "org_id");
+        assert_eq!(Verdict::ClaudeOutage.blame(), "claude");
+    }
+
+    #[test]
+    fn session_key_goes_through_the_cookie_store() {
+        assert!(session_key_is_cookie_safe("sk-ant-sid01-abcDEF_-123"));
+        assert!(!session_key_is_cookie_safe(""));
+        assert!(!session_key_is_cookie_safe("sk-ant sid"));
+        assert!(!session_key_is_cookie_safe("sk;ant"));
+        assert!(!session_key_is_cookie_safe("sk-ant-ключ"));
+
+        assert!(install_session_cookie("sk-ant-sid01-abc").is_ok());
+        let names = cookie_names_for(&CLAUDE_URL);
+        assert!(names.iter().any(|n| n == "sessionKey"), "cookies={:?}", names);
+        let api_url = Url::parse("https://claude.ai/api/organizations/x/usage").unwrap();
+        assert!(cookie_names_for(&api_url).iter().any(|n| n == "sessionKey"));
+
+        let e = install_session_cookie("bad key").unwrap_err();
+        assert_eq!(e.verdict, Verdict::BadSessionKey);
+        assert!(!e.session_expired);
+    }
+
+    #[test]
+    fn set_cookie_names_are_logged_without_values() {
+        let mut h = HeaderMap::new();
+        h.append(SET_COOKIE, HeaderValue::from_static("__cf_bm=secret; Path=/; HttpOnly"));
+        h.append(SET_COOKIE, HeaderValue::from_static("cf_clearance=secret2; Path=/"));
+        let names = set_cookie_names(&h);
+        assert_eq!(names, vec!["__cf_bm", "cf_clearance"]);
+        assert!(!names.join(",").contains("secret"));
     }
 
     #[test]
     fn login_page_is_recognised_as_expired_cookie() {
-        let usage = reqwest::Url::parse("https://claude.ai/api/organizations/x/usage").unwrap();
+        let usage = Url::parse("https://claude.ai/api/organizations/x/usage").unwrap();
         // Real JSON on the real endpoint → not a login page.
         assert!(!looks_like_login_page(&usage, r#"{"seven_day":{}}"#));
         // 2xx on the endpoint but an HTML shell came back → expired cookie.
         assert!(looks_like_login_page(&usage, "<!DOCTYPE html><html>…"));
         // Redirected to /login (even with a non-HTML body) → expired.
-        let login = reqwest::Url::parse("https://claude.ai/login").unwrap();
+        let login = Url::parse("https://claude.ai/login").unwrap();
         assert!(looks_like_login_page(&login, "whatever"));
         // Bounced to a different host (auth provider) → expired.
-        let other = reqwest::Url::parse("https://auth.anthropic.com/authorize").unwrap();
+        let other = Url::parse("https://auth.anthropic.com/authorize").unwrap();
         assert!(looks_like_login_page(&other, "{}"));
     }
 }
