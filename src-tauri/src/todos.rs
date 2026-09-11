@@ -609,6 +609,13 @@ pub fn load_checked_for_read(path: &Path) -> Result<TodoFile, String> {
     file_or_refusal(path, load_checked(path))
 }
 
+pub fn load_known(path: &Path) -> Result<TodoFile, String> {
+    match load_checked(path) {
+        LoadOutcome::FutureVersion { .. } => Ok(load(path)),
+        outcome => file_or_refusal(path, outcome),
+    }
+}
+
 pub fn load_for_write(path: &Path) -> Result<TodoFile, String> {
     load_for_write_versioned(path).map(|(file, _)| file)
 }
@@ -2837,6 +2844,41 @@ mod tests {
             }
             std::fs::remove_dir_all(&dir).ok();
         }
+    }
+
+    #[test]
+    fn load_known_refuses_unreadable_with_the_refusal_wording() {
+        let (dir, path) = staged_fixture("load-known-corrupt", "corrupt/truncated.json");
+        let err = load_known(&path).unwrap_err();
+        assert!(err.starts_with("board unreadable ("), "got: {err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_known_reads_future_version_via_the_lenient_parse() {
+        let (dir, path) = staged_fixture("load-known-future", "v2/future-version.json");
+        let file = load_known(&path).unwrap();
+        assert_eq!(file.todos.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_known_reports_an_empty_board_for_a_missing_file() {
+        let dir = scratch_dir("load-known-missing");
+        let path = dir.join("todos.json");
+        let file = load_known(&path).unwrap();
+        assert!(file.todos.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_known_matches_load_checked_for_a_healthy_board() {
+        let (dir, path) = staged_fixture("load-known-full", "v2/full.json");
+        let known = load_known(&path).unwrap();
+        let checked = load_checked_for_read(&path).unwrap();
+        assert_eq!(known.todos.len(), checked.todos.len());
+        assert_eq!(known.changes.len(), checked.changes.len());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
