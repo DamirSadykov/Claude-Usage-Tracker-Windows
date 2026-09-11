@@ -1215,8 +1215,16 @@ pub fn read_backup(todos_path: &Path, name: &str) -> Result<TodoFile, String> {
     }
     let src = backup_dir(todos_path).join(name);
     let content = std::fs::read_to_string(&src).map_err(|e| e.to_string())?;
-    let mut file: TodoFile =
+    let value: serde_json::Value =
         serde_json::from_str(&content).map_err(|e| format!("backup is not a valid todo file: {e}"))?;
+    let version = normalize_version(value.get("version"));
+    if version > CURRENT_VERSION as u64 {
+        return Err(format!(
+            "backup version {version} is newer than this writer (CURRENT {CURRENT_VERSION})"
+        ));
+    }
+    let mut file: TodoFile =
+        serde_json::from_value(value).map_err(|e| format!("backup is not a valid todo file: {e}"))?;
     for t in &mut file.todos {
         t.status = canonical_status(&t.status).to_string();
     }
@@ -1394,6 +1402,12 @@ pub fn parse_import(content: &str) -> Result<TodoFile, String> {
             .map_err(|e| format!("not a list of tasks: {e}"))?;
         TodoFile { version: default_version(), todos, changes: Vec::new() }
     } else {
+        let version = normalize_version(value.get("version"));
+        if version > CURRENT_VERSION as u64 {
+            return Err(format!(
+                "import file version {version} is newer than this writer (CURRENT {CURRENT_VERSION})"
+            ));
+        }
         serde_json::from_value(value).map_err(|e| format!("not a task file: {e}"))?
     };
     for t in &mut file.todos {
@@ -1775,6 +1789,38 @@ mod tests {
         // Path-traversal names are rejected.
         assert!(read_backup(&path, "../todos.json").is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_backup_refuses_future_version() {
+        let dir = scratch_dir("backup-future");
+        let path = dir.join("todos.json");
+        let content = std::fs::read_to_string(fixtures_dir().join("v2/future-version.json")).unwrap();
+        let bdir = backup_dir(&path);
+        std::fs::create_dir_all(&bdir).unwrap();
+        let name = "todos-future.json";
+        std::fs::write(bdir.join(name), &content).unwrap();
+
+        let err = read_backup(&path, name).unwrap_err();
+        assert!(err.contains("newer than this writer"), "got: {err}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_backup_still_accepts_v2() {
+        let dir = scratch_dir("backup-v2");
+        let path = dir.join("todos.json");
+        let content = std::fs::read_to_string(fixtures_dir().join("v2/full.json")).unwrap();
+        let bdir = backup_dir(&path);
+        std::fs::create_dir_all(&bdir).unwrap();
+        let name = "todos-v2.json";
+        std::fs::write(bdir.join(name), &content).unwrap();
+
+        let restored = read_backup(&path, name).unwrap();
+        assert!(!restored.todos.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -2670,6 +2716,21 @@ mod tests {
         assert_eq!(parse_import(envelope).unwrap().todos.len(), 1);
         assert_eq!(parse_import(bare).unwrap().todos.len(), 1);
         assert!(parse_import("not json").is_err());
+    }
+
+    #[test]
+    fn parse_import_refuses_future_version() {
+        let content = std::fs::read_to_string(fixtures_dir().join("v2/future-version.json")).unwrap();
+        let err = parse_import(&content).unwrap_err();
+        assert!(err.contains("newer than this writer"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_import_accepts_v1_and_v2_fixtures() {
+        let v1 = std::fs::read_to_string(fixtures_dir().join("v1/full.json")).unwrap();
+        let v2 = std::fs::read_to_string(fixtures_dir().join("v2/full.json")).unwrap();
+        assert!(!parse_import(&v1).unwrap().todos.is_empty());
+        assert!(!parse_import(&v2).unwrap().todos.is_empty());
     }
 
     fn fixtures_dir() -> PathBuf {
