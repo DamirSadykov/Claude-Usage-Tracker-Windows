@@ -543,32 +543,45 @@ fn ensure_corrupt_backup(path: &Path, raw: &str, timeout: Duration) -> Option<Pa
 }
 
 fn load_checked_with_timeout(path: &Path, backup_timeout: Duration) -> LoadOutcome {
+    load_checked_with_timeout_versioned(path, backup_timeout).0
+}
+
+fn load_checked_with_timeout_versioned(
+    path: &Path,
+    backup_timeout: Duration,
+) -> (LoadOutcome, Option<u32>) {
     let raw = match std::fs::read_to_string(path) {
         Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return LoadOutcome::Missing,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (LoadOutcome::Missing, None),
         Err(e) => {
-            return LoadOutcome::Unreadable { reason: format!("read-error: {e}"), backup: None }
+            return (
+                LoadOutcome::Unreadable { reason: format!("read-error: {e}"), backup: None },
+                None,
+            )
         }
     };
     match detect_issue(&raw) {
-        Issue::FutureVersion(version) => LoadOutcome::FutureVersion { version },
+        Issue::FutureVersion(version) => (LoadOutcome::FutureVersion { version }, None),
         Issue::Unreadable(reason) => {
             let backup = ensure_corrupt_backup(path, &raw, backup_timeout);
-            LoadOutcome::Unreadable { reason: reason.to_string(), backup }
+            (LoadOutcome::Unreadable { reason: reason.to_string(), backup }, None)
         }
-        Issue::Ok(patched) => match serde_json::from_value::<TodoFile>(patched) {
-            Ok(mut file) => {
-                for t in &mut file.todos {
-                    t.status = canonical_status(&t.status).to_string();
+        Issue::Ok(patched) => {
+            let on_disk_version = patched.get("version").and_then(Value::as_u64).map(|v| v as u32);
+            match serde_json::from_value::<TodoFile>(patched) {
+                Ok(mut file) => {
+                    for t in &mut file.todos {
+                        t.status = canonical_status(&t.status).to_string();
+                    }
+                    migrate_plan_roles(&mut file);
+                    (LoadOutcome::Ok(file), on_disk_version)
                 }
-                migrate_plan_roles(&mut file);
-                LoadOutcome::Ok(file)
+                Err(e) => {
+                    let backup = ensure_corrupt_backup(path, &raw, backup_timeout);
+                    (LoadOutcome::Unreadable { reason: format!("schema: {e}"), backup }, None)
+                }
             }
-            Err(e) => {
-                let backup = ensure_corrupt_backup(path, &raw, backup_timeout);
-                LoadOutcome::Unreadable { reason: format!("schema: {e}"), backup }
-            }
-        },
+        }
     }
 }
 
@@ -597,7 +610,14 @@ pub fn load_checked_for_read(path: &Path) -> Result<TodoFile, String> {
 }
 
 pub fn load_for_write(path: &Path) -> Result<TodoFile, String> {
-    file_or_refusal(path, load_checked_with_timeout(path, Duration::from_secs(15)))
+    load_for_write_versioned(path).map(|(file, _)| file)
+}
+
+fn load_for_write_versioned(path: &Path) -> Result<(TodoFile, bool), String> {
+    let (outcome, on_disk_version) =
+        load_checked_with_timeout_versioned(path, Duration::from_secs(15));
+    let stale = on_disk_version.is_some_and(|v| v < CURRENT_VERSION);
+    file_or_refusal(path, outcome).map(|file| (file, stale))
 }
 
 /// v1 → v2: the field-role split (t#253 field review) — `description` carries
@@ -751,9 +771,10 @@ pub fn transact_if<T>(
     mutate: impl FnOnce(&mut TodoFile) -> Result<(bool, T), String>,
 ) -> Result<(TodoFile, T), TransactError> {
     let lock = board_lock::acquire(path).map_err(|e| TransactError::Lock(e.to_string()))?;
-    let mut file = load_for_write(path).map_err(TransactError::Unwritable)?;
+    let (mut file, stale_version) =
+        load_for_write_versioned(path).map_err(TransactError::Unwritable)?;
     let (changed, out) = mutate(&mut file).map_err(TransactError::Failed)?;
-    if changed {
+    if changed || stale_version {
         save_locked(path, &file, &lock).map_err(TransactError::Failed)?;
     }
     Ok((file, out))
@@ -3082,6 +3103,40 @@ mod tests {
 
         let reloaded = load(&path);
         assert_eq!(reloaded.todos[0].number, 1, "a real change must be persisted");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn transact_if_writes_a_stale_v1_board_even_when_mutate_reports_no_change() {
+        let (dir, path) = staged_fixture("transact-if-stale-v1", "v1/full.json");
+
+        let (file, ()) = transact_if(&path, |_file| Ok((false, ()))).unwrap();
+        assert_eq!(file.version, 2);
+
+        let on_disk: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(on_disk["version"], 2);
+        let on_disk_todos = on_disk["todos"].as_array().unwrap();
+        assert_eq!(on_disk_todos.len(), 3);
+        assert_eq!(
+            serde_json::to_value(&file.todos).unwrap(),
+            Value::Array(on_disk_todos.clone()),
+            "the migrated task set must be what actually landed on disk"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn transact_if_leaves_an_up_to_date_v2_board_untouched_on_a_no_op() {
+        let (dir, path) = staged_fixture("transact-if-v2-noop", "v2/full.json");
+        let before = std::fs::read(&path).unwrap();
+
+        let (file, ()) = transact_if(&path, |_file| Ok((false, ()))).unwrap();
+        assert_eq!(file.version, 2);
+
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(before, after, "an already-current board must not be rewritten on a no-op");
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
