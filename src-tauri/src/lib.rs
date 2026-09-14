@@ -572,12 +572,18 @@ async fn resolve_project(app: &AppHandle, cfg: &AppConfig) -> Result<String, ()>
 fn spawn_poll_loop(app: AppHandle, notify: Arc<Notify>) {
     tauri::async_runtime::spawn(async move {
         let mut ctx = AutoStartCtx::default();
+        info!("poll loop: started");
         loop {
             let cfg = { app.state::<Mutex<AppConfig>>().lock().unwrap().clone() };
             let interval = cfg.refresh_interval.max(10);
             let next_deadline = if !cfg.session_key.is_empty() && !cfg.org_id.is_empty() {
                 run_cycle(&app, &cfg, &mut ctx).await
             } else {
+                info!(
+                    "poll loop: cycle skipped, config incomplete session_key_len={} org_id_len={}",
+                    cfg.session_key.len(),
+                    cfg.org_id.len()
+                );
                 None
             };
             let max_sleep = Duration::from_secs(interval);
@@ -1024,6 +1030,12 @@ fn configure(
 ) -> Result<(), String> {
     let disable = !config.notifications_enabled;
     let system_info = config.system_info_enabled;
+    info!(
+        "configure: session_key_len={} org_id_len={} refresh_interval={}",
+        config.session_key.len(),
+        config.org_id.len(),
+        config.refresh_interval
+    );
     *state.lock().unwrap() = config;
     if disable {
         // Turning notifications off re-arms the engine for a clean next enable.
@@ -1037,6 +1049,7 @@ fn configure(
 
 #[tauri::command]
 fn refresh_now(notify: tauri::State<'_, Arc<Notify>>) -> Result<(), String> {
+    info!("refresh_now: requested");
     notify.notify_one();
     Ok(())
 }
