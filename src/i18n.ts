@@ -49,6 +49,7 @@ const messages = {
     loadTimeout:
         "Something went wrong: the app got no reply from its own backend in 40 seconds. This is not a server or session key error — try again or report the problem.",
     updateSessionKey: "Update session key",
+    configureFailed: "Backend rejected the settings",
     save: "Save",
     sessionKey: "Session Key",
     sessionKeyPlaceholder: "Paste sessionKey from claude.ai cookie",
@@ -670,6 +671,7 @@ const messages = {
     loadTimeout:
         "Что-то пошло не так: приложение не дождалось ответа от собственного бэкенда за 40 секунд. Это не ошибка сервера и не ключ сессии — повторите или сообщите о проблеме.",
     updateSessionKey: "Обновить ключ сессии",
+    configureFailed: "Бэкенд не принял настройки",
     save: "Сохранить",
     sessionKey: "Session Key",
     sessionKeyPlaceholder: "Вставьте sessionKey из cookie claude.ai",

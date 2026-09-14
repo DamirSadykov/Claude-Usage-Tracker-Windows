@@ -1006,11 +1006,25 @@ fn get_service_status(state: tauri::State<'_, Arc<Mutex<StatusState>>>) -> Statu
 #[tauri::command]
 fn configure(
     app: AppHandle,
-    config: AppConfig,
+    config: serde_json::Value,
     state: tauri::State<'_, Mutex<AppConfig>>,
     engine: tauri::State<'_, Mutex<AlertEngine>>,
     notify: tauri::State<'_, Arc<Notify>>,
 ) -> Result<(), String> {
+    let config: AppConfig = match serde_json::from_value(config) {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!("configure: конфиг отвергнут — {e}");
+            error!("{msg}");
+            record_diag(
+                &app,
+                "configure",
+                "Настройки не приняты бэкендом",
+                msg.clone(),
+            );
+            return Err(msg);
+        }
+    };
     let disable = !config.notifications_enabled;
     let system_info = config.system_info_enabled;
     info!(

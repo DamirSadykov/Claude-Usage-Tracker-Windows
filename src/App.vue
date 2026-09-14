@@ -24,7 +24,7 @@ import type { AlertTiers, AlertTypes } from "./thresholds";
 import { localizeAlert } from "./alertFormat";
 import type { AlertEvent } from "./alertFormat";
 import { useUpdater, initUpdater } from "./updater";
-import { logInfo, logWarn } from "./logging";
+import { logInfo, logWarn, logError } from "./logging";
 
 const isMini = window.location.hash === "#mini";
 const isAnalytics = window.location.hash === "#analytics";
@@ -489,7 +489,16 @@ async function applyConfig() {
         return;
     }
     beginLoading();
-    await invoke("configure", { config: buildConfig() });
+    try {
+        await invoke("configure", { config: buildConfig() });
+    } catch (e) {
+        const detail = e instanceof Error ? e.stack ?? e.message : String(e);
+        void logError(`[frontend] configure failed: ${detail}`);
+        settleLoading();
+        error.value = `${t("configureFailed")}: ${detail}`;
+        errorReportable.value = true;
+        sessionExpired.value = false;
+    }
 }
 
 async function ensurePermission(): Promise<boolean> {
