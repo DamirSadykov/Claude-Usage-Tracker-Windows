@@ -1,7 +1,7 @@
 // `cli.mjs corrections` — the PUBLIC DATA CONTRACT for user-correction signals
 // mined from Claude Code transcripts (task t#101, part A of the L3→L4 outcome
 // breakdown t#86). Lazily loaded by ../cli.mjs; one exported `run(args)` like
-// every other area (todos/phases/triage).
+// every other area (todos/triage).
 //
 // SCOPE (collection + statistics, not classification)
 //   This tool owns COLLECTION + STATISTICS and exposes them as a versioned JSON

@@ -123,15 +123,25 @@ function metricVal(tokens: number, cost: number): number {
   return metric.value === "cost" ? cost : tokens;
 }
 
-// "claude-opus-4-7" → "Opus 4.7", "claude-sonnet-5" → "Sonnet 5"
+// "claude-opus-4-7" → "Opus 4.7", "gpt-5.6-sol" → "Sol 5.6".
 function modelLabel(m: string): string {
-  const fam = m.includes("fable")
+  const lower = m.toLowerCase();
+  const openAi = lower.match(/gpt-(\d+(?:\.\d+)?)-(sol|terra|luna)/);
+  if (openAi) {
+    const family = openAi[2][0].toUpperCase() + openAi[2].slice(1);
+    return `${family} ${openAi[1]}`;
+  }
+  const codex = lower.match(/gpt-(\d+(?:\.\d+)?)-codex/);
+  if (codex) return `Codex ${codex[1]}`;
+  const gpt = lower.match(/gpt-(\d+(?:\.\d+)?)/);
+  if (gpt) return `GPT ${gpt[1]}`;
+  const fam = lower.includes("fable")
     ? "Fable"
-    : m.includes("opus")
+    : lower.includes("opus")
       ? "Opus"
-      : m.includes("sonnet")
+      : lower.includes("sonnet")
         ? "Sonnet"
-        : m.includes("haiku")
+        : lower.includes("haiku")
           ? "Haiku"
           : m;
   // Version sits right after the family: opus-4-8 → 4.8, sonnet-5 → 5 (no minor),
@@ -150,6 +160,11 @@ const FAMILY_HSL: Record<string, [number, number, number]> = {
   Opus: [16, 63, 59], // #d97757
   Sonnet: [113, 50, 58], // #6ccb5f
   Haiku: [209, 58, 59], // #5b9bd5
+  Sol: [158, 64, 52], // emerald
+  Terra: [213, 94, 68], // blue
+  Luna: [187, 85, 48], // cyan
+  Codex: [160, 84, 39], // OpenAI green
+  GPT: [160, 84, 39],
 };
 const FALLBACK_HSL: [number, number, number] = [220, 8, 62];
 

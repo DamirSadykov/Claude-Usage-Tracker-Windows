@@ -270,6 +270,7 @@ mod tests {
             project: None,
             is_subagent: false,
             agent_name: None,
+            agent_id: None,
             tool_uses: Vec::new(),
             service_tier: None,
             git_commits: 0,

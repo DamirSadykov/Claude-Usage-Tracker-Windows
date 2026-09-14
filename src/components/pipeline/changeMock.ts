@@ -1,0 +1,120 @@
+import type { RunGraphNode } from "../../graphModel";
+import type { ChangeRecord, ChangeTask } from "./changeAdapt";
+
+export const mockChange: ChangeRecord = {
+    id: "mock-c0",
+    number: 0,
+    title: "Демо без запущенного приложения",
+    delta:
+        "Показ вне Tauri — invoke недоступен, поэтому это не живые данные с доски, а\nфиксированный пример того же формата, чтобы экран не выглядел пустым.",
+    project: "demo",
+    spec: [],
+    budget_usd: 20,
+    parallel_limit: 1,
+    created_at: "2026-08-01T09:00:00Z",
+    updated_at: "2026-08-01T12:00:00Z",
+};
+
+export const mockTasks: ChangeTask[] = [
+    {
+        id: "mock-t1",
+        number: 1,
+        subject: "Завожу структуру карточки",
+        status: "done",
+        kind: "auto",
+        change_id: "mock-c0",
+        spec: ["tasks#ui"],
+        spec_seen: [{ address: "tasks#ui", hash: "h1", blocks: [], text: "строка раздела", at: "2026-08-01T09:10:00Z" }],
+        spec_answers: [
+            {
+                address: "tasks#ui",
+                verdict: "unchanged",
+                note: "раздел не двигали",
+                at: "2026-08-01T10:00:00Z",
+            },
+        ],
+        status_history: [
+            { status: "backlog", at: "2026-08-01T09:00:00Z" },
+            { status: "in_progress", at: "2026-08-01T09:10:00Z" },
+            { status: "done", at: "2026-08-01T10:00:00Z" },
+        ],
+        handoff_at: "2026-08-01T10:00:00Z",
+    },
+    {
+        id: "mock-t2",
+        number: 2,
+        subject: "Закрываю задачу, забыв ответить на раздел",
+        status: "done",
+        kind: "auto",
+        change_id: "mock-c0",
+        spec: ["tasks#spec-registry"],
+        status_history: [
+            { status: "backlog", at: "2026-08-01T10:05:00Z" },
+            { status: "in_progress", at: "2026-08-01T10:10:00Z" },
+            { status: "done", at: "2026-08-01T11:00:00Z" },
+        ],
+    },
+    {
+        id: "mock-t3",
+        number: 3,
+        subject: "Жду ручного решения",
+        status: "review",
+        change_id: "mock-c0",
+        status_history: [
+            { status: "backlog", at: "2026-08-01T11:05:00Z" },
+            { status: "in_progress", at: "2026-08-01T11:10:00Z" },
+            { status: "review", at: "2026-08-01T11:40:00Z" },
+        ],
+    },
+    {
+        id: "mock-t4",
+        number: 4,
+        subject: "В очереди",
+        status: "backlog",
+        change_id: "mock-c0",
+        status_history: [{ status: "backlog", at: "2026-08-01T11:45:00Z" }],
+    },
+];
+
+export const mockNodes: RunGraphNode[] = [
+    {
+        id: "mock-t1",
+        number: 1,
+        subject: "Завожу структуру карточки",
+        status: "done",
+        gate: false,
+        group: false,
+        cost: 0.42,
+        duration_minutes: 50,
+        duration_calendar: false,
+        measurability: "measured",
+        blocks: 1,
+        tokens: 12000,
+        messages: 8,
+        tool_calls: 6,
+        tool_errors: 0,
+        task_cost: 0.42,
+        unattributed_cost: null,
+        agents: [],
+    },
+    {
+        id: "mock-t2",
+        number: 2,
+        subject: "Закрываю задачу, забыв ответить на раздел",
+        status: "done",
+        gate: false,
+        group: false,
+        cost: 0.18,
+        duration_minutes: 20,
+        duration_calendar: false,
+        measurability: "measured",
+        blocks: 1,
+        tokens: 4000,
+        messages: 3,
+        tool_calls: 2,
+        tool_errors: 0,
+        task_cost: 0.18,
+        unattributed_cost: null,
+        agents: [],
+    },
+];
