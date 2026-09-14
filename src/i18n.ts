@@ -47,7 +47,7 @@ const messages = {
     retry: "Retry",
     loading: "Loading…",
     loadTimeout:
-        "Couldn't fetch usage data. Your session key may have expired — check it in settings and your connection.",
+        "Something went wrong: the app got no reply from its own backend in 40 seconds. This is not a server or session key error — try again or report the problem.",
     updateSessionKey: "Update session key",
     save: "Save",
     sessionKey: "Session Key",
@@ -870,7 +870,7 @@ const messages = {
     retry: "Повторить",
     loading: "Загрузка данных…",
     loadTimeout:
-        "Не удалось получить данные. Возможно, истёк ключ сессии — проверьте его в настройках и подключение к сети.",
+        "Что-то пошло не так: приложение не дождалось ответа от собственного бэкенда за 40 секунд. Это не ошибка сервера и не ключ сессии — повторите или сообщите о проблеме.",
     updateSessionKey: "Обновить ключ сессии",
     save: "Сохранить",
     sessionKey: "Session Key",

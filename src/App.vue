@@ -273,13 +273,15 @@ function beginLoading() {
         // Only claim a timeout if we still have nothing to show — a stale
         // cached `usage` shouldn't be masked by the error banner.
         if (!error.value) {
-            void logWarn(
-                `[frontend] load watchdog fired after ${LOAD_WATCHDOG_MS}ms without usage event; configured=${Boolean(configured.value)}`,
-            );
+            const detail = `load watchdog fired after ${LOAD_WATCHDOG_MS}ms without usage event; configured=${Boolean(configured.value)}`;
+            void logWarn(`[frontend] ${detail}`);
+            void invoke("report_frontend_error", {
+                summary: "Бэкенд не ответил на запрос данных",
+                detail,
+            }).catch(() => {});
             error.value = t("loadTimeout");
-            errorReportable.value = false;
-            // A silent backend is most often an expired key — offer the fix.
-            sessionExpired.value = true;
+            errorReportable.value = true;
+            sessionExpired.value = false;
         }
     }, LOAD_WATCHDOG_MS);
 }
