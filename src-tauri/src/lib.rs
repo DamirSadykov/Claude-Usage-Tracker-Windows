@@ -287,13 +287,13 @@ async fn run_cycle(
     let usage = match usage::fetch_usage(&cfg.session_key, &cfg.org_id).await {
         Ok(u) => u,
         Err(e) => {
-            let msg = e.to_string();
+            let msg = format!("{} [{}]", e, e.verdict.code());
             let session_expired = e.session_expired;
             record_diag(
                 app,
                 "usage-fetch",
                 "Не удалось получить данные об использовании",
-                format!("fetch_usage failed: {}", msg),
+                format!("fetch_usage failed: verdict={} blame={} {}", e.verdict.code(), e.verdict.blame(), e),
             );
             let _ = app.emit(
                 "usage-error",
@@ -572,12 +572,18 @@ async fn resolve_project(app: &AppHandle, cfg: &AppConfig) -> Result<String, ()>
 fn spawn_poll_loop(app: AppHandle, notify: Arc<Notify>) {
     tauri::async_runtime::spawn(async move {
         let mut ctx = AutoStartCtx::default();
+        info!("poll loop: started");
         loop {
             let cfg = { app.state::<Mutex<AppConfig>>().lock().unwrap().clone() };
             let interval = cfg.refresh_interval.max(10);
             let next_deadline = if !cfg.session_key.is_empty() && !cfg.org_id.is_empty() {
                 run_cycle(&app, &cfg, &mut ctx).await
             } else {
+                info!(
+                    "poll loop: cycle skipped, config incomplete session_key_len={} org_id_len={}",
+                    cfg.session_key.len(),
+                    cfg.org_id.len()
+                );
                 None
             };
             let max_sleep = Duration::from_secs(interval);
@@ -1024,6 +1030,12 @@ fn configure(
 ) -> Result<(), String> {
     let disable = !config.notifications_enabled;
     let system_info = config.system_info_enabled;
+    info!(
+        "configure: session_key_len={} org_id_len={} refresh_interval={}",
+        config.session_key.len(),
+        config.org_id.len(),
+        config.refresh_interval
+    );
     *state.lock().unwrap() = config;
     if disable {
         // Turning notifications off re-arms the engine for a clean next enable.
@@ -1037,6 +1049,7 @@ fn configure(
 
 #[tauri::command]
 fn refresh_now(notify: tauri::State<'_, Arc<Notify>>) -> Result<(), String> {
+    info!("refresh_now: requested");
     notify.notify_one();
     Ok(())
 }
@@ -2961,7 +2974,7 @@ pub fn run() {
                 // diagnostics for "data won't fetch" reports.
                 .level_for("claude_usage_tracker_lib", log::LevelFilter::Debug)
                 .max_file_size(2 * 1024 * 1024)
-                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepOne)
+                .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepAll)
                 .build(),
         )
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -3018,6 +3031,10 @@ pub fn run() {
             let diag_store = Arc::new(DiagStore::default());
             if let Ok(log_dir) = app.path().app_log_dir() {
                 std::fs::create_dir_all(&log_dir).ok();
+                let pruned = report::prune_rotated_logs(&log_dir, report::LOG_RETENTION);
+                if pruned > 0 {
+                    info!("Removed {pruned} rotated log file(s) older than {} days", report::LOG_RETENTION.as_secs() / 86_400);
+                }
                 report::set_panic_file(&log_dir);
                 if let Some(rep) = report::take_panic_report(&log_dir, &version) {
                     warn!("Recovered a crash report from the previous run");

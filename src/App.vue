@@ -27,6 +27,7 @@ import { localizeAlert } from "./alertFormat";
 import type { AlertEvent } from "./alertFormat";
 import { useUpdater, initUpdater } from "./updater";
 import { readSettingsSnapshot } from "./settingsStore";
+import { logInfo, logWarn } from "./logging";
 
 const isMini = window.location.hash === "#mini";
 const isAnalytics = window.location.hash === "#analytics";
@@ -272,10 +273,15 @@ function beginLoading() {
         // Only claim a timeout if we still have nothing to show — a stale
         // cached `usage` shouldn't be masked by the error banner.
         if (!error.value) {
+            const detail = `load watchdog fired after ${LOAD_WATCHDOG_MS}ms without usage event; configured=${Boolean(configured.value)}`;
+            void logWarn(`[frontend] ${detail}`);
+            void invoke("report_frontend_error", {
+                summary: "Бэкенд не ответил на запрос данных",
+                detail,
+            }).catch(() => {});
             error.value = t("loadTimeout");
-            errorReportable.value = false;
-            // A silent backend is most often an expired key — offer the fix.
-            sessionExpired.value = true;
+            errorReportable.value = true;
+            sessionExpired.value = false;
         }
     }, LOAD_WATCHDOG_MS);
 }
@@ -459,7 +465,10 @@ function buildConfig() {
 }
 
 async function applyConfig() {
-    if (!configured.value) return;
+    if (!configured.value) {
+        void logInfo("[frontend] applyConfig skipped: session key or org id empty");
+        return;
+    }
     beginLoading();
     await invoke("configure", { config: buildConfig() });
 }
@@ -1224,7 +1233,6 @@ onUnmounted(() => {
                         {{ t("reportIssue") }}
                     </button>
                     <button
-                        v-if="errorReportable"
                         class="link-btn"
                         @click="openLog"
                         style="margin-top: 8px"
