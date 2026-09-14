@@ -24,6 +24,7 @@ import type { AlertTiers, AlertTypes } from "./thresholds";
 import { localizeAlert } from "./alertFormat";
 import type { AlertEvent } from "./alertFormat";
 import { useUpdater, initUpdater } from "./updater";
+import { logInfo, logWarn } from "./logging";
 
 const isMini = window.location.hash === "#mini";
 const isAnalytics = window.location.hash === "#analytics";
@@ -250,6 +251,9 @@ function beginLoading() {
         // Only claim a timeout if we still have nothing to show — a stale
         // cached `usage` shouldn't be masked by the error banner.
         if (!error.value) {
+            void logWarn(
+                `[frontend] load watchdog fired after ${LOAD_WATCHDOG_MS}ms without usage event; configured=${Boolean(configured.value)}`,
+            );
             error.value = t("loadTimeout");
             errorReportable.value = false;
             // A silent backend is most often an expired key — offer the fix.
@@ -478,7 +482,10 @@ function buildConfig() {
 }
 
 async function applyConfig() {
-    if (!configured.value) return;
+    if (!configured.value) {
+        void logInfo("[frontend] applyConfig skipped: session key or org id empty");
+        return;
+    }
     beginLoading();
     await invoke("configure", { config: buildConfig() });
 }
