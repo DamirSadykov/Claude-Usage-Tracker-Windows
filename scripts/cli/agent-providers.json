@@ -1,0 +1,53 @@
+{
+  "version": 2,
+  "providers": {
+    "anthropic": {
+      "label": "Anthropic",
+      "models": ["opus", "sonnet", "haiku"]
+    },
+    "openai": {
+      "label": "OpenAI",
+      "models": ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
+    }
+  },
+  "modes": {
+    "critic": ["off", "session", "agent"],
+    "architect": ["off", "agent"],
+    "worker": ["always"],
+    "review": ["off", "agent"]
+  },
+  "duties": {
+    "critic": {
+      "mode": "session",
+      "provider": "openai",
+      "model": "gpt-5.6-terra",
+      "role": "critic",
+      "reasoning_effort": "high",
+      "instructions": "Act as a constructive critic before planning. Clarify the goal, expose assumptions and risks, compare viable alternatives, and identify the smallest question that needs a user decision. Do not create tasks or expand scope."
+    },
+    "architect": {
+      "mode": "agent",
+      "provider": "openai",
+      "model": "gpt-5.6-terra",
+      "role": "architect",
+      "reasoning_effort": "high",
+      "instructions": "Act as the architect. Protect system boundaries, data contracts and migration paths. Prefer a small coherent design over local patches."
+    },
+    "worker": {
+      "mode": "always",
+      "provider": "anthropic",
+      "model": "sonnet",
+      "role": "worker",
+      "reasoning_effort": "",
+      "instructions": "Implement the declared task. Stay inside its scope and satisfy its concrete outputs and checks."
+    },
+    "review": {
+      "mode": "agent",
+      "provider": "anthropic",
+      "model": "opus",
+      "role": "reviewer",
+      "reasoning_effort": "",
+      "instructions": "Act as the reviewer. Inspect correctness, regressions, tests and maintainability. Report concrete findings before the summary."
+    }
+  }
+}

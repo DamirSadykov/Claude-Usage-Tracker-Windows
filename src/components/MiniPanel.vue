@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted } from "vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { readSettingsSnapshot } from "../settingsStore";
 
 interface UsageTier {
   percent_used: number;
@@ -59,15 +60,11 @@ async function startDrag() {
 }
 
 onMounted(async () => {
-  // Seed the layout flag from the store — the mini window may mount after the
-  // backend's last `configure`, so we can't rely on the event alone.
-  try {
-    const { load } = await import("@tauri-apps/plugin-store");
-    const store = await load("settings.json");
-    systemInfo.value = (await store.get<boolean>("systemInfoEnabled")) ?? true;
-  } catch {
-    /* not under Tauri / first run */
-  }
+  // Seed the layout flag through the shared settings layer — the mini window may
+  // mount after the backend's last `configure`, so we can't rely on the
+  // `system-info-enabled` event alone. That event stays the live channel below
+  // (it also carries the drop-stale-readings side-effect).
+  systemInfo.value = (await readSettingsSnapshot()).systemInfoEnabled;
 
   // The backend polling loop emits these globally to every window; the mini
   // panel is a pure view — no fetching, timers or threshold logic of its own.

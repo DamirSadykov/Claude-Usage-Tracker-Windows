@@ -1,0 +1,139 @@
+{
+  "version": 2,
+  "todos": [
+    {
+      "id": "b2222222-0000-4000-8000-000000000001",
+      "number": 42,
+      "subject": "Свести схему CSV-экспорта с дашбордом",
+      "description": "Экспорт и дашборд расходятся в именах колонок — свести перед тем, как добавлять новую.",
+      "status": "in_progress",
+      "status_history": [
+        { "status": "backlog", "at": "2026-02-01T09:00:00.000Z" },
+        { "status": "queue", "at": "2026-02-02T09:00:00.000Z" },
+        { "status": "in_progress", "at": "2026-02-03T09:00:00.000Z" }
+      ],
+      "priority": "high",
+      "kind": "auto",
+      "change_id": "c3333333-0000-4000-8000-000000000001",
+      "scheduled_for": "2026-02-10",
+      "plan": "1. сверить список колонок\n2. написать миграцию для устаревших файлов",
+      "project": "usage-tracker",
+      "from": "claude-usage-tracker-windows",
+      "comments": [
+        {
+          "id": "c4444444-0000-4000-8000-000000000001",
+          "author": "user",
+          "body": "давай сначала сверим формат с дашбордом",
+          "created_at": "2026-02-01T09:05:00.000Z"
+        }
+      ],
+      "links": ["b2222222-0000-4000-8000-000000000002"],
+      "depends_on": ["b2222222-0000-4000-8000-000000000003"],
+      "produces": ["docs/specs/tasks/spec.md#board-file"],
+      "spec": ["tasks#board-file"],
+      "spec_answers": [
+        {
+          "blocks": ["3f9a1c2b"],
+          "after": "актуальный текст раздела после правки",
+          "address": "tasks#board-file",
+          "verdict": "updated",
+          "note": "раздел дополнен контрактом версий",
+          "at": "2026-02-03T10:00:00.000Z"
+        }
+      ],
+      "spec_seen": [
+        {
+          "blocks": ["1a2b3c4d"],
+          "text": "текст раздела на момент показа сессии",
+          "address": "tasks#board-file",
+          "hash": "1a2b3c4d",
+          "at": "2026-02-03T09:00:00.000Z"
+        }
+      ],
+      "verify": "npx vitest run scripts/cli/spec.test.mjs",
+      "retry_limit": 2,
+      "on_issue": "b2222222-0000-4000-8000-000000000002",
+      "budget_usd": 5.0,
+      "parallel_limit": 2,
+      "outcome": "ok",
+      "outcome_reason": "ok",
+      "outcome_at": "2026-02-03T11:00:00.000Z",
+      "handoff": "Спека и фикстуры записаны, следующий шаг — Node-замок.",
+      "handoff_at": "2026-02-03T11:00:00.000Z",
+      "handout_at": "2026-02-03T08:00:00.000Z",
+      "imported_at": "2026-02-01T08:00:00.000Z",
+      "created_by": "claude",
+      "created_at": "2026-02-01T09:00:00.000Z",
+      "updated_at": "2026-02-03T11:00:00.000Z"
+    },
+    {
+      "id": "b2222222-0000-4000-8000-000000000002",
+      "number": 43,
+      "subject": "Разобрать конфликт форматов",
+      "status": "review",
+      "project": "usage-tracker",
+      "created_at": "2026-02-02T09:00:00.000Z",
+      "updated_at": "2026-02-02T09:00:00.000Z"
+    },
+    {
+      "id": "b2222222-0000-4000-8000-000000000003",
+      "number": 41,
+      "subject": "Собрать список полей обеих схем",
+      "status": "done",
+      "project": "usage-tracker",
+      "created_at": "2026-01-31T09:00:00.000Z",
+      "updated_at": "2026-02-01T08:30:00.000Z"
+    },
+    {
+      "id": "b2222222-0000-4000-8000-000000000004",
+      "number": 44,
+      "subject": "Легаси change-root без записи Change",
+      "description": "Change-root старого образца: флаг change есть, отдельной записи Change (t#360) ещё нет — принадлежность детей читается по depends_on, не по change_id.",
+      "status": "queue",
+      "change": true,
+      "project": "usage-tracker",
+      "created_at": "2026-01-15T09:00:00.000Z",
+      "updated_at": "2026-01-15T09:00:00.000Z"
+    },
+    {
+      "id": "b2222222-0000-4000-8000-000000000005",
+      "number": 45,
+      "subject": "Только что заведённая CLI-задача",
+      "status": "backlog",
+      "status_history": [
+        { "status": "backlog", "at": "2026-02-04T09:00:00.000Z" }
+      ],
+      "scheduled_for": null,
+      "plan": "",
+      "created_by": "claude",
+      "created_at": "2026-02-04T09:00:00.000Z",
+      "updated_at": "2026-02-04T09:00:00.000Z"
+    }
+  ],
+  "changes": [
+    {
+      "id": "c3333333-0000-4000-8000-000000000001",
+      "number": 29,
+      "title": "контракт файла доски — замок fail-closed, recovery, фикстуры и версии",
+      "delta": "Записать контракт файла доски в спеку и положить фикстуры по версиям, затем реализовать замок и recovery на обеих сторонах.",
+      "project": "usage-tracker",
+      "spec": ["tasks#board-file"],
+      "budget_usd": 20.0,
+      "parallel_limit": 1,
+      "created_at": "2026-02-01T09:00:00.000Z",
+      "updated_at": "2026-02-03T11:00:00.000Z"
+    },
+    {
+      "id": "c3333333-0000-4000-8000-000000000002",
+      "number": 17,
+      "title": "пример завершённого change'а",
+      "delta": "Демонстрационная запись со всеми полями Change, включая закрытие и происхождение из старого root'а.",
+      "project": "usage-tracker",
+      "spec": [],
+      "migrated_from": 208,
+      "created_at": "2026-01-10T09:00:00.000Z",
+      "updated_at": "2026-01-20T09:00:00.000Z",
+      "closed_at": "2026-01-20T09:00:00.000Z"
+    }
+  ]
+}

@@ -1,0 +1,54 @@
+:root {
+    --accent-2: #3aa0ff;
+    --ok: #6ccb5f;
+    --warn: #ffc107;
+    --high: #d97757;
+    --crit: #f87171;
+    --claude: #d97757;
+    --theme: #e3b341;
+
+    --win-bg: #1c1c1c;
+    --titlebar: #202020;
+    --layer: #272727;
+    --layer-2: #2f2f2f;
+    --layer-hover: #323232;
+    --input-bg: #2d2d2d;
+    --canvas-bg: #161616;
+    --rail-bg: #1a1a1a;
+    --node-bg: #242424;
+    --node-bg-2: #262626;
+
+    --r-win: 8px;
+    --r-card: 8px;
+    --r-ctl: 5px;
+    --r-pill: 999px;
+
+    --mono: "Cascadia Code", "Cascadia Mono", ui-monospace, "SF Mono", Menlo,
+        monospace;
+}
+
+.pipe-root {
+    --text-2: rgba(255, 255, 255, 0.8);
+    --text-3: rgba(255, 255, 255, 0.56);
+    --stroke: rgba(255, 255, 255, 0.07);
+    --stroke-strong: rgba(255, 255, 255, 0.11);
+    --track: rgba(255, 255, 255, 0.08);
+    --accent-soft: rgba(76, 194, 255, 0.16);
+    --theme-bg: rgba(227, 179, 65, 0.05);
+    --theme-bg-2: rgba(227, 179, 65, 0.11);
+    --theme-stroke: rgba(227, 179, 65, 0.22);
+    --project-bg: rgba(255, 255, 255, 0.018);
+    --project-stroke: rgba(255, 255, 255, 0.09);
+}
+
+.pipe-root.accent-claude {
+    --accent: #d97757;
+    --accent-2: #c96444;
+    --accent-soft: rgba(217, 119, 87, 0.16);
+}
+
+.pipe-root.accent-purple {
+    --accent: #a78bfa;
+    --accent-2: #8b6df0;
+    --accent-soft: rgba(167, 139, 250, 0.16);
+}
