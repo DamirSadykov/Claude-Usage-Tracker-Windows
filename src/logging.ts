@@ -31,7 +31,7 @@ export function installErrorLogging() {
     });
 }
 
-async function reportFatal(summary: string, detail: string) {
+export async function reportFatal(summary: string, detail: string) {
     // Both calls are best-effort: under a plain `vite preview` (no Tauri) they
     // throw, and that must not cascade into another error.
     try {

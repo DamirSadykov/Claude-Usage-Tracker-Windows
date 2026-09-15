@@ -27,7 +27,7 @@ import { localizeAlert } from "./alertFormat";
 import type { AlertEvent } from "./alertFormat";
 import { useUpdater, initUpdater } from "./updater";
 import { readSettingsSnapshot } from "./settingsStore";
-import { logInfo, logWarn } from "./logging";
+import { logInfo, logWarn, logError } from "./logging";
 
 const isMini = window.location.hash === "#mini";
 const isAnalytics = window.location.hash === "#analytics";
@@ -470,7 +470,19 @@ async function applyConfig() {
         return;
     }
     beginLoading();
-    await invoke("configure", { config: buildConfig() });
+    try {
+        const config = buildConfig();
+        void logInfo("[frontend] configure: invoke");
+        await invoke("configure", { config });
+        void logInfo("[frontend] configure: ok");
+    } catch (e) {
+        const detail = e instanceof Error ? e.stack ?? e.message : String(e);
+        void logError(`[frontend] configure failed: ${detail}`);
+        settleLoading();
+        error.value = `${t("configureFailed")}: ${detail}`;
+        errorReportable.value = true;
+        sessionExpired.value = false;
+    }
 }
 
 async function ensurePermission(): Promise<boolean> {
@@ -838,6 +850,7 @@ onMounted(async () => {
     if (isPipeline) return; // the pipeline preview renders mocked data only
 
     await loadSettings();
+    void logInfo(`[frontend] onMounted: settings loaded configured=${Boolean(configured.value)}`);
     await loadCodexLimits();
     codexLimitsTimer = setInterval(() => { void loadCodexLimits(); }, 30_000);
 
@@ -945,6 +958,7 @@ onMounted(async () => {
         ),
     );
 
+    void logInfo("[frontend] onMounted: listeners ready");
     if (configured.value) {
         await applyConfig();
     }

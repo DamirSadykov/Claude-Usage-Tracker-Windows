@@ -21,7 +21,7 @@ import "./styles/fonts/fira-code.css";
 import "./styles/fonts/jetbrains-mono.css";
 import App from "./App.vue";
 import i18n from "./i18n";
-import { installErrorLogging } from "./logging";
+import { installErrorLogging, reportFatal } from "./logging";
 import { applyFont, readCachedFontId } from "./fontSwitch";
 
 installErrorLogging();
@@ -29,4 +29,10 @@ installErrorLogging();
 // reconciles it against the persisted store value on load.
 applyFont(readCachedFontId());
 
-createApp(App).use(i18n).mount("#app");
+const app = createApp(App);
+app.config.errorHandler = (err, _instance, info) => {
+    const detail = err instanceof Error ? err.stack ?? err.message : String(err);
+    console.error(err);
+    void reportFatal(`Ошибка Vue (${info})`, detail);
+};
+app.use(i18n).mount("#app");
