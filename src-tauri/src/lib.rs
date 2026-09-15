@@ -1011,6 +1011,7 @@ fn configure(
     engine: tauri::State<'_, Mutex<AlertEngine>>,
     notify: tauri::State<'_, Arc<Notify>>,
 ) -> Result<(), String> {
+    info!("configure: received");
     let config: AppConfig = match serde_json::from_value(config) {
         Ok(c) => c,
         Err(e) => {

@@ -490,7 +490,10 @@ async function applyConfig() {
     }
     beginLoading();
     try {
-        await invoke("configure", { config: buildConfig() });
+        const config = buildConfig();
+        void logInfo("[frontend] configure: invoke");
+        await invoke("configure", { config });
+        void logInfo("[frontend] configure: ok");
     } catch (e) {
         const detail = e instanceof Error ? e.stack ?? e.message : String(e);
         void logError(`[frontend] configure failed: ${detail}`);
@@ -849,6 +852,7 @@ onMounted(async () => {
     if (isSettings) return; // the settings window self-initializes via SettingsWindow
 
     await loadSettings();
+    void logInfo(`[frontend] onMounted: settings loaded configured=${Boolean(configured.value)}`);
 
     try {
         envBadge.value = await invoke<string | null>("app_env_label");
@@ -953,6 +957,7 @@ onMounted(async () => {
         ),
     );
 
+    void logInfo("[frontend] onMounted: listeners ready");
     if (configured.value) {
         await applyConfig();
     }
