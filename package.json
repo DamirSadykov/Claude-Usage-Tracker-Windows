@@ -34,6 +34,7 @@
     "@tauri-apps/plugin-store": "^2.2.0",
     "@tauri-apps/plugin-updater": "^2.10.1",
     "@vitejs/plugin-vue": "^5.2.3",
+    "ajv": "^8.20.0",
     "git-cliff": "^2.13.1",
     "typescript": "^5.7.0",
     "vite": "^6.3.0",

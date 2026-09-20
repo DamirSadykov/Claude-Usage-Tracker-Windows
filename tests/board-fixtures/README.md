@@ -8,6 +8,11 @@
 
 CURRENT для обоих писателей на этом шаге — `version: 2`.
 
+`board.schema.json` — снимок, который Rust генерирует из `TodoFile` через
+`schemars` (`board_schema_fixture_is_generated_from_rust_types`). Node читает
+его только в `scripts/cli/board-schema.test.mjs` через Ajv: рабочий CLI не
+получает новую зависимость и сохраняет нынешнее recovery-поведение.
+
 ## Список фикстур
 
 | Файл | Что показывает | CLI (v2) | Приложение (v2) |
@@ -42,6 +47,13 @@ CURRENT для обоих писателей на этом шаге — `version
 | `corrupt/truncated.json`, `not-object.json`, `todos-not-array.json`, `empty-file.json` | не читается: восстановление (один бэкап, мутация отказывает кодом 4). Покрыто: `describe("matrix row: corrupt/*.json — CLI v2 writer")` → `` it(`corrupt/${name} is unreadable: read yields an empty board with one backup, write refuses with exit code 4`) `` по каждому файлу (см. также `scripts/cli/todos.test.mjs`, `scripts/cli/board-recover.test.mjs`) | не читается: восстановление. Покрыто: `corrupt_fixtures_are_unreadable` (+ `corrupt_backup_is_written_once_across_two_loads` на однократность бэкапа, `load_for_write_refuses_unreadable_and_future_version_with_spec_messages` на отказ записи) |
 | `corrupt/todo-field-type.json` | читается (некритичное несовпадение типа), число остаётся строкой и переживает запись как есть. Покрыто: `it("corrupt/todo-field-type.json — Node still reads it (asymmetry with Rust) and round-trips the loose field")` | не читается: восстановление (см. таблицу выше). Покрыто: `corrupt_fixtures_are_unreadable` |
 | `v2/full.json`, узел №2 (`links`/`depends_on`/`comments` отсутствуют) с явно записанными пустыми массивами вместо отсутствия | — | нормализация «отсутствующий массив == пустой» проверена отдельно. Покрыто: `missing_array_and_explicit_empty_array_fixtures_are_equivalent` |
+
+## Матрица контракта «старый и новый писатель»
+
+| Пара | Общая проверка | Поведение записи остаётся прежним |
+|---|---|---|
+| CLI v2 (сквозной JSON) → приложение v2 (Rust) | `board.schema.json` выводится из Rust-структур; Ajv проверяет v1/v2-фактуры только в Node-тесте | CLI продолжает переносить неизвестные поля, приложение по-прежнему их отбрасывает при типизированной записи |
+| приложение v2 (Rust) → CLI v2 (сквозной JSON) | те же фактуры и та же схема; `corrupt/todo-field-type.json` отдельно доказывает, что строка вместо `number` нарушает типизированный контракт | CLI по-прежнему читает этот исторически допустимый loose-узел; runtime-валидации схемой нет |
 
 «Читается-но-не-пишется» — не отказ команды целиком: чтение и вывод
 проходят, отказывает именно попытка сохранить файл — мутирующая команда

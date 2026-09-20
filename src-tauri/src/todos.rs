@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use log::warn;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -33,7 +34,7 @@ use crate::board_lock;
 /// optional field unset — so a caller that cares about three fields can spell
 /// those and leave the rest to `..Default::default()` instead of re-listing the
 /// whole struct every time a field is added.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct Todo {
     pub id: String,
     /// Stable, human-facing task number (like a GitHub issue number) for inline
@@ -246,7 +247,7 @@ pub struct Todo {
 /// One entry of a todo's transition log: the status entered and when (RFC3339).
 /// Written by [`set_status`], [`upsert`] and the cc-todos CLI; keep the shape in
 /// lockstep with `todos.mjs` (`{ status, at }`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct StatusChange {
     pub status: String,
     #[serde(default)]
@@ -257,7 +258,7 @@ pub struct StatusChange {
 /// string so another source can be added without a migration). `body` is plain
 /// text; the UI renders links in it. `id`/`created_at` are set by whoever appends
 /// (the frontend or the cc-todos CLI).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Comment {
     pub id: String,
     pub author: String,
@@ -272,7 +273,7 @@ pub struct Comment {
 /// `Comment::author`); `note` is what the session said about THAT section; `at`
 /// is when it was answered — the Stop guard compares it against the session's
 /// own start, so an answer inherited from earlier work does not count as one.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SpecAnswer {
     /// Hashes of the section BLOCKS this task moved (t#353) — content-addressed,
     /// never positional, so an inserted neighbour cannot shift the attribution
@@ -299,7 +300,7 @@ pub struct SpecAnswer {
 /// session's context (t#352). `hash` is a short SHA-256 of the section's PROSE
 /// with whitespace normalised — metadata is excluded, since the provenance
 /// stamp itself rewrites those lines.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SpecSeen {
     /// Block hashes as shown, the baseline the closing answer diffs against.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -323,6 +324,10 @@ fn default_version() -> u32 {
 
 pub const CURRENT_VERSION: u32 = 2;
 
+pub fn board_json_schema() -> schemars::Schema {
+    schemars::schema_for!(TodoFile)
+}
+
 /// A CHANGE as a RECORD rather than a task (t#360): the delta of one round, the
 /// spec sections it moves and the group's ceilings. A task points at it through
 /// [`Todo::change_id`]; membership is a field, not a `depends_on` edge, so a
@@ -330,7 +335,7 @@ pub const CURRENT_VERSION: u32 = 2;
 /// status is DERIVED — open while any member is open — and never stored; only
 /// `closed_at` records the moment it was declared finished. Keep in lockstep
 /// with scripts/cli/change.mjs, which writes this shape.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Change {
     pub id: String,
     #[serde(default)]
@@ -361,7 +366,7 @@ pub struct Change {
 
 /// The on-disk shape of `todos.json`. `version` lets us migrate the format
 /// later; unknown/missing fields default so older or hand-edited files load.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TodoFile {
     #[serde(default = "default_version")]
     pub version: u32,
@@ -1614,6 +1619,37 @@ pub fn merge_import(local: &TodoFile, incoming: &TodoFile, now: &str) -> (TodoFi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn board_schema_describes_current_typed_wire_format() {
+        let schema = serde_json::to_value(board_json_schema()).expect("schema serializes");
+        let definitions = schema["$defs"].as_object().expect("schema definitions");
+        assert_eq!(schema["title"], "TodoFile");
+        for name in ["Todo", "Change", "StatusChange", "Comment", "SpecAnswer", "SpecSeen"] {
+            assert!(definitions.contains_key(name), "missing {name} from board schema");
+        }
+
+        let todo = &definitions["Todo"];
+        let properties = todo["properties"].as_object().expect("Todo properties");
+        assert_eq!(properties["number"]["type"], "integer");
+        assert!(
+            properties["budget_usd"]["type"].as_array().is_some_and(|types| types.contains(&Value::from("number"))),
+            "optional budget_usd must retain its number type"
+        );
+    }
+
+    #[test]
+    fn board_schema_fixture_is_generated_from_rust_types() {
+        let generated = serde_json::to_value(board_json_schema()).expect("schema serializes");
+        let fixture = fixtures_dir().join("board.schema.json");
+        if std::env::var_os("UPDATE_BOARD_SCHEMA").is_some() {
+            std::fs::write(&fixture, format!("{}\n", serde_json::to_string_pretty(&generated).unwrap()))
+                .expect("write schema fixture");
+        }
+        let committed: Value = serde_json::from_str(&std::fs::read_to_string(&fixture).expect("read schema fixture"))
+            .expect("schema fixture is JSON");
+        assert_eq!(committed, generated, "run UPDATE_BOARD_SCHEMA=1 cargo test board_schema_fixture");
+    }
 
     fn todo(id: &str, status: &str) -> Todo {
         Todo {

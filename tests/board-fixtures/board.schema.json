@@ -1,0 +1,423 @@
+{
+  "$defs": {
+    "Change": {
+      "description": "A CHANGE as a RECORD rather than a task (t#360): the delta of one round, the\nspec sections it moves and the group's ceilings. A task points at it through\n[`Todo::change_id`]; membership is a field, not a `depends_on` edge, so a\nmissing edge can no longer drop a task out of its change in silence. Its\nstatus is DERIVED — open while any member is open — and never stored; only\n`closed_at` records the moment it was declared finished. Keep in lockstep\nwith scripts/cli/change.mjs, which writes this shape.",
+      "properties": {
+        "budget_usd": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "closed_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "delta": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "migrated_from": {
+          "description": "Task number this record was migrated from — the only bridge back to the\nera when a change was a root task, and what makes the migration idempotent.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "number": {
+          "default": 0,
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "parallel_limit": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "project": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "spec": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "title": {
+          "default": "",
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "Comment": {
+      "description": "One comment in a todo's thread. `author` is `\"user\"` or `\"claude\"` (a plain\nstring so another source can be added without a migration). `body` is plain\ntext; the UI renders links in it. `id`/`created_at` are set by whoever appends\n(the frontend or the cc-todos CLI).",
+      "properties": {
+        "author": {
+          "type": "string"
+        },
+        "body": {
+          "default": "",
+          "type": "string"
+        },
+        "created_at": {
+          "default": "",
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "author"
+      ],
+      "type": "object"
+    },
+    "SpecAnswer": {
+      "description": "One task's answer about one addressed spec section at closing time (t#341).\n`verdict` is `unchanged` | `updated` (a plain string, same reasoning as\n`Comment::author`); `note` is what the session said about THAT section; `at`\nis when it was answered — the Stop guard compares it against the session's\nown start, so an answer inherited from earlier work does not count as one.",
+      "properties": {
+        "address": {
+          "default": "",
+          "type": "string"
+        },
+        "after": {
+          "description": "The section's text as it stood when the delta was claimed — the second\nhalf of the pair `SpecSeen::text` starts. Frozen here rather than read\noff the live file, which keeps moving after the task closes and would\nanswer a different question every week. Only `updated` carries one.",
+          "type": "string"
+        },
+        "at": {
+          "default": "",
+          "type": "string"
+        },
+        "blocks": {
+          "description": "Hashes of the section BLOCKS this task moved (t#353) — content-addressed,\nnever positional, so an inserted neighbour cannot shift the attribution\nand an edited block loses its old mark by itself.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "note": {
+          "default": "",
+          "type": "string"
+        },
+        "verdict": {
+          "default": "",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "SpecSeen": {
+      "description": "One addressed section's fingerprint at the moment it was injected into a\nsession's context (t#352). `hash` is a short SHA-256 of the section's PROSE\nwith whitespace normalised — metadata is excluded, since the provenance\nstamp itself rewrites those lines.",
+      "properties": {
+        "address": {
+          "default": "",
+          "type": "string"
+        },
+        "at": {
+          "default": "",
+          "type": "string"
+        },
+        "blocks": {
+          "description": "Block hashes as shown, the baseline the closing answer diffs against.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "hash": {
+          "default": "",
+          "type": "string"
+        },
+        "text": {
+          "description": "The section's text as shown. Hashes answer \"did it move\"; showing WHAT\nmoved needs the bytes that were there before, and this anchor is the one\nmoment they exist. Bounded by the section budget (README §7).",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "StatusChange": {
+      "description": "One entry of a todo's transition log: the status entered and when (RFC3339).\nWritten by [`set_status`], [`upsert`] and the cc-todos CLI; keep the shape in\nlockstep with `todos.mjs` (`{ status, at }`).",
+      "properties": {
+        "at": {
+          "default": "",
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "type": "object"
+    },
+    "Todo": {
+      "description": "One user todo. `id` is generated by the frontend (a stable opaque string).\n`status` is one kanban column: `backlog` | `queue` | `in_progress` |\n`review` | `done`. The pre-kanban `pending` status is migrated to `backlog`\non load (see [`canonical_status`]). Optional fields are omitted from the file\nwhen empty to keep hand-edits readable.\n\n`Default` mirrors \"an empty row as the file would deserialize it\" — every\noptional field unset — so a caller that cares about three fields can spell\nthose and leave the rest to `..Default::default()` instead of re-listing the\nwhole struct every time a field is added.",
+      "properties": {
+        "budget_usd": {
+          "description": "Spend ceiling for this node in USD (t#302); on a change root (`change`) it is\nthe ceiling of the whole GROUP. Only the ceiling is stored — actual spend is\nderived from the usage blocks. None = no ceiling declared.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "change": {
+          "description": "Change-root marker (t#255): `true` = this task is a CHANGE aggregator — it\n`depends_on` all of its children, closes last (the done-gate enforces the\norder), and its `description` carries the change's DELTA: what this change\nmakes different and why now, surfaced when a child task is worked. Purely a\nmarker over the dep graph — no behavior of its own here. `false` is omitted\nfrom the file so existing todos need no migration. The legacy field name\n`theme` is still read as an alias (t#345) — only `change` is ever written.\nKeep in lockstep with the cc-todos CLI (`set-change`) and GraphView.vue.",
+          "type": "boolean"
+        },
+        "change_id": {
+          "description": "Id of the [`Change`] record this task belongs to (t#360) — membership as a\nfield, replacing the member→root edge. None = outside every change, which\nis a legal state (the board's free tasks). A board still carrying `change`\nroots resolves membership through the edges instead, until it is migrated.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "comments": {
+          "description": "Discussion thread on this todo (user + Claude). Empty → omitted from the\nfile so hand-edits and the common no-comment case stay clean.",
+          "items": {
+            "$ref": "#/$defs/Comment"
+          },
+          "type": "array"
+        },
+        "created_at": {
+          "default": "",
+          "type": "string"
+        },
+        "created_by": {
+          "description": "Who composed this todo: `\"user\"` (hand-written in the UI) or `\"claude\"`\n(the cc-todos CLI). Empty (legacy rows) renders as a user task — no AI\nbadge — so existing files need no migration.",
+          "type": "string"
+        },
+        "depends_on": {
+          "description": "Ids of todos this one DEPENDS ON — the directed edges of the task graph\n(#88). `a.depends_on = [b]` means b must be done before a; b blocks a.\nKept acyclic and within a single project board (enforced by [`add_dep`]).\nDistinct from `links`/inline `#N`, which are non-blocking references the\ngraph draws as a second, dashed edge. Empty → omitted from the file.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "description": {
+          "default": "",
+          "type": "string"
+        },
+        "from": {
+          "description": "Project this task was filed FROM (issue #13). The cc-todos CLI sets it\nautomatically to the originating session's project when a task is filed\nagainst a DIFFERENT project, so the board can show its provenance. None for\nsame-project or app-created tasks.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "handoff": {
+          "description": "Handoff note carried FORWARD along dependency edges (#141): what this task\nproduced and where it left off, written by the LLM (like a phases handoff).\nA session working on a task that DEPENDS ON this one pulls it in via\n`cc-todos todos handoff <task>`, so naturally-cumulative context flows down\nthe graph without a transitive walk. Empty → omitted from the file.",
+          "type": "string"
+        },
+        "handoff_at": {
+          "description": "When `handoff` was last WRITTEN, RFC3339; None = never. Distinct from\n`updated_at`, which any edit bumps: the Stop-hook guard (#59) needs to tell\na baton written for THIS session's work from one a previous session left —\nwith only `updated_at`, a year-old handoff on a task touched today reads as\nfresh. Set by whoever writes the field (the cc-todos CLI and [`upsert`]).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "handout_at": {
+          "description": "When `todos run <change> --next` (scripts/cli/run.mjs, t#520) last handed\nthis node out to a caller driving the loop itself, RFC3339; None = never\nhanded out this way. NOT a status move — the node still enters\n`in_progress` only on `--report` — it exists so `outcome.mjs`'s weak file\nevidence has a boundary to measure an mtime against that is not the\nexecutor's own word about when it started. Overwritten on every\nre-hand-out, so a re-run's window starts fresh. The app has no UI field\nfor it and never reads it; it must still live here (see `spec`, above) or\na save from the UI would drop it silently. Empty → omitted from the file.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "imported_at": {
+          "description": "When this todo arrived via an import (#181), RFC3339; None = created here.\nSet by [`merge_import`] on every task it brings in, so the board can mark\nthem and the user can tell an imported row from a local one — in particular\na FORK, the copy made when an incoming task's id already existed locally.\nNever cleared: it is provenance, not transient state.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "description": "Task-graph node type (#88): `\"auto\"` = a node a headless runner may execute\nunattended, `\"\"` (default) = `manual`, a human/review gate. Orthogonal to\n`status` (the kanban column) and to the DERIVED pipeline state (blocked/ready,\ncomputed from `depends_on`, never stored). Empty is omitted so existing files\nneed no migration and the conservative default stays `manual`. Keep in lockstep\nwith the cc-todos CLI (`set-kind`) and GraphView.vue.",
+          "type": "string"
+        },
+        "links": {
+          "description": "Ids of related todos. Stored one-way per todo; the UI also surfaces the\nreverse direction by scanning. Empty → omitted from the file.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "number": {
+          "default": 0,
+          "description": "Stable, human-facing task number (like a GitHub issue number) for inline\n`#N` references. Assigned once (see [`ensure_numbers`]) and never reused,\nso a reference stays valid even after other tasks are deleted. 0 = not yet\nassigned (legacy/hand-edited rows; backfilled on the next load/write).",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "on_issue": {
+          "description": "Id of the task control jumps to when this node's outcome is `issue` (t#302),\ne.g. a review node handing work back to the implementation node. This is NOT\na dependency: it lives on the RUN layer, is never mirrored into `depends_on`,\nand is deliberately invisible to [`dep_reaches`] / [`add_dep`] — the stored\ndep graph stays acyclic even when the process itself loops. None = no\ntransition declared. Empty → omitted from the file.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "outcome": {
+          "description": "Machine predicate of this node's outcome (t#304): `\"ok\"` | `\"issue\"`, empty =\nNO CHECK HAS RUN. The empty case is deliberately not `ok`: a node nobody\nverified must never pass for a verified one, which is why the field is a\ntri-state string rather than a bool. `ok` requires BOTH — `verify` exited 0\nand everything declared in `produces` exists; either one failing makes it\n`issue`. Free judgement is not a predicate here: only a command's exit code\nand the produces check write this field. Empty → omitted from the file.",
+          "type": "string"
+        },
+        "outcome_at": {
+          "description": "When the check that produced `outcome` ran, RFC3339 (t#304). Distinct from\n`updated_at`, which any edit bumps: a runner needs to tell a verdict made for\nthe CURRENT state of the node from one made two edits ago. Empty → omitted.",
+          "type": "string"
+        },
+        "outcome_reason": {
+          "description": "Short machine reason behind `outcome` (t#304): `\"ok\"`, `\"verify:issue\"`,\n`\"missing:<path>\"`. Written by the same check that writes `outcome` and read\nas a pair with it — a reason left over from an earlier check would describe\nthe wrong verdict. Empty → omitted from the file.",
+          "type": "string"
+        },
+        "parallel_limit": {
+          "description": "How many steps of the group a runner may carry at once (t#302). Parallelism\nitself is not declared — it is the ABSENCE of an edge; only its limit is,\nand only on a change root. None = no limit declared.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "plan": {
+          "default": "",
+          "description": "Raw plan markdown. Originally user-only and mostly empty; since plan mode\nbecame the task-forming ritual (t#253) the accepted plan is stored here by\nthe session too (`cli todos set-plan` / `add --plan`) — on the change root\nfor a multi-session plan, on the task itself for a one-session plan.",
+          "type": "string"
+        },
+        "priority": {
+          "description": "Priority bucket: `high` | `medium` | `low`, or empty = unset. Drives which\ntasks the SessionStart hook injects (a min-level threshold) and how verbose\neach one is. Empty is omitted from the file so existing todos need no\nmigration and unprioritized rows stay clean. Keep the value set in lockstep\nwith [`PRIORITIES`], the cc-todos CLI, and TodoWindow.vue.",
+          "type": "string"
+        },
+        "produces": {
+          "description": "What this step COMMITS to produce (t#302): file paths, interfaces, records.\nDeclared BEFORE the work — that is what separates it from `handoff`, the\nbaton written after it. A runner checks the declaration against what the\nstep actually produced; anything touched but never declared stays a side\neffect. Empty → omitted from the file (no migration).",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "project": {
+          "description": "Project basename this todo belongs to (matches a transcript cwd\nbasename); None = not tied to a project.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "retry_limit": {
+          "description": "Retry cap M of the `N/<=M` record (t#302): how many times this node may be\nre-run after a failed outcome. Only the cap is stored — the attempt count N\nis DERIVED from `status_history` and the usage blocks, never written here.\nNone = no cap declared, which FORBIDS the retry rather than allowing an\nendless one.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "scheduled_for": {
+          "description": "ISO date `YYYY-MM-DD` the user plans to do this; None = unscheduled.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "spec": {
+          "description": "Addresses of the spec sections this task changes (t#339), each\n`<domain>#<slug>` into `docs/specs/<domain>/spec.md`. Written by the CLI,\nwhich validates every address against the registry before the write; the\napp only carries the field. It MUST live here even though nothing in the\napp reads it: the app rewrites the whole file, so a field it does not know\nis silently dropped on the next save. Empty → omitted from the file.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "spec_answers": {
+          "description": "The closing answer per addressed spec section (t#341, docs/specs/README.md\n§8): `unchanged` = the section still holds after this work, `updated` = it\nmoved and was edited. The Stop hook refuses to let a linked task close\nwithout a fresh entry per address, which is why the record has to be\nstructural — a phrase in prose would only teach the next session to reword.\nSame carry-the-field-you-do-not-read rule as `spec` above. Empty → omitted.",
+          "items": {
+            "$ref": "#/$defs/SpecAnswer"
+          },
+          "type": "array"
+        },
+        "spec_seen": {
+          "description": "Fingerprint of each addressed spec section AS IT WAS SHOWN to the session\nat the `in_progress` anchor. The closing answer `updated` is checked\nagainst it — without a baseline, \"the section moved\" was a claim that\ncost exactly as much as \"it did not\". Same carry-the-field-you-do-not-read\nrule as `spec`/`spec_answers`. Empty → omitted.",
+          "items": {
+            "$ref": "#/$defs/SpecSeen"
+          },
+          "type": "array"
+        },
+        "status": {
+          "type": "string"
+        },
+        "status_history": {
+          "description": "Transition log (t#87): one entry per status ENTERED, appended by every\nwriter — [`set_status`] (UI drag), [`upsert`] (UI edit) and the cc-todos\nCLI. Token attribution needs \"when was this task in_progress\", and\n`updated_at` can't answer that (any edit bumps it). Legacy rows have no\nhistory — readers must treat an empty log as \"status held since\n`created_at`\". Empty → omitted from the file (no migration).",
+          "items": {
+            "$ref": "#/$defs/StatusChange"
+          },
+          "type": "array"
+        },
+        "subject": {
+          "type": "string"
+        },
+        "updated_at": {
+          "default": "",
+          "type": "string"
+        },
+        "verify": {
+          "description": "Verification command for this node (t#302). The outcome is its EXIT CODE —\n0 = ok, anything else = issue — so the predicate stays machine-made and the\nrun reproducible. A node with no `verify` is not auto-executable whatever\nits `kind` says. Empty → omitted from the file.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "subject",
+        "status"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "The on-disk shape of `todos.json`. `version` lets us migrate the format\nlater; unknown/missing fields default so older or hand-edited files load.",
+  "properties": {
+    "changes": {
+      "description": "Changes as records (t#360). Empty → omitted, so a board that has not been\nmigrated yet stays byte-identical. This field MUST survive every write:\ndropping it would take every task's membership with it.",
+      "items": {
+        "$ref": "#/$defs/Change"
+      },
+      "type": "array"
+    },
+    "todos": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/Todo"
+      },
+      "type": "array"
+    },
+    "version": {
+      "default": 1,
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "title": "TodoFile",
+  "type": "object"
+}
