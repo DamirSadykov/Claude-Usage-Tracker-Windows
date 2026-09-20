@@ -37,6 +37,7 @@ import {
   appendTaskSessionEvent,
   readTaskSessionEvents,
   lastTaskSessionEvent,
+  loadBoard,
 } from "./todos.mjs";
 
 describe("todos list scope and pagination", () => {
@@ -718,8 +719,7 @@ describe("declaration commands", () => {
     }
   };
 
-  const read = (number) =>
-    JSON.parse(readFileSync(file, "utf8")).todos.find((t) => t.number === number);
+  const read = (number) => loadBoard(file).todos.find((t) => t.number === number);
 
   beforeEach(() => seed([todo(1), todo(2), todo(3, { project: "other-board" })]));
   afterEach(() => rmSync(dir, { recursive: true, force: true }));
@@ -1074,8 +1074,7 @@ describe("todos set", () => {
     }
   };
 
-  const read = (number) =>
-    JSON.parse(readFileSync(file, "utf8")).todos.find((t) => t.number === number);
+  const read = (number) => loadBoard(file).todos.find((t) => t.number === number);
 
   beforeEach(() => seed([todo(1), todo(2), todo(3, { project: "other-board" })]));
   afterEach(() => rmSync(dir, { recursive: true, force: true }));
@@ -1254,7 +1253,7 @@ describe("todos add: subject cap", () => {
     }
   };
 
-  const todos = () => JSON.parse(readFileSync(file, "utf8")).todos;
+  const todos = () => loadBoard(file).todos;
 
   it("accepts a subject exactly at the 150-char cap", () => {
     const subject = "x".repeat(150);
@@ -1320,8 +1319,7 @@ describe("rules the CLI enforces instead of explaining", () => {
     }
   };
 
-  const read = (number) =>
-    JSON.parse(readFileSync(file, "utf8")).todos.find((t) => t.number === number);
+  const read = (number) => loadBoard(file).todos.find((t) => t.number === number);
 
   afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
@@ -1615,7 +1613,7 @@ describe("todos — board recovery & versions (t#575)", () => {
     const added = run("add", "first task on a fresh board");
     expect(added.code).toBe(0);
     expect(corruptBackups()).toHaveLength(0);
-    expect(JSON.parse(readFileSync(boardFile, "utf8")).version).toBe(2);
+    expect(JSON.parse(readFileSync(boardFile, "utf8")).version).toBe(3);
   });
 
   describe("fixture v2/future-version.json", () => {
@@ -1624,7 +1622,7 @@ describe("todos — board recovery & versions (t#575)", () => {
     it("is readable: a reading command sees the task and prints the recovery state", () => {
       const { code, out, err } = run("list", "--all", "--json");
       expect(code).toBe(0);
-      expect(err).toMatch(/version 99.*CURRENT 2/);
+      expect(err).toMatch(/version 99.*CURRENT 3/);
       expect(JSON.parse(out).some((t) => t.number === 60)).toBe(true);
     });
 
@@ -1634,7 +1632,7 @@ describe("todos — board recovery & versions (t#575)", () => {
       const status = run("set", "status", "60", "backlog");
       expect(take.code).toBe(4);
       expect(status.code).toBe(4);
-      expect(take.err).toContain("board version 99 is newer than this writer (CURRENT 2)");
+      expect(take.err).toContain("board version 99 is newer than this writer (CURRENT 3)");
       expect(corruptBackups()).toHaveLength(0);
       expect(readFileSync(boardFile).equals(before)).toBe(true);
       expect(existsSync(path.join(dir, "com.claude-usage-tracker.app", "task-sessions.jsonl"))).toBe(false);
@@ -1648,7 +1646,7 @@ describe("todos — board recovery & versions (t#575)", () => {
       const before = readFileSync(boardFile);
       const { code, err } = run("add", "x");
       expect(code).toBe(4);
-      expect(err).toContain("board version 1 is older than this writer (CURRENT 2) and needs migration");
+      expect(err).toContain("board version 1 is older than this writer (CURRENT 3) and needs migration");
       expect(readFileSync(boardFile).equals(before)).toBe(true);
       expect(corruptBackups()).toHaveLength(0);
     });
@@ -1656,7 +1654,7 @@ describe("todos — board recovery & versions (t#575)", () => {
     it("lets a reading command through and names both versions in the recovery line", () => {
       const { code, out, err } = run("list", "--all", "--json");
       expect(code).toBe(0);
-      expect(err).toMatch(/board recovery:.*version 1.*CURRENT 2/);
+      expect(err).toMatch(/board recovery:.*version 1.*CURRENT 3/);
       expect(JSON.parse(out)).toHaveLength(3);
     });
   });
@@ -1666,7 +1664,7 @@ describe("todos — board recovery & versions (t#575)", () => {
     const before = readFileSync(boardFile);
     const { code, err } = run("add", "no version on disk yet");
     expect(code).toBe(4);
-    expect(err).toContain("board version 1 is older than this writer (CURRENT 2) and needs migration");
+    expect(err).toContain("board version 1 is older than this writer (CURRENT 3) and needs migration");
     expect(readFileSync(boardFile).equals(before)).toBe(true);
     expect(corruptBackups()).toHaveLength(0);
   });

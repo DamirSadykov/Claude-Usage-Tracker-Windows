@@ -71,28 +71,33 @@ describe("matrix row: v1/*.json (version 1) — CLI v2 writer", () => {
   });
 });
 
-describe("matrix row: v2/*.json known fields — CLI v2 writer", () => {
-  it("v2/empty.json round-trips untouched", () => {
+describe("matrix row: v2/*.json known fields — CLI v3 writer", () => {
+  it("v2/empty.json writes as v3", () => {
     stage("v2/empty.json");
     const data = loadBoard(file);
     expect(data.version).toBe(2);
 
     saveBoard(file, data);
-    const reread = loadBoard(file);
-    expect(reread).toEqual({ version: 2, todos: [] });
+    const reread = JSON.parse(readFileSync(file, "utf8"));
+    expect(reread).toEqual({ version: 3, todos: [] });
   });
 
-  it("v2/full.json known fields round-trip losslessly", () => {
+  it("v2/full.json writes process fields only under ext.process in v3", () => {
     stage("v2/full.json");
-    const original = JSON.parse(readFileSync(file, "utf8"));
-
     const data = loadBoard(file);
     saveBoard(file, data);
-    const reread = JSON.parse(readFileSync(file, "utf8"));
+    const written = JSON.parse(readFileSync(file, "utf8"));
+    const reread = loadBoard(file);
 
-    expect(reread.version).toBe(2);
-    expect(reread.todos).toEqual(original.todos);
-    expect(reread.changes).toEqual(original.changes);
+    expect(written.version).toBe(3);
+    for (const field of ["produces", "verify", "retry_limit", "on_issue", "budget_usd", "parallel_limit", "outcome", "outcome_reason", "outcome_at", "handout_at"]) {
+      expect(written.todos[0][field]).toBeUndefined();
+      expect(written.todos[0].ext.process[field]).toBeDefined();
+    }
+    for (const field of ["spec", "budget_usd", "parallel_limit"]) {
+      expect(written.changes[0][field]).toBeUndefined();
+      expect(written.changes[0].ext.process[field]).toBeDefined();
+    }
 
     const t0 = reread.todos[0];
     expect(t0.id).toBe("b2222222-0000-4000-8000-000000000001");
@@ -168,7 +173,7 @@ describe("matrix row: v2/*.json known fields — CLI v2 writer", () => {
   });
 });
 
-describe("matrix row: v2/unknown-field.json — CLI v2 writer", () => {
+describe("matrix row: v2/unknown-field.json — CLI v3 writer", () => {
   it("ext and reviewer_note survive a CLI write (Node passes unknown fields through)", () => {
     stage("v2/unknown-field.json");
     const data = loadBoard(file);
@@ -177,9 +182,29 @@ describe("matrix row: v2/unknown-field.json — CLI v2 writer", () => {
 
     saveBoard(file, data);
     const reread = JSON.parse(readFileSync(file, "utf8"));
+    expect(reread.version).toBe(3);
     expect(reread.todos[0].ext).toEqual({ triage: { kind: "stale", note: "не двигалась 40 дней" } });
     expect(reread.todos[0].reviewer_note).toBe("поле, которого нет ни в CLI, ни в приложении");
     expect(reread.todos[0].status).toBe("backlog");
+  });
+});
+
+describe("matrix row: v3/*.json — CLI v3 writer", () => {
+  it("v3/empty.json round-trips losslessly", () => {
+    stage("v3/empty.json");
+    const original = JSON.parse(readFileSync(file, "utf8"));
+    saveBoard(file, loadBoard(file));
+    expect(JSON.parse(readFileSync(file, "utf8"))).toEqual(original);
+  });
+
+  it("v3/full.json round-trips losslessly", () => {
+    stage("v3/full.json");
+    const original = JSON.parse(readFileSync(file, "utf8"));
+    const data = loadBoard(file);
+    expect(data.todos[0].verify).toBe("cargo test board_schema_fixture");
+    expect(data.changes[0].spec).toEqual(["tasks#board-file"]);
+    saveBoard(file, data);
+    expect(JSON.parse(readFileSync(file, "utf8"))).toEqual(original);
   });
 });
 
@@ -207,8 +232,8 @@ describe("matrix row: v2/future-version.json — CLI v2 writer", () => {
   });
 });
 
-describe("matrix row: corrupt/*.json — CLI v2 writer", () => {
-  for (const name of ["truncated.json", "not-object.json", "todos-not-array.json", "empty-file.json"]) {
+describe("matrix row: corrupt/*.json — CLI v3 writer", () => {
+  for (const name of ["truncated.json", "not-object.json", "todos-not-array.json", "empty-file.json", "mixed-v2-v3.json"]) {
     it(`corrupt/${name} is unreadable: read yields an empty board with one backup, write refuses with exit code 4`, () => {
       stage(`corrupt/${name}`);
       const before = readFileSync(file);
@@ -240,7 +265,7 @@ describe("matrix row: corrupt/*.json — CLI v2 writer", () => {
 
     saveBoard(file, data);
     const reread = JSON.parse(readFileSync(file, "utf8"));
-    expect(reread.version).toBe(2);
+    expect(reread.version).toBe(3);
     expect(reread.todos[0].number).toBe("42");
   });
 });

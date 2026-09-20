@@ -43,7 +43,7 @@ import {
   summarizeRuns,
   formatRunHistory,
 } from "./run.mjs";
-import { isReadyNode } from "./todos.mjs";
+import { isReadyNode, loadBoard } from "./todos.mjs";
 
 // ── fixtures ─────────────────────────────────────────────────────────────────
 const task = (number, extra = {}) => ({
@@ -713,7 +713,7 @@ describe("liveEffects — the board seam", () => {
     try {
       const { setStatus } = liveEffects({ cwd: process.cwd() });
       await setStatus({ task: { id: "id-2", number: 2 }, status: "in_progress" });
-      const after = JSON.parse(readFileSync(path.join(appDir, "todos.json"), "utf8"));
+      const after = loadBoard(path.join(appDir, "todos.json"));
       expect(after.todos[0].status).toBe("in_progress");
       // No journal at all: the only binding a step gets is the one run-step.mjs
       // writes for the session that does the work.
@@ -744,7 +744,7 @@ describe("stampHandout — the one thing --next writes (t#520)", () => {
       expect(data.todos[0].handout_at).toBe(at2);
       expect(data.todos[1].handout_at).toBe(at2);
       expect(data.todos[2].handout_at).toBeUndefined();
-      const onDisk = JSON.parse(readFileSync(file, "utf8"));
+      const onDisk = loadBoard(file);
       expect(onDisk.todos[0].handout_at).toBe(at2);
       expect(onDisk.todos[1].handout_at).toBe(at2);
     } finally {
@@ -857,7 +857,7 @@ describe("run(['--next']) — the field wired end to end onto the real board (t#
     process.stdout.write = () => true;
     try {
       await run(["1", "--next"]);
-      const after1 = JSON.parse(readFileSync(path.join(appDir, "todos.json"), "utf8"));
+      const after1 = loadBoard(path.join(appDir, "todos.json"));
       const t2a = after1.todos.find((t) => t.number === 2);
       const t3a = after1.todos.find((t) => t.number === 3);
       expect(t2a.handout_at).toEqual(expect.any(String));
@@ -867,7 +867,7 @@ describe("run(['--next']) — the field wired end to end onto the real board (t#
 
       await new Promise((r) => setTimeout(r, 5));
       await run(["1", "--next"]);
-      const after2 = JSON.parse(readFileSync(path.join(appDir, "todos.json"), "utf8"));
+      const after2 = loadBoard(path.join(appDir, "todos.json"));
       const t2b = after2.todos.find((t) => t.number === 2);
       expect(t2b.handout_at >= t2a.handout_at).toBe(true);
       expect(t2b.status).toBe("queue");

@@ -20,6 +20,7 @@ import {
   changeStatus,
   sortedChanges,
 } from "./change.mjs";
+import { loadBoard } from "./todos.mjs";
 
 const task = (number, fields = {}) => ({
   id: `id-${number}`,
@@ -263,7 +264,7 @@ describe("cli change", () => {
     }
   };
 
-  const read = () => JSON.parse(readFileSync(board, "utf8"));
+  const read = () => loadBoard(board);
 
   beforeEach(() => {
     dir = mkdtempSync(path.join(os.tmpdir(), "cut-change-"));

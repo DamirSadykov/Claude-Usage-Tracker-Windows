@@ -12,7 +12,7 @@ describe("board.schema.json — Rust-derived schema checked by Node", () => {
   const validate = new Ajv2020({ allErrors: true, validateFormats: false }).compile(schema);
   const fixture = (name) => JSON.parse(readFileSync(path.join(FIXTURES, name), "utf8"));
 
-  for (const name of ["v1/empty.json", "v1/full.json", "v2/empty.json", "v2/full.json", "v2/unknown-field.json", "v2/future-version.json"]) {
+  for (const name of ["v1/empty.json", "v1/full.json", "v2/empty.json", "v2/full.json", "v2/unknown-field.json", "v2/future-version.json", "v3/empty.json", "v3/full.json"]) {
     it(`${name} satisfies the shared typed contract`, () => {
       expect(validate(fixture(name)), validate.errors?.map((error) => `${error.instancePath} ${error.message}`).join("; ")).toBe(true);
     });

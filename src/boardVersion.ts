@@ -1,1 +1,1 @@
-export const BOARD_CURRENT_VERSION = 2;
+export const BOARD_CURRENT_VERSION = 3;

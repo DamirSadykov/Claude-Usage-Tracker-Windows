@@ -19,3 +19,4 @@ settings.local.json
 .vscode/
 *.swp
 .claude/phases/
+src-tauri/target-test/

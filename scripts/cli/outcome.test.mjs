@@ -26,6 +26,7 @@ import {
   handoutStartOf,
   evidenceWindowStartOf,
 } from "./outcome.mjs";
+import { loadBoard } from "./todos.mjs";
 
 // ── fixtures ─────────────────────────────────────────────────────────────────
 // One transcript line: a tool_use with a file_path at `ts`.
@@ -574,8 +575,7 @@ describe("outcome --write (end to end)", () => {
     }
   };
 
-  const read = (number) =>
-    JSON.parse(readFileSync(file, "utf8")).todos.find((t) => t.number === number);
+  const read = (number) => loadBoard(file).todos.find((t) => t.number === number);
 
   beforeEach(() => seed([todo(1, { produces: ["scripts/cli/outcome.mjs"] })]));
   afterEach(() => rmSync(dir, { recursive: true, force: true }));
@@ -587,7 +587,7 @@ describe("outcome --write (end to end)", () => {
     expect(after.outcome).toBe("issue");
     expect(after.outcome_reason).toBe("missing:scripts/cli/outcome.mjs");
     expect(typeof after.outcome_at).toBe("string");
-    expect(Object.keys(after).filter((k) => !k.startsWith("outcome"))).toEqual(
+    expect(Object.keys(after).filter((k) => !k.startsWith("outcome") && k !== "ext")).toEqual(
       Object.keys(before),
     );
     for (const k of Object.keys(before)) expect(after[k]).toEqual(before[k]);

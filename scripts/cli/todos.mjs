@@ -152,6 +152,7 @@ const printedRecovery = new Set();
 
 function load(file) {
   const { data, issue } = readBoardTolerant(file);
+  hydrateProcessAliases(data);
   if (issue) {
     const key = `${issue.kind}:${file}`;
     if (!printedRecovery.has(key)) {
@@ -205,9 +206,47 @@ function save(file, data) {
     return;
   }
   data.version = CURRENT;
+  const wire = structuredClone(data);
+  migrateToV3(wire);
+  wire.version = CURRENT;
   const tmp = `${file}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n");
+  writeFileSync(tmp, JSON.stringify(wire, null, 2) + "\n");
   renameWithRetry(tmp, file);
+}
+
+const TODO_PROCESS_FIELDS = ["produces", "verify", "retry_limit", "on_issue", "budget_usd", "parallel_limit", "outcome", "outcome_reason", "outcome_at", "handout_at"];
+const CHANGE_PROCESS_FIELDS = ["spec", "budget_usd", "parallel_limit"];
+
+function aliasProcess(row, fields) {
+  if (!row || typeof row !== "object" || !row.ext?.process || typeof row.ext.process !== "object") return;
+  for (const field of fields) {
+    if (!Object.hasOwn(row.ext.process, field) || Object.hasOwn(row, field)) continue;
+    Object.defineProperty(row, field, { value: row.ext.process[field], writable: true, configurable: true, enumerable: true });
+  }
+}
+
+function hydrateProcessAliases(data) {
+  if (data?.version < 3) return;
+  for (const todo of data.todos || []) aliasProcess(todo, TODO_PROCESS_FIELDS);
+  for (const change of data.changes || []) aliasProcess(change, CHANGE_PROCESS_FIELDS);
+}
+
+function moveProcess(row, fields) {
+  if (!row || typeof row !== "object") return;
+  const ext = row.ext && typeof row.ext === "object" && !Array.isArray(row.ext) ? row.ext : {};
+  const process = ext.process && typeof ext.process === "object" && !Array.isArray(ext.process) ? ext.process : {};
+  for (const field of fields) {
+    if (row[field] !== undefined) process[field] = row[field];
+    else delete process[field];
+    delete row[field];
+  }
+  if (Object.keys(process).length) ext.process = process;
+  if (Object.keys(ext).length) row.ext = ext;
+}
+
+function migrateToV3(data) {
+  for (const todo of data.todos || []) moveProcess(todo, TODO_PROCESS_FIELDS);
+  for (const change of data.changes || []) moveProcess(change, CHANGE_PROCESS_FIELDS);
 }
 
 // A command that writes ONE row saves after it and is atomic by construction.
