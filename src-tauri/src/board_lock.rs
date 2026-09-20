@@ -11,7 +11,6 @@ use serde_json::Value;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(25);
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
-const STALE_AGE: Duration = Duration::from_secs(600);
 const STALE_MTIME_AGE: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
@@ -70,7 +69,7 @@ fn normalized_board_path(board: &Path) -> PathBuf {
     canon_parent.join(file_name)
 }
 
-fn normalize_key(board: &Path) -> String {
+pub(crate) fn normalize_key(board: &Path) -> String {
     let combined = normalized_board_path(board);
     let s = combined.to_string_lossy().into_owned();
     if cfg!(windows) {
@@ -80,7 +79,7 @@ fn normalize_key(board: &Path) -> String {
     }
 }
 
-fn lock_path_for(board: &Path) -> PathBuf {
+pub(crate) fn lock_path_for(board: &Path) -> PathBuf {
     let normalized = normalized_board_path(board);
     let mut name = normalized.file_name().map(|f| f.to_os_string()).unwrap_or_default();
     name.push(".lock");
@@ -117,25 +116,9 @@ fn parse_holder(content: &str) -> Option<LockHolder> {
     Some(LockHolder { pid, writer, at })
 }
 
-fn age_from_at(at: &str) -> Option<Duration> {
-    let dt = chrono::DateTime::parse_from_rfc3339(at).ok()?;
-    let now = chrono::Utc::now();
-    Some(
-        now.signed_duration_since(dt.with_timezone(&chrono::Utc))
-            .to_std()
-            .unwrap_or(Duration::from_secs(0)),
-    )
-}
-
 pub(crate) fn is_stale(content: &str, mtime_age: Duration, pid_alive: impl Fn(u32) -> bool) -> bool {
-    let Some(holder) = parse_holder(content) else {
-        return mtime_age > STALE_MTIME_AGE;
-    };
-    if !pid_alive(holder.pid) {
-        return true;
-    }
-    match age_from_at(&holder.at) {
-        Some(age) => age > STALE_AGE,
+    match parse_holder(content) {
+        Some(holder) => !pid_alive(holder.pid),
         None => mtime_age > STALE_MTIME_AGE,
     }
 }
@@ -177,15 +160,18 @@ fn pid_alive(_pid: u32) -> bool {
     true
 }
 
-fn write_lock_file(lock_path: &Path, pid: u32) -> std::io::Result<()> {
-    let content = serde_json::json!({
+fn lock_content(pid: u32, writer: &str) -> String {
+    serde_json::json!({
         "pid": pid,
-        "writer": "app",
+        "writer": writer,
         "at": chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
     })
-    .to_string();
+    .to_string()
+}
+
+fn write_lock_file(lock_path: &Path, pid: u32) -> std::io::Result<()> {
     let mut f = OpenOptions::new().write(true).create_new(true).open(lock_path)?;
-    f.write_all(content.as_bytes())
+    f.write_all(lock_content(pid, "app").as_bytes())
 }
 
 fn remove_stale(lock_path: &Path) {
@@ -319,6 +305,41 @@ pub fn acquire_with_timeout(board: &Path, timeout: Duration) -> Result<BoardLock
 
 pub fn acquire(board: &Path) -> Result<BoardLock, LockError> {
     acquire_impl(board, DEFAULT_TIMEOUT)
+}
+
+pub fn is_held_by_us(board: &Path) -> bool {
+    let key = normalize_key(board);
+    let me = std::thread::current().id();
+    matches!(registry().lock().unwrap().get(&key), Some((owner, _)) if *owner == me)
+}
+
+fn reaffirm_at(lock_path: &Path) -> Result<(), LockError> {
+    let pid = std::process::id();
+    match read_lock(lock_path) {
+        ReadOutcome::Content(content) => match parse_holder(&content) {
+            Some(holder) if holder.pid == pid => Ok(()),
+            Some(holder) => Err(LockError::Busy {
+                pid: holder.pid,
+                writer: holder.writer,
+                at: holder.at,
+                path: lock_path.to_path_buf(),
+            }),
+            None => Err(LockError::Unreadable { path: lock_path.to_path_buf() }),
+        },
+        ReadOutcome::Missing | ReadOutcome::Unreadable => {
+            Err(LockError::Unreadable { path: lock_path.to_path_buf() })
+        }
+    }
+}
+
+pub fn reaffirm(board: &Path) -> Result<(), LockError> {
+    reaffirm_at(&lock_path_for(board))
+}
+
+impl BoardLock {
+    pub(crate) fn reaffirm(&self) -> Result<(), LockError> {
+        reaffirm_at(&self.lock_path)
+    }
 }
 
 fn release_file(lock_path: &Path) {
@@ -524,17 +545,16 @@ mod tests {
         assert!(!is_stale(&alive_content, Duration::from_secs(0), |_| true));
         assert!(is_stale(&alive_content, Duration::from_secs(0), |_| false));
 
-        let old_at = (chrono::Utc::now() - chrono::Duration::minutes(11))
+        let very_old_at = (chrono::Utc::now() - chrono::Duration::hours(2))
             .to_rfc3339_opts(SecondsFormat::Millis, true);
-        let old_content = node_content(1234, "app", &old_at);
-        assert!(is_stale(&old_content, Duration::from_secs(0), |_| true));
+        let old_but_alive = node_content(1234, "app", &very_old_at);
+        assert!(!is_stale(&old_but_alive, Duration::from_secs(0), |_| true));
+        assert!(is_stale(&old_but_alive, Duration::from_secs(0), |_| false));
 
-        // pid alive but `at` unparsable -> falls back to the mtime rule.
         let bad_at_content = serde_json::json!({ "pid": 1234, "writer": "app", "at": "not-a-date" }).to_string();
-        assert!(!is_stale(&bad_at_content, Duration::from_secs(10), |_| true));
-        assert!(is_stale(&bad_at_content, Duration::from_secs(31), |_| true));
+        assert!(!is_stale(&bad_at_content, Duration::from_secs(999), |_| true));
+        assert!(is_stale(&bad_at_content, Duration::from_secs(0), |_| false));
 
-        // pid not a valid positive integer -> falls back to the mtime rule.
         let bad_pid_content = serde_json::json!({ "pid": -5, "writer": "app", "at": now_ms() }).to_string();
         assert!(!is_stale(&bad_pid_content, Duration::from_secs(10), |_| true));
         assert!(is_stale(&bad_pid_content, Duration::from_secs(31), |_| true));
@@ -601,18 +621,24 @@ mod tests {
     }
 
     #[test]
-    fn stale_by_age_with_live_pid_is_swept_on_acquire() {
+    fn live_pid_lock_is_never_stale_by_age_alone() {
         let board = unique_board();
         let lock_path = lock_path_for(board.path());
         let pid = std::process::id();
-        let old_at = (chrono::Utc::now() - chrono::Duration::minutes(11))
+        let old_at = (chrono::Utc::now() - chrono::Duration::hours(2))
             .to_rfc3339_opts(SecondsFormat::Millis, true);
         std::fs::write(&lock_path, node_content(pid, "cli", &old_at)).unwrap();
 
-        let lock = acquire_impl(board.path(), Duration::from_millis(200)).unwrap();
+        let err = acquire_impl(board.path(), Duration::from_millis(100)).unwrap_err();
+        match err {
+            LockError::Busy { pid: p, writer, .. } => {
+                assert_eq!(p, pid);
+                assert_eq!(writer, "cli");
+            }
+            other => panic!("expected Busy, got {other:?}"),
+        }
         let content = std::fs::read_to_string(&lock_path).unwrap();
-        assert!(content.contains("\"writer\":\"app\""));
-        drop(lock);
+        assert!(content.contains("\"writer\":\"cli\""), "a live holder's lock must not be swept");
     }
 
     #[test]
@@ -625,5 +651,48 @@ mod tests {
         release_file(&lock_path);
 
         assert!(lock_path.exists());
+    }
+
+    #[test]
+    fn is_held_by_us_reflects_registry_membership() {
+        let board = unique_board();
+        assert!(!is_held_by_us(board.path()));
+        let lock = acquire_impl(board.path(), Duration::from_millis(200)).unwrap();
+        assert!(is_held_by_us(board.path()));
+        drop(lock);
+        assert!(!is_held_by_us(board.path()));
+    }
+
+    #[test]
+    fn reaffirm_leaves_the_lock_file_untouched_while_still_ours() {
+        let board = unique_board();
+        let lock = acquire_impl(board.path(), Duration::from_millis(200)).unwrap();
+        let lock_path = lock_path_for(board.path());
+        let before = std::fs::read_to_string(&lock_path).unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+
+        assert!(reaffirm(board.path()).is_ok());
+
+        let after = std::fs::read_to_string(&lock_path).unwrap();
+        assert_eq!(before, after, "reaffirm only re-reads ownership — it must not rewrite the file");
+        drop(lock);
+    }
+
+    #[test]
+    fn reaffirm_refuses_once_the_lock_belongs_to_someone_else() {
+        let board = unique_board();
+        let lock = acquire_impl(board.path(), Duration::from_millis(200)).unwrap();
+        let lock_path = lock_path_for(board.path());
+        let thief_pid = std::process::id().wrapping_add(999_999).max(1);
+        std::fs::write(&lock_path, node_content(thief_pid, "app", &now_ms())).unwrap();
+
+        let err = reaffirm(board.path()).unwrap_err();
+        match err {
+            LockError::Busy { pid, .. } => assert_eq!(pid, thief_pid),
+            other => panic!("expected Busy, got {other:?}"),
+        }
+
+        std::fs::remove_file(&lock_path).ok();
+        drop(lock);
     }
 }

@@ -120,21 +120,22 @@ fn cli_writers_and_rust_writer_share_the_board_without_losing_a_transition() {
     let rust_half = rust_half.to_vec();
     let writer_path = board_path.clone();
     let writer = std::thread::spawn(move || {
-        let _lock = board_lock::acquire(&writer_path).expect("rust acquire");
-        let mut file = todos::load(&writer_path);
-        todos::ensure_numbers(&mut file);
-        let now = chrono::Utc::now().to_rfc3339();
-        for n in &rust_half {
-            let id = file
-                .todos
-                .iter()
-                .find(|t| t.number == *n)
-                .expect("task not found")
-                .id
-                .clone();
-            assert!(todos::set_status(&mut file, &id, "in_progress", &now));
-        }
-        todos::save(&writer_path, &file).expect("rust save");
+        todos::transact(&writer_path, |file| {
+            todos::ensure_numbers(file);
+            let now = chrono::Utc::now().to_rfc3339();
+            for n in &rust_half {
+                let id = file
+                    .todos
+                    .iter()
+                    .find(|t| t.number == *n)
+                    .expect("task not found")
+                    .id
+                    .clone();
+                assert!(todos::set_status(file, &id, "in_progress", &now));
+            }
+            Ok::<(), String>(())
+        })
+        .expect("rust save");
     });
     writer.join().expect("writer thread panicked");
 

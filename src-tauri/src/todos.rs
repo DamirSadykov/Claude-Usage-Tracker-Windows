@@ -14,6 +14,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use log::warn;
@@ -542,32 +543,45 @@ fn ensure_corrupt_backup(path: &Path, raw: &str, timeout: Duration) -> Option<Pa
 }
 
 fn load_checked_with_timeout(path: &Path, backup_timeout: Duration) -> LoadOutcome {
+    load_checked_with_timeout_versioned(path, backup_timeout).0
+}
+
+fn load_checked_with_timeout_versioned(
+    path: &Path,
+    backup_timeout: Duration,
+) -> (LoadOutcome, Option<u32>) {
     let raw = match std::fs::read_to_string(path) {
         Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return LoadOutcome::Missing,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (LoadOutcome::Missing, None),
         Err(e) => {
-            return LoadOutcome::Unreadable { reason: format!("read-error: {e}"), backup: None }
+            return (
+                LoadOutcome::Unreadable { reason: format!("read-error: {e}"), backup: None },
+                None,
+            )
         }
     };
     match detect_issue(&raw) {
-        Issue::FutureVersion(version) => LoadOutcome::FutureVersion { version },
+        Issue::FutureVersion(version) => (LoadOutcome::FutureVersion { version }, None),
         Issue::Unreadable(reason) => {
             let backup = ensure_corrupt_backup(path, &raw, backup_timeout);
-            LoadOutcome::Unreadable { reason: reason.to_string(), backup }
+            (LoadOutcome::Unreadable { reason: reason.to_string(), backup }, None)
         }
-        Issue::Ok(patched) => match serde_json::from_value::<TodoFile>(patched) {
-            Ok(mut file) => {
-                for t in &mut file.todos {
-                    t.status = canonical_status(&t.status).to_string();
+        Issue::Ok(patched) => {
+            let on_disk_version = patched.get("version").and_then(Value::as_u64).map(|v| v as u32);
+            match serde_json::from_value::<TodoFile>(patched) {
+                Ok(mut file) => {
+                    for t in &mut file.todos {
+                        t.status = canonical_status(&t.status).to_string();
+                    }
+                    migrate_plan_roles(&mut file);
+                    (LoadOutcome::Ok(file), on_disk_version)
                 }
-                migrate_plan_roles(&mut file);
-                LoadOutcome::Ok(file)
+                Err(e) => {
+                    let backup = ensure_corrupt_backup(path, &raw, backup_timeout);
+                    (LoadOutcome::Unreadable { reason: format!("schema: {e}"), backup }, None)
+                }
             }
-            Err(e) => {
-                let backup = ensure_corrupt_backup(path, &raw, backup_timeout);
-                LoadOutcome::Unreadable { reason: format!("schema: {e}"), backup }
-            }
-        },
+        }
     }
 }
 
@@ -595,8 +609,22 @@ pub fn load_checked_for_read(path: &Path) -> Result<TodoFile, String> {
     file_or_refusal(path, load_checked(path))
 }
 
+pub fn load_known(path: &Path) -> Result<TodoFile, String> {
+    match load_checked(path) {
+        LoadOutcome::FutureVersion { .. } => Ok(load(path)),
+        outcome => file_or_refusal(path, outcome),
+    }
+}
+
 pub fn load_for_write(path: &Path) -> Result<TodoFile, String> {
-    file_or_refusal(path, load_checked_with_timeout(path, Duration::from_secs(15)))
+    load_for_write_versioned(path).map(|(file, _)| file)
+}
+
+fn load_for_write_versioned(path: &Path) -> Result<(TodoFile, bool), String> {
+    let (outcome, on_disk_version) =
+        load_checked_with_timeout_versioned(path, Duration::from_secs(15));
+    let stale = on_disk_version.is_some_and(|v| v < CURRENT_VERSION);
+    file_or_refusal(path, outcome).map(|file| (file, stale))
 }
 
 /// v1 → v2: the field-role split (t#253 field review) — `description` carries
@@ -672,8 +700,10 @@ fn split_vision(plan: &str) -> Option<(String, String)> {
 }
 
 fn tmp_path_for(path: &Path) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let mut tmp_name = path.file_name().map(|f| f.to_os_string()).unwrap_or_default();
-    tmp_name.push(format!(".{}.tmp", std::process::id()));
+    tmp_name.push(format!(".{}{n}.tmp", std::process::id()));
     path.with_file_name(tmp_name)
 }
 
@@ -681,7 +711,7 @@ fn is_transient_rename_error(e: &std::io::Error) -> bool {
     matches!(e.raw_os_error(), Some(5) | Some(32) | Some(33))
 }
 
-pub fn save(path: &Path, file: &TodoFile) -> Result<(), String> {
+fn write_atomic(path: &Path, file: &TodoFile, lock: Option<&board_lock::BoardLock>) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
@@ -691,6 +721,9 @@ pub fn save(path: &Path, file: &TodoFile) -> Result<(), String> {
     json.push('\n');
     let tmp = tmp_path_for(path);
     std::fs::write(&tmp, json.as_bytes()).map_err(|e| e.to_string())?;
+    if let Some(lock) = lock {
+        lock.reaffirm().map_err(|e| e.to_string())?;
+    }
     for _ in 0..5 {
         match std::fs::rename(&tmp, path) {
             Ok(()) => return Ok(()),
@@ -701,6 +734,71 @@ pub fn save(path: &Path, file: &TodoFile) -> Result<(), String> {
         }
     }
     std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+}
+
+fn save(path: &Path, file: &TodoFile) -> Result<(), String> {
+    write_atomic(path, file, None)
+}
+
+fn save_locked(path: &Path, file: &TodoFile, lock: &board_lock::BoardLock) -> Result<(), String> {
+    write_atomic(path, file, Some(lock))
+}
+
+pub fn write_export(path: &Path, file: &TodoFile) -> Result<(), String> {
+    save(path, file)
+}
+
+#[derive(Debug)]
+pub enum TransactError {
+    Lock(String),
+    Unwritable(String),
+    Failed(String),
+}
+
+impl std::fmt::Display for TransactError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TransactError::Lock(e) | TransactError::Unwritable(e) | TransactError::Failed(e) => {
+                write!(f, "{e}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TransactError {}
+
+impl From<TransactError> for String {
+    fn from(e: TransactError) -> String {
+        e.to_string()
+    }
+}
+
+pub fn transact_if<T>(
+    path: &Path,
+    mutate: impl FnOnce(&mut TodoFile) -> Result<(bool, T), String>,
+) -> Result<(TodoFile, T), TransactError> {
+    let lock = board_lock::acquire(path).map_err(|e| TransactError::Lock(e.to_string()))?;
+    let (mut file, stale_version) =
+        load_for_write_versioned(path).map_err(TransactError::Unwritable)?;
+    let (changed, out) = mutate(&mut file).map_err(TransactError::Failed)?;
+    if changed || stale_version {
+        save_locked(path, &file, &lock).map_err(TransactError::Failed)?;
+    }
+    Ok((file, out))
+}
+
+pub fn transact<T>(
+    path: &Path,
+    mutate: impl FnOnce(&mut TodoFile) -> Result<T, String>,
+) -> Result<(TodoFile, T), TransactError> {
+    transact_if(path, |file| mutate(file).map(|out| (true, out)))
+}
+
+pub fn replace_locked(path: &Path, mut file: TodoFile) -> Result<TodoFile, String> {
+    let lock = board_lock::acquire(path).map_err(|e| e.to_string())?;
+    ensure_numbers(&mut file);
+    save_locked(path, &file, &lock)?;
+    Ok(file)
 }
 
 /// The largest task number currently assigned (0 if none).
@@ -1087,14 +1185,7 @@ pub fn backup_after_verified_load(todos_path: &Path) -> Result<String, String> {
 }
 
 pub fn resolves_to_same_path(left: &Path, right: &Path) -> bool {
-    let (Ok(left), Ok(right)) = (std::fs::canonicalize(left), std::fs::canonicalize(right)) else {
-        return false;
-    };
-    if cfg!(windows) {
-        left.to_string_lossy().eq_ignore_ascii_case(&right.to_string_lossy())
-    } else {
-        left == right
-    }
+    board_lock::normalize_key(left) == board_lock::normalize_key(right)
 }
 
 /// The most recent backup (by file mtime), or None if none exist.
@@ -1131,8 +1222,16 @@ pub fn read_backup(todos_path: &Path, name: &str) -> Result<TodoFile, String> {
     }
     let src = backup_dir(todos_path).join(name);
     let content = std::fs::read_to_string(&src).map_err(|e| e.to_string())?;
-    let mut file: TodoFile =
+    let value: serde_json::Value =
         serde_json::from_str(&content).map_err(|e| format!("backup is not a valid todo file: {e}"))?;
+    let version = normalize_version(value.get("version"));
+    if version > CURRENT_VERSION as u64 {
+        return Err(format!(
+            "backup version {version} is newer than this writer (CURRENT {CURRENT_VERSION})"
+        ));
+    }
+    let mut file: TodoFile =
+        serde_json::from_value(value).map_err(|e| format!("backup is not a valid todo file: {e}"))?;
     for t in &mut file.todos {
         t.status = canonical_status(&t.status).to_string();
     }
@@ -1310,6 +1409,12 @@ pub fn parse_import(content: &str) -> Result<TodoFile, String> {
             .map_err(|e| format!("not a list of tasks: {e}"))?;
         TodoFile { version: default_version(), todos, changes: Vec::new() }
     } else {
+        let version = normalize_version(value.get("version"));
+        if version > CURRENT_VERSION as u64 {
+            return Err(format!(
+                "import file version {version} is newer than this writer (CURRENT {CURRENT_VERSION})"
+            ));
+        }
         serde_json::from_value(value).map_err(|e| format!("not a task file: {e}"))?
     };
     for t in &mut file.todos {
@@ -1691,6 +1796,38 @@ mod tests {
         // Path-traversal names are rejected.
         assert!(read_backup(&path, "../todos.json").is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_backup_refuses_future_version() {
+        let dir = scratch_dir("backup-future");
+        let path = dir.join("todos.json");
+        let content = std::fs::read_to_string(fixtures_dir().join("v2/future-version.json")).unwrap();
+        let bdir = backup_dir(&path);
+        std::fs::create_dir_all(&bdir).unwrap();
+        let name = "todos-future.json";
+        std::fs::write(bdir.join(name), &content).unwrap();
+
+        let err = read_backup(&path, name).unwrap_err();
+        assert!(err.contains("newer than this writer"), "got: {err}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_backup_still_accepts_v2() {
+        let dir = scratch_dir("backup-v2");
+        let path = dir.join("todos.json");
+        let content = std::fs::read_to_string(fixtures_dir().join("v2/full.json")).unwrap();
+        let bdir = backup_dir(&path);
+        std::fs::create_dir_all(&bdir).unwrap();
+        let name = "todos-v2.json";
+        std::fs::write(bdir.join(name), &content).unwrap();
+
+        let restored = read_backup(&path, name).unwrap();
+        assert!(!restored.todos.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -2588,6 +2725,21 @@ mod tests {
         assert!(parse_import("not json").is_err());
     }
 
+    #[test]
+    fn parse_import_refuses_future_version() {
+        let content = std::fs::read_to_string(fixtures_dir().join("v2/future-version.json")).unwrap();
+        let err = parse_import(&content).unwrap_err();
+        assert!(err.contains("newer than this writer"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_import_accepts_v1_and_v2_fixtures() {
+        let v1 = std::fs::read_to_string(fixtures_dir().join("v1/full.json")).unwrap();
+        let v2 = std::fs::read_to_string(fixtures_dir().join("v2/full.json")).unwrap();
+        assert!(!parse_import(&v1).unwrap().todos.is_empty());
+        assert!(!parse_import(&v2).unwrap().todos.is_empty());
+    }
+
     fn fixtures_dir() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/board-fixtures")
     }
@@ -2692,6 +2844,41 @@ mod tests {
             }
             std::fs::remove_dir_all(&dir).ok();
         }
+    }
+
+    #[test]
+    fn load_known_refuses_unreadable_with_the_refusal_wording() {
+        let (dir, path) = staged_fixture("load-known-corrupt", "corrupt/truncated.json");
+        let err = load_known(&path).unwrap_err();
+        assert!(err.starts_with("board unreadable ("), "got: {err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_known_reads_future_version_via_the_lenient_parse() {
+        let (dir, path) = staged_fixture("load-known-future", "v2/future-version.json");
+        let file = load_known(&path).unwrap();
+        assert_eq!(file.todos.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_known_reports_an_empty_board_for_a_missing_file() {
+        let dir = scratch_dir("load-known-missing");
+        let path = dir.join("todos.json");
+        let file = load_known(&path).unwrap();
+        assert!(file.todos.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_known_matches_load_checked_for_a_healthy_board() {
+        let (dir, path) = staged_fixture("load-known-full", "v2/full.json");
+        let known = load_known(&path).unwrap();
+        let checked = load_checked_for_read(&path).unwrap();
+        assert_eq!(known.todos.len(), checked.todos.len());
+        assert_eq!(known.changes.len(), checked.changes.len());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -2828,6 +3015,68 @@ mod tests {
     }
 
     #[test]
+    fn save_refuses_when_the_lock_it_holds_is_stolen_before_rename() {
+        let dir = scratch_dir("save-stolen-lock");
+        let path = dir.join("todos.json");
+        let lock = board_lock::acquire(&path).unwrap();
+        let lock_path = board_lock::lock_path_for(&path);
+        let thief_pid = std::process::id().wrapping_add(999_999).max(1);
+        std::fs::write(
+            &lock_path,
+            serde_json::json!({ "pid": thief_pid, "writer": "app", "at": chrono::Utc::now().to_rfc3339() })
+                .to_string(),
+        )
+        .unwrap();
+
+        let err = save_locked(&path, &TodoFile::default(), &lock).unwrap_err();
+        assert!(err.contains("board locked"), "unexpected error: {err}");
+        assert!(!path.exists(), "the theft must block the rename, not just the message");
+
+        std::fs::remove_file(&lock_path).ok();
+        drop(lock);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_locked_reaffirms_regardless_of_which_thread_acquired_the_lock() {
+        let dir = scratch_dir("save-locked-cross-thread");
+        let path = dir.join("todos.json");
+
+        let acquire_path = path.clone();
+        let lock = std::thread::spawn(move || board_lock::acquire(&acquire_path).unwrap())
+            .join()
+            .unwrap();
+
+        let write_path = path.clone();
+        let write_result = std::thread::spawn(move || save_locked(&write_path, &TodoFile::default(), &lock))
+            .join()
+            .unwrap();
+        assert!(write_result.is_ok(), "legitimate cross-thread write must succeed: {write_result:?}");
+
+        let acquire_path = path.clone();
+        let lock = std::thread::spawn(move || board_lock::acquire(&acquire_path).unwrap())
+            .join()
+            .unwrap();
+        let lock_path = board_lock::lock_path_for(&path);
+        let thief_pid = std::process::id().wrapping_add(999_999).max(1);
+        std::fs::write(
+            &lock_path,
+            serde_json::json!({ "pid": thief_pid, "writer": "app", "at": chrono::Utc::now().to_rfc3339() })
+                .to_string(),
+        )
+        .unwrap();
+
+        let write_path = path.clone();
+        let err = std::thread::spawn(move || save_locked(&write_path, &TodoFile::default(), &lock).unwrap_err())
+            .join()
+            .unwrap();
+        assert!(err.contains("board locked"), "theft from a foreign thread must still be caught: {err}");
+
+        std::fs::remove_file(&lock_path).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn load_for_write_returns_verified_board_on_ok_and_missing() {
         let dir = scratch_dir("write-ok");
         let missing_path = dir.join("does-not-exist.json");
@@ -2884,6 +3133,127 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    #[test]
+    fn export_target_that_is_the_not_yet_created_board_is_rejected() {
+        let dir = scratch_dir("export-missing-board");
+        let board_path = dir.join("todos.json");
+        assert!(!board_path.exists(), "the board must not exist yet — that's the bug this guards against");
+        assert!(resolves_to_same_path(&board_path, &board_path));
+        assert!(resolves_to_same_path(&board_path, &dir.join(".").join("todos.json")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn concurrent_saves_in_one_process_do_not_collide_on_tmp() {
+        let dir = scratch_dir("save-tmp-race");
+        let path = dir.join("todos.json");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..25 {
+                    save(&path, &TodoFile::default()).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            let result = h.join();
+            assert!(result.is_ok(), "a concurrent save panicked/errored: {result:?}");
+        }
+
+        let entries: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
+        for entry in &entries {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            assert!(!name.ends_with(".tmp"), "leftover tmp file: {name}");
+        }
+        assert_eq!(entries.len(), 1, "expected exactly the final todos.json, got {entries:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn transact_if_leaves_mtime_untouched_when_every_task_already_has_a_number() {
+        let dir = scratch_dir("transact-if-no-change");
+        let path = dir.join("todos.json");
+        let mut seed = TodoFile::default();
+        let mut t = todo("t1", "backlog");
+        t.number = 1;
+        seed.todos.push(t);
+        save(&path, &seed).unwrap();
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let (file, ()) = transact_if(&path, |file| Ok((ensure_numbers(file), ()))).unwrap();
+        assert_eq!(file.todos.len(), 1);
+
+        let after = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(before, after, "a no-op backfill must not rewrite the file");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn transact_if_writes_when_mutate_reports_a_change() {
+        let dir = scratch_dir("transact-if-change");
+        let path = dir.join("todos.json");
+        let mut seed = TodoFile::default();
+        seed.todos.push(todo("t1", "backlog"));
+        save(&path, &seed).unwrap();
+
+        let (file, ()) = transact_if(&path, |file| Ok((ensure_numbers(file), ()))).unwrap();
+        assert_eq!(file.todos[0].number, 1);
+
+        let reloaded = load(&path);
+        assert_eq!(reloaded.todos[0].number, 1, "a real change must be persisted");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn transact_if_writes_a_stale_v1_board_even_when_mutate_reports_no_change() {
+        let (dir, path) = staged_fixture("transact-if-stale-v1", "v1/full.json");
+
+        let (file, ()) = transact_if(&path, |_file| Ok((false, ()))).unwrap();
+        assert_eq!(file.version, 2);
+
+        let on_disk: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(on_disk["version"], 2);
+        let on_disk_todos = on_disk["todos"].as_array().unwrap();
+        assert_eq!(on_disk_todos.len(), 3);
+        assert_eq!(
+            serde_json::to_value(&file.todos).unwrap(),
+            Value::Array(on_disk_todos.clone()),
+            "the migrated task set must be what actually landed on disk"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn transact_if_leaves_an_up_to_date_v2_board_untouched_on_a_no_op() {
+        let (dir, path) = staged_fixture("transact-if-v2-noop", "v2/full.json");
+        let before = std::fs::read(&path).unwrap();
+
+        let (file, ()) = transact_if(&path, |_file| Ok((false, ()))).unwrap();
+        assert_eq!(file.version, 2);
+
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(before, after, "an already-current board must not be rewritten on a no-op");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn transact_reports_unwritable_board_as_its_own_error_kind() {
+        let dir = scratch_dir("transact-error-kinds");
+        let path = dir.join("todos.json");
+        std::fs::write(&path, "not json").unwrap();
+        match transact(&path, |file| Ok(ensure_numbers(file))) {
+            Err(TransactError::Unwritable(_)) => {}
+            other => panic!("expected Unwritable, got {other:?}"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn v1_empty_fixtures_round_trips_to_v2() {

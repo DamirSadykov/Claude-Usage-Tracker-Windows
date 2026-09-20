@@ -19,8 +19,9 @@ import {
   releaseBoardLock,
   boardLockPath,
   sweepOrphanTmp,
+  renameWithRetry,
+  reaffirmBoardLock,
   BoardLockedError,
-  BOARD_LOCK_STALE_AGE_MS,
   BOARD_LOCK_UNREADABLE_STALE_MS,
 } from "./board-lock.mjs";
 
@@ -132,16 +133,19 @@ describe("board lock — the primitive", () => {
     rmSync(lock);
   });
 
-  it("breaks a live holder's lock once its `at` passes the 10-minute ceiling", () => {
+  it("never breaks a live holder's lock, no matter how old its `at` is", () => {
     dir = mkdtempSync(path.join(os.tmpdir(), "lock-"));
     const file = path.join(dir, "todos.json");
     const lock = boardLockPath(file);
-    const longAgo = new Date(Date.now() - BOARD_LOCK_STALE_AGE_MS - 5_000).toISOString();
-    writeFileSync(lock, JSON.stringify({ pid: process.pid, writer: "cli", at: longAgo }));
+    const hoursAgo = new Date(Date.now() - 6 * 60 * 60_000).toISOString();
+    writeFileSync(lock, JSON.stringify({ pid: process.pid, writer: "cli", at: hoursAgo }));
 
     const got = acquireBoardLock(file, { waitMs: 200 });
-    expect(got.ok).toBe(true);
-    releaseBoardLock(got.lock);
+    expect(got.ok).toBe(false);
+    expect(got.reason).toBe("TIMEOUT");
+    const content = JSON.parse(readFileSync(lock, "utf8"));
+    expect(content.pid).toBe(process.pid);
+    rmSync(lock);
   });
 
   it("shares one lock across two different-case spellings of the same path", () => {
@@ -257,6 +261,66 @@ describe("sweepOrphanTmp", () => {
     expect(existsSync(file)).toBe(true);
     expect(existsSync(`${file}.123.tmp`)).toBe(false);
     expect(existsSync(`${file}.notanumber.tmp`)).toBe(true);
+  });
+});
+
+describe("board lock — the rename guard (t#598)", () => {
+  let dir;
+  afterEach(() => {
+    if (dir) rmSync(dir, { recursive: true, force: true });
+    dir = null;
+  });
+
+  it("leaves the lock file untouched and lets the rename through while the lock is still ours", () => {
+    dir = mkdtempSync(path.join(os.tmpdir(), "lock-"));
+    const file = path.join(dir, "todos.json");
+    const held = acquireBoardLock(file, { waitMs: 0 });
+    expect(held.ok).toBe(true);
+    const before = readFileSync(held.lock, "utf8");
+
+    const tmp = `${file}.${process.pid}.tmp`;
+    writeFileSync(tmp, "content");
+    renameWithRetry(tmp, file);
+
+    expect(readFileSync(file, "utf8")).toBe("content");
+    const after = readFileSync(held.lock, "utf8");
+    expect(after).toBe(before);
+    releaseBoardLock(held.lock);
+  });
+
+  it("refuses the rename once the lock it held was stolen out from under it", () => {
+    dir = mkdtempSync(path.join(os.tmpdir(), "lock-"));
+    const file = path.join(dir, "todos.json");
+    const held = acquireBoardLock(file, { waitMs: 0 });
+    expect(held.ok).toBe(true);
+
+    writeFileSync(held.lock, JSON.stringify({ pid: DEAD_PID, writer: "cli", at: new Date().toISOString() }));
+
+    const tmp = `${file}.${process.pid}.tmp`;
+    writeFileSync(tmp, "content");
+    expect(() => renameWithRetry(tmp, file)).toThrow(BoardLockedError);
+    expect(existsSync(file)).toBe(false);
+    expect(existsSync(tmp)).toBe(true);
+
+    rmSync(held.lock);
+    rmSync(tmp);
+  });
+
+  it("does not guard a rename for a file this process never locked", () => {
+    dir = mkdtempSync(path.join(os.tmpdir(), "lock-"));
+    const file = path.join(dir, "todos.json");
+    const tmp = `${file}.${process.pid}.tmp`;
+    writeFileSync(tmp, "content");
+
+    renameWithRetry(tmp, file);
+
+    expect(readFileSync(file, "utf8")).toBe("content");
+  });
+
+  it("reaffirmBoardLock throws BoardLockedError when the lock is missing", () => {
+    dir = mkdtempSync(path.join(os.tmpdir(), "lock-"));
+    const lock = boardLockPath(path.join(dir, "todos.json"));
+    expect(() => reaffirmBoardLock(lock)).toThrow(BoardLockedError);
   });
 });
 

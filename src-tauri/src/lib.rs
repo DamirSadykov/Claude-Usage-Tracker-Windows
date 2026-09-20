@@ -1736,7 +1736,7 @@ async fn get_task_costs(
     if attr.is_none() && events.is_empty() {
         return Ok(None);
     }
-    let board = todos::load(&todos_path(&app)?);
+    let board = todos::load_known(&todos_path(&app)?)?;
     let usage = stats.sessions_all().map_err(|e| e.to_string())?;
     let blocks = task_sessions::blocks(&events, &session_ends(&usage));
     Ok(Some(task_cost::compute(
@@ -1757,7 +1757,7 @@ async fn get_task_blocks(
     stats: tauri::State<'_, Arc<StatsDb>>,
     task: Option<String>,
 ) -> Result<task_sessions::TaskBlocks, String> {
-    let board = todos::load(&todos_path(&app)?);
+    let board = todos::load_known(&todos_path(&app)?)?;
     let events = task_sessions::load(&task_sessions_path(&app)?);
     let usage = stats.sessions_all().map_err(|e| e.to_string())?;
     let mut blocks = task_sessions::blocks(&events, &session_ends(&usage));
@@ -1788,7 +1788,7 @@ async fn get_task_graph(
     change: String,
     format: Option<String>,
 ) -> Result<graph::TaskGraph, String> {
-    let board = todos::load(&todos_path(&app)?);
+    let board = todos::load_known(&todos_path(&app)?)?;
     let events = task_sessions::load(&task_sessions_path(&app)?);
     let usage = stats.sessions_all().map_err(|e| e.to_string())?;
     // The whole-task yardstick is judged over ALL blocks, then the graph keeps
@@ -2596,11 +2596,11 @@ fn install_codex_hook(app: AppHandle) -> Result<String, String> {
 /// the commands refresh it under the same lock right after they write, so the
 /// tracker's OWN edits never look like an external change (see `spawn_todos_watch`).
 #[derive(Default)]
-struct TodoSnapshot(Mutex<HashMap<String, String>>);
+struct TodoSnapshot(Mutex<Option<HashMap<String, String>>>);
 
 /// Pushed to the main window when a todo moves into `review`/`done` by an
 /// external writer (the cc-todos CLI, a Claude session, a hand-edit).
-#[derive(Serialize, Clone)]
+#[derive(Serialize, Clone, Debug, PartialEq)]
 struct TodoStatusAlert {
     subject: String,
     status: String,
@@ -2614,6 +2614,27 @@ fn todo_status_map(file: &todos::TodoFile) -> HashMap<String, String> {
         .collect()
 }
 
+fn diff_snapshot(
+    prev: Option<&HashMap<String, String>>,
+    file: &todos::TodoFile,
+) -> (HashMap<String, String>, Vec<TodoStatusAlert>) {
+    let mut alerts = Vec::new();
+    if let Some(prev) = prev {
+        for t in &file.todos {
+            let into_target = t.status == "review" || t.status == "done";
+            let changed = prev.get(&t.id).map(|s| s != &t.status).unwrap_or(false);
+            if into_target && changed {
+                alerts.push(TodoStatusAlert {
+                    subject: t.subject.clone(),
+                    status: t.status.clone(),
+                    project: t.project.clone(),
+                });
+            }
+        }
+    }
+    (todo_status_map(file), alerts)
+}
+
 /// Mutate the todo store atomically AND keep [`TodoSnapshot`] in lockstep. The
 /// snapshot is updated under the same lock the watcher takes, spanning the file
 /// write, so the watcher can never observe the new file with a stale snapshot
@@ -2625,28 +2646,24 @@ fn write_todos_locked(
     let path = todos_path(app)?;
     let snap = app.state::<TodoSnapshot>();
     let mut guard = snap.0.lock().unwrap();
-    let _board_lock = board_lock::acquire(&path).map_err(|e| e.to_string())?;
-    let mut file = todos::load_for_write(&path)?;
-    // Backfill task numbers for any legacy/hand-edited rows before mutating, so
-    // every persisted file has stable `#N` references (upsert numbers new tasks).
-    todos::ensure_numbers(&mut file);
-    mutate(&mut file);
-    todos::save(&path, &file)?;
-    *guard = todo_status_map(&file);
+    let (file, ()) = todos::transact(&path, |file| {
+        todos::ensure_numbers(file);
+        mutate(file);
+        Ok(())
+    })?;
+    *guard = Some(todo_status_map(&file));
     Ok(file.todos)
 }
 
 fn write_todos_locked_replace(
     app: &AppHandle,
-    mut file: todos::TodoFile,
+    file: todos::TodoFile,
 ) -> Result<Vec<todos::Todo>, String> {
     let path = todos_path(app)?;
     let snap = app.state::<TodoSnapshot>();
     let mut guard = snap.0.lock().unwrap();
-    let _board_lock = board_lock::acquire(&path).map_err(|e| e.to_string())?;
-    todos::ensure_numbers(&mut file);
-    todos::save(&path, &file)?;
-    *guard = todo_status_map(&file);
+    let file = todos::replace_locked(&path, file)?;
+    *guard = Some(todo_status_map(&file));
     Ok(file.todos)
 }
 
@@ -2792,7 +2809,7 @@ fn export_todos(app: AppHandle, path: String) -> Result<usize, String> {
     let mut file = todos::load_checked_for_read(&board_path)?;
     todos::ensure_numbers(&mut file);
     let count = file.todos.len();
-    todos::save(target_path, &file)?;
+    todos::write_export(target_path, &file)?;
     Ok(count)
 }
 
@@ -2802,7 +2819,7 @@ fn export_todos(app: AppHandle, path: String) -> Result<usize, String> {
 fn preview_todo_import(app: AppHandle, path: String) -> Result<todos::ImportReport, String> {
     let content = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
     let incoming = todos::parse_import(&content)?;
-    let mut local = todos::load(&todos_path(&app)?);
+    let mut local = todos::load_known(&todos_path(&app)?)?;
     todos::ensure_numbers(&mut local);
     let now = chrono::Utc::now().to_rfc3339();
     let (_, report) = todos::merge_import(&local, &incoming, &now);
@@ -2893,22 +2910,21 @@ fn spawn_todos_watch(app: AppHandle) {
         {
             let snap = app.state::<TodoSnapshot>();
             let mut guard = snap.0.lock().unwrap();
-            match board_lock::acquire(&path) {
-                Ok(_board_lock) => match todos::load_for_write(&path) {
-                    Ok(mut file) => {
-                        if todos::ensure_numbers(&mut file) {
-                            let _ = todos::save(&path, &file);
-                        }
-                        *guard = todo_status_map(&file);
-                    }
-                    Err(e) => {
-                        warn!("todos watcher startup: board not writable, skipping number backfill: {e}");
-                        *guard = todo_status_map(&todos::load(&path));
-                    }
-                },
-                Err(e) => {
+            match todos::transact_if(&path, |file| Ok((todos::ensure_numbers(file), ()))) {
+                Ok((file, ())) => {
+                    *guard = Some(todo_status_map(&file));
+                }
+                Err(todos::TransactError::Lock(e)) => {
                     warn!("todos watcher startup: board lock unavailable, skipping number backfill: {e}");
-                    *guard = todo_status_map(&todos::load(&path));
+                    *guard = todos::load_known(&path).ok().map(|f| todo_status_map(&f));
+                }
+                Err(todos::TransactError::Unwritable(e)) => {
+                    warn!("todos watcher startup: board not writable, skipping number backfill: {e}");
+                    *guard = todos::load_known(&path).ok().map(|f| todo_status_map(&f));
+                }
+                Err(todos::TransactError::Failed(e)) => {
+                    warn!("todos watcher startup: number backfill failed: {e}");
+                    *guard = todos::load_known(&path).ok().map(|f| todo_status_map(&f));
                 }
             }
         }
@@ -2934,21 +2950,14 @@ fn spawn_todos_watch(app: AppHandle) {
             let alerts: Vec<TodoStatusAlert> = {
                 let snap = app.state::<TodoSnapshot>();
                 let mut guard = snap.0.lock().unwrap();
-                let file = todos::load(&path);
-                let mut out = Vec::new();
-                for t in &file.todos {
-                    let into_target = t.status == "review" || t.status == "done";
-                    let changed = guard.get(&t.id).map(|s| s != &t.status).unwrap_or(false);
-                    if into_target && changed {
-                        out.push(TodoStatusAlert {
-                            subject: t.subject.clone(),
-                            status: t.status.clone(),
-                            project: t.project.clone(),
-                        });
+                match todos::load_known(&path) {
+                    Ok(file) => {
+                        let (map, alerts) = diff_snapshot(guard.as_ref(), &file);
+                        *guard = Some(map);
+                        alerts
                     }
+                    Err(_) => Vec::new(),
                 }
-                *guard = todo_status_map(&file);
-                out
             };
             if alerts.is_empty() {
                 continue;
@@ -3582,5 +3591,47 @@ mod hook_install_tests {
         assert!(!plan_installed(&root));
         wire_hook_event_matched(&mut root, "PreToolUse", "ExitPlanMode", GUARD_CMD);
         assert!(plan_installed(&root));
+    }
+}
+
+#[cfg(test)]
+mod todo_snapshot_tests {
+    use super::*;
+
+    fn todo(id: &str, status: &str) -> todos::Todo {
+        todos::Todo {
+            id: id.to_string(),
+            subject: format!("task {id}"),
+            status: status.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn board(todos: Vec<todos::Todo>) -> todos::TodoFile {
+        todos::TodoFile { todos, ..Default::default() }
+    }
+
+    #[test]
+    fn no_prior_snapshot_seeds_the_map_without_alerting() {
+        let file = board(vec![todo("a", "review")]);
+        let (map, alerts) = diff_snapshot(None, &file);
+        assert!(alerts.is_empty());
+        assert_eq!(map.get("a"), Some(&"review".to_string()));
+    }
+
+    #[test]
+    fn a_task_moving_into_done_since_the_prior_snapshot_alerts_once() {
+        let prev: HashMap<String, String> = [("a".to_string(), "queue".to_string())].into();
+        let file = board(vec![todo("a", "done")]);
+        let (_, alerts) = diff_snapshot(Some(&prev), &file);
+        assert_eq!(alerts, vec![TodoStatusAlert { subject: "task a".to_string(), status: "done".to_string(), project: None }]);
+    }
+
+    #[test]
+    fn a_task_moving_into_a_non_target_status_does_not_alert() {
+        let prev: HashMap<String, String> = [("a".to_string(), "queue".to_string())].into();
+        let file = board(vec![todo("a", "in_progress")]);
+        let (_, alerts) = diff_snapshot(Some(&prev), &file);
+        assert!(alerts.is_empty());
     }
 }

@@ -3,7 +3,6 @@ import path from "node:path";
 
 const envWaitMs = Number(process.env.BOARD_LOCK_WAIT_MS);
 export const BOARD_LOCK_WAIT_MS = envWaitMs > 0 ? envWaitMs : 15_000;
-export const BOARD_LOCK_STALE_AGE_MS = 10 * 60_000;
 export const BOARD_LOCK_UNREADABLE_STALE_MS = 30_000;
 const POLL_MS = 25;
 
@@ -109,11 +108,7 @@ function isPidAlive(pid) {
 
 function isStale(info) {
   if (!info.parsed) return Date.now() - info.mtimeMs > BOARD_LOCK_UNREADABLE_STALE_MS;
-  if (!isPidAlive(info.parsed.pid)) return true;
-  const atMs = Date.parse(info.parsed.at);
-  if (Number.isNaN(atMs)) return Date.now() - info.mtimeMs > BOARD_LOCK_UNREADABLE_STALE_MS;
-  const age = Math.max(0, Date.now() - atMs);
-  return age > BOARD_LOCK_STALE_AGE_MS;
+  return !isPidAlive(info.parsed.pid);
 }
 
 function stealStaleLock(lock) {
@@ -175,7 +170,22 @@ function lockedMessage(lock, info) {
   return `board locked (contents unreadable): ${lock}`;
 }
 
+export function reaffirmBoardLock(lock) {
+  const info = readLockInfo(lock);
+  const owner = info.parsed;
+  if (!owner || owner.pid !== process.pid) {
+    throw new BoardLockedError(lockedMessage(lock, info), {
+      lockPath: lock,
+      pid: owner ? owner.pid : null,
+      writer: owner ? owner.writer : null,
+      at: owner ? owner.at : null,
+    });
+  }
+}
+
 export function renameWithRetry(tmp, file, { retries = 5, delayMs = 50 } = {}) {
+  const lock = boardLockPath(file);
+  if (active.has(lock)) reaffirmBoardLock(lock);
   for (let attempt = 0; ; attempt++) {
     try {
       fs.renameSync(tmp, file);
