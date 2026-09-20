@@ -860,7 +860,7 @@ pub fn to_d2(graph: &TaskGraph) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::todos::StatusChange;
+    use crate::todos::{StatusChange, CURRENT_VERSION};
 
     fn todo(id: &str, number: u32, subject: &str) -> Todo {
         Todo {
@@ -883,7 +883,7 @@ mod tests {
     }
 
     fn board(todos: Vec<Todo>) -> TodoFile {
-        TodoFile { version: 2, todos, changes: Vec::new() }
+        TodoFile { version: CURRENT_VERSION, todos, changes: Vec::new() }
     }
 
     fn block(task: &str) -> TaskBlock {
@@ -1368,7 +1368,7 @@ mod tests {
 #[cfg(test)]
 mod change_record_tests {
     use super::*;
-    use crate::todos::{Change, StatusChange};
+    use crate::todos::{Change, StatusChange, CURRENT_VERSION};
 
     fn todo(id: &str, number: u32, change_id: Option<&str>) -> Todo {
         Todo {
@@ -1408,7 +1408,7 @@ mod change_record_tests {
 
     fn board() -> TodoFile {
         TodoFile {
-            version: 2,
+            version: CURRENT_VERSION,
             todos: vec![
                 worked(todo("t-1", 1, Some("ch-1")), "2026-08-01T10:00:00Z", "2026-08-01T12:00:00Z"),
                 worked(todo("t-2", 2, Some("ch-1")), "2026-08-02T09:00:00Z", "2026-08-03T09:00:00Z"),

@@ -20,6 +20,7 @@ import type { PipelineMode } from "./pipeline/modes";
 import type { BoardChange } from "./pipeline/adapt";
 import { useProjectLinks } from "../projectLinks";
 import { useHotkeys } from "../hotkeys";
+import { BOARD_CURRENT_VERSION } from "../boardVersion";
 import {
   EXT_BUCKETS,
   resolveBucket,
@@ -145,8 +146,6 @@ const boardState = ref<BoardStateInfo | null>(null);
 const boardRecovering = computed(
   () => boardState.value !== null && boardState.value.state !== "ok",
 );
-
-const BOARD_CURRENT_VERSION = 2;
 
 async function loadBoardState() {
   try {
