@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { boardPath, loadBoard, loadBoardForWrite, saveBoard } from "./todos.mjs";
+import { boardPath, loadBoard, loadBoardForWrite, saveBoard, findChange, changeAddress } from "./board-io.mjs";
 import { withBoardLock } from "./board-lock.mjs";
+
+export { findChange, changeAddress } from "./board-io.mjs";
 
 export const CHANGE_REF = /^c\s*#?\s*(\d+)$/i;
 
@@ -23,12 +25,6 @@ export function nextChangeNumber(data) {
     if (typeof c.number === "number" && c.number > max) max = c.number;
   }
   return max + 1;
-}
-
-export function changeAddress(change) {
-  if (!change) return "";
-  if (change.legacy) return `t#${change.number}`;
-  return `c#${change.number}`;
 }
 
 export function createChange(data, fields = {}) {
@@ -63,15 +59,6 @@ export function byRecency(a, b) {
 
 export function sortedChanges(data) {
   return [...changesOf(data)].sort(byRecency);
-}
-
-export function findChange(data, ref) {
-  const parsed = parseChangeRef(ref);
-  if (!parsed) return null;
-  const list = changesOf(data);
-  if (parsed.number !== undefined)
-    return list.find((c) => c.number === parsed.number) ?? null;
-  return list.find((c) => c.id === parsed.id) ?? null;
 }
 
 export function findChangeByTitle(data, title, project) {
@@ -206,7 +193,7 @@ function fail(msg) {
   process.exit(1);
 }
 
-function parseArgs(args) {
+export function parseArgs(args) {
   const flags = {};
   const positional = [];
   for (let i = 0; i < args.length; i++) {
@@ -443,31 +430,6 @@ function cmdSet(args) {
   process.stdout.write(`ok: ${changeAddress(change)} ${field} -> ${shown}\n`);
 }
 
-async function cmdMigrate(args) {
-  const { flags } = parseArgs(args);
-  const { describe: describeMigration, migrate } = await import("./change-migrate.mjs");
-  const file = boardPath();
-  withBoardLock(file, () => {
-    const data = flags.go ? loadBoardForWrite(file) : loadBoard(file);
-    const lines = describeMigration(data);
-    if (!lines.length) {
-      process.stdout.write("нечего мигрировать: ни одного корня с флагом на доске\n");
-      return;
-    }
-    process.stdout.write(lines.join("\n") + "\n");
-    if (!flags.go) {
-      process.stdout.write("\nсухой прогон, ничего не записано — повтори с --go\n");
-      return;
-    }
-    const result = migrate(data);
-    saveBoard(file, data);
-    for (const note of result.notes) process.stdout.write(`note: ${note}\n`);
-    process.stdout.write(
-      `ok: ${result.created.length} запис(и) заведено, ${result.roots} корней снято с доски\n`,
-    );
-  });
-}
-
 export function run(args) {
   const [cmd, ...rest] = args;
   if (!cmd || cmd === "-h" || cmd === "--help" || cmd === "help") {
@@ -479,6 +441,5 @@ export function run(args) {
   if (cmd === "show") return cmdShow(rest);
   if (cmd === "close") return cmdClose(rest);
   if (cmd === "set") return cmdSet(rest);
-  if (cmd === "migrate") return cmdMigrate(rest);
   fail(`unknown command: ${cmd}\n\n${USAGE}`);
 }

@@ -21,6 +21,8 @@ import path from "node:path";
 
 import { listDomainIds, loadDomain, resolveRoot, resolveAddress } from "./spec.mjs";
 import { roamingBase } from "./settings.mjs";
+import { meterFile, readAsks, coverageOf } from "./spec-meter.mjs";
+import { changeRootsFor, loadBoard, resolveTask, specAddressesForManual } from "./board-io.mjs";
 
 // Letters and digits only, the same normalisation the handoff guard uses on a
 // baton (`stop-hook.mjs::norm`) — punctuation, markdown and code fences all
@@ -296,11 +298,8 @@ function fail(msg) {
 }
 
 // What the board already knows about this task: the addresses it (or its change
-// root) carries, and the text worth matching when the caller gave none. Read
-// through todos.mjs dynamically, the way the rest of the registry reads the
-// board — a match must not take a static dependency on it.
-async function fromBoard(token) {
-  const { loadBoard, resolveTask, changeRootsFor, specAddressesForManual } = await import("./todos.mjs");
+// root) carries, and the text worth matching when the caller gave none.
+function fromBoard(token) {
   const data = loadBoard();
   const todo = resolveTask(data, token);
   if (!todo) fail(`refusing: no task matches "${token}"`);
@@ -341,10 +340,6 @@ const USAGE =
 // a lost measurement must not cost anyone an answer.
 const QUERY_KEPT = 120;
 
-export function meterFile() {
-  return path.join(roamingBase(), "com.claude-usage-tracker.app", "spec-match.jsonl");
-}
-
 export function noteAsk(fields) {
   try {
     const file = meterFile();
@@ -353,47 +348,6 @@ export function noteAsk(fields) {
   } catch {
     // measuring must never break the thing it measures
   }
-}
-
-export function readAsks(file = meterFile()) {
-  let raw;
-  try {
-    raw = readFileSync(file, "utf8");
-  } catch {
-    return [];
-  }
-  return raw
-    .split("\n")
-    .filter((l) => l.trim())
-    .map((l) => {
-      try {
-        return JSON.parse(l);
-      } catch {
-        return null;
-      }
-    })
-    .filter(Boolean);
-}
-
-export function coverageOf(asks, project) {
-  const rows = project ? asks.filter((a) => a.project === project) : asks;
-  const empty = rows.filter((a) => a.zero);
-  let streak = 0;
-  for (let i = rows.length - 1; i >= 0 && rows[i].zero; i--) streak++;
-  const byQuery = new Map();
-  for (const a of empty) {
-    const key = String(a.query ?? "").toLowerCase();
-    byQuery.set(key, (byQuery.get(key) ?? 0) + 1);
-  }
-  return {
-    asks: rows.length,
-    empty: empty.length,
-    hit: rows.length - empty.length,
-    share: rows.length ? Number((empty.length / rows.length).toFixed(2)) : 0,
-    streak,
-    recent: empty.slice(-10).map((a) => ({ at: String(a.ts).slice(0, 10), query: a.query, task: a.task ?? null })),
-    repeated: [...byQuery.entries()].filter(([, n]) => n > 1).sort((a, b) => b[1] - a[1]),
-  };
 }
 
 // Long queries make long hit lists, and a wall of matched words is not evidence
@@ -422,7 +376,7 @@ export async function run(args) {
   let linked = [];
   let todo = null;
   if (flags.task) {
-    const board = await fromBoard(flags.task);
+    const board = fromBoard(flags.task);
     linked = board.linked;
     todo = board.todo;
     if (!text.trim()) text = board.text;

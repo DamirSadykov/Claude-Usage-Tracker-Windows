@@ -40,38 +40,17 @@
 // Exit code is non-zero on any error (bad status, unknown id, usage), so a
 // caller can tell success from failure.
 
-import { readFileSync, writeFileSync, appendFileSync, mkdirSync } from "node:fs";
+import { readFileSync, appendFileSync, mkdirSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { spawn, execFileSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { matchPlanCli, specsEnabled } from "./settings.mjs";
 import { resolveAddress, showSection, sectionFingerprint, blocksOf } from "./spec.mjs";
-import { findChange, changeAddress } from "./change.mjs";
-import { withBoardLock, renameWithRetry } from "./board-lock.mjs";
-import { CURRENT, BoardUnreadableError, readBoardTolerant, recoveryLine, refusalFor } from "./board-recover.mjs";
+import { findChange, changeAddress, CURRENT, BoardUnreadableError, STATUSES, col, isDone, isChangeRoot, normalizeLimit, todosPath, load, save, boardPath, loadBoard, assertBoardWritable, loadBoardForWrite, saveBoard, withDeferredSave, resolveTask, changeRootsFor, changeAsRoot, specAddressesForManual } from "./board-io.mjs";
+import { withBoardLock } from "./board-lock.mjs";
 
-export { CURRENT, BoardUnreadableError };
-
-// Kanban columns, in board order. Keep in lockstep with todos.rs::STATUSES.
-export const STATUSES = ["backlog", "queue", "in_progress", "review", "done"];
-
-// Normalize a possibly-legacy status to a real column. Pre-column tasks stored
-// `pending`; the tracker migrates them to `backlog` on load and the SessionStart
-// hook does the same — mirror it so `--status` matches what the board shows.
-const col = (s) => (STATUSES.includes(s) ? s : "backlog");
-
-// A task counts as "done" iff its normalized column is `done` (review ≠ done —
-// still a gate). Shared by the ready frontier and the done-gate so both read the
-// dependency graph the same way.
-export const isDone = (t) => !!t && col(t.status) === "done";
-
-// A task counts as a CHANGE root when either the current field (`change`) or
-// the field it replaces (`theme`, t#345) is set on it — the same read-old/write-
-// new alias `col()` uses above for the pre-column `pending` status. Only
-// `change` is ever written from here on; `theme` is read so an existing file
-// keeps working until its rows are next saved.
-export const isChangeRoot = (t) => !!(t && (t.change ?? t.theme));
+export { findChange, changeAddress, CURRENT, BoardUnreadableError, STATUSES, col, isDone, isChangeRoot, normalizeLimit, boardPath, loadBoard, assertBoardWritable, loadBoardForWrite, saveBoard, withDeferredSave, resolveTask, changeRootsFor, changeAsRoot, specAddressesForManual } from "./board-io.mjs";
 
 // The READY predicate of the frontier (#88): a task is workable when it is not
 // closed and every task it depends_on IS closed. Exported so `ready`, `pipeline`
@@ -126,43 +105,6 @@ function normalizePriority(v) {
 // «никаких значений из воздуха»). The plan notations `<=M` (§11) and `$N` (§13)
 // are accepted verbatim, so a limit copied out of a `## Steps` block lands
 // without hand-editing.
-export function normalizeLimit(value, { integer = true } = {}) {
-  if (value == null || value === true) return undefined;
-  const s = String(value).trim().toLowerCase();
-  if (s === "" || s === "none" || s === "clear" || s === "off") return null;
-  const num = s.replace(/^<=/, "").replace(/^\$/, "").trim();
-  if (!/^\d+(\.\d+)?$/.test(num)) return undefined;
-  const n = Number(num);
-  if (!Number.isFinite(n) || n <= 0) return undefined;
-  if (integer && !Number.isInteger(n)) return undefined;
-  return n;
-}
-
-// Same location the tracker and the hook use: the app data dir on Windows.
-function todosPath() {
-  const appData =
-    process.env.APPDATA ||
-    path.join(process.env.USERPROFILE || "", "AppData", "Roaming");
-  return path.join(appData, "com.claude-usage-tracker.app", "todos.json");
-}
-
-// A missing/corrupt file yields an empty store rather than throwing — same
-// forgiving contract as todos.rs::load.
-const printedRecovery = new Set();
-
-function load(file) {
-  const { data, issue } = readBoardTolerant(file);
-  hydrateProcessAliases(data);
-  if (issue) {
-    const key = `${issue.kind}:${file}`;
-    if (!printedRecovery.has(key)) {
-      printedRecovery.add(key);
-      process.stderr.write(recoveryLine(issue) + "\n");
-    }
-    Object.defineProperty(data, "__boardIssue", { value: issue, enumerable: false, configurable: true });
-  }
-  return data;
-}
 
 // Association groups live next to todos.json (project-groups.json), written by
 // the app. Sibling of `todosPath`. See src-tauri/src/project_groups.rs.
@@ -195,107 +137,12 @@ function relatedProjects(project) {
   return [...set].sort();
 }
 
-// Atomic write: serialize to a sibling temp file, then rename over the target
-// (rename replaces the destination on Windows). 2-space pretty-print matches the
-// tracker's serde output so hand-readable diffs stay stable.
-function save(file, data) {
-  const issue = data && data.__boardIssue;
-  if (issue) throw refusalFor(issue);
-  if (deferred) {
-    deferred.dirty = true;
-    return;
-  }
-  data.version = CURRENT;
-  const wire = structuredClone(data);
-  migrateToV3(wire);
-  wire.version = CURRENT;
-  const tmp = `${file}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify(wire, null, 2) + "\n");
-  renameWithRetry(tmp, file);
-}
-
-const TODO_PROCESS_FIELDS = ["produces", "verify", "retry_limit", "on_issue", "budget_usd", "parallel_limit", "outcome", "outcome_reason", "outcome_at", "handout_at"];
-const CHANGE_PROCESS_FIELDS = ["spec", "budget_usd", "parallel_limit"];
-
-function aliasProcess(row, fields) {
-  if (!row || typeof row !== "object" || !row.ext?.process || typeof row.ext.process !== "object") return;
-  for (const field of fields) {
-    if (!Object.hasOwn(row.ext.process, field) || Object.hasOwn(row, field)) continue;
-    Object.defineProperty(row, field, { value: row.ext.process[field], writable: true, configurable: true, enumerable: true });
-  }
-}
-
-function hydrateProcessAliases(data) {
-  if (data?.version < 3) return;
-  for (const todo of data.todos || []) aliasProcess(todo, TODO_PROCESS_FIELDS);
-  for (const change of data.changes || []) aliasProcess(change, CHANGE_PROCESS_FIELDS);
-}
-
-function moveProcess(row, fields) {
-  if (!row || typeof row !== "object") return;
-  const ext = row.ext && typeof row.ext === "object" && !Array.isArray(row.ext) ? row.ext : {};
-  const process = ext.process && typeof ext.process === "object" && !Array.isArray(ext.process) ? ext.process : {};
-  for (const field of fields) {
-    if (row[field] !== undefined) process[field] = row[field];
-    else delete process[field];
-    delete row[field];
-  }
-  if (Object.keys(process).length) ext.process = process;
-  if (Object.keys(ext).length) row.ext = ext;
-}
-
-function migrateToV3(data) {
-  for (const todo of data.todos || []) moveProcess(todo, TODO_PROCESS_FIELDS);
-  for (const change of data.changes || []) moveProcess(change, CHANGE_PROCESS_FIELDS);
-}
-
-// A command that writes ONE row saves after it and is atomic by construction.
-// `apply` writes a whole graph — a task, its edges, its declarations, then the
-// next — and every one of those steps saved on its own: dozens of writes, each a
-// chance to fail with the board half-built. It did fail (EPERM, the app holding
-// the file), and the re-run forked the graph into duplicate tasks.
-//
-// So the unit of atomicity becomes the CALLER's, not the field's: inside this
-// wrapper every save() only marks the board dirty, and the single write happens
-// at the end. A throw anywhere in between leaves the file untouched — the run is
-// all or nothing, which is what makes re-running the same file safe.
-let deferred = null;
-
-export function withDeferredSave(file, data, fn) {
-  if (deferred) return fn();
-  deferred = { dirty: false };
-  let out;
-  try {
-    out = fn();
-  } catch (e) {
-    // A pass that threw is a pass that did not happen: drop the accumulated
-    // changes rather than writing whatever got as far as memory.
-    deferred = null;
-    throw e;
-  }
-  const dirty = deferred.dirty;
-  deferred = null;
-  if (dirty) save(file, data);
-  return out;
-}
 
 function fail(msg) {
   process.stderr.write(msg + "\n");
   process.exit(1);
 }
 
-// The board file and its forgiving load / atomic save, for the sibling commands
-// that write through this module's rules (`apply`, t#314) instead of re-deriving
-// the path and the JSON contract on their own.
-export const boardPath = () => todosPath();
-export const loadBoard = (file = todosPath()) => load(file);
-export function assertBoardWritable(data) {
-  const issue = data && data.__boardIssue;
-  if (issue) throw refusalFor(issue);
-  return data;
-}
-export const loadBoardForWrite = (file = todosPath()) => assertBoardWritable(load(file));
-export const saveBoard = (file, data) => save(file, data);
 
 export function taskSessionsPath() {
   const appData =
@@ -1603,20 +1450,6 @@ function cmdList(args) {
 // `#N` reference, or the `t#N` task-link form the hook/README train the agent to
 // write — the graph/dep CLI is friendlier with the human-facing notation the
 // board shows. Returns undefined if nothing matches.
-export function resolveTask(data, token) {
-  const t = String(token ?? "").trim();
-  if (!t) return undefined;
-  const byId = data.todos.find((x) => x && x.id === t);
-  if (byId) return byId;
-  // Strip an optional leading `t` (task-link form) then an optional `#`.
-  const num = t.replace(/^t?#?/i, "");
-  if (/^\d+$/.test(num)) {
-    const n = parseInt(num, 10);
-    return data.todos.find((x) => x && x.number === n);
-  }
-  return undefined;
-}
-
 // The board a task belongs to, normalized (global = ""). Mirrors todos.rs::board_of.
 const boardOf = (t) => t.project || "";
 
@@ -1878,50 +1711,6 @@ function directPrereqs(data, t) {
 // (an outer change wrapping an inner one stays out of view). Exported for the
 // SessionStart hook (hook.mjs), which surfaces the same vision for in_progress
 // tasks.
-export function changeAsRoot(record, data) {
-  if (!record) return null;
-  const members = (data?.todos ?? []).filter((x) => x && x.change_id === record.id);
-  const closed = members.length > 0 && members.every((x) => isDone(x));
-  return {
-    id: record.id,
-    number: record.number,
-    address: `c#${record.number}`,
-    subject: record.title,
-    description: record.delta ?? "",
-    plan: record.plan ?? "",
-    spec: Array.isArray(record.spec) ? [...record.spec] : [],
-    status: closed ? "done" : "queue",
-    budget_usd: record.budget_usd,
-    parallel_limit: record.parallel_limit,
-    record: true,
-    depends_on: members.map((x) => x.id),
-  };
-}
-
-export function changeRootsFor(data, t) {
-  if (t?.change_id) {
-    const record = (data?.changes ?? []).find((c) => c && c.id === t.change_id);
-    if (record) return [changeAsRoot(record, data)];
-  }
-  const roots = [];
-  const seen = new Set([t.id]);
-  let frontier = [t.id];
-  while (frontier.length) {
-    const next = [];
-    for (const id of frontier) {
-      for (const d of data.todos) {
-        if (!d || seen.has(d.id)) continue;
-        if (!Array.isArray(d.depends_on) || !d.depends_on.includes(id)) continue;
-        seen.add(d.id);
-        if (isChangeRoot(d)) roots.push(d);
-        else next.push(d.id);
-      }
-    }
-    frontier = next;
-  }
-  return roots;
-}
-
 // Human-readable block of the vision a task inherits from its change root(s)
 // — the counterpart of formatInheritedHandoff for the OTHER direction: handoff
 // flows down the dep edges, the vision is read UP them (t#255 field roles: a
@@ -1947,22 +1736,6 @@ export function formatChangeVision(t, roots) {
 // also inherits its root's, so the two can't double-print the same address.
 // Addresses collected from several roots are deduped in encounter order, since
 // two branches can name the same section.
-function resolveSpecAddresses(t, roots) {
-  const own = Array.isArray(t.spec) ? t.spec.filter(Boolean) : [];
-  if (own.length) return { source: "task", addresses: own };
-  const seen = new Set();
-  const addresses = [];
-  for (const r of roots) {
-    for (const a of Array.isArray(r.spec) ? r.spec.filter(Boolean) : []) {
-      if (!seen.has(a)) {
-        seen.add(a);
-        addresses.push(a);
-      }
-    }
-  }
-  return { source: "root", addresses };
-}
-
 // THE choke point every AUTOMATIC consumer goes through (the SessionStart
 // injection, the section printed on the move into in_progress, baseline
 // recording) — GATED BY DEFAULT: `specsEnabled` false (the default) turns it
@@ -1974,15 +1747,7 @@ function resolveSpecAddresses(t, roots) {
 // caller passes `appData` — there is no way to reach it and skip the check.
 export function specAddressesFor(t, roots, appData) {
   if (!specsEnabled(appData)) return { source: "off", addresses: [] };
-  return resolveSpecAddresses(t, roots);
-}
-
-// The two manual `cli spec …` commands (spec.mjs::cmdAnswer, spec-match.mjs's
-// `fromBoard`) call THIS one, by name, instead — a link the user typed a
-// command about stays readable regardless of the automatic switch above. Named
-// so the opt-out is visible at the call site without opening this file.
-export function specAddressesForManual(t, roots) {
-  return resolveSpecAddresses(t, roots);
+  return specAddressesForManual(t, roots);
 }
 
 // One addressed section's block, in the exact three shapes `showSection` can
@@ -2551,26 +2316,6 @@ function dispatch(cmd, rest) {
     case "rm":
       cmdRemove(rest);
       break;
-    // Loaded lazily: the reconciliation reads transcripts and imports back from
-    // this module, so a static import would close a cycle and make every plain
-    // `todos list` pay for a parser it never uses.
-    case "outcome":
-      return import("./outcome.mjs").then((m) => m.run(rest));
-    // Same reason for the lazy load: the runner imports back from this module and
-    // pulls in the step executor, and a plain `todos list` must not pay for it.
-    case "run":
-      return import("./run.mjs").then((m) => m.run(rest));
-    // Lazy for the same reason: the file reader is dead weight for every command
-    // that is not recording a graph.
-    case "apply":
-      return import("./apply.mjs").then((m) => m.run(rest));
-    // Lazy too — it pulls in the rule table and the runner's change closure.
-    case "lint":
-      return import("./lint.mjs").then((m) => m.run(rest));
-    // Lazy as well: the field-run metric reads transcripts and the plan hook, and
-    // no ordinary board command should pay for either.
-    case "adoption":
-      return import("./adoption.mjs").then((m) => m.run(rest));
     case "comment":
       cmdComment(rest);
       break;

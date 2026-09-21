@@ -35,13 +35,17 @@ function closureOf(entry) {
   return seen;
 }
 
-function areaModules() {
+function modulesFromMap(name) {
   const text = readFileSync(path.join(ROOT, ENTRY), "utf8");
-  const block = text.match(/const AREAS = \{([\s\S]*?)\n\};/);
-  expect(block, "AREAS map in scripts/cli.mjs").toBeTruthy();
+  const block = text.match(new RegExp(`const ${name} = \\{([\\s\\S]*?)\\n\\};`));
+  expect(block, `${name} map in scripts/cli.mjs`).toBeTruthy();
   return [...block[1].matchAll(/["'](\.\/cli\/[^"']+\.mjs)["']/g)].map((m) =>
     path.posix.normalize(path.posix.join("scripts", m[1])),
   );
+}
+
+function areaModules() {
+  return [...modulesFromMap("AREAS"), ...modulesFromMap("SUBCOMMANDS")];
 }
 
 function bundledResources() {

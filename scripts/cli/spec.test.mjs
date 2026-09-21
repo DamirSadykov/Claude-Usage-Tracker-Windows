@@ -23,7 +23,8 @@ import {
   addSection,
   stampTitle,
 } from "./spec.mjs";
-import { matchSections, addressesIn, stem, buildCorpus, coverageOf } from "./spec-match.mjs";
+import { matchSections, addressesIn, stem, buildCorpus } from "./spec-match.mjs";
+import { coverageOf } from "./spec-meter.mjs";
 
 const cli = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "cli.mjs");
 
@@ -532,6 +533,21 @@ describe("cli spec — command wiring", () => {
     expect(out).toMatch(/ok:/);
     expect(out).toMatch(/tasks/);
     expect(out).toMatch(/usage-tracker/);
+  });
+
+  it("lint runs clean when the app data dir holds no todos.json", () => {
+    const appData = mkdtempSync(path.join(os.tmpdir(), "cut-spec-noboard-"));
+    try {
+      const out = execFileSync(process.execPath, [cli, "spec", "lint"], {
+        cwd: dir,
+        encoding: "utf8",
+        windowsHide: true,
+        env: { ...process.env, APPDATA: appData },
+      });
+      expect(out).toMatch(/ok:/);
+    } finally {
+      rmSync(appData, { recursive: true, force: true });
+    }
   });
 
   it("an empty registry is not a green light — lint says there is nothing to check and names the stray files", () => {
