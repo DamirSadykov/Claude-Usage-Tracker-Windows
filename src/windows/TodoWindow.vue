@@ -1,0 +1,4021 @@
+<script setup lang="ts">
+// Standalone task manager, rendered when index.html is loaded with the `#todos`
+// hash (see tauri.conf.json `todos` window). The tracker OWNS the todo list: the
+// user creates/edits tasks here, they're persisted to `todos.json` in the app
+// data dir, and a Claude Code SessionStart hook reads that file to surface the
+// active ones for the current project. Claude only flips `status` (and edits
+// details on request) by rewriting the same file.
+//
+// The view is a kanban board: one column per status, cards drag between columns
+// (which persists the new status). Columns mirror `todos.rs::STATUSES`.
+import { ref, computed, watch, onMounted, onUnmounted, nextTick } from "vue";
+import { useI18n, type Composer } from "vue-i18n";
+import { invoke } from "@tauri-apps/api/core";
+import ProjectAutocomplete from "../kernel/ProjectAutocomplete.vue";
+import ProjectLabel from "../kernel/ProjectLabel.vue";
+import GraphView from "../board/GraphView.vue";
+import SpecView from "../spec/SpecView.vue";
+import PipelineGraph from "../process/pipeline/PipelineGraph.vue";
+import type { PipelineMode } from "../process/pipeline/modes";
+import type { BoardChange, Comment, Todo } from "../contracts/board";
+import { useProjectLinks } from "../analytics/projectLinks";
+import { useHotkeys } from "../kernel/hotkeys";
+import { BOARD_CURRENT_VERSION } from "../board/boardVersion";
+import {
+  EXT_BUCKETS,
+  resolveBucket,
+  bucketClass,
+  STATUS_MAP_KEY,
+  type StatusMap,
+  type ExtBucketId,
+} from "../contracts/externalStatus";
+import i18n from "../kernel/i18n";
+import { useSettings } from "../kernel/settingsStore";
+import type { TriageDigest, DigestItem } from "../contracts/types";
+
+const { t, locale } = useI18n();
+
+// Apply a locale to BOTH this component's composer and the canonical global
+// i18n instance. Setting only the composer's `locale` proved unreliable in this
+// standalone window, so we also push it onto `i18n.global` directly.
+function applyLocale(l: string | null | undefined) {
+  if (l !== "en" && l !== "ru") return;
+  locale.value = l;
+  (i18n.global as Composer).locale.value = l;
+}
+
+// Each Tauri window is a separate WebView; vue-i18n boots from navigator language
+// and doesn't see the popup's saved locale. Follow the shared settings snapshot so
+// this window opens — and stays — in the language the user picked. (The main
+// window also pushes `todos-locale` on open; both paths call applyLocale.)
+const { settings, initSettings } = useSettings();
+watch(() => settings.value.locale, (l) => applyLocale(l));
+
+// Kanban columns, left to right — must match `todos.rs::STATUSES`. `dot` is the
+// column's accent colour, also used for each card's left stripe.
+interface Column {
+  id: string;
+  labelKey: string;
+  dot: string;
+}
+const COLUMNS: Column[] = [
+  { id: "backlog", labelKey: "colBacklog", dot: "#9aa0aa" },
+  { id: "queue", labelKey: "colQueue", dot: "#ffc107" },
+  { id: "in_progress", labelKey: "statusInProgress", dot: "#4cc2ff" },
+  { id: "review", labelKey: "colReview", dot: "#b388ff" },
+  { id: "done", labelKey: "statusDone", dot: "#6ccb5f" },
+];
+const COL_BY_ID: Record<string, Column> = Object.fromEntries(
+  COLUMNS.map((c) => [c.id, c]),
+);
+
+const todos = ref<Todo[]>([]);
+const changes = ref<BoardChange[]>([]);
+const loading = ref(true);
+const errorMsg = ref("");
+
+interface BoardStateInfo {
+  state: "ok" | "unreadable" | "future-version";
+  file: string;
+  backup?: string | null;
+  reason?: string | null;
+  version?: number | null;
+}
+const boardState = ref<BoardStateInfo | null>(null);
+const boardRecovering = computed(
+  () => boardState.value !== null && boardState.value.state !== "ok",
+);
+
+async function loadBoardState() {
+  try {
+    boardState.value = await invoke<BoardStateInfo>("board_state");
+  } catch {
+    boardState.value = null;
+    return;
+  }
+  if (boardState.value.state !== "ok") void loadLatestBoardBackup();
+}
+
+interface TodoBackupInfo {
+  name: string;
+  when_ms: number;
+}
+const latestBoardBackup = ref<TodoBackupInfo | null>(null);
+const restoringBoard = ref(false);
+
+async function loadLatestBoardBackup() {
+  try {
+    latestBoardBackup.value = await invoke<TodoBackupInfo | null>("latest_todo_backup");
+  } catch {
+    latestBoardBackup.value = null;
+  }
+}
+
+async function restoreBoardFromBackup() {
+  if (restoringBoard.value || !latestBoardBackup.value) return;
+  if (typeof window !== "undefined" && !window.confirm(t("migrateRestoreConfirm"))) return;
+  restoringBoard.value = true;
+  try {
+    await invoke("restore_todo_backup", {});
+    await loadTodos();
+  } catch (e) {
+    errorMsg.value = String(e);
+  } finally {
+    restoringBoard.value = false;
+  }
+}
+
+// Filters
+const projectFilter = ref<string>(""); // "" = all
+const showDone = ref(false);
+const search = ref("");
+
+// Drag-and-drop state: id of the card being dragged + id of the column hovered.
+const dragId = ref<string | null>(null);
+const overCol = ref<string | null>(null);
+
+// Live reload: a watcher in the backend emits `todos-file-changed` when
+// todos.json changes on disk (CLI / Claude / hand-edit). We defer the reload
+// while a drag or the form is open so it never yanks state from under the user.
+const pendingReload = ref(false);
+
+// Form state (doubles as create + edit). editingId === null → creating.
+const editingId = ref<string | null>(null);
+const fSubject = ref("");
+const fDescription = ref("");
+const fScheduled = ref("");
+const fPlan = ref("");
+const fProject = ref("");
+// Column a freshly created task lands in (set by the column's "+" button).
+const formStatus = ref("backlog");
+// Priority bucket for the new-task form; "" = unset. Mirrors todos.rs::PRIORITIES.
+const fPriority = ref("");
+const formOpen = ref(false);
+
+// Priority buckets, most→least important; "" = unset. The <select>s offer these
+// plus an empty option. Kept in lockstep with todos.rs / the cc-todos CLI.
+const PRIORITY_LEVELS = ["high", "medium", "low"] as const;
+
+const SUBJECT_LIMIT = 150;
+const fSubjectRemaining = computed(() => SUBJECT_LIMIT - fSubject.value.trim().length);
+const fSubjectOverLimit = computed(() => fSubjectRemaining.value < 0);
+
+// Projects the tracker has seen (from cc_usage), so the picker offers real
+// projects even before any todo uses them.
+const knownProjects = ref<string[]>([]);
+
+// Merge-link badges (issue #13). A task's `project` is stored raw, so it may be a
+// canonical (absorbed others) or an alias (folded into a canonical) — need both.
+const { aliasesOf, canonicalOf } = useProjectLinks();
+
+// Project list for the filter/picker — RESOLVED to canonical names so a renamed
+// project's tasks don't split across the old and new name. `knownProjects`
+// (cc_projects) already comes canonical.
+const projects = computed(() => {
+  const set = new Set<string>();
+  for (const t of todos.value) if (t.project) set.add(canonicalOf(t.project) ?? t.project);
+  for (const p of knownProjects.value) set.add(p);
+  return [...set].sort();
+});
+
+
+// Todos passing the active filters (project + search + show-done), the pool the
+// board draws from. Per-column ordering is applied in `itemsFor`.
+const visible = computed(() => {
+  let list = todos.value.slice();
+  if (projectFilter.value) {
+    // Resolve through merge links so the canonical filter also catches tasks
+    // still tagged with a merged-away alias name.
+    list = list.filter((t) => (canonicalOf(t.project) ?? t.project ?? "") === projectFilter.value);
+  }
+  if (!showDone.value) list = list.filter((t) => t.status !== "done");
+  const q = search.value.trim().toLowerCase();
+  if (q) {
+    // A bare number or `#N` query also matches the task NUMBER (substring, so
+    // "10" surfaces #10/#102/…) — searching by number, not just title/text.
+    const qNum = q.replace(/^#/, "");
+    const numeric = /^\d+$/.test(qNum);
+    list = list.filter(
+      (t) =>
+        t.subject.toLowerCase().includes(q) ||
+        t.description.toLowerCase().includes(q) ||
+        (t.project ?? "").toLowerCase().includes(q) ||
+        (numeric && String(t.number ?? "").includes(qNum)),
+    );
+  }
+  return list;
+});
+
+// Hide the Done column when "show done" is off — there's nothing to show there.
+const boardColumns = computed(() =>
+  showDone.value ? COLUMNS : COLUMNS.filter((c) => c.id !== "done"),
+);
+
+// Cards for one column, scheduled-first then most-recently-updated.
+function itemsFor(colId: string): Todo[] {
+  return visible.value
+    .filter((t) => t.status === colId)
+    .sort((a, b) => {
+      const da = a.scheduled_for || "9999-99-99";
+      const db = b.scheduled_for || "9999-99-99";
+      if (da !== db) return da < db ? -1 : 1;
+      return (b.updated_at || "").localeCompare(a.updated_at || "");
+    });
+}
+
+const openCount = computed(
+  () => todos.value.filter((t) => t.status !== "done").length,
+);
+
+async function loadTodos(silent = false) {
+  if (!silent) loading.value = true;
+  try {
+    todos.value = await invoke<Todo[]>("get_todos");
+    errorMsg.value = "";
+  } catch (e) {
+    errorMsg.value = String(e);
+  } finally {
+    if (!silent) loading.value = false;
+  }
+  try {
+    changes.value = await invoke<BoardChange[]>("get_changes");
+  } catch {
+    changes.value = [];
+  }
+  void loadBoardState();
+}
+
+// Reload now if it's safe; otherwise mark it pending until the drag/form ends.
+function requestReload() {
+  if (dragId.value || formOpen.value) {
+    pendingReload.value = true;
+    return;
+  }
+  void loadTodos(true);
+}
+// Run a deferred reload once the user is no longer mid-interaction.
+function flushPendingReload() {
+  if (pendingReload.value && !dragId.value && !formOpen.value) {
+    pendingReload.value = false;
+    void loadTodos(true);
+  }
+}
+
+function subjectCounterLabel(remaining: number): string {
+  return remaining >= 0
+    ? t("todoSubjectRemaining", { n: remaining })
+    : t("todoSubjectOverLimit", { n: -remaining });
+}
+
+function resetForm() {
+  editingId.value = null;
+  fSubject.value = "";
+  fDescription.value = "";
+  fScheduled.value = "";
+  fPlan.value = "";
+  fProject.value = "";
+  formStatus.value = "backlog";
+  fPriority.value = "";
+  formOpen.value = false;
+  flushPendingReload();
+}
+
+function startNew(colId = "backlog") {
+  resetForm();
+  formStatus.value = colId;
+  if (projectFilter.value) fProject.value = projectFilter.value;
+  formOpen.value = true;
+  // Pull fresh in case the window was already focused when a new project landed.
+  void refreshKnownProjects();
+}
+
+async function submitForm() {
+  const subject = fSubject.value.trim();
+  if (!subject || subject.length > SUBJECT_LIMIT) return;
+  const existing = editingId.value
+    ? todos.value.find((x) => x.id === editingId.value)
+    : null;
+  const todo: Todo = {
+    id: editingId.value ?? crypto.randomUUID(),
+    subject,
+    description: fDescription.value.trim(),
+    status: existing?.status ?? formStatus.value,
+    priority: fPriority.value || "",
+    scheduled_for: fScheduled.value || null,
+    plan: fPlan.value.trim(),
+    project: fProject.value.trim() || null,
+    comments: existing?.comments,
+    links: existing?.links,
+    created_by: existing?.created_by ?? "user",
+    created_at: existing?.created_at ?? "",
+    updated_at: existing?.updated_at ?? "",
+    ext: existing?.ext,
+  };
+  try {
+    todos.value = await invoke<Todo[]>("upsert_todo", { todo });
+    resetForm();
+  } catch (e) {
+    errorMsg.value = String(e);
+  }
+}
+
+// Move a card to a new column. Update the local list first so the card jumps
+// instantly, then persist; on failure reload from disk to undo the optimism.
+async function moveStatus(todo: Todo, status: string) {
+  if (todo.status === status) return;
+  todos.value = todos.value.map((t) =>
+    t.id === todo.id ? { ...t, status } : t,
+  );
+  try {
+    todos.value = await invoke<Todo[]>("set_todo_status", {
+      id: todo.id,
+      status,
+    });
+  } catch (e) {
+    errorMsg.value = String(e);
+    await loadTodos();
+  }
+}
+
+// Deleting a task asks first (issue #21): the card's trash opens a confirm
+// dialog; the actual removal happens in confirmDelete. `pendingDelete` holds the
+// task awaiting confirmation (null = no dialog open).
+const pendingDelete = ref<Todo | null>(null);
+function removeTodo(todo: Todo) {
+  pendingDelete.value = todo;
+}
+function cancelDelete() {
+  pendingDelete.value = null;
+}
+async function confirmDelete() {
+  const todo = pendingDelete.value;
+  if (!todo) return;
+  pendingDelete.value = null;
+  try {
+    todos.value = await invoke<Todo[]>("delete_todo", { id: todo.id });
+    if (editingId.value === todo.id) resetForm();
+    if (detailId.value === todo.id) closeDetail();
+  } catch (e) {
+    errorMsg.value = String(e);
+  }
+}
+
+// --- Detail view (master-detail editor) ---
+// The board swaps to a full-screen detail editor: left rail lists the open
+// task's project siblings, right panel edits its fields. `draft` is an isolated
+// editable copy, so an external live-reload of `todos` never clobbers an in-
+// progress edit; `saveDetail` merges the draft back over the existing todo
+// (preserving id / comments / links / created_at) and persists via `upsert_todo`.
+const view = ref<"board" | "detail">("board");
+const detailId = ref<string | null>(null);
+const detail = computed(() => todos.value.find((t) => t.id === detailId.value) ?? null);
+
+// Transient "Saved ✓" confirmation shown after a successful detail save.
+const saved = ref(false);
+let savedTimer: ReturnType<typeof setTimeout> | null = null;
+function flashSaved() {
+  saved.value = true;
+  if (savedTimer) clearTimeout(savedTimer);
+  savedTimer = setTimeout(() => (saved.value = false), 2000);
+}
+
+interface Draft {
+  subject: string;
+  description: string;
+  plan: string;
+  handoff: string;
+  project: string;
+  scheduled_for: string;
+  status: string;
+  priority: string;
+}
+const draft = ref<Draft>({
+  subject: "",
+  description: "",
+  plan: "",
+  handoff: "",
+  project: "",
+  scheduled_for: "",
+  status: "backlog",
+  priority: "",
+});
+const draftSubjectRemaining = computed(() => SUBJECT_LIMIT - draft.value.subject.trim().length);
+const draftSubjectOverLimit = computed(() => draftSubjectRemaining.value < 0);
+
+function rankStatus(s: string): number {
+  const i = COLUMNS.findIndex((c) => c.id === s);
+  return i < 0 ? COLUMNS.length : i;
+}
+// Left-rail tasks: same project as the open task (project-less tasks group
+// together), ordered by board column so the rail reads like a mini board.
+const detailSiblings = computed(() => {
+  const p = detail.value?.project ?? null;
+  return todos.value
+    .filter((t) => (t.project ?? null) === p)
+    .slice()
+    .sort((a, b) => rankStatus(a.status) - rankStatus(b.status));
+});
+
+// Handoff the open task INHERITS from its direct prerequisites (#141): the same
+// view `cc-todos todos handoff <task>` gives an agent, surfaced read-only in the
+// card. Only direct `depends_on` — cumulative context rides authored handoff text.
+const inheritedHandoff = computed(() => {
+  const cur = detail.value;
+  if (!cur || !Array.isArray(cur.depends_on) || !cur.depends_on.length) return [];
+  const byId = new Map(todos.value.map((t) => [t.id, t]));
+  return cur.depends_on
+    .map((id) => byId.get(id))
+    .filter((p): p is Todo => !!p)
+    .map((p) => ({
+      id: p.id,
+      number: p.number,
+      subject: p.subject,
+      status: p.status,
+      handoff: (p.handoff ?? "").trim(),
+    }));
+});
+
+function openDetail(todo: Todo) {
+  detailId.value = todo.id;
+  draft.value = {
+    subject: todo.subject,
+    description: todo.description ?? "",
+    plan: todo.plan ?? "",
+    handoff: todo.handoff ?? "",
+    project: todo.project ?? "",
+    scheduled_for: todo.scheduled_for ?? "",
+    status: todo.status,
+    priority: todo.priority ?? "",
+  };
+  descMode.value = "edit";
+  mention.value = null;
+  saved.value = false;
+  view.value = "detail";
+}
+
+function closeDetail() {
+  view.value = "board";
+  detailId.value = null;
+}
+
+async function saveDetail() {
+  const cur = detail.value;
+  if (!cur) return;
+  const d = draft.value;
+  if (!d.subject.trim() || d.subject.trim().length > SUBJECT_LIMIT) return;
+  const todo: Todo = {
+    ...cur, // keep id / comments / links / created_at / updated_at
+    subject: d.subject.trim(),
+    description: d.description.trim(),
+    plan: d.plan.trim(),
+    handoff: d.handoff.trim(),
+    project: d.project.trim() || null,
+    scheduled_for: d.scheduled_for || null,
+    status: d.status,
+    priority: d.priority || "",
+  };
+  try {
+    todos.value = await invoke<Todo[]>("upsert_todo", { todo });
+    flashSaved();
+  } catch (e) {
+    errorMsg.value = String(e);
+  }
+}
+
+// --- Comments (discussion thread on the open task) ---
+// A comment is posted independently of the field draft: appending one persists
+// immediately (it's a discrete action, not part of the "Save" of edited fields),
+// so a pending draft edit is left untouched. `detail.value` is the persisted
+// todo, so we merge onto that — never onto the draft.
+const newComment = ref("");
+
+const detailComments = computed(() => detail.value?.comments ?? []);
+
+async function persistComments(comments: Comment[]) {
+  const cur = detail.value;
+  if (!cur) return;
+  try {
+    todos.value = await invoke<Todo[]>("upsert_todo", {
+      todo: { ...cur, comments },
+    });
+  } catch (e) {
+    errorMsg.value = String(e);
+  }
+}
+
+async function addComment() {
+  const body = newComment.value.trim();
+  if (!body || !detail.value) return;
+  const comment: Comment = {
+    id: crypto.randomUUID(),
+    author: "user",
+    body,
+    created_at: new Date().toISOString(),
+  };
+  await persistComments([...(detail.value.comments ?? []), comment]);
+  newComment.value = "";
+}
+
+async function removeComment(id: string) {
+  if (!detail.value) return;
+  await persistComments(
+    (detail.value.comments ?? []).filter((c) => c.id !== id),
+  );
+}
+
+function commentAuthorLabel(author: string) {
+  return author === "claude" ? t("todoAuthorClaude") : t("todoAuthorYou");
+}
+
+// Format an ISO timestamp for a comment line. Empty/garbage → "" so a hand-
+// edited comment without a date just shows no time rather than "Invalid Date".
+function fmtTime(iso: string | undefined) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleString(locale.value === "ru" ? "ru-RU" : "en-US", {
+    day: "2-digit",
+    month: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+// --- Mini editor: inline links & references (GitHub-style) ---
+// Split plain text into runs, marking URLs, task references (t#N) and project
+// references (@name). Deliberately NOT v-html: every run renders through Vue
+// text interpolation (escaped) — a crafted comment can't inject markup. Opened
+// URLs go through the backend `open_url` command (http/https only); t#N/@name
+// navigate inside the app.
+//
+// Task refs use `t#N`, NOT a bare `#N` (#63): in prose `#104` overwhelmingly means
+// a GitHub PR/issue, and when its number collided with a task's the link silently
+// pointed at the wrong task (even in another project). So `#N` is now plain text;
+// only the explicit `t#N` form links to a task.
+type Seg =
+  | { kind: "text"; text: string }
+  | { kind: "url"; text: string; href: string }
+  | { kind: "task"; text: string; number: number; subject: string }
+  | { kind: "project"; text: string; project: string };
+
+// One pass: URL | t#digits (task ref) | @slug. Classification by which group
+// matched. The `t` is required (see above) and must not be the tail of a word
+// (the lookbehind rejects `part#5`); a bare `#N` matches nothing here.
+const TOKEN_RE =
+  /(https?:\/\/[^\s<>]+|www\.[^\s<>]+)|(?<![A-Za-z0-9])[tT]#(\d+)|@([A-Za-z0-9._\-]+)/g;
+
+// Stable lookups for resolving references while rendering.
+const byNumber = computed(() => {
+  const m = new Map<number, Todo>();
+  for (const t of todos.value) if (t.number) m.set(t.number, t);
+  return m;
+});
+const projectSet = computed(() => new Set(projects.value));
+
+// Strip trailing prose punctuation that almost certainly isn't part of the URL
+// ("see https://x.com." → drop the period), while keeping a closing bracket that
+// actually balances one inside the URL (e.g. a /wiki/Foo_(bar) link).
+function trimUrlTail(url: string): string {
+  let u = url;
+  while (u.length) {
+    const ch = u[u.length - 1];
+    if (".,;:!?'\"«»".includes(ch)) {
+      u = u.slice(0, -1);
+      continue;
+    }
+    if (ch === ")" || ch === "]" || ch === "}") {
+      const open = ch === ")" ? "(" : ch === "]" ? "[" : "{";
+      const opens = u.split(open).length - 1;
+      const closes = u.split(ch).length - 1;
+      if (closes > opens) {
+        u = u.slice(0, -1);
+        continue;
+      }
+    }
+    break;
+  }
+  return u;
+}
+
+function tokenize(text: string): Seg[] {
+  const out: Seg[] = [];
+  if (!text) return out;
+  const byNum = byNumber.value;
+  const projs = projectSet.value;
+  let last = 0;
+  for (const m of text.matchAll(TOKEN_RE)) {
+    const start = m.index ?? 0;
+    let seg: Seg | null = null;
+    let consumed = m[0].length;
+    if (m[1]) {
+      const url = trimUrlTail(m[1]);
+      if (url) {
+        const href = url.startsWith("www.") ? `https://${url}` : url;
+        seg = { kind: "url", text: url, href };
+        consumed = url.length;
+      }
+    } else if (m[2]) {
+      const num = parseInt(m[2], 10);
+      const tt = byNum.get(num);
+      // Only a number that maps to a real task becomes a link; otherwise the
+      // `t#5` is left as plain text so it doesn't pretend to be a reference.
+      if (tt) seg = { kind: "task", text: `t#${num}`, number: num, subject: tt.subject };
+    } else if (m[3]) {
+      let proj = m[3];
+      if (!projs.has(proj)) {
+        const trimmed = proj.replace(/[._\-]+$/, "");
+        proj = projs.has(trimmed) ? trimmed : "";
+      }
+      if (proj) {
+        seg = { kind: "project", text: `@${proj}`, project: proj };
+        consumed = 1 + proj.length;
+      }
+    }
+    if (start > last) out.push({ kind: "text", text: text.slice(last, start) });
+    if (seg) {
+      out.push(seg);
+      last = start + consumed;
+    } else {
+      // Unresolved token → emit verbatim as text (trailing punct rejoins later).
+      out.push({ kind: "text", text: m[0] });
+      last = start + m[0].length;
+    }
+  }
+  if (last < text.length) out.push({ kind: "text", text: text.slice(last) });
+  return out;
+}
+
+async function openLink(href: string) {
+  try {
+    await invoke("open_url", { url: href });
+  } catch (e) {
+    errorMsg.value = String(e);
+  }
+}
+
+// User-facing guide (how tasks & analytics work). Published as the repo wiki's
+// Home page, so the short `/wiki` URL is stable regardless of page naming.
+const GUIDE_URL =
+  "https://github.com/DamirSadykov/Claude-Usage-Tracker-Windows/wiki";
+function openGuide() {
+  openLink(GUIDE_URL);
+}
+
+// Open the shared settings window on the Tasks tab (issue #45).
+async function openSettings() {
+  await invoke("open_settings_window", { tab: "tasks" });
+}
+
+// Board vs graph view (#88): the graph is an alternative rendering of the SAME
+// filtered board, toggled in place — not a separate window. It shares this
+// window's `todos` and `projectFilter`.
+// `specs` is the third rendering (t#346): not another view of the board, but
+// the level ABOVE it — the spec section a change points at, with that change's
+// graph under it.
+const viewMode = ref<"board" | "graph" | "specs">("board");
+// The graph tab has two renderings while the redesign lands: the new lane/wire
+// screens (default) and the classic force layout. The choice is remembered per
+// machine so a session that prefers the old picture keeps it.
+const graphUiNew = ref(localStorage.getItem("graph-ui") !== "classic");
+// `specsTab` is a per-machine opt-in; `settings.specsEnabled` (t#361) is the
+// master switch — the tab needs BOTH. With the switch off (its default) the
+// tab is gone even on a machine that opted in, and any view already parked on
+// `specs` (a stored state, or the switch flipped while this window is open)
+// falls back to the board rather than rendering with no tab to reach it from.
+const specsTab = ref(localStorage.getItem("specs-tab") === "on");
+const specsTabVisible = computed(() => specsTab.value && settings.value.specsEnabled);
+watch(
+  () => settings.value.specsEnabled,
+  (on) => {
+    if (!on && viewMode.value === "specs") viewMode.value = "board";
+  },
+);
+const specMode = ref<PipelineMode>("reader");
+watch(graphUiNew, (on) =>
+  localStorage.setItem("graph-ui", on ? "next" : "classic"),
+);
+// In graph view the ONE shared search box (below) highlights matching nodes instead
+// of filtering; Enter cycles to the next hit via GraphView's exposed `cycleNext`.
+const graphRef = ref<InstanceType<typeof GraphView> | null>(null);
+function onSearchEnter() {
+  if (viewMode.value === "graph") graphRef.value?.cycleNext();
+}
+
+// Keyboard shortcuts (registry in ../hotkeys): Ctrl+F → search, Ctrl+P → project.
+const searchInputRef = ref<HTMLInputElement | null>(null);
+const projectAcRef = ref<InstanceType<typeof ProjectAutocomplete> | null>(null);
+useHotkeys({
+  search: () => searchInputRef.value?.focus(),
+  project: () => projectAcRef.value?.focus(),
+});
+
+// GraphView mutates dependencies through the backend and hands back the fresh
+// list; adopt it so both views stay in lockstep without a reload round-trip.
+function onGraphUpdate(list: Todo[]) {
+  todos.value = list;
+}
+
+// --- the spec a task is about (t#339/t#346) ----------------------------------
+//
+// A task's `spec` is written by the CLI and, until now, was invisible here: the
+// board showed the delta and never what the delta was TO. That gap is what the
+// whole mechanic exists to close, so the link belongs on the card, not only in
+// the session's injected context.
+//
+// The walk mirrors `todos.mjs::specAddressesFor`: the task's OWN addresses win
+// outright, and only a task without any inherits its nearest change's.
+// Inheritance is REPLACEMENT, not a merge — otherwise one section would be
+// listed twice for the same task.
+function changeRootsOf(t: Todo): { spec: string[] }[] {
+  if (t.change_id) {
+    const record = changes.value.find((c) => c.id === t.change_id);
+    if (record) return [{ spec: record.spec ?? [] }];
+  }
+  const roots: Todo[] = [];
+  const seen = new Set<string>([t.id]);
+  let frontier = [t.id];
+  while (frontier.length && !roots.length) {
+    const next: string[] = [];
+    for (const parent of todos.value) {
+      if (!(parent.depends_on ?? []).some((d) => frontier.includes(d))) continue;
+      if (seen.has(parent.id)) continue;
+      seen.add(parent.id);
+      if (parent.change) roots.push(parent);
+      else next.push(parent.id);
+    }
+    frontier = next;
+  }
+  return roots.map((r) => ({ spec: r.spec ?? [] }));
+}
+
+function specLinkOf(t: Todo): { addresses: string[]; inherited: boolean } {
+  const own = (t.spec ?? []).filter(Boolean);
+  if (own.length) return { addresses: own, inherited: false };
+  const seen = new Set<string>();
+  for (const r of changeRootsOf(t)) for (const a of r.spec ?? []) seen.add(a);
+  return { addresses: [...seen], inherited: true };
+}
+
+const detailSpec = computed(() =>
+  detail.value ? specLinkOf(detail.value) : { addresses: [], inherited: false },
+);
+// The closing answers recorded for THIS task (`cli spec answer`, t#341) — the
+// board's own copy of what the guard was told.
+const detailAnswers = computed(() => detail.value?.spec_answers ?? []);
+
+// Jump from a task to the section it is about. Opening the Specs tab rather
+// than a popup keeps one place where a section is read — the tab also shows the
+// other changes on it, which is the context a reader wants next.
+const specTarget = ref<{ address: string; project: string } | null>(null);
+function openSpecSection(address: string) {
+  if (!settings.value.specsEnabled) return;
+  specTarget.value = { address, project: detail.value?.project ?? "" };
+  viewMode.value = "specs";
+  closeDetail();
+}
+
+// Clicking a graph node opens that task's card — the same detail panel the board
+// uses (it overlays the graph and returns to it on close).
+// The pipeline screens address a task the way a human does — "#345" — while the
+// classic graph passes the uuid. Accept both so either can open the card.
+function onPipelineOpen(ref: string) {
+  const byRef = ref.startsWith("#")
+    ? byNumber.value.get(Number(ref.slice(1)))
+    : todos.value.find((x) => x.id === ref);
+  if (byRef) openDetail(byRef);
+}
+
+// Navigate a t#N reference to that task's detail; a @name reference back to the
+// board filtered to that project.
+function openTask(number: number) {
+  const t = byNumber.value.get(number);
+  if (t) openDetail(t);
+}
+function openProject(name: string) {
+  projectFilter.value = name;
+  closeDetail();
+}
+
+// --- Nightly-triage digest (#35) ---
+// The latest digest the triage agent published (read-only; null until a run has
+// happened, or if the file is unreadable). Shown as a chip beside the open-task
+// count, expanding to a popover whose #N references jump to the task card. The
+// triage agent owns writes via the cc-triage CLI; we only ever read.
+const triageDigest = ref<TriageDigest | null>(null);
+const triageOpen = ref(false);
+
+async function loadTriageDigest() {
+  try {
+    triageDigest.value =
+      (await invoke<TriageDigest | null>("get_triage_digest")) ?? null;
+  } catch {
+    // not under Tauri, or no digest yet
+  }
+}
+
+// Display order: most urgent finding first, advisory suggestions last. The kinds
+// mirror triage.rs::KINDS; the order here is a UI choice.
+const TRIAGE_KIND_ORDER = ["overdue", "stale", "no_priority", "suggestion"] as const;
+const TRIAGE_KIND_LABEL: Record<string, string> = {
+  overdue: "triageKindOverdue",
+  stale: "triageKindStale",
+  no_priority: "triageKindNoPriority",
+  suggestion: "triageKindSuggestion",
+  other: "triageKindOther",
+};
+
+// Items bucketed by kind in display order, empty buckets dropped. A kind the
+// tracker doesn't know (a newer writer) falls into a trailing "other" bucket so
+// nothing silently disappears.
+const triageGroups = computed<{ kind: string; items: DigestItem[] }[]>(() => {
+  const d = triageDigest.value;
+  if (!d) return [];
+  const out: { kind: string; items: DigestItem[] }[] = [];
+  const known = new Set<string>(TRIAGE_KIND_ORDER);
+  for (const kind of TRIAGE_KIND_ORDER) {
+    const items = d.items.filter((i) => i.kind === kind);
+    if (items.length) out.push({ kind, items });
+  }
+  const rest = d.items.filter((i) => !known.has(i.kind));
+  if (rest.length) out.push({ kind: "other", items: rest });
+  return out;
+});
+
+const triageHeadline = computed(() => {
+  const h = triageDigest.value?.headline?.trim();
+  if (h) return h;
+  // A digest with no headline → "ready"; no digest at all → the schedule label,
+  // so the always-visible chip reads sensibly before the first run.
+  return triageDigest.value ? t("triageAlertEmpty") : t("triageSchedule");
+});
+
+function triageKindLabel(kind: string): string {
+  const key = TRIAGE_KIND_LABEL[kind];
+  return key ? t(key) : kind;
+}
+
+// Empty/garbage timestamp → "" (mirrors fmtTime) so a hand-edited digest shows
+// no time rather than "Invalid Date".
+const triageGeneratedLabel = computed(() => {
+  const iso = triageDigest.value?.generated_at;
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleString(locale.value === "ru" ? "ru-RU" : "en-US", {
+    day: "2-digit",
+    month: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+});
+
+// A digest #N is a live link only if it maps to a real task on the board.
+function triageHasTask(num?: number): boolean {
+  return num != null && byNumber.value.has(num);
+}
+
+// Jump from a digest reference to that task's card, closing the popover.
+function triageGoToTask(num?: number) {
+  if (!triageHasTask(num)) return;
+  triageOpen.value = false;
+  openTask(num as number);
+}
+
+// The audit SCHEDULE controls (enable/time/model/run-now, #35) moved to
+// Settings → Tasks. This window keeps only the READ-ONLY digest chip/popover
+// below; the schedule config now lives in the settings panel.
+
+// Distinct other tasks this one references inline (t#N) across its description and
+// comments — drives the card's link chip. Uses tokenize so it counts exactly
+// what renders as a reference (a #frag inside a URL isn't one) and only resolved
+// numbers.
+function refCount(todo: Todo): number {
+  const nums = new Set<number>();
+  const scan = (text: string | undefined) => {
+    if (!text) return;
+    for (const s of tokenize(text)) {
+      if (s.kind === "task" && s.number !== todo.number) nums.add(s.number);
+    }
+  };
+  scan(todo.description);
+  for (const c of todo.comments ?? []) scan(c.body);
+  return nums.size;
+}
+
+// Description has an edit/preview toggle: edit = textarea, preview = the same
+// text with links/references rendered. Reset to edit whenever a task opens.
+const descMode = ref<"edit" | "preview">("edit");
+const descSegments = computed(() => tokenize(draft.value.description));
+
+// --- Inline-reference autocomplete (the "preview the task you mean" popup) ---
+// A GitHub-style trigger menu: typing `t#` lists tasks (number + subject so you
+// can tell which one), `@` lists projects. It drives plain-text insertion — the
+// stored text stays `t#12` / `@proj`, resolved at render time by tokenize().
+const descTextarea = ref<HTMLTextAreaElement | null>(null);
+const commentTextarea = ref<HTMLTextAreaElement | null>(null);
+const descMenuEl = ref<HTMLUListElement | null>(null);
+const commentMenuEl = ref<HTMLUListElement | null>(null);
+
+// Keep the keyboard-highlighted item visible as the menu scrolls.
+async function scrollSelIntoView() {
+  await nextTick();
+  const m = mention.value;
+  if (!m) return;
+  const ul = m.target === "desc" ? descMenuEl.value : commentMenuEl.value;
+  const li = ul?.children[m.sel] as HTMLElement | undefined;
+  li?.scrollIntoView({ block: "nearest" });
+}
+interface MentionState {
+  target: "desc" | "comment";
+  trigger: "#" | "@"; // logical kind: task picker vs project picker
+  query: string;
+  start: number; // index of the FIRST trigger char (the `t` of `t#`, or `@`)
+  prefixLen: number; // trigger length: 2 for `t#`, 1 for `@`
+  caret: number; // caret index (end of the query)
+  sel: number; // highlighted candidate
+}
+const mention = ref<MentionState | null>(null);
+
+interface MentionItem {
+  label: string;
+  sub: string;
+  value: string;
+}
+const mentionItems = computed<MentionItem[]>(() => {
+  const m = mention.value;
+  if (!m) return [];
+  // Trim so a trailing space (still typing a multi-word title) doesn't break the
+  // number-prefix match; the list scrolls, so we keep a generous cap.
+  const q = m.query.trim().toLowerCase();
+  if (m.trigger === "#") {
+    let list = todos.value.filter((t) => t.number && t.id !== detailId.value);
+    if (q) {
+      // GitHub-style: match by number prefix OR anywhere in the title text, so
+      // you can find a task by typing "#" then words from its subject.
+      list = list.filter(
+        (t) =>
+          String(t.number).startsWith(q) ||
+          t.subject.toLowerCase().includes(q),
+      );
+    }
+    return list
+      .slice()
+      .sort((a, b) => (a.number ?? 0) - (b.number ?? 0))
+      .slice(0, 50)
+      .map((t) => ({ label: `t#${t.number}`, sub: t.subject, value: String(t.number) }));
+  }
+  let list = projects.value;
+  if (q) list = list.filter((p) => p.toLowerCase().includes(q));
+  return list.slice(0, 50).map((p) => ({ label: `@${p}`, sub: "", value: p }));
+});
+
+// A mention is a SESSION: it opens the moment a `t#` (task) or `@` (project)
+// trigger is typed at line start or after whitespace, and stays open as you keep
+// typing, so a `t#` query can hold the words of a task title (spaces and all),
+// GitHub-style. The session ends when the trigger is deleted, the caret leaves it,
+// a newline/oversized/`@`-with-space query appears, or you pick/escape. Picking
+// inserts `t#<number>` / `@<project>`, not the title. A bare `#` does NOT trigger
+// the task picker (#63): `#N` is prose (a PR/issue), only `t#N` is a task ref.
+const MENTION_MAX_QUERY = 60;
+// True if position `i` is a word start — index 0 or preceded by whitespace — so a
+// `t#`/`@` mid-word (e.g. `art#5`, `email@host`) isn't hijacked into a picker.
+const atWordStart = (text: string, i: number) => i === 0 || /\s/.test(text[i - 1]);
+function onMentionInput(target: "desc" | "comment", e: Event) {
+  const el = e.target as HTMLTextAreaElement;
+  const text = el.value;
+  const caret = el.selectionStart ?? text.length;
+  const m = mention.value;
+  // Continue an open session while its trigger prefix is still intact.
+  const prefixIntact = (s: MentionState) =>
+    s.trigger === "@"
+      ? text[s.start] === "@"
+      : /[tT]/.test(text[s.start] ?? "") && text[s.start + 1] === "#";
+  if (m && m.target === target && caret >= m.start + m.prefixLen && prefixIntact(m)) {
+    const query = text.slice(m.start + m.prefixLen, caret);
+    const ok =
+      !query.includes("\n") &&
+      query.length <= MENTION_MAX_QUERY &&
+      (m.trigger === "#"
+        ? !/\s{2,}/.test(query) // a double space ends a title search
+        : /^[A-Za-z0-9._\-]*$/.test(query)); // project names have no spaces
+    if (ok) {
+      m.query = query;
+      m.caret = caret;
+      m.sel = 0; // reset highlight to the top result as the query changes
+      return;
+    }
+    mention.value = null;
+  }
+  // Open a new session only when a trigger was JUST completed at the caret: `@`
+  // (1 char) or `t#` (2 chars, the `#` just typed after a word-start `t`).
+  const prev = text[caret - 1];
+  if (prev === "@" && atWordStart(text, caret - 1)) {
+    mention.value = { target, trigger: "@", query: "", start: caret - 1, prefixLen: 1, caret, sel: 0 };
+  } else if (
+    prev === "#" &&
+    /[tT]/.test(text[caret - 2] ?? "") &&
+    atWordStart(text, caret - 2)
+  ) {
+    mention.value = { target, trigger: "#", query: "", start: caret - 2, prefixLen: 2, caret, sel: 0 };
+  } else if (mention.value && mention.value.target === target) {
+    mention.value = null;
+  }
+}
+
+async function pickMention(item: MentionItem) {
+  const m = mention.value;
+  if (!m) return;
+  const insert = (m.trigger === "#" ? `t#${item.value}` : `@${item.value}`) + " ";
+  const apply = (text: string) =>
+    text.slice(0, m.start) + insert + text.slice(m.caret);
+  if (m.target === "desc") draft.value.description = apply(draft.value.description);
+  else newComment.value = apply(newComment.value);
+  const newCaret = m.start + insert.length;
+  mention.value = null;
+  await nextTick();
+  const el = m.target === "desc" ? descTextarea.value : commentTextarea.value;
+  if (el) {
+    el.focus();
+    el.setSelectionRange(newCaret, newCaret);
+  }
+}
+
+function onMentionKeydown(target: "desc" | "comment", e: KeyboardEvent) {
+  const m = mention.value;
+  if (!m || m.target !== target) return;
+  if (e.key === "Escape") {
+    e.preventDefault();
+    mention.value = null;
+    return;
+  }
+  const items = mentionItems.value;
+  if (!items.length) return;
+  if (e.key === "ArrowDown") {
+    e.preventDefault();
+    m.sel = (m.sel + 1) % items.length;
+    void scrollSelIntoView();
+  } else if (e.key === "ArrowUp") {
+    e.preventDefault();
+    m.sel = (m.sel - 1 + items.length) % items.length;
+    void scrollSelIntoView();
+  } else if (
+    (e.key === "Enter" && !e.ctrlKey && !e.metaKey) ||
+    e.key === "Tab"
+  ) {
+    // Plain Enter/Tab picks the highlighted item; Ctrl/Cmd+Enter is left for
+    // "post comment", so it falls through to that handler.
+    e.preventDefault();
+    void pickMention(items[Math.min(m.sel, items.length - 1)]);
+  }
+}
+
+// Close the menu on blur, deferred so a mousedown on an item still registers.
+function onMentionBlur() {
+  setTimeout(() => {
+    mention.value = null;
+  }, 120);
+}
+
+// --- Drag and drop (native HTML5) ---
+function onDragStart(todo: Todo, e: DragEvent) {
+  dragId.value = todo.id;
+  if (e.dataTransfer) {
+    e.dataTransfer.effectAllowed = "move";
+    // Some browsers require data to be set for the drag to start at all.
+    e.dataTransfer.setData("text/plain", todo.id);
+  }
+}
+function onDragEnd() {
+  dragId.value = null;
+  overCol.value = null;
+  flushPendingReload();
+}
+function onColDragOver(colId: string, e: DragEvent) {
+  if (!dragId.value) return;
+  e.preventDefault();
+  if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+  if (overCol.value !== colId) overCol.value = colId;
+}
+function onColDragLeave(colId: string, e: DragEvent) {
+  // Ignore leaves into child elements of the same column body.
+  const related = e.relatedTarget as Node | null;
+  if (related && (e.currentTarget as HTMLElement).contains(related)) return;
+  if (overCol.value === colId) overCol.value = null;
+}
+function onColDrop(colId: string) {
+  const id = dragId.value;
+  overCol.value = null;
+  dragId.value = null;
+  if (!id) return;
+  const todo = todos.value.find((t) => t.id === id);
+  if (todo) void moveStatus(todo, colId);
+}
+
+function statusLabel(s: string) {
+  const c = COL_BY_ID[s];
+  return c ? t(c.labelKey) : s;
+}
+function columnColor(s: string) {
+  return COL_BY_ID[s]?.dot ?? "var(--text-4)";
+}
+
+// Localized label for a priority bucket ("" → the "no priority" option).
+function priorityLabel(p: string | null | undefined): string {
+  if (p === "high") return t("todoPriorityHigh");
+  if (p === "medium") return t("todoPriorityMedium");
+  if (p === "low") return t("todoPriorityLow");
+  return t("todoPriorityNone");
+}
+
+// --- External tasks (readonly mirror; plan External-integration-public-side, ph6) ---
+// The tracker OWNS todos (above); external tasks are a READONLY mirror folded on the
+// backend into external_tasks.json and surfaced via get_external_tasks / poll_external
+// + the `external-tasks-updated` event. They carry SOURCE-NATIVE status strings (not
+// our 5 columns), so they live in a separate "External" mode — a grouped-by-source
+// list, never the kanban board — and are never editable/draggable here.
+interface ExternalTask {
+  task_id: string;
+  source: string;
+  title: string;
+  status: string;
+  url: string;
+  updated_at: string;
+  priority?: string | null;
+  assignee?: string | null;
+  // Forward-compat DTO: the private side will start sending these (project now,
+  // description maybe). Optional so today's payloads (without them) stay valid;
+  // the UI renders them only when present.
+  description?: string | null;
+  project?: string | null;
+  last_event_ts: string;
+  last_event_kind: string;
+}
+interface ExternalTasksCache {
+  tasks: ExternalTask[];
+  last_poll_at?: string | null;
+}
+interface StatusChange {
+  task_id: string;
+  source: string;
+  to: string;
+}
+interface ExternalTasksUpdate {
+  tasks: ExternalTask[];
+  changes: StatusChange[];
+}
+
+// Top-level view mode: the owned board ("local") vs the readonly mirror ("external").
+const taskMode = ref<"local" | "external">("local");
+const externalTasks = ref<ExternalTask[]>([]);
+const externalLastPoll = ref<string | null>(null);
+const externalRefreshing = ref(false);
+// Whether this device is enrolled — drives the empty tab's "connect a resolver"
+// prompt vs the plain "nothing mirrored yet" message.
+const externalBound = ref(false);
+// Keys (source::task_id) whose status changed during this session, so the list can
+// badge "изменилось" until the user leaves the tab (then they've been seen).
+const externalChanged = ref<Set<string>>(new Set());
+
+function extKey(source: string, taskId: string): string {
+  return `${source}::${taskId}`;
+}
+function externalIsChanged(t: ExternalTask): boolean {
+  return externalChanged.value.has(extKey(t.source, t.task_id));
+}
+
+const externalCount = computed(() => externalTasks.value.length);
+
+// User-owned status→bucket overrides (Settings → Integrations), read from
+// settings.json. Empty = fall back to the keyword heuristic in externalStatus.ts.
+const statusMap = ref<StatusMap>({});
+async function loadStatusMap() {
+  try {
+    const { load: loadStore } = await import("@tauri-apps/plugin-store");
+    const store = await loadStore("settings.json");
+    statusMap.value = (await store.get<StatusMap>(STATUS_MAP_KEY)) ?? {};
+  } catch {
+    // store missing / not under Tauri → keep the heuristic defaults
+  }
+}
+
+// Pill colour follows the SAME resolution as the column, so a remapped status
+// recolours to match its new column.
+function extStatusClass(status: string): string {
+  return bucketClass(resolveBucket(status, statusMap.value));
+}
+
+// Readonly kanban: fixed columns, source statuses resolved to a bucket via the user
+// map (heuristic default). Cards DON'T drag — status is owned upstream. The "other"
+// column only appears when something landed there. Tasks keep the backend's
+// freshest-first order within each column.
+interface ExtColumn {
+  id: ExtBucketId;
+  label: string;
+  dot: string;
+  tasks: ExternalTask[];
+}
+const externalColumns = computed<ExtColumn[]>(() => {
+  const buckets: Record<ExtBucketId, ExternalTask[]> = { open: [], active: [], done: [], other: [] };
+  for (const tk of externalTasks.value) buckets[resolveBucket(tk.status, statusMap.value)].push(tk);
+  const cols: ExtColumn[] = [];
+  for (const b of EXT_BUCKETS) {
+    // "other" is a catch-all — show it only when non-empty; the three real
+    // columns always render (even empty) so the board reads as a kanban.
+    if (b.id === "other" && !buckets.other.length) continue;
+    cols.push({ id: b.id, label: t(b.labelKey), dot: b.dot, tasks: buckets[b.id] });
+  }
+  return cols;
+});
+
+// Read the persisted mirror without polling (fast, offline-friendly). Also drives
+// the "External · N" count chip while in local mode.
+async function loadExternalTasks() {
+  try {
+    const cache = await invoke<ExternalTasksCache>("get_external_tasks");
+    externalTasks.value = cache.tasks ?? [];
+    externalLastPoll.value = cache.last_poll_at ?? null;
+  } catch (e) {
+    errorMsg.value = String(e);
+  }
+}
+
+// Enrolled? poll_external returns null when not bound; we read enrollment_status so
+// the empty tab can point at Settings → Integrations instead of looking broken.
+async function refreshExternalBound() {
+  try {
+    const status = await invoke<{ account: string | null }>("enrollment_status");
+    externalBound.value = !!status?.account;
+  } catch {
+    externalBound.value = false;
+  }
+}
+
+function applyExternalUpdate(update: ExternalTasksUpdate) {
+  externalTasks.value = update.tasks ?? [];
+  for (const c of update.changes ?? []) externalChanged.value.add(extKey(c.source, c.task_id));
+  externalBound.value = true;
+}
+
+// Manual refresh (the tab's Refresh button). null = not enrolled.
+async function refreshExternal() {
+  if (externalRefreshing.value) return;
+  externalRefreshing.value = true;
+  try {
+    const update = await invoke<ExternalTasksUpdate | null>("poll_external");
+    if (update) applyExternalUpdate(update);
+    else externalBound.value = false;
+    await loadExternalTasks(); // pick up the fresh last_poll_at
+  } catch (e) {
+    errorMsg.value = String(e);
+  } finally {
+    externalRefreshing.value = false;
+  }
+}
+
+function switchMode(m: "local" | "external") {
+  taskMode.value = m;
+  if (m === "external") {
+    void refreshExternalBound();
+    void loadExternalTasks();
+    void loadStatusMap();
+  } else {
+    // Left the tab → the "изменилось" badges have been seen; clear them, and drop
+    // any open detail so re-entering the tab lands on the list.
+    externalChanged.value = new Set();
+    externalDetailKey.value = null;
+  }
+}
+
+async function openExternal(url: string) {
+  if (url) await openLink(url);
+}
+
+// --- External detail (readonly card) ---
+// Opening an external task shows a readonly detail of what the mirror KNOWS: the
+// contract deliberately omits the raw description (sanitised away on the private
+// side; the `url` is the door to the full task), so there's no editable body — this
+// is a metadata + provenance view, keyed by source::task_id so a live poll that
+// updates the task re-renders it in place.
+const externalDetailKey = ref<string | null>(null);
+const externalDetailTask = computed<ExternalTask | null>(() => {
+  if (!externalDetailKey.value) return null;
+  return (
+    externalTasks.value.find(
+      (t) => extKey(t.source, t.task_id) === externalDetailKey.value,
+    ) ?? null
+  );
+});
+function openExternalDetail(t: ExternalTask) {
+  externalDetailKey.value = extKey(t.source, t.task_id);
+}
+function closeExternalDetail() {
+  externalDetailKey.value = null;
+}
+
+// Human label for an envelope `type` (contract §1.1: the four fixed event forms).
+function eventKindLabel(kind: string): string {
+  switch (kind) {
+    case "task_created":
+      return t("extEventCreated");
+    case "task_status_changed":
+      return t("extEventStatus");
+    case "task_moved":
+      return t("extEventMoved");
+    case "task_comment_added":
+      return t("extEventComment");
+    default:
+      return kind;
+  }
+}
+
+// Absolute timestamp for the detail meta (relTime gives the relative one).
+function fmtDateTime(iso: string | undefined | null): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleString(locale.value === "ru" ? "ru-RU" : "en-US", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+// Open the shared settings window on the Integrations tab (the enrollment screen).
+async function openIntegrations() {
+  await invoke("open_settings_window", { tab: "integrations" });
+}
+
+// "just now" / "N min ago" / "N h ago" for a recent RFC3339 timestamp; older or
+// unparseable falls back to the absolute fmtTime.
+function relTime(iso: string | undefined | null): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  const min = Math.floor((Date.now() - d.getTime()) / 60000);
+  if (min < 1) return t("todoJustNow");
+  if (min < 60) return `${min}${t("minShort")} ${t("todoAgo")}`;
+  const h = Math.floor(min / 60);
+  if (h < 24) return `${h}${t("hourShort")} ${t("todoAgo")}`;
+  return fmtTime(iso);
+}
+
+let unlistenLocale: (() => void) | null = null;
+let unlistenTodos: (() => void) | null = null;
+let unlistenFocus: (() => void) | null = null;
+let unlistenTriage: (() => void) | null = null;
+let unlistenExternal: (() => void) | null = null;
+let unlistenTaskCosts: (() => void) | null = null;
+
+// Refresh the project picker from cc_usage. The todos window is a persisted
+// webview (created once at startup, then shown/hidden), so `onMounted` runs a
+// single time — without re-pulling, a project first used after launch never
+// reaches the picker. We also kick a background ingest (like the Analytics
+// window) so a brand-new project lands in cc_usage even if Analytics was never
+// opened this session.
+// ── tokens-per-task (t#87) ────────────────────────────────────────────────────
+// The backend joins the transcript-derived session→task attribution with the
+// per-session token totals (get_task_costs). Conservative by design: a session
+// counts toward a task only when the evidence names exactly one task, so a
+// missing chip means "not attributable", not "free".
+interface TaskCostRow {
+  id: string;
+  number: number;
+  sessions: number;
+  direct_sessions: number;
+  interval_sessions: number;
+  explicit_sessions: number;
+  auto_sessions: number;
+  total_tokens: number;
+  cost: number;
+}
+interface TaskCostsPayload {
+  generated_at: string;
+  tasks: TaskCostRow[];
+  ambiguous_sessions: number;
+  ambiguous_tokens: number;
+  ambiguous_cost: number;
+}
+const taskCosts = ref<Map<string, TaskCostRow>>(new Map());
+
+async function loadTaskCosts() {
+  try {
+    const res = await invoke<TaskCostsPayload | null>("get_task_costs");
+    const m = new Map<string, TaskCostRow>();
+    for (const r of res?.tasks ?? []) m.set(r.id, r);
+    taskCosts.value = m;
+  } catch {
+    // keep whatever we had — the chip is best-effort decoration
+  }
+}
+
+function costOf(todo: Todo | null | undefined): TaskCostRow | null {
+  if (!todo) return null;
+  return taskCosts.value.get(todo.id) ?? null;
+}
+
+const fmtCost = (c: number) => "$" + (c >= 100 ? String(Math.round(c)) : c.toFixed(2));
+const fmtTok = (n: number) =>
+  n >= 1_000_000 ? (n / 1_000_000).toFixed(1) + "M" : n >= 1_000 ? Math.round(n / 1_000) + "k" : String(n);
+
+function costTitle(todo: Todo): string {
+  const r = costOf(todo);
+  if (!r) return "";
+  return `${t("todoCostHint")}: ${r.sessions} ${t("todoCostSessions")} · ${fmtTok(r.total_tokens)} ${t("todoCostTokens")}`;
+}
+
+// ── cost by block (t#298) ─────────────────────────────────────────────────────
+// A block = this task worked by ONE session over ONE stretch of time, from the
+// binding journal (`todos take` / a status move). The per-task total above is
+// per-SESSION and older than the journal, so the two disagree by design: work
+// between blocks belongs to no task, and pre-journal sessions have no blocks at
+// all. That difference is shown rather than hidden — see `blocksOutside`.
+interface TaskBlockRow {
+  task: string;
+  number: number;
+  subject: string;
+  session: string;
+  from: string;
+  to: string;
+  explicit: boolean;
+  source: string;
+  project?: string;
+  cost: number;
+  total_tokens: number;
+  messages: number;
+  tool_calls: number;
+  tool_errors: number;
+}
+interface TaskBlocksPayload {
+  blocks: TaskBlockRow[];
+  explicit_blocks: number;
+  auto_blocks: number;
+}
+
+const taskBlocks = ref<TaskBlockRow[]>([]);
+
+async function loadTaskBlocks(id: string | null) {
+  if (!id) {
+    taskBlocks.value = [];
+    return;
+  }
+  try {
+    const res = await invoke<TaskBlocksPayload | null>("get_task_blocks", { task: id });
+    taskBlocks.value = res?.blocks ?? [];
+  } catch {
+    taskBlocks.value = [];
+  }
+}
+
+const blocksSum = computed(() =>
+  taskBlocks.value.reduce((acc, b) => acc + (b.cost || 0), 0),
+);
+
+const blocksOutside = computed(() => {
+  const total = detail.value ? (costOf(detail.value)?.cost ?? 0) : 0;
+  return Math.max(0, total - blocksSum.value);
+});
+
+watch(detailId, (id) => {
+  void loadTaskBlocks(id);
+});
+
+function blockSpan(b: TaskBlockRow): string {
+  const ms = new Date(b.to).getTime() - new Date(b.from).getTime();
+  if (!Number.isFinite(ms) || ms <= 0) return "—";
+  const min = Math.round(ms / 60000);
+  if (min < 60) return `${min}m`;
+  return `${Math.floor(min / 60)}h ${String(min % 60).padStart(2, "0")}m`;
+}
+
+async function refreshKnownProjects() {
+  try {
+    knownProjects.value = await invoke<string[]>("get_cc_projects");
+  } catch {
+    // analytics never ingested → keep the todo-derived fallback
+  }
+  invoke("ingest_cc_usage")
+    .then(async (n) => {
+      if (typeof n === "number" && n > 0) {
+        try {
+          knownProjects.value = await invoke<string[]>("get_cc_projects");
+        } catch {}
+      }
+    })
+    .catch(() => {});
+}
+
+onMounted(async () => {
+  await initSettings();
+  applyLocale(settings.value.locale);
+  // The main window pushes its current locale here whenever it opens this
+  // window — this is a separate WebView that may detect a different navigator
+  // language and have no saved locale to read from the store.
+  const { listen } = await import("@tauri-apps/api/event");
+  unlistenLocale = await listen<string>("todos-locale", (e) => {
+    applyLocale(e.payload);
+  });
+  // Live reload: the backend watcher fires this whenever todos.json changes on
+  // disk (CLI / Claude / hand-edit), so the board stays in sync without a manual
+  // refresh.
+  unlistenTodos = await listen("todos-file-changed", () => {
+    requestReload();
+  });
+  // A fresh nightly-triage digest landed (the backend broadcasts to all
+  // windows); refresh the chip so it reflects the latest run.
+  unlistenTriage = await listen("triage-alert", () => {
+    void loadTriageDigest();
+  });
+  // A poll folded new external events; refresh the mirror + flag changed tasks.
+  // Fires whether or not the External tab is open, so the count chip stays live.
+  unlistenExternal = await listen<ExternalTasksUpdate>("external-tasks-updated", (e) => {
+    applyExternalUpdate(e.payload);
+  });
+  // The background publisher re-derived the session→task attribution (t#87);
+  // re-read the joined costs so the ⚡ chips stay current.
+  unlistenTaskCosts = await listen("task-costs-updated", () => {
+    void loadTaskCosts();
+  });
+  await loadTodos();
+  void loadTaskCosts();
+  // Populate the "External · N" count chip even while in local mode.
+  void loadExternalTasks();
+  void loadStatusMap();
+  await refreshKnownProjects();
+  void loadTriageDigest();
+  // Persisted webview: refresh the picker each time the window is brought to
+  // front, so a project used since the last view (now in cc_usage) shows up.
+  const { getCurrentWindow } = await import("@tauri-apps/api/window");
+  unlistenFocus = await getCurrentWindow().onFocusChanged(({ payload: focused }) => {
+    if (focused) {
+      void refreshKnownProjects();
+      void loadTriageDigest();
+      // Pick up a status remap done in the Settings → Integrations window.
+      void loadStatusMap();
+      void loadExternalTasks();
+    }
+  });
+});
+
+onUnmounted(() => {
+  if (unlistenLocale) unlistenLocale();
+  if (unlistenTodos) unlistenTodos();
+  if (unlistenFocus) unlistenFocus();
+  if (unlistenTriage) unlistenTriage();
+  if (unlistenExternal) unlistenExternal();
+  if (unlistenTaskCosts) unlistenTaskCosts();
+});
+</script>
+
+<template>
+  <div class="tw-root">
+    <!-- BOARD VIEW (owned todos) -->
+    <template v-if="taskMode === 'local' && view === 'board'">
+    <header class="tw-head">
+      <div class="tw-title">
+        <h1>{{ t("tasksTitle") }}</h1>
+        <div class="tw-modes">
+          <button class="tw-mode active" @click="switchMode('local')">
+            {{ t("todoModeLocal") }}
+          </button>
+          <button class="tw-mode" @click="switchMode('external')">
+            {{ t("todoModeExternal") }}<span v-if="externalCount" class="tw-mode-count">{{ externalCount }}</span>
+          </button>
+        </div>
+        <span class="tw-open">{{ openCount }} {{ t("todoOpenItems") }}</span>
+        <div class="tw-triage">
+          <button
+            class="tw-triage-chip"
+            :class="{ open: triageOpen }"
+            :title="t('triageAlertTitle')"
+            @click="triageOpen = !triageOpen"
+          >
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M5.5 2.5h5l2 2v9h-9v-11z" />
+              <path d="M6 7.5h4M6 10h2.5" />
+            </svg>
+            <span class="tw-triage-headline">{{ triageHeadline }}</span>
+            <span class="tw-triage-caret">›</span>
+          </button>
+
+          <template v-if="triageOpen">
+            <div class="tw-triage-backdrop" @click="triageOpen = false"></div>
+            <div class="tw-triage-pop">
+              <div class="tw-triage-pop-head">
+                <span class="tw-triage-pop-title">{{ t("triageAlertTitle") }}</span>
+                <span class="tw-triage-meta" v-if="triageDigest">
+                  <span v-if="triageDigest.project">{{ triageDigest.project }}</span>
+                  <span v-if="triageGeneratedLabel">{{ triageGeneratedLabel }}</span>
+                </span>
+              </div>
+              <!-- Schedule config moved to Settings → Tasks (#35). When nothing
+                   has run yet, point there instead of showing an empty popover. -->
+              <div v-if="!triageDigest" class="tw-triage-clean">
+                {{ t("triageNoRuns") }}
+              </div>
+              <template v-if="triageDigest">
+                <p v-if="triageDigest.summary" class="tw-triage-summary">
+                  {{ triageDigest.summary }}
+                </p>
+                <div v-if="!triageGroups.length" class="tw-triage-clean">
+                  {{ t("triageCardClean") }}
+                </div>
+                <div v-for="g in triageGroups" :key="g.kind" class="tw-triage-group">
+                  <div class="tw-triage-group-head" :class="`k-${g.kind}`">
+                    <span class="tw-triage-dot"></span>
+                    <span>{{ triageKindLabel(g.kind) }}</span>
+                    <span class="tw-triage-count">{{ g.items.length }}</span>
+                  </div>
+                  <ul class="tw-triage-list">
+                    <li v-for="(it, i) in g.items" :key="i" class="tw-triage-item">
+                      <div class="tw-triage-line">
+                        <a
+                          v-if="triageHasTask(it.number)"
+                          class="tw-ref tw-triage-ref"
+                          @click.prevent="triageGoToTask(it.number)"
+                          >#{{ it.number }}</a
+                        ><span v-else-if="it.number != null" class="tw-triage-num"
+                          >#{{ it.number }}</span
+                        ><span class="tw-triage-subject">{{ it.subject }}</span>
+                      </div>
+                      <div v-if="it.note" class="tw-triage-note">{{ it.note }}</div>
+                    </li>
+                  </ul>
+                </div>
+              </template>
+            </div>
+          </template>
+        </div>
+      </div>
+      <div class="tw-spacer"></div>
+      <div class="tw-search">
+        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4">
+          <circle cx="7" cy="7" r="4.5" />
+          <line x1="10.5" y1="10.5" x2="14" y2="14" stroke-linecap="round" />
+        </svg>
+        <input
+          ref="searchInputRef"
+          v-model="search"
+          class="tw-search-input"
+          :placeholder="viewMode === 'graph' ? t('graphSearch') : t('todoSearch')"
+          :title="viewMode === 'graph' ? t('graphSearchHint') : undefined"
+          @keydown.enter="onSearchEnter"
+          @keydown.esc="search = ''"
+        />
+      </div>
+      <ProjectAutocomplete
+        ref="projectAcRef"
+        v-model="projectFilter"
+        :options="projects"
+        :placeholder="t('todoFilterAll')"
+        clearable
+        commit-on="select"
+        width="170px"
+      />
+      <label class="tw-toggle">
+        <input type="checkbox" v-model="showDone" />
+        {{ t("todoShowDone") }}
+      </label>
+      <div class="tw-viewtoggle" role="tablist">
+        <button
+          class="tw-vt"
+          :class="{ active: viewMode === 'board' }"
+          role="tab"
+          :aria-selected="viewMode === 'board'"
+          :title="t('viewBoard')"
+          @click="viewMode = 'board'"
+        >
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4">
+            <rect x="1.5" y="2.5" width="3.6" height="11" rx="1" />
+            <rect x="6.2" y="2.5" width="3.6" height="7.5" rx="1" />
+            <rect x="10.9" y="2.5" width="3.6" height="9.5" rx="1" />
+          </svg>
+          {{ t("viewBoard") }}
+        </button>
+        <button
+          class="tw-vt"
+          :class="{ active: viewMode === 'graph' }"
+          role="tab"
+          :aria-selected="viewMode === 'graph'"
+          :title="t('viewGraph')"
+          @click="viewMode = 'graph'"
+        >
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="4" cy="4" r="2" />
+            <circle cx="12" cy="4" r="2" />
+            <circle cx="8" cy="12.5" r="2" />
+            <path d="M5.6 5.4 8 10.6M10.4 5.4 8 10.6" />
+          </svg>
+          {{ t("viewGraph") }}
+        </button>
+        <button
+          v-if="specsTabVisible"
+          class="tw-vt"
+          :class="{ active: viewMode === 'specs' }"
+          role="tab"
+          :aria-selected="viewMode === 'specs'"
+          :title="t('viewSpecs')"
+          @click="viewMode = 'specs'"
+        >
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 2.5h7l3 3v8H3z" />
+            <path d="M9.5 2.5v3.5H13" />
+            <path d="M5.5 8.5h5M5.5 11h3" />
+          </svg>
+          {{ t("viewSpecs") }}
+        </button>
+      </div>
+      <button
+        v-if="viewMode === 'graph' || viewMode === 'specs'"
+        class="tw-guide"
+        :title="graphUiNew ? t('graphUiOld') : t('graphUiNew')"
+        @click="graphUiNew = !graphUiNew"
+      >
+        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M2.5 5.5h11M2.5 10.5h11" />
+          <circle cx="6" cy="5.5" r="1.6" />
+          <circle cx="10" cy="10.5" r="1.6" />
+        </svg>
+        {{ graphUiNew ? t("graphUiOld") : t("graphUiNew") }}
+      </button>
+      <button class="tw-guide" :title="t('todoGuideHint')" @click="openGuide">
+        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M2.5 3.2c1.8-.6 3.7-.6 5.5.3 1.8-.9 3.7-.9 5.5-.3v8.6c-1.8-.6-3.7-.6-5.5.3-1.8-.9-3.7-.9-5.5-.3z" />
+          <path d="M8 3.5v8.6" />
+        </svg>
+        {{ t("todoGuide") }}
+      </button>
+      <button class="tw-guide" :title="t('settings')" @click="openSettings">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+          <path d="M19.43 12.98c.04-.32.07-.64.07-.98s-.03-.66-.07-.98l2.11-1.65c.19-.15.24-.42.12-.64l-2-3.46c-.12-.22-.39-.3-.61-.22l-2.49 1c-.52-.4-1.08-.73-1.69-.98l-.38-2.65C14.46 2.18 14.25 2 14 2h-4c-.25 0-.46.18-.49.42l-.38 2.65c-.61.25-1.17.59-1.69.98l-2.49-1c-.23-.09-.49 0-.61.22l-2 3.46c-.13.22-.07.49.12.64l2.11 1.65c-.04.32-.07.65-.07.98s.03.66.07.98l-2.11 1.65c-.19.15-.24.42-.12.64l2 3.46c.12.22.39.3.61.22l2.49-1c.52.4 1.08.73 1.69.98l.38 2.65c.03.24.18.42.43.42h4c.25 0 .46-.18.49-.42l.38-2.65c.61-.25 1.17-.59 1.69-.98l2.49 1c.23.09.49 0 .61-.22l2-3.46c.12-.22.07-.49-.12-.64l-2.11-1.65zM12 15.5c-1.93 0-3-1.07-3-3.5s1.07-3.5 3-3.5 3 1.07 3 3.5-1.07 3.5-3 3.5z" />
+        </svg>
+        {{ t("settings") }}
+      </button>
+      <button class="tw-add" @click="startNew('backlog')">+ {{ t("todoAdd") }}</button>
+    </header>
+
+    <div v-if="errorMsg" class="tw-error">{{ errorMsg }}</div>
+
+    <div v-if="boardRecovering" class="tw-recovery">
+      <span class="tw-recovery-text">
+        <template v-if="boardState?.state === 'unreadable'">
+          {{ t("boardUnreadable", { reason: boardState.reason }) }}
+          {{ boardState.backup ? t("boardBackupAt", { path: boardState.backup }) : t("boardNoBackup") }}
+        </template>
+        <template v-else-if="boardState?.state === 'future-version'">
+          {{ t("boardFutureVersion", { version: boardState.version, current: BOARD_CURRENT_VERSION }) }}
+        </template>
+        <template v-if="latestBoardBackup">
+          {{ t("boardRestorePeriodicBackup", { path: latestBoardBackup.name }) }}
+        </template>
+      </span>
+      <button
+        v-if="latestBoardBackup"
+        class="tw-recovery-restore"
+        :disabled="restoringBoard"
+        @click="restoreBoardFromBackup"
+      >
+        {{ restoringBoard ? t("migrateRestoring") : t("migrateRestore") }}
+      </button>
+    </div>
+
+    <div v-if="loading" class="tw-empty">{{ t("loading") }}</div>
+
+    <!-- Task graph, new rendering: lanes by theme, artifacts on wires, ref rings -->
+    <PipelineGraph
+      v-else-if="viewMode === 'graph' && graphUiNew"
+      @open="onPipelineOpen"
+    />
+
+    <!-- Task graph: an alternative view of the same filtered board (#88) -->
+    <GraphView
+      ref="graphRef"
+      v-else-if="viewMode === 'graph'"
+      :todos="todos"
+      :project="projectFilter"
+      :query="search"
+      @update="onGraphUpdate"
+      @open="onPipelineOpen"
+    />
+
+    <!-- Specs, new rendering: reader and review over the same registry -->
+    <PipelineGraph
+      v-else-if="viewMode === 'specs' && graphUiNew"
+      v-model:mode="specMode"
+      @open="onPipelineOpen"
+    />
+
+    <!-- Specs: the level above the board — section, its changes, their graph -->
+    <SpecView
+      v-else-if="viewMode === 'specs'"
+      :todos="todos"
+      :changes="changes"
+      :project="projectFilter"
+      :target="specTarget"
+      @open="onPipelineOpen"
+    />
+
+    <!-- Kanban board -->
+    <main v-else class="tw-board">
+      <section
+        v-for="col in boardColumns"
+        :key="col.id"
+        class="tw-col"
+        :class="{ over: overCol === col.id }"
+        @dragover="onColDragOver(col.id, $event)"
+        @dragleave="onColDragLeave(col.id, $event)"
+        @drop.prevent="onColDrop(col.id)"
+      >
+        <div class="tw-col-head">
+          <span class="tw-col-dot" :style="{ background: col.dot }"></span>
+          <span class="tw-col-name">{{ t(col.labelKey) }}</span>
+          <span class="tw-col-count">{{ itemsFor(col.id).length }}</span>
+          <button class="tw-col-add" :title="t('todoAdd')" @click="startNew(col.id)">
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
+              <path d="M8 3v10M3 8h10" />
+            </svg>
+          </button>
+        </div>
+
+        <div class="tw-col-body scroll">
+          <div v-if="!itemsFor(col.id).length" class="tw-col-empty">
+            {{ overCol === col.id ? t("todoDropHere") : t("todoColEmpty") }}
+          </div>
+
+          <article
+            v-for="todo in itemsFor(col.id)"
+            :key="todo.id"
+            class="tw-card"
+            :class="{ dragging: dragId === todo.id, done: todo.status === 'done' }"
+            :style="{ borderLeftColor: columnColor(todo.status) }"
+            draggable="true"
+            @dragstart="onDragStart(todo, $event)"
+            @dragend="onDragEnd"
+          >
+            <div class="tw-card-title"><span v-if="todo.number" class="tw-card-num">#{{ todo.number }}</span>{{ todo.subject }}</div>
+            <p v-if="todo.description" class="tw-card-desc">{{ todo.description }}</p>
+
+            <div class="tw-card-meta">
+              <span
+                v-if="todo.priority"
+                class="tw-chip tw-prio"
+                :class="'tw-prio-' + todo.priority"
+                :title="t('todoPriority')"
+                >{{ priorityLabel(todo.priority) }}</span
+              >
+              <span v-if="todo.created_by === 'claude'" class="tw-ai sm" :title="t('todoAiHint')">{{ t("todoAi") }}</span>
+              <span v-if="todo.project" class="tw-tag">
+                <ProjectLabel
+                  :name="todo.project"
+                  :aliases="aliasesOf(todo.project)"
+                  :merged-into="canonicalOf(todo.project)"
+                />
+              </span>
+              <span
+                v-if="todo.from && todo.from !== todo.project"
+                class="tw-chip tw-from"
+                :title="t('todoFromHint')"
+              >↘ {{ t("todoFrom") }} {{ todo.from }}</span>
+              <span
+                v-if="todo.imported_at"
+                class="tw-chip tw-imported"
+                :title="t('todoImportedHint')"
+              >⤓ {{ t("todoImported") }}</span>
+              <span v-if="todo.scheduled_for" class="tw-chip">📅 {{ todo.scheduled_for }}</span>
+              <span v-if="todo.plan" class="tw-chip" :title="todo.plan">📝</span>
+              <!-- Only the task's OWN link on the card: an inherited one would
+                   repeat the change root's chip on every step under it. -->
+              <span
+                v-for="a in todo.spec ?? []"
+                :key="a"
+                class="tw-chip tw-spec"
+                :title="t('todoSpecHint')"
+                @click.stop="openSpecSection(a)"
+              >📘 {{ a }}</span>
+              <span v-if="refCount(todo)" class="tw-chip" :title="t('todoRefs')">🔗 {{ refCount(todo) }}</span>
+              <span v-if="costOf(todo)" class="tw-chip" :title="costTitle(todo)">⚡ {{ fmtCost(costOf(todo)!.cost) }}</span>
+            </div>
+
+            <div class="tw-card-foot">
+              <select
+                :value="todo.status"
+                class="tw-select sm"
+                @click.stop
+                @mousedown.stop
+                @change="moveStatus(todo, ($event.target as HTMLSelectElement).value)"
+              >
+                <option v-for="c in COLUMNS" :key="c.id" :value="c.id">{{ statusLabel(c.id) }}</option>
+              </select>
+              <div class="tw-card-actions">
+                <button class="tw-icon" :title="t('todoEdit')" @click.stop="openDetail(todo)" @mousedown.stop>
+                  <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M11.5 2.5l2 2L6 12l-2.5.5L4 10z" />
+                    <path d="M10.5 3.5l2 2" />
+                  </svg>
+                </button>
+                <button class="tw-icon danger" :title="t('todoDelete')" @click.stop="removeTodo(todo)" @mousedown.stop>
+                  <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M3 4.5h10" />
+                    <path d="M6.5 4.5V3.2a.7.7 0 0 1 .7-.7h1.6a.7.7 0 0 1 .7.7v1.3" />
+                    <path d="M4.3 4.5l.5 8a1 1 0 0 0 1 .95h4.4a1 1 0 0 0 1-.95l.5-8" />
+                    <path d="M6.6 7v4M9.4 7v4" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+          </article>
+        </div>
+      </section>
+    </main>
+    </template>
+
+    <!-- DETAIL VIEW: master-detail editor (left = project siblings, right = fields) -->
+    <template v-else-if="taskMode === 'local'">
+      <header class="tw-head">
+        <button class="tw-back" @click="closeDetail">
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 3.5 5 8l4.5 4.5" /></svg>
+          {{ t("todoBack") }}
+        </button>
+        <div class="tw-title">
+          <h1><span v-if="detail?.number" class="tw-detail-num">#{{ detail.number }}</span>{{ draft.subject || t("todoNew") }}</h1>
+          <span v-if="detail && detail.created_by === 'claude'" class="tw-ai" :title="t('todoAiHint')">{{ t("todoAi") }}</span>
+        </div>
+        <div class="tw-spacer"></div>
+        <transition name="tw-fade">
+          <span v-if="saved" class="tw-saved">
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 8.5l3 3 6-7" /></svg>
+            {{ t("todoSaved") }}
+          </span>
+        </transition>
+        <button class="tw-btn" :disabled="!draft.subject.trim() || draftSubjectOverLimit" @click="saveDetail">{{ t("save") }}</button>
+      </header>
+
+      <div v-if="errorMsg" class="tw-error">{{ errorMsg }}</div>
+
+      <div class="tw-detail">
+        <aside class="tw-detail-list">
+          <div class="tw-detail-list-hd">{{ detail && detail.project ? detail.project : t("todoNoProject") }}</div>
+          <button
+            v-for="td in detailSiblings"
+            :key="td.id"
+            class="tw-detail-item"
+            :class="{ active: td.id === detailId }"
+            @click="openDetail(td)"
+          >
+            <span class="tw-detail-item-dot" :style="{ background: columnColor(td.status) }"></span>
+            <span class="tw-detail-item-subj" :class="{ done: td.status === 'done' }"><span v-if="td.number" class="tw-detail-item-num">#{{ td.number }}</span>{{ td.subject }}</span>
+            <span v-if="td.created_by === 'claude'" class="tw-ai sm" :title="t('todoAiHint')">{{ t("todoAi") }}</span>
+          </button>
+        </aside>
+
+        <section v-if="detail" class="tw-detail-main">
+          <label class="tw-field">
+            <span>{{ t("todoSubject") }}</span>
+            <input v-model="draft.subject" class="tw-input" maxlength="200" />
+            <span
+              v-if="draftSubjectRemaining < 30"
+              class="tw-subject-counter"
+              :class="{ crit: draftSubjectOverLimit }"
+            >{{ subjectCounterLabel(draftSubjectRemaining) }}</span>
+          </label>
+          <div class="tw-row">
+            <label class="tw-field">
+              <span>{{ t("todoStatus") }}</span>
+              <select v-model="draft.status" class="tw-select">
+                <option v-for="c in COLUMNS" :key="c.id" :value="c.id">{{ t(c.labelKey) }}</option>
+              </select>
+            </label>
+            <label class="tw-field">
+              <span>{{ t("todoPriority") }}</span>
+              <select v-model="draft.priority" class="tw-select">
+                <option value="">{{ t("todoPriorityNone") }}</option>
+                <option v-for="p in PRIORITY_LEVELS" :key="p" :value="p">{{ priorityLabel(p) }}</option>
+              </select>
+            </label>
+          </div>
+          <label class="tw-field">
+            <span>{{ t("todoProject") }}</span>
+            <ProjectAutocomplete
+              v-model="draft.project"
+              :options="projects"
+              :placeholder="t('todoNoProject')"
+              clearable
+            />
+          </label>
+          <div
+            v-if="detail?.from && detail.from !== draft.project"
+            class="tw-from-note"
+            :title="t('todoFromHint')"
+          >
+            ↘ {{ t("todoFrom") }} <strong>{{ detail.from }}</strong>
+          </div>
+          <div class="tw-row">
+            <label class="tw-field">
+              <span>{{ t("todoScheduledFor") }}</span>
+              <input v-model="draft.scheduled_for" class="tw-input" type="date" />
+            </label>
+          </div>
+          <label class="tw-field">
+            <span class="tw-field-row">
+              {{ t("todoDescription") }}
+              <button
+                type="button"
+                class="tw-mode"
+                @click="descMode = descMode === 'edit' ? 'preview' : 'edit'"
+              >
+                {{ descMode === "edit" ? t("todoPreview") : t("todoEditField") }}
+              </button>
+            </span>
+            <div v-if="descMode === 'edit'" class="tw-mention-wrap">
+              <textarea
+                ref="descTextarea"
+                v-model="draft.description"
+                class="tw-input tw-area"
+                rows="7"
+                @input="onMentionInput('desc', $event)"
+                @keydown="onMentionKeydown('desc', $event)"
+                @blur="onMentionBlur"
+              ></textarea>
+              <ul v-if="mention && mention.target === 'desc' && mentionItems.length" ref="descMenuEl" class="tw-mention">
+                <li
+                  v-for="(it, i) in mentionItems"
+                  :key="it.value"
+                  class="tw-mention-item"
+                  :class="{ sel: i === mention.sel }"
+                  @mousedown.prevent="pickMention(it)"
+                >
+                  <span class="tw-mention-key">{{ it.label }}</span>
+                  <span v-if="it.sub" class="tw-mention-sub">{{ it.sub }}</span>
+                </li>
+              </ul>
+            </div>
+            <div v-else class="tw-richtext">
+              <template v-if="draft.description.trim()"
+                ><template v-for="(s, i) in descSegments" :key="i"
+                  ><a v-if="s.kind === 'url'" class="tw-link" @click.prevent="openLink(s.href)">{{ s.text }}</a
+                  ><a v-else-if="s.kind === 'task'" class="tw-ref" :title="s.subject" @click.prevent="openTask(s.number)">{{ s.text }}<span class="tw-ref-title">{{ s.subject }}</span></a
+                  ><a v-else-if="s.kind === 'project'" class="tw-ref tw-ref-proj" @click.prevent="openProject(s.project)">{{ s.text }}</a
+                  ><span v-else>{{ s.text }}</span></template
+                ></template
+              >
+              <span v-else class="tw-richtext-empty">{{ t("todoNoDescription") }}</span>
+            </div>
+          </label>
+          <!-- The plan (t#253 field roles): HOW only — the STEPS + ORDER part of an
+               accepted plan; the vision lives in the description. -->
+          <label class="tw-field">
+            <span>{{ t("todoPlan") }} <em class="tw-hint">{{ t("todoPlanHint") }}</em></span>
+            <textarea v-model="draft.plan" class="tw-input tw-area" rows="5"></textarea>
+          </label>
+
+          <!-- Handoff (#141): what this task hands forward to whatever depends on it.
+               Written here or by the cc-todos CLI; a session on a dependent task reads it. -->
+          <label class="tw-field">
+            <span>{{ t("todoHandoff") }} <em class="tw-hint">{{ t("todoHandoffHint") }}</em></span>
+            <textarea v-model="draft.handoff" class="tw-input tw-area" rows="4"></textarea>
+          </label>
+
+          <!-- Inherited handoff: read-only, what the tasks THIS one depends on left
+               off. Mirrors `cc-todos todos handoff <task>`. -->
+          <div v-if="inheritedHandoff.length" class="tw-field tw-handoff-in">
+            <span class="tw-handoff-in-hd">{{ t("todoHandoffInherited") }}</span>
+            <div v-for="p in inheritedHandoff" :key="p.id" class="tw-handoff-item">
+              <div class="tw-handoff-item-hd">t#{{ p.number }} · {{ p.subject }}</div>
+              <p v-if="p.handoff" class="tw-handoff-item-body">{{ p.handoff }}</p>
+              <p v-else class="tw-handoff-item-empty">{{ t("todoHandoffItemEmpty") }}</p>
+            </div>
+          </div>
+
+          <!-- The spec this task is about (t#339/t#346): read-only here on
+               purpose — the link is written by `todos set spec`, which validates
+               the address against the registry, and the answers by `spec answer`.
+               A field typed here would accept an address that resolves to
+               nothing, which is the one thing the link must never be. -->
+          <div v-if="detailSpec.addresses.length || detailAnswers.length" class="tw-field tw-spec-box">
+            <span class="tw-handoff-in-hd">
+              {{ t("todoSpec") }}
+              <em v-if="detailSpec.inherited" class="tw-hint">{{ t("todoSpecInherited") }}</em>
+            </span>
+            <div class="tw-spec-links">
+              <button
+                v-for="a in detailSpec.addresses"
+                :key="a"
+                class="tw-spec-link"
+                :title="t('todoSpecHint')"
+                @click.prevent="openSpecSection(a)"
+              >📘 {{ a }}</button>
+            </div>
+            <div v-for="(a, i) in detailAnswers" :key="i" class="tw-spec-answer">
+              <span class="tw-spec-verdict" :class="`v-${a.verdict}`">{{ a.verdict }}</span>
+              <span class="tw-spec-answer-addr">{{ a.address }}</span>
+              <span class="tw-spec-answer-at">{{ (a.at || "").slice(0, 10) }}</span>
+              <p class="tw-spec-answer-note">{{ a.note }}</p>
+            </div>
+          </div>
+
+          <div class="tw-form-actions">
+            <transition name="tw-fade">
+              <span v-if="saved" class="tw-saved">
+                <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 8.5l3 3 6-7" /></svg>
+                {{ t("todoSaved") }}
+              </span>
+            </transition>
+            <button type="button" class="tw-btn ghost" @click="closeDetail">{{ t("todoBack") }}</button>
+            <button type="button" class="tw-btn" :disabled="!draft.subject.trim() || draftSubjectOverLimit" @click="saveDetail">{{ t("save") }}</button>
+          </div>
+
+          <!-- Cost by block: the task's spend split by (session x interval) -->
+          <div class="tw-blocks">
+            <div class="tw-blocks-hd" :title="t('todoBlocksHint')">
+              {{ t("todoBlocks") }}
+              <span v-if="taskBlocks.length" class="tw-comments-n">{{ taskBlocks.length }}</span>
+            </div>
+            <div v-if="!taskBlocks.length" class="tw-comments-empty">{{ t("todoBlocksEmpty") }}</div>
+            <template v-else>
+              <ul class="tw-block-list">
+                <li v-for="(b, i) in taskBlocks" :key="b.session + b.from + i" class="tw-block">
+                  <span class="tw-block-when">{{ fmtTime(b.from) }}</span>
+                  <span class="tw-block-span">{{ blockSpan(b) }}</span>
+                  <span class="tw-block-cost">{{ fmtCost(b.cost) }}</span>
+                  <span class="tw-block-msgs">{{ b.tool_calls }} {{ t("todoBlocksCalls") }}</span>
+                  <span v-if="b.tool_errors" class="tw-block-errs">{{ b.tool_errors }} {{ t("todoBlocksErrors") }}</span>
+                  <span
+                    class="tw-block-kind"
+                    :class="{ auto: !b.explicit }"
+                    :title="b.explicit ? b.source : t('todoBlocksAutoHint')"
+                  >{{ b.explicit ? t("todoBlocksExplicit") : t("todoBlocksAuto") }}</span>
+                </li>
+              </ul>
+              <div class="tw-blocks-foot">
+                <span>{{ t("todoBlocksSum") }}: <b>{{ fmtCost(blocksSum) }}</b></span>
+                <span v-if="blocksOutside > 0.005" class="tw-blocks-outside" :title="t('todoBlocksOutsideHint')">
+                  {{ t("todoBlocksOutside") }}: <b>{{ fmtCost(blocksOutside) }}</b>
+                </span>
+              </div>
+            </template>
+          </div>
+
+          <!-- Comments thread (posted independently of the field draft) -->
+          <div class="tw-comments">
+            <div class="tw-comments-hd">
+              {{ t("todoComments") }}
+              <span v-if="detailComments.length" class="tw-comments-n">{{ detailComments.length }}</span>
+            </div>
+            <div v-if="!detailComments.length" class="tw-comments-empty">{{ t("todoCommentsEmpty") }}</div>
+            <ul v-else class="tw-comment-list">
+              <li
+                v-for="c in detailComments"
+                :key="c.id"
+                class="tw-comment"
+                :class="{ ai: c.author === 'claude' }"
+              >
+                <div class="tw-comment-head">
+                  <span class="tw-comment-author" :class="{ ai: c.author === 'claude' }">{{ commentAuthorLabel(c.author) }}</span>
+                  <span v-if="fmtTime(c.created_at)" class="tw-comment-time">{{ fmtTime(c.created_at) }}</span>
+                  <button class="tw-comment-del" :title="t('todoDelete')" @click="removeComment(c.id)">
+                    <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M4 4l8 8M12 4l-8 8" /></svg>
+                  </button>
+                </div>
+                <p class="tw-comment-body"
+                  ><template v-for="(s, i) in tokenize(c.body)" :key="i"
+                    ><a v-if="s.kind === 'url'" class="tw-link" @click.prevent="openLink(s.href)">{{ s.text }}</a
+                    ><a v-else-if="s.kind === 'task'" class="tw-ref" :title="s.subject" @click.prevent="openTask(s.number)">{{ s.text }}<span class="tw-ref-title">{{ s.subject }}</span></a
+                    ><a v-else-if="s.kind === 'project'" class="tw-ref tw-ref-proj" @click.prevent="openProject(s.project)">{{ s.text }}</a
+                    ><span v-else>{{ s.text }}</span></template
+                  ></p
+                >
+              </li>
+            </ul>
+            <div class="tw-comment-compose">
+              <div class="tw-mention-wrap">
+                <textarea
+                  ref="commentTextarea"
+                  v-model="newComment"
+                  class="tw-input tw-area"
+                  :placeholder="t('todoCommentPlaceholder')"
+                  rows="2"
+                  @input="onMentionInput('comment', $event)"
+                  @keydown="onMentionKeydown('comment', $event)"
+                  @keydown.ctrl.enter="addComment"
+                  @keydown.meta.enter="addComment"
+                  @blur="onMentionBlur"
+                ></textarea>
+                <ul v-if="mention && mention.target === 'comment' && mentionItems.length" ref="commentMenuEl" class="tw-mention up">
+                  <li
+                    v-for="(it, i) in mentionItems"
+                    :key="it.value"
+                    class="tw-mention-item"
+                    :class="{ sel: i === mention.sel }"
+                    @mousedown.prevent="pickMention(it)"
+                  >
+                    <span class="tw-mention-key">{{ it.label }}</span>
+                    <span v-if="it.sub" class="tw-mention-sub">{{ it.sub }}</span>
+                  </li>
+                </ul>
+              </div>
+              <button class="tw-btn" :disabled="!newComment.trim()" @click="addComment">{{ t("todoCommentAdd") }}</button>
+            </div>
+          </div>
+        </section>
+        <section v-else class="tw-detail-main tw-detail-empty">{{ t("todoColEmpty") }}</section>
+      </div>
+    </template>
+
+    <!-- EXTERNAL VIEW: readonly mirror of external tasks, grouped by source (ph6) -->
+    <template v-else>
+      <!-- LIST sub-view: grouped readonly cards -->
+      <template v-if="!externalDetailTask">
+      <header class="tw-head">
+        <div class="tw-title">
+          <h1>{{ t("tasksTitle") }}</h1>
+          <div class="tw-modes">
+            <button class="tw-mode" @click="switchMode('local')">
+              {{ t("todoModeLocal") }}
+            </button>
+            <button class="tw-mode active" @click="switchMode('external')">
+              {{ t("todoModeExternal") }}<span v-if="externalCount" class="tw-mode-count">{{ externalCount }}</span>
+            </button>
+          </div>
+        </div>
+        <div class="tw-spacer"></div>
+        <span v-if="externalLastPoll" class="tw-ext-poll">
+          {{ t("todoExtLastPoll") }} {{ relTime(externalLastPoll) }}
+        </span>
+        <button class="tw-guide" :disabled="externalRefreshing" @click="refreshExternal">
+          <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9" />
+            <path d="M13.5 2.5v3h-3" />
+          </svg>
+          {{ externalRefreshing ? t("todoExtRefreshing") : t("todoExtRefresh") }}
+        </button>
+        <button class="tw-guide" :title="t('settings')" @click="openSettings">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M19.43 12.98c.04-.32.07-.64.07-.98s-.03-.66-.07-.98l2.11-1.65c.19-.15.24-.42.12-.64l-2-3.46c-.12-.22-.39-.3-.61-.22l-2.49 1c-.52-.4-1.08-.73-1.69-.98l-.38-2.65C14.46 2.18 14.25 2 14 2h-4c-.25 0-.46.18-.49.42l-.38 2.65c-.61.25-1.17.59-1.69.98l-2.49-1c-.23-.09-.49 0-.61.22l-2 3.46c-.13.22-.07.49.12.64l2.11 1.65c-.04.32-.07.65-.07.98s.03.66.07.98l-2.11 1.65c-.19.15-.24.42-.12.64l2 3.46c.12.22.39.3.61.22l2.49-1c.52.4 1.08.73 1.69.98l.38 2.65c.03.24.18.42.43.42h4c.25 0 .46-.18.49-.42l.38-2.65c.61-.25 1.17-.59 1.69-.98l2.49 1c.23.09.49 0 .61-.22l2-3.46c.12-.22.07-.49-.12-.64l-2.11-1.65zM12 15.5c-1.93 0-3-1.07-3-3.5s1.07-3.5 3-3.5 3 1.07 3 3.5-1.07 3.5-3 3.5z" />
+          </svg>
+          {{ t("settings") }}
+        </button>
+      </header>
+
+      <div v-if="errorMsg" class="tw-error">{{ errorMsg }}</div>
+
+      <!-- Not enrolled: nothing to mirror until a resolver is connected. -->
+      <div v-if="!externalBound && !externalCount" class="tw-empty tw-ext-empty">
+        <p>{{ t("todoExtNotBound") }}</p>
+        <button class="tw-btn" @click="openIntegrations">{{ t("todoExtOpenSettings") }}</button>
+      </div>
+      <!-- Enrolled but the mirror is still empty. -->
+      <div v-else-if="!externalCount" class="tw-empty">{{ t("todoExtEmpty") }}</div>
+
+      <main v-else class="tw-ext-board">
+        <section v-for="col in externalColumns" :key="col.id" class="tw-col tw-ext-col">
+          <div class="tw-col-head">
+            <span class="tw-col-dot" :style="{ background: col.dot }"></span>
+            <span class="tw-col-name">{{ col.label }}</span>
+            <span class="tw-col-count">{{ col.tasks.length }}</span>
+          </div>
+          <div class="tw-col-body scroll">
+            <article
+              v-for="tk in col.tasks"
+              :key="tk.source + '::' + tk.task_id"
+              class="tw-ext-card"
+              :class="{ changed: externalIsChanged(tk) }"
+              role="button"
+              tabindex="0"
+              @click="openExternalDetail(tk)"
+              @keyup.enter="openExternalDetail(tk)"
+            >
+              <div class="tw-ext-row">
+                <span class="tw-ext-source-badge">{{ tk.source }}</span>
+                <span v-if="externalIsChanged(tk)" class="tw-ext-changed" :title="t('todoExtChanged')">•</span>
+                <a class="tw-ext-link" :title="tk.url" @click.stop.prevent="openExternal(tk.url)">
+                  <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M6 3H3.5v9.5h9.5V10" />
+                    <path d="M9 3h4v4M13 3l-6 6" />
+                  </svg>
+                </a>
+              </div>
+              <div class="tw-ext-card-title">{{ tk.title }}</div>
+              <div class="tw-ext-card-foot">
+                <span class="tw-ext-status" :class="extStatusClass(tk.status)">{{ tk.status }}</span>
+                <span v-if="tk.assignee" class="tw-ext-assignee">{{ tk.assignee }}</span>
+              </div>
+            </article>
+            <div v-if="!col.tasks.length" class="tw-col-empty">—</div>
+          </div>
+        </section>
+      </main>
+      </template>
+
+      <!-- DETAIL sub-view: readonly metadata + provenance for one external task -->
+      <template v-else-if="externalDetailTask">
+        <header class="tw-head">
+          <button class="tw-back" @click="closeExternalDetail">
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 3.5 5 8l4.5 4.5" /></svg>
+            {{ t("todoBack") }}
+          </button>
+          <div class="tw-title">
+            <span class="tw-ext-detail-source">{{ externalDetailTask.source }}</span>
+          </div>
+        </header>
+
+        <main class="tw-ext-detail">
+          <div class="tw-ext-detail-card">
+            <div class="tw-ext-detail-top">
+              <span class="tw-ext-status" :class="extStatusClass(externalDetailTask.status)">
+                {{ externalDetailTask.status }}
+              </span>
+              <span v-if="externalIsChanged(externalDetailTask)" class="tw-ext-changed">
+                • {{ t("todoExtChanged") }}
+              </span>
+            </div>
+            <h1 class="tw-ext-detail-title">{{ externalDetailTask.title }}</h1>
+
+            <dl class="tw-ext-detail-meta">
+              <div class="tw-ext-detail-row">
+                <dt>{{ t("extfSource") }}</dt>
+                <dd>{{ externalDetailTask.source }}</dd>
+              </div>
+              <div v-if="externalDetailTask.project" class="tw-ext-detail-row">
+                <dt>{{ t("extfProject") }}</dt>
+                <dd>{{ externalDetailTask.project }}</dd>
+              </div>
+              <div v-if="externalDetailTask.assignee" class="tw-ext-detail-row">
+                <dt>{{ t("extfAssignee") }}</dt>
+                <dd>{{ externalDetailTask.assignee }}</dd>
+              </div>
+              <div v-if="externalDetailTask.priority" class="tw-ext-detail-row">
+                <dt>{{ t("extfPriority") }}</dt>
+                <dd>{{ priorityLabel(externalDetailTask.priority) }}</dd>
+              </div>
+              <div class="tw-ext-detail-row">
+                <dt>{{ t("extfUpdated") }}</dt>
+                <dd>{{ fmtDateTime(externalDetailTask.updated_at) }}</dd>
+              </div>
+              <div v-if="externalDetailTask.last_event_kind" class="tw-ext-detail-row">
+                <dt>{{ t("extfLastEvent") }}</dt>
+                <dd>
+                  {{ eventKindLabel(externalDetailTask.last_event_kind) }}
+                  <span v-if="relTime(externalDetailTask.last_event_ts)" class="tw-ext-detail-dim">
+                    · {{ relTime(externalDetailTask.last_event_ts) }}
+                  </span>
+                </dd>
+              </div>
+            </dl>
+
+            <!-- Sanitised description, once the source provides it (DTO groundwork). -->
+            <div v-if="externalDetailTask.description" class="tw-ext-detail-desc">
+              {{ externalDetailTask.description }}
+            </div>
+
+            <button class="tw-btn" @click="openExternal(externalDetailTask.url)">
+              <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="margin-right:6px">
+                <path d="M6 3H3.5v9.5h9.5V10" />
+                <path d="M9 3h4v4M13 3l-6 6" />
+              </svg>
+              {{ t("todoExtOpenSource") }}
+            </button>
+
+            <p class="tw-ext-detail-note">{{ t("todoExtDescNote") }}</p>
+          </div>
+        </main>
+      </template>
+    </template>
+
+    <!-- Delete confirmation (issue #21) -->
+    <div v-if="pendingDelete" class="tw-modal" @click.self="cancelDelete">
+      <div class="tw-form tw-confirm">
+        <div class="tw-form-title">{{ t("todoDeleteConfirmTitle") }}</div>
+        <p class="tw-confirm-body">
+          {{ t("todoDeleteConfirmBody") }} <strong>{{ pendingDelete.subject }}</strong>
+        </p>
+        <div class="tw-form-actions">
+          <button type="button" class="tw-btn ghost" @click="cancelDelete">{{ t("todoCancel") }}</button>
+          <button type="button" class="tw-btn danger" @click="confirmDelete">{{ t("todoDelete") }}</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Create / edit form (modal overlay) -->
+    <div v-if="formOpen" class="tw-modal" @click.self="resetForm">
+      <form class="tw-form" @submit.prevent="submitForm">
+        <div class="tw-form-title">
+          {{ editingId ? t("todoEdit") : t("todoNew") }}
+        </div>
+        <input
+          v-model="fSubject"
+          class="tw-input"
+          :placeholder="t('todoSubjectPlaceholder')"
+          maxlength="200"
+          autofocus
+        />
+        <span
+          v-if="fSubjectRemaining < 30"
+          class="tw-subject-counter"
+          :class="{ crit: fSubjectOverLimit }"
+        >{{ subjectCounterLabel(fSubjectRemaining) }}</span>
+        <textarea
+          v-model="fDescription"
+          class="tw-input tw-area"
+          :placeholder="t('todoDescription')"
+          rows="2"
+        ></textarea>
+        <label class="tw-field">
+          <span>{{ t("todoProject") }}</span>
+          <ProjectAutocomplete
+            v-model="fProject"
+            :options="projects"
+            :placeholder="t('todoProjectPlaceholder')"
+          />
+        </label>
+        <label class="tw-field">
+          <span>{{ t("todoPriority") }}</span>
+          <select v-model="fPriority" class="tw-select">
+            <option value="">{{ t("todoPriorityNone") }}</option>
+            <option v-for="p in PRIORITY_LEVELS" :key="p" :value="p">{{ priorityLabel(p) }}</option>
+          </select>
+        </label>
+        <div class="tw-row">
+          <label class="tw-field">
+            <span>{{ t("todoScheduledFor") }}</span>
+            <input v-model="fScheduled" class="tw-input" type="date" />
+          </label>
+        </div>
+        <label class="tw-field">
+          <span>{{ t("todoPlan") }} <em class="tw-hint">{{ t("todoPlanHint") }}</em></span>
+          <textarea v-model="fPlan" class="tw-input tw-area" rows="4"></textarea>
+        </label>
+        <div class="tw-form-actions">
+          <button type="button" class="tw-btn ghost" @click="resetForm">{{ t("todoCancel") }}</button>
+          <button type="submit" class="tw-btn" :disabled="!fSubject.trim() || fSubjectOverLimit">{{ t("save") }}</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</template>
+
+<style scoped>
+.tw-root {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--flyout-bg, #1c1c1c);
+  color: var(--text);
+  font-family: var(--segoe);
+  overflow: hidden;
+}
+.tw-head {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--stroke-strong);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  flex-shrink: 0;
+}
+.tw-title {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.tw-title h1 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+}
+.tw-detail-num {
+  margin-right: 7px;
+  color: var(--text-3);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.tw-open {
+  font-size: 12px;
+  color: var(--text-3);
+}
+.tw-spacer {
+  flex: 1;
+}
+.tw-search {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--card-bg);
+  border: 1px solid var(--stroke-strong);
+  border-radius: 6px;
+  padding: 0 9px;
+  color: var(--text-3);
+}
+.tw-search:focus-within {
+  border-color: var(--accent);
+}
+.tw-search-input {
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--text);
+  font-size: 12px;
+  font-family: var(--segoe);
+  padding: 6px 0;
+  width: 150px;
+}
+.tw-select {
+  background: var(--card-bg);
+  color: var(--text-2);
+  border: 1px solid var(--stroke-strong);
+  border-radius: 6px;
+  padding: 5px 8px;
+  font-size: 12px;
+  font-family: var(--segoe);
+}
+.tw-select.sm {
+  padding: 3px 6px;
+  font-size: 11px;
+  max-width: 110px;
+}
+.tw-toggle {
+  font-size: 12px;
+  color: var(--text-3);
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+}
+.tw-guide {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid var(--stroke-strong);
+  background: var(--card-bg);
+  color: var(--text-3);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  font-family: var(--segoe);
+  transition: color 120ms, border-color 120ms;
+}
+.tw-guide:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+.tw-guide svg {
+  opacity: 0.85;
+}
+/* Segmented Board/Graph view switch (#88). */
+.tw-viewtoggle {
+  display: inline-flex;
+  border: 1px solid var(--stroke-strong);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.tw-vt {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  border: none;
+  background: var(--card-bg);
+  color: var(--text-3);
+  padding: 6px 10px;
+  font-size: 12px;
+  font-family: var(--segoe);
+  cursor: pointer;
+  transition: color 120ms, background 120ms;
+}
+.tw-vt + .tw-vt {
+  border-left: 1px solid var(--stroke-strong);
+}
+.tw-vt:hover {
+  color: var(--text);
+}
+.tw-vt.active {
+  background: var(--accent);
+  color: #06283b;
+}
+.tw-vt svg {
+  opacity: 0.85;
+}
+.tw-add {
+  border: 1px solid var(--accent);
+  background: var(--accent);
+  color: #06283b;
+  border-radius: 6px;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  font-family: var(--segoe);
+}
+.tw-add:hover {
+  filter: brightness(1.1);
+}
+.tw-error {
+  color: #f87171;
+  font-size: 12px;
+  word-break: break-word;
+  padding: 8px 16px 0;
+  flex-shrink: 0;
+}
+.tw-recovery {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: #f2b90c;
+  background: rgba(242, 185, 12, 0.1);
+  border: 1px solid rgba(242, 185, 12, 0.3);
+  border-radius: 6px;
+  font-size: 12px;
+  word-break: break-word;
+  margin: 8px 16px 0;
+  padding: 8px 10px;
+  flex-shrink: 0;
+}
+.tw-recovery-text {
+  flex: 1;
+}
+.tw-recovery-restore {
+  flex-shrink: 0;
+  border: 1px solid rgba(242, 185, 12, 0.4);
+  background: transparent;
+  color: inherit;
+  border-radius: 4px;
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  font-family: var(--segoe);
+}
+.tw-recovery-restore:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.tw-recovery-restore:not(:disabled):hover {
+  background: rgba(242, 185, 12, 0.15);
+}
+.tw-empty {
+  color: var(--text-3);
+  font-size: 13px;
+  text-align: center;
+  padding: 40px 0;
+}
+
+/* Mode switcher: owned board vs readonly external mirror (ph6). */
+.tw-modes {
+  display: inline-flex;
+  gap: 2px;
+  background: var(--card-bg);
+  border: 1px solid var(--stroke-strong);
+  border-radius: 7px;
+  padding: 2px;
+}
+.tw-mode {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: none;
+  background: transparent;
+  color: var(--text-3);
+  border-radius: 5px;
+  padding: 4px 10px;
+  font-size: 12px;
+  font-family: var(--segoe);
+  cursor: pointer;
+  transition: background 120ms, color 120ms;
+}
+.tw-mode:hover {
+  color: var(--text);
+}
+.tw-mode:not(.active):hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+/* Theme-proof active state: a translucent accent tint (sits dark over the card) with
+   white text — readable under ANY accent (blue/purple/claude/mint), unlike a dark
+   on-accent text that only worked for the light-blue default. */
+.tw-mode.active {
+  background: var(--accent-soft);
+  color: var(--text);
+  font-weight: 600;
+  box-shadow: inset 0 0 0 1px var(--accent-soft);
+}
+.tw-mode-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.14);
+  color: inherit;
+  font-size: 10.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+/* External (readonly mirror) — kanban board */
+.tw-ext-poll {
+  font-size: 11.5px;
+  color: var(--text-4);
+  white-space: nowrap;
+}
+.tw-ext-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  max-width: 360px;
+  margin: 0 auto;
+  line-height: 1.5;
+}
+/* Board layout mirrors the local one (.tw-board), so external tasks read as a
+   familiar kanban — but the cards are readonly (no drag: status is owned upstream). */
+.tw-ext-board {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  gap: 12px;
+  padding: 14px 16px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  align-items: stretch;
+}
+.tw-ext-card {
+  background: var(--card-bg);
+  border: 1px solid var(--stroke-strong);
+  border-left: 3px solid var(--stroke-strong);
+  border-radius: 6px;
+  padding: 9px 11px;
+  cursor: pointer;
+  transition: border-color 120ms, background 120ms;
+}
+.tw-ext-card:hover {
+  border-color: var(--accent);
+  background: var(--card-bg-hover, rgba(255, 255, 255, 0.03));
+}
+.tw-ext-card:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.tw-ext-card.changed {
+  border-left-color: var(--accent);
+}
+.tw-ext-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.tw-ext-source-badge {
+  flex: 1;
+  min-width: 0;
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--text-4);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tw-ext-changed {
+  flex-shrink: 0;
+  font-size: 14px;
+  line-height: 1;
+  color: var(--accent);
+}
+.tw-ext-link {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-4);
+  cursor: pointer;
+  transition: color 120ms;
+}
+.tw-ext-link:hover {
+  color: var(--accent);
+}
+.tw-ext-card-title {
+  margin: 6px 0 8px;
+  font-size: 13px;
+  line-height: 1.35;
+  color: var(--text);
+}
+.tw-ext-card-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.tw-ext-status {
+  flex-shrink: 0;
+  font-size: 10.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  padding: 2px 7px;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-3);
+  white-space: nowrap;
+}
+.tw-ext-status.s-done {
+  background: rgba(108, 203, 95, 0.16);
+  color: #6ccb5f;
+}
+.tw-ext-status.s-active {
+  background: rgba(76, 194, 255, 0.16);
+  color: #4cc2ff;
+}
+.tw-ext-status.s-open {
+  background: rgba(154, 160, 170, 0.16);
+  color: #b6bcc6;
+}
+.tw-ext-assignee {
+  font-size: 11.5px;
+  color: var(--text-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* External detail (readonly metadata + provenance) */
+.tw-ext-detail-source {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-3);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.tw-ext-detail {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 16px;
+}
+.tw-ext-detail-card {
+  max-width: 560px;
+  margin: 0 auto;
+  background: var(--card-bg);
+  border: 1px solid var(--stroke-strong);
+  border-radius: 8px;
+  padding: 18px 20px;
+}
+.tw-ext-detail-top {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.tw-ext-detail-title {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text);
+  line-height: 1.35;
+  margin: 0 0 16px;
+}
+.tw-ext-detail-meta {
+  margin: 0 0 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+.tw-ext-detail-row {
+  display: flex;
+  gap: 12px;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--stroke-weak, rgba(255, 255, 255, 0.05));
+  font-size: 13px;
+}
+.tw-ext-detail-row:last-child {
+  border-bottom: none;
+}
+.tw-ext-detail-row dt {
+  flex: 0 0 120px;
+  color: var(--text-4);
+}
+.tw-ext-detail-row dd {
+  flex: 1;
+  margin: 0;
+  color: var(--text-2);
+}
+.tw-ext-detail-dim {
+  color: var(--text-4);
+}
+.tw-ext-detail-desc {
+  margin: 0 0 16px;
+  padding: 12px 14px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--stroke-strong);
+  border-radius: 6px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-2);
+  white-space: pre-wrap;
+}
+.tw-ext-detail-note {
+  margin: 14px 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-4);
+}
+.tw-ext-detail-card .tw-btn {
+  display: inline-flex;
+  align-items: center;
+}
+
+/* Board */
+.tw-board {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  gap: 12px;
+  padding: 14px 16px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  align-items: stretch;
+}
+.tw-col {
+  flex: 1 1 0;
+  min-width: 188px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--stroke);
+  border-radius: 10px;
+  transition: border-color 120ms, background 120ms;
+}
+.tw-col.over {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.tw-col-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  flex-shrink: 0;
+}
+.tw-col-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.tw-col-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+.tw-col-count {
+  font-size: 12px;
+  color: var(--text-3);
+  background: var(--track);
+  border-radius: 9px;
+  padding: 1px 7px;
+  min-width: 18px;
+  text-align: center;
+}
+.tw-col-add {
+  margin-left: auto;
+  background: transparent;
+  border: none;
+  color: var(--text-3);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  padding: 2px;
+  border-radius: 4px;
+}
+.tw-col-add:hover {
+  color: var(--text);
+  background: var(--card-bg-hover);
+}
+.tw-col-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 4px 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.tw-col-empty {
+  color: var(--text-4);
+  font-size: 12px;
+  text-align: center;
+  padding: 18px 6px;
+  border: 1px dashed var(--stroke-strong);
+  border-radius: 8px;
+  margin: 2px;
+}
+
+/* Card */
+.tw-card {
+  background: var(--card-bg);
+  border: 1px solid var(--stroke-strong);
+  border-left: 3px solid var(--text-4);
+  border-radius: var(--card-radius);
+  padding: 10px 11px;
+  cursor: grab;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.tw-card:hover {
+  background: var(--card-bg-hover);
+}
+.tw-card.dragging {
+  opacity: 0.4;
+  cursor: grabbing;
+}
+.tw-card.done .tw-card-title {
+  text-decoration: line-through;
+  color: var(--text-3);
+}
+.tw-card-title {
+  font-size: 16px;
+  font-weight: 500;
+  line-height: 1.35;
+  word-break: break-word;
+}
+.tw-card-num {
+  margin-right: 6px;
+  color: var(--text-3);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.tw-card-desc {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-3);
+  line-height: 1.4;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-word;
+}
+
+/* The spec link (t#339/t#346) — a chip on the card, a read-only block in the
+   detail. Blue, like every other "this opens somewhere else" affordance here. */
+.tw-spec {
+  cursor: pointer;
+  color: #4cc2ff;
+  border-color: color-mix(in srgb, #4cc2ff 40%, transparent);
+}
+.tw-spec:hover {
+  border-color: #4cc2ff;
+}
+.tw-spec-box {
+  display: block;
+}
+.tw-spec-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 4px 0 8px;
+}
+.tw-spec-link {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 11.5px;
+  background: none;
+  border: 1px solid color-mix(in srgb, #4cc2ff 40%, transparent);
+  border-radius: 5px;
+  color: #4cc2ff;
+  cursor: pointer;
+  padding: 2px 7px;
+}
+.tw-spec-link:hover {
+  border-color: #4cc2ff;
+}
+.tw-spec-answer {
+  border-left: 2px solid var(--tw-border, #2a2f3a);
+  padding: 2px 0 2px 9px;
+  margin-bottom: 7px;
+}
+.tw-spec-verdict {
+  font-size: 9.5px;
+  border-radius: 4px;
+  padding: 1px 5px;
+  background: #3a4150;
+}
+.tw-spec-verdict.v-updated {
+  background: #2f5a2a;
+}
+.tw-spec-answer-addr {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 11px;
+  opacity: 0.7;
+  margin-left: 6px;
+}
+.tw-spec-answer-at {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 11px;
+  opacity: 0.45;
+  margin-left: 6px;
+}
+.tw-spec-answer-note {
+  margin: 3px 0 0;
+  font-size: 12px;
+  line-height: 1.45;
+  opacity: 0.85;
+}
+
+/* Inherited handoff (#141): read-only summary of what upstream deps left off. */
+.tw-handoff-in {
+  gap: 6px;
+}
+.tw-handoff-in-hd {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-3, #7a808a);
+}
+.tw-handoff-item {
+  border-left: 2px solid var(--stroke-strong, rgba(255, 255, 255, 0.12));
+  background: var(--card-bg);
+  border-radius: 4px;
+  padding: 6px 9px;
+}
+.tw-handoff-item + .tw-handoff-item {
+  margin-top: 4px;
+}
+.tw-handoff-item-hd {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+.tw-handoff-item-body {
+  margin: 3px 0 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-2);
+  white-space: pre-wrap;
+}
+.tw-handoff-item-empty {
+  margin: 3px 0 0;
+  font-size: 12px;
+  font-style: italic;
+  color: var(--text-3, #7a808a);
+}
+.tw-card-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  align-items: center;
+}
+.tw-tag {
+  font-size: 12px;
+  color: var(--text-2);
+  background: var(--track);
+  padding: 1px 7px;
+  border-radius: 8px;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+/* In the card, a long project name should wrap inside the tag rather than be
+   ellipsised (ProjectLabel truncates by default for table cells). */
+.tw-tag :deep(.pl) {
+  max-width: 100%;
+}
+.tw-tag :deep(.pl-name) {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  overflow-wrap: anywhere;
+}
+.tw-chip {
+  font-size: 12px;
+  color: var(--text-3);
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+/* Priority chip — colour-coded by bucket (high red, medium amber, low muted). */
+.tw-prio {
+  font-weight: 600;
+  padding: 1px 7px;
+  border-radius: 999px;
+  text-transform: capitalize;
+}
+.tw-prio-high {
+  color: #d4453a;
+  background: rgba(212, 69, 58, 0.13);
+}
+.tw-prio-medium {
+  color: #c07c19;
+  background: rgba(192, 124, 25, 0.14);
+}
+.tw-prio-low {
+  color: var(--text-3);
+  background: var(--track);
+}
+/* Provenance chip — "↘ from <project>" for a cross-project task. */
+.tw-from {
+  color: var(--text-2);
+  background: var(--track);
+  padding: 1px 7px;
+  border-radius: 8px;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+/* Same provenance, shown read-only in the detail/edit view. */
+/* Task that arrived via a board import (#181) — in particular a fork, whose local
+   twin is still on the board, so the two need to be told apart at a glance. */
+.tw-imported {
+  color: #d29922;
+  background: rgba(210, 153, 34, 0.14);
+  padding: 1px 7px;
+  border-radius: 8px;
+}
+.tw-from-note {
+  font-size: 13px;
+  color: var(--text-3);
+}
+.tw-from-note strong {
+  color: var(--text);
+  font-weight: 600;
+}
+.tw-card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  margin-top: 1px;
+}
+.tw-card-actions {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+}
+.tw-icon {
+  background: transparent;
+  border: 1px solid var(--stroke-strong);
+  color: var(--text-3);
+  border-radius: 5px;
+  width: 26px;
+  height: 26px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.tw-icon:hover {
+  background: var(--card-bg-hover);
+  color: var(--text);
+}
+.tw-icon.danger:hover {
+  border-color: #f87171;
+  color: #f87171;
+}
+
+/* Modal form */
+.tw-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 32px 20px;
+  overflow-y: auto;
+}
+.tw-form {
+  width: 100%;
+  max-width: 680px;
+  display: flex;
+  flex-direction: column;
+  gap: 13px;
+  padding: 22px;
+  border: 1px solid var(--stroke-strong);
+  border-radius: 10px;
+  background: var(--flyout-bg);
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
+}
+.tw-form-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-2);
+  margin-bottom: 2px;
+}
+.tw-input {
+  background: var(--card-bg);
+  color: var(--text);
+  border: 1px solid var(--stroke-strong);
+  border-radius: 5px;
+  padding: 9px 11px;
+  font-size: 13px;
+  font-family: var(--segoe);
+  width: 100%;
+  /* Render native controls in dark theme so the <input type="date"> calendar
+     picker icon (and its popup) isn't a dark-on-dark, near-invisible glyph on
+     Windows/WebView2 — same fix the settings selects already use. */
+  color-scheme: dark;
+}
+.tw-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.tw-area {
+  resize: vertical;
+  min-height: 36px;
+  line-height: 1.6;
+}
+.tw-row {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.tw-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-3);
+  flex: 1;
+  min-width: 140px;
+}
+.tw-hint {
+  color: var(--text-4);
+  font-style: italic;
+  font-weight: 400;
+}
+.tw-subject-counter {
+  align-self: flex-end;
+  font-size: 11px;
+  color: var(--text-4);
+}
+.tw-subject-counter.crit {
+  color: var(--crit);
+  font-weight: 600;
+}
+.tw-form-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.tw-btn {
+  border: none;
+  background: var(--accent);
+  color: #06283b;
+  border-radius: 5px;
+  padding: 7px 16px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  font-family: var(--segoe);
+}
+.tw-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.tw-btn.ghost {
+  background: transparent;
+  color: var(--text-3);
+  border: 1px solid var(--stroke-strong);
+}
+.tw-btn.danger {
+  background: #e0524a;
+  color: #fff;
+}
+.tw-btn.danger:hover {
+  background: #d4453a;
+}
+/* Delete-confirmation dialog: a narrow .tw-form panel with a short question. */
+.tw-confirm {
+  max-width: 360px;
+}
+.tw-confirm-body {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-2);
+  word-break: break-word;
+}
+
+/* AI-authored badge — violet so it can't be mistaken for a status colour. */
+.tw-ai {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #c4a7ff;
+  background: rgba(179, 136, 255, 0.16);
+  border: 1px solid rgba(179, 136, 255, 0.5);
+  border-radius: 6px;
+  padding: 1px 6px;
+  line-height: 1.5;
+  flex-shrink: 0;
+}
+.tw-ai.sm {
+  font-size: 10.5px;
+  padding: 0 5px;
+}
+
+/* "Saved ✓" confirmation */
+.tw-saved {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--success, #6ccb5f);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.tw-fade-enter-active,
+.tw-fade-leave-active {
+  transition: opacity 200ms ease;
+}
+.tw-fade-enter-from,
+.tw-fade-leave-to {
+  opacity: 0;
+}
+
+/* Detail view (master-detail editor) */
+.tw-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: transparent;
+  border: 1px solid var(--stroke-strong);
+  color: var(--text-2);
+  border-radius: 6px;
+  padding: 5px 11px 5px 8px;
+  font-size: 12px;
+  font-family: var(--segoe);
+  cursor: pointer;
+}
+.tw-back:hover {
+  background: var(--card-bg-hover);
+  color: var(--text);
+}
+.tw-detail {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  gap: 14px;
+  padding: 14px 16px;
+  overflow: hidden;
+}
+.tw-detail-list {
+  flex: 0 0 264px;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--stroke);
+  border-radius: 10px;
+  padding: 8px;
+}
+.tw-detail-list-hd {
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-3);
+  padding: 4px 6px 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tw-detail-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  text-align: left;
+  width: 100%;
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  padding: 8px;
+  color: var(--text-2);
+  cursor: pointer;
+  font-family: var(--segoe);
+  font-size: 13px;
+}
+.tw-detail-item:hover {
+  background: var(--card-bg-hover);
+}
+.tw-detail-item.active {
+  background: var(--accent-soft);
+  color: var(--text);
+}
+.tw-detail-item-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.tw-detail-item-subj {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tw-detail-item-subj.done {
+  text-decoration: line-through;
+  color: var(--text-3);
+}
+.tw-detail-item-num {
+  margin-right: 5px;
+  color: var(--text-3);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.tw-detail-main {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 13px;
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--stroke);
+  border-radius: 10px;
+  padding: 18px 20px;
+}
+.tw-detail-main .tw-select {
+  width: 100%;
+}
+.tw-detail-empty {
+  align-items: center;
+  justify-content: center;
+  color: var(--text-4);
+  font-size: 13px;
+}
+
+/* Comments thread */
+.tw-blocks {
+  border-top: 1px solid var(--stroke-strong);
+  padding-top: 14px;
+  margin-top: 2px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.tw-blocks-hd {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-2);
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  cursor: help;
+}
+.tw-block-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.tw-block {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  font-size: 12.5px;
+  color: var(--text-3);
+  padding: 4px 8px;
+  border-radius: 7px;
+  background: var(--track);
+}
+.tw-block-when {
+  min-width: 108px;
+  color: var(--text-2);
+}
+.tw-block-span {
+  min-width: 46px;
+  font-variant-numeric: tabular-nums;
+}
+.tw-block-cost {
+  min-width: 56px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-1);
+  font-weight: 600;
+}
+.tw-block-msgs {
+  min-width: 76px;
+  font-variant-numeric: tabular-nums;
+}
+.tw-block-errs {
+  color: var(--danger, #d9534f);
+}
+.tw-block-kind {
+  margin-left: auto;
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 9px;
+  background: var(--card-bg);
+  border: 1px solid var(--stroke-strong);
+  color: var(--text-3);
+}
+.tw-block-kind.auto {
+  border-style: dashed;
+  cursor: help;
+}
+.tw-blocks-foot {
+  display: flex;
+  gap: 16px;
+  font-size: 12.5px;
+  color: var(--text-3);
+  padding: 0 8px;
+}
+.tw-blocks-outside {
+  cursor: help;
+}
+.tw-comments {
+  border-top: 1px solid var(--stroke-strong);
+  padding-top: 14px;
+  margin-top: 2px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.tw-comments-hd {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-2);
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.tw-comments-n {
+  font-size: 11.5px;
+  color: var(--text-3);
+  background: var(--track);
+  border-radius: 9px;
+  padding: 1px 7px;
+  min-width: 18px;
+  text-align: center;
+}
+.tw-comments-empty {
+  font-size: 13px;
+  color: var(--text-4);
+}
+.tw-comment-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.tw-comment {
+  background: var(--card-bg);
+  border: 1px solid var(--stroke-strong);
+  border-left: 3px solid var(--text-4);
+  border-radius: var(--card-radius);
+  padding: 8px 11px;
+}
+/* Claude comments get the same violet accent as the AI badge. */
+.tw-comment.ai {
+  border-left-color: #b388ff;
+}
+.tw-comment-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.tw-comment-author {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-2);
+}
+.tw-comment-author.ai {
+  color: #c4a7ff;
+}
+.tw-comment-time {
+  font-size: 11.5px;
+  color: var(--text-4);
+}
+.tw-comment-del {
+  margin-left: auto;
+  background: transparent;
+  border: none;
+  color: var(--text-4);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  padding: 2px;
+  border-radius: 4px;
+  opacity: 0;
+  transition: opacity 120ms;
+}
+.tw-comment:hover .tw-comment-del {
+  opacity: 1;
+}
+.tw-comment-del:hover {
+  color: #f87171;
+  background: var(--card-bg-hover);
+}
+.tw-comment-body {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.65;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.tw-comment-compose {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: flex-end;
+}
+.tw-comment-compose .tw-area {
+  width: 100%;
+}
+
+/* Mini editor: clickable links + edit/preview toggle */
+.tw-link {
+  color: var(--accent);
+  text-decoration: none;
+  cursor: pointer;
+  word-break: break-all;
+}
+.tw-link:hover {
+  text-decoration: underline;
+}
+.tw-field-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.tw-mode {
+  background: transparent;
+  border: none;
+  color: var(--accent);
+  font-family: var(--segoe);
+  font-size: 11px;
+  cursor: pointer;
+  padding: 1px 4px;
+  border-radius: 4px;
+}
+.tw-mode:hover {
+  background: var(--card-bg-hover);
+}
+.tw-richtext {
+  background: var(--card-bg);
+  border: 1px solid var(--stroke-strong);
+  border-radius: 5px;
+  padding: 9px 11px;
+  font-size: 13px;
+  line-height: 1.7;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+  min-height: 36px;
+}
+.tw-richtext-empty {
+  color: var(--text-4);
+  font-style: italic;
+}
+
+/* Inline references (t#N task, @name project) */
+.tw-ref {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-radius: 4px;
+  padding: 0 4px;
+  cursor: pointer;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.tw-ref:hover {
+  text-decoration: underline;
+}
+.tw-ref-title {
+  font-weight: 400;
+  opacity: 0.8;
+  margin-left: 4px;
+}
+.tw-ref-proj {
+  color: #c4a7ff;
+  background: rgba(179, 136, 255, 0.16);
+}
+
+/* Nightly-triage digest (#35): a chip beside the open-task count that expands
+   to a read-only popover; #N references inside jump to the task card. */
+.tw-triage {
+  position: relative;
+  display: inline-flex;
+}
+.tw-triage-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 280px;
+  padding: 3px 9px;
+  border: 1px solid var(--stroke-strong);
+  border-radius: 999px;
+  background: var(--card-bg);
+  color: var(--text-2);
+  font-family: var(--segoe);
+  font-size: 12px;
+  cursor: pointer;
+  transition:
+    background 120ms,
+    border-color 120ms;
+}
+.tw-triage-chip:hover,
+.tw-triage-chip.open {
+  background: var(--card-bg-hover);
+  border-color: var(--accent);
+}
+.tw-triage-chip svg {
+  flex: none;
+  color: var(--text-3);
+}
+.tw-triage-headline {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tw-triage-caret {
+  flex: none;
+  color: var(--text-3);
+  font-size: 14px;
+  line-height: 1;
+  transition: transform 120ms;
+}
+.tw-triage-chip.open .tw-triage-caret {
+  transform: rotate(90deg);
+}
+.tw-triage-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+}
+.tw-triage-pop {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 41;
+  width: 340px;
+  max-height: 60vh;
+  overflow-y: auto;
+  padding: 12px;
+  background: var(--card-bg);
+  border: 1px solid var(--stroke-strong);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.tw-triage-pop-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+.tw-triage-pop-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+.tw-triage-meta {
+  display: inline-flex;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-4);
+  white-space: nowrap;
+}
+.tw-triage-summary {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-2);
+}
+.tw-triage-clean {
+  font-size: 12px;
+  color: var(--text-3);
+}
+.tw-triage-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.tw-triage-group-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--text-2);
+}
+.tw-triage-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-3);
+  flex: none;
+}
+.tw-triage-group-head.k-overdue .tw-triage-dot {
+  background: #f87171;
+}
+.tw-triage-group-head.k-stale .tw-triage-dot {
+  background: var(--warning);
+}
+.tw-triage-group-head.k-no_priority .tw-triage-dot {
+  background: var(--text-3);
+}
+.tw-triage-group-head.k-suggestion .tw-triage-dot {
+  background: var(--accent);
+}
+.tw-triage-count {
+  color: var(--text-4);
+  font-weight: 400;
+}
+.tw-triage-list {
+  margin: 0;
+  padding: 0 0 0 13px;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.tw-triage-item {
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--text-2);
+}
+.tw-triage-num {
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+  margin-right: 5px;
+}
+.tw-triage-ref {
+  margin-right: 5px;
+}
+.tw-triage-note {
+  color: var(--text-3);
+  margin-top: 1px;
+  padding-left: 16px;
+  position: relative;
+}
+.tw-triage-note::before {
+  content: "→";
+  position: absolute;
+  left: 2px;
+  color: var(--text-4);
+}
+
+/* Inline-reference autocomplete menu */
+.tw-mention-wrap {
+  position: relative;
+  width: 100%;
+}
+.tw-mention {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  z-index: 30;
+  margin: 3px 0 0;
+  padding: 4px;
+  list-style: none;
+  background: var(--card-bg);
+  border: 1px solid var(--stroke-strong);
+  border-radius: 6px;
+  max-height: 220px;
+  overflow-y: auto;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+}
+.tw-mention.up {
+  top: auto;
+  bottom: 100%;
+  margin: 0 0 3px;
+}
+.tw-mention-item {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.tw-mention-item:hover,
+.tw-mention-item.sel {
+  background: var(--accent-soft);
+}
+.tw-mention-key {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+  flex-shrink: 0;
+}
+.tw-mention-sub {
+  font-size: 12px;
+  color: var(--text-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+</style>

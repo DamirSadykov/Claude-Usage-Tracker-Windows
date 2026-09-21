@@ -20,9 +20,9 @@ import "./styles/fonts/montserrat.css";
 import "./styles/fonts/fira-code.css";
 import "./styles/fonts/jetbrains-mono.css";
 import App from "./App.vue";
-import i18n from "./i18n";
-import { installErrorLogging, reportFatal } from "./logging";
-import { applyFont, readCachedFontId } from "./fontSwitch";
+import i18n from "./kernel/i18n";
+import { installErrorLogging, reportFatal } from "./kernel/logging";
+import { applyFont, readCachedFontId } from "./kernel/fontSwitch";
 
 installErrorLogging();
 // Apply the cached font before paint (every window) to avoid a flash; App.vue

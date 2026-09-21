@@ -2,18 +2,18 @@
 import { ref, onMounted, onUnmounted, computed } from "vue";
 import { useI18n } from "vue-i18n";
 import { invoke } from "@tauri-apps/api/core";
-import SettingsWindow from "./components/SettingsWindow.vue";
-import UsagePanel from "./components/UsagePanel.vue";
-import CodexUsageCards from "./components/CodexUsageCards.vue";
-import MiniPanel from "./components/MiniPanel.vue";
-import AnalyticsPanel from "./components/AnalyticsPanel.vue";
-import AnalyticsWindow from "./components/AnalyticsWindow.vue";
-import TodoWindow from "./components/TodoWindow.vue";
-import FocusControls from "./components/FocusControls.vue";
-import ServiceStatusBar from "./components/ServiceStatusBar.vue";
-import AboutPanel from "./components/AboutPanel.vue";
-import PipelineWindow from "./components/pipeline/PipelineWindow.vue";
-import { applyFont, writeCachedFontId, DEFAULT_FONT_ID } from "./fontSwitch";
+import SettingsWindow from "./windows/SettingsWindow.vue";
+import UsagePanel from "./analytics/UsagePanel.vue";
+import CodexUsageCards from "./analytics/CodexUsageCards.vue";
+import MiniPanel from "./windows/MiniPanel.vue";
+import AnalyticsPanel from "./analytics/AnalyticsPanel.vue";
+import AnalyticsWindow from "./windows/AnalyticsWindow.vue";
+import TodoWindow from "./windows/TodoWindow.vue";
+import FocusControls from "./analytics/FocusControls.vue";
+import ServiceStatusBar from "./analytics/ServiceStatusBar.vue";
+import AboutPanel from "./windows/AboutPanel.vue";
+import PipelineWindow from "./process/pipeline/PipelineWindow.vue";
+import { applyFont, writeCachedFontId, DEFAULT_FONT_ID } from "./kernel/fontSwitch";
 import {
     DEFAULT_THRESHOLDS,
     normalize,
@@ -21,166 +21,20 @@ import {
     normalizeAlertTiers,
     defaultAlertTypes,
     normalizeAlertTypes,
-} from "./thresholds";
-import type { AlertTiers, AlertTypes } from "./thresholds";
-import { localizeAlert } from "./alertFormat";
-import type { AlertEvent } from "./alertFormat";
-import { useUpdater, initUpdater } from "./updater";
-import { readSettingsSnapshot } from "./settingsStore";
-import { logInfo, logWarn, logError } from "./logging";
+} from "./kernel/thresholds";
+import type { AlertTiers, AlertTypes } from "./kernel/thresholds";
+import { localizeAlert } from "./analytics/alertFormat";
+import type { AlertEvent } from "./analytics/alertFormat";
+import { useUpdater, initUpdater } from "./kernel/updater";
+import { readSettingsSnapshot } from "./kernel/settingsStore";
+import { logInfo, logWarn, logError } from "./kernel/logging";
+import type { CodexRateLimits, ForecastData, UsageData, UsageLevels } from "./contracts/types";
 
 const isMini = window.location.hash === "#mini";
 const isAnalytics = window.location.hash === "#analytics";
 const isTodos = window.location.hash === "#todos";
 const isSettings = window.location.hash === "#settings";
 const isPipeline = window.location.hash === "#pipeline";
-
-export interface UsageTier {
-    percent_used: number;
-    reset_at: string | null;
-    is_limited: boolean;
-}
-
-export interface ExtraUsage {
-    used_credits: number;
-    monthly_limit: number;
-    utilization: number;
-    currency: string;
-}
-
-// A weekly limit scoped to one model, from the API's `limits[]`. The model shown
-// is dynamic (e.g. "Fable") — the API moved per-model caps here and now sends the
-// old flat seven_day_opus/sonnet fields as null.
-export interface ScopedTier {
-    model: string;
-    percent_used: number;
-    reset_at: string | null;
-    is_limited: boolean;
-}
-
-export interface UsageData {
-    five_hour: UsageTier;
-    seven_day: UsageTier;
-    seven_day_opus: UsageTier | null;
-    seven_day_sonnet: UsageTier | null;
-    scoped_weekly: ScopedTier[];
-    extra_usage: ExtraUsage | null;
-    prepaid_balance: number | null;
-    prepaid_currency: string | null;
-}
-
-export interface CodexLimitWindow {
-    usedPercent: number;
-    windowMinutes: number;
-    resetsAt: number;
-}
-
-export interface CodexRateLimits {
-    observedAt: string;
-    limitId: string;
-    planType: string | null;
-    primary: CodexLimitWindow | null;
-    secondary: CodexLimitWindow | null;
-    credits: { hasCredits: boolean; unlimited: boolean; balance: string } | null;
-    rateLimitReachedType: string | null;
-}
-
-// Colour buckets (0..3) computed by the backend, one per tier.
-export interface UsageLevels {
-    five_hour: number;
-    seven_day: number;
-    seven_day_opus: number | null;
-    seven_day_sonnet: number | null;
-    scoped_weekly: number[];
-    extra_usage: number | null;
-}
-
-// Exhaustion forecast per tier (issue #7), computed by the backend.
-export interface TierForecast {
-    rate_per_hour: number;
-    eta_minutes: number | null;
-    allowed_per_hour: number | null;
-    pace: "unknown" | "ok" | "warn";
-    coverage_hours: number;
-}
-
-export interface ForecastData {
-    five_hour: TierForecast;
-    seven_day: TierForecast;
-    extra_usage: TierForecast | null;
-}
-
-// One line in a nightly-triage digest (#35): a finding the agent surfaced or an
-// advisory move it proposed. `number`/`id` loosely tie it back to a todo; either
-// may be absent for a board-wide note. Mirrors triage.rs::DigestItem.
-export interface DigestItem {
-    kind: string;
-    number?: number;
-    id?: string;
-    subject: string;
-    note: string;
-}
-
-// The latest nightly-triage digest, read from triage-digest.json. Read-only on
-// the tracker side — the triage agent owns writes via the cc-triage CLI. Mirrors
-// triage.rs::TriageDigest.
-export interface TriageDigest {
-    version: number;
-    generated_at: string;
-    project?: string | null;
-    headline: string;
-    summary: string;
-    items: DigestItem[];
-}
-
-// The latest user-corrections outcome metric (task t#101), read from
-// corrections-metrics.json. Read-only on the tracker side — `cli.mjs corrections
-// publish` owns writes. Mirrors corrections.rs::CorrectionsMetrics. Numbers are
-// layer-1 CANDIDATES (upper bound) from a heuristic net; classifying them further
-// is out of scope for this metric.
-export interface CorrectionsTotals {
-    sessions: number;
-    assistant_turns: number;
-    user_turns: number;
-    candidate_corrections: number;
-    done_claims: number;
-    rework_after_done: number;
-    likely_llm: number;
-    ambiguous: number;
-    corrections_per_session: number | null;
-    rework_after_done_rate: number | null;
-}
-export interface CorrectionsSessionStat {
-    assistant_turns: number;
-    user_turns: number;
-    candidate_corrections: number;
-    done_claims: number;
-    rework_after_done: number;
-    corrections_per_session: number | null;
-    rework_after_done_rate: number | null;
-}
-export interface CorrectionsSessionRow {
-    session: string;
-    project_dir?: string | null;
-    // Exact project name (last path component of the transcript cwd), the same key
-    // the token KPIs filter by. Optional — older metrics files predate it.
-    project?: string | null;
-    modified_at?: string | null;
-    stats: CorrectionsSessionStat;
-    likely_llm: number;
-    ambiguous: number;
-}
-export interface CorrectionsMetrics {
-    version: number;
-    contract_version: number;
-    generated_at: string;
-    scope: string;
-    project?: string | null;
-    totals: CorrectionsTotals;
-    // Per-session rows — the analytics card filters these by the active date
-    // range + project and re-aggregates the totals client-side.
-    sessions: CorrectionsSessionRow[];
-}
 
 const { t, locale } = useI18n();
 
