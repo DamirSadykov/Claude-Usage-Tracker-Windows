@@ -3,7 +3,7 @@
 //!
 //! The board (todos.rs) says WHAT was planned and in what order; the binding
 //! journal folded into blocks (task_sessions.rs) plus their sums from SQLite
-//! (stats::BlockTotals / the per-agent split of t#300) say what the run actually
+//! (contracts::analytics_read::BlockTotals / the per-agent split of t#300) say what the run actually
 //! COST. This module joins the two into one node-per-task model and renders it —
 //! Mermaid is the canonical format, D2 an extra.
 //!
@@ -33,7 +33,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde::Serialize;
 
-use crate::stats::BlockTotals;
+use crate::contracts::analytics_read::BlockTotals;
 use crate::task_sessions::{self, TaskBlock};
 use crate::todos::{Todo, TodoFile};
 

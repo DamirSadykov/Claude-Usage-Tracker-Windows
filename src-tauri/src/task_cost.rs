@@ -47,7 +47,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::stats::SessionUsage;
+use crate::contracts::analytics_read::SessionUsage;
 use crate::task_sessions::{self, TaskBlock};
 use crate::todos::{Todo, TodoFile};
 

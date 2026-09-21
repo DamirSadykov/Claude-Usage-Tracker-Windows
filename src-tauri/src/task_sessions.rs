@@ -20,7 +20,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::stats::BlockTotals;
+use crate::contracts::analytics_read::BlockTotals;
 use crate::todos::TodoFile;
 
 /// Sources that mean "the binding was STATED" — everything else (the

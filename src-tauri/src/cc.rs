@@ -14,6 +14,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use crate::stats::{CcAgentRow, CcUsageRow, StatsDb, ToolResultRow, TurnRow};
+pub use crate::kernel::paths::claude_dir;
 
 /// A whole transcript file parsed into its concerns: per-message usage rows
 /// (assistant lines), tool-result outcomes (user lines), turn-duration rows
@@ -323,20 +324,6 @@ fn project_name(cwd: &str) -> Option<String> {
     } else {
         Some(name.to_string())
     }
-}
-
-/// Resolve the Claude config directory: `CLAUDE_CONFIG_DIR` if set, else
-/// `~/.claude` (via USERPROFILE on Windows, HOME elsewhere).
-pub fn claude_dir() -> Option<PathBuf> {
-    if let Ok(d) = std::env::var("CLAUDE_CONFIG_DIR") {
-        if !d.trim().is_empty() {
-            return Some(PathBuf::from(d));
-        }
-    }
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .ok()?;
-    Some(PathBuf::from(home).join(".claude"))
 }
 
 fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>) {

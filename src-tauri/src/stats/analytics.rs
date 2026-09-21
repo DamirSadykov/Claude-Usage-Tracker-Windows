@@ -4,6 +4,8 @@
 use rusqlite::{params, Connection};
 use serde::Serialize;
 
+pub use crate::contracts::analytics_read::*;
+
 use super::StatsDb;
 
 #[derive(Debug, Serialize)]
@@ -32,21 +34,6 @@ pub struct ProjectUsage {
     pub cost: f64,
     pub messages: i64,
     pub sessions: i64,
-}
-
-#[derive(Debug, Serialize)]
-pub struct SessionUsage {
-    pub session_id: String,
-    pub project: Option<String>,
-    pub start: String, // earliest ts in the session
-    pub end: String,   // latest ts in the session
-    pub total_tokens: i64,
-    pub cost: f64,
-    pub messages: i64,
-    /// Cache-write tokens — useful for spotting sessions that are cheap in
-    /// input/output but expensive in cache (`costly_by_cache` ranking).
-    #[serde(default)]
-    pub cache_create: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -607,15 +594,6 @@ fn sessions_in(
 /// message belongs to the block. Tool calls come from `cc_tool_use` joined to
 /// `cc_usage` (the tool table carries no ts/session of its own); tool errors
 /// from `cc_tool_result`, which is session-scoped but has no message link.
-#[derive(Debug, Clone, Serialize, Default)]
-pub struct BlockTotals {
-    pub cost: f64,
-    pub total_tokens: i64,
-    pub messages: i64,
-    pub tool_calls: i64,
-    pub tool_errors: i64,
-}
-
 /// One agent's share of a block (t#300). The main loop is reported as a row with
 /// `agent_id = None`, so the rows always sum back to the block's own totals.
 /// `description` is what the agent was launched for — it names the work, which is

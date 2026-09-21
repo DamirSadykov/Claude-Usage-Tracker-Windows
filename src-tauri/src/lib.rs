@@ -1,6 +1,7 @@
 pub mod alerts;
 pub mod board_lock;
 pub mod cc;
+pub mod contracts;
 pub mod codex;
 pub mod corrections;
 pub mod domain;
@@ -8,6 +9,7 @@ pub mod enroll;
 pub mod external;
 pub mod graph;
 pub mod identity;
+pub mod kernel;
 pub mod memory;
 pub mod project_groups;
 pub mod report;
@@ -43,6 +45,7 @@ use domain::{compute_levels, is_muted, today_spent_for, UsageLevels};
 use report::{DiagReport, DiagStore};
 use stats::StatsDb;
 use usage::UsageData;
+use kernel::paths::{cc_hook_script_path, claude_dir};
 
 static TRAY_OK: &[u8] = include_bytes!("../icons/tray-ok.png");
 static TRAY_WARN: &[u8] = include_bytes!("../icons/tray-warn.png");
@@ -1148,7 +1151,7 @@ async fn ingest_cc_usage(
     if !config.lock().unwrap().cc_analytics_enabled {
         return Ok(0);
     }
-    let claude = cc::claude_dir();
+    let claude = claude_dir();
     let codex = codex::codex_dir();
     let db = stats.inner().clone();
     // Disk-heavy walk/parse — keep it off the async runtime threads.
@@ -1712,7 +1715,7 @@ fn task_sessions_path(app: &AppHandle) -> Result<PathBuf, String> {
 
 /// Session ends (last `cc_usage` ts) keyed by session id — what closes the last
 /// open block of a session.
-fn session_ends(usage: &[stats::SessionUsage]) -> HashMap<String, String> {
+fn session_ends(usage: &[contracts::analytics_read::SessionUsage]) -> HashMap<String, String> {
     usage
         .iter()
         .map(|u| (u.session_id.clone(), u.end.clone()))
@@ -1833,7 +1836,7 @@ async fn get_task_graph(
 /// a reader wants anyway — the subagent files sit next to the session's own.
 #[tauri::command]
 async fn reveal_transcript(session: String, agent: Option<String>) -> Result<String, String> {
-    let base = cc::claude_dir().ok_or("Каталог Claude не найден")?;
+    let base = claude_dir().ok_or("Каталог Claude не найден")?;
     let agent = agent.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let path = cc::transcript_path(&base, session.trim(), agent)
         .ok_or("Транскрипт не найден — файл мог быть очищен по сроку хранения")?;
@@ -2023,34 +2026,6 @@ fn save_project_groups(
 //                    ExitPlanMode) — plan mode as the task-forming ritual (t#253).
 // The CLI areas need no separate wiring — the hook hands Claude the cli.mjs path
 // and Claude calls `cli.mjs todos …` itself.
-
-/// Absolute path to the unified `cli.mjs`, forward-slashed for a clean
-/// settings.json command on Windows. In a packaged build it's the bundled
-/// resource; in `tauri dev` it's the repo's `scripts/` (preferred there, since
-/// the resource copy under target/ is wiped on rebuild).
-pub(crate) fn cc_hook_script_path(app: &AppHandle) -> Result<String, String> {
-    let resource = app
-        .path()
-        .resolve("scripts/cli.mjs", tauri::path::BaseDirectory::Resource)
-        .ok()
-        .filter(|p| p.exists());
-    let dev = {
-        let d = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("scripts")
-            .join("cli.mjs");
-        std::fs::canonicalize(&d).ok().filter(|p| p.exists())
-    };
-    let chosen = if cfg!(debug_assertions) {
-        dev.or(resource)
-    } else {
-        resource.or(dev)
-    };
-    let p = chosen.ok_or_else(|| "cli.mjs not found (resource or dev path)".to_string())?;
-    // Drop the Windows \\?\ prefix canonicalize adds, use forward slashes.
-    let s = p.to_string_lossy().replace('\\', "/");
-    Ok(s.strip_prefix("//?/").map(str::to_string).unwrap_or(s))
-}
 
 /// A SessionStart hook command that belongs to the tracker — either the unified
 /// `cli.mjs … hook` or a legacy standalone `cc-todos-hook.mjs` from before the

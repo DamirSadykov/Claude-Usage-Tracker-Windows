@@ -130,7 +130,7 @@ fn newest_jsonl(dir: &Path) -> Option<PathBuf> {
 /// as "nothing is written" when the truth is "wrong place".
 pub fn project_dirs() -> Vec<ProjectDir> {
     let mut out: BTreeMap<String, String> = BTreeMap::new();
-    let base = match crate::cc::claude_dir() {
+    let base = match crate::kernel::paths::claude_dir() {
         Some(d) => d.join("projects"),
         None => return Vec::new(),
     };
@@ -213,13 +213,13 @@ pub fn spec_projects() -> Vec<ProjectDir> {
 
 #[tauri::command]
 pub fn spec_domains(app: tauri::AppHandle, dir: String) -> Result<Value, String> {
-    let cli = crate::cc_hook_script_path(&app)?;
+    let cli = crate::kernel::paths::cc_hook_script_path(&app)?;
     run_spec(&cli, &dir, &["domains"])
 }
 
 #[tauri::command]
 pub fn spec_section(app: tauri::AppHandle, dir: String, address: String) -> Result<Value, String> {
-    let cli = crate::cc_hook_script_path(&app)?;
+    let cli = crate::kernel::paths::cc_hook_script_path(&app)?;
     run_spec(&cli, &dir, &["show", &address])
 }
 
