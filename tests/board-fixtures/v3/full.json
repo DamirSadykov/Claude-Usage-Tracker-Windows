@@ -1,0 +1,50 @@
+{
+  "version": 3,
+  "todos": [
+    {
+      "id": "e6666666-0000-4000-8000-000000000001",
+      "number": 61,
+      "subject": "Узел v3 со всеми полями процесса",
+      "description": "",
+      "status": "review",
+      "kind": "auto",
+      "plan": "",
+      "handoff": "Проверка и артефакты готовы.",
+      "created_at": "2026-09-01T09:00:00.000Z",
+      "updated_at": "2026-09-02T10:00:00.000Z",
+      "ext": {
+        "triage": { "kind": "fresh", "note": "сохраняется как непрозрачное расширение" },
+        "process": {
+          "produces": ["tests/board-fixtures/v3/full.json"],
+          "verify": "cargo test board_schema_fixture",
+          "retry_limit": 2,
+          "on_issue": "e6666666-0000-4000-8000-000000000002",
+          "budget_usd": 7.5,
+          "parallel_limit": 2,
+          "outcome": "ok",
+          "outcome_reason": "ok",
+          "outcome_at": "2026-09-02T10:00:00.000Z",
+          "handout_at": "2026-09-02T09:00:00.000Z"
+        }
+      }
+    }
+  ],
+  "changes": [
+    {
+      "id": "f7777777-0000-4000-8000-000000000001",
+      "number": 30,
+      "title": "Change v3 с процессом в ext",
+      "delta": "Перенести поля процесса в пространство расширения.",
+      "project": "usage-tracker",
+      "created_at": "2026-09-01T09:00:00.000Z",
+      "updated_at": "2026-09-02T10:00:00.000Z",
+      "ext": {
+        "process": {
+          "spec": ["tasks#board-file"],
+          "budget_usd": 25.0,
+          "parallel_limit": 3
+        }
+      }
+    }
+  ]
+}

@@ -604,7 +604,10 @@ export function buildReviewPrompt({ task, workerResult = "", execution, appData 
     "You are the review stage of an autonomous task lifecycle.",
     execution?.instructions || "Review correctness, scope, regressions and the declared obligations.",
     "Inspect the workspace read-only. Do not edit files and do not change the task board.",
-    "The deterministic verify command runs after you; assess whether the implementation is ready for it.",
+    "The deterministic verify command is run by the harness after you, on the host. It is not yours",
+    "to run and not the worker's: do not run tests, do not demand test output in the worker report,",
+    "and never mark an issue for missing test evidence. Judge the diff itself — correctness, scope,",
+    "regressions, and whether each declared obligation is met in the files.",
     "",
     `TASK: t#${task?.number ?? "?"} ${task?.subject || ""}`,
     task?.description ? `DESCRIPTION: ${task.description}` : "",
@@ -614,7 +617,7 @@ export function buildReviewPrompt({ task, workerResult = "", execution, appData 
     workerResult ? `WORKER REPORT:\n${clampOutput(workerResult, 8000)}` : "WORKER REPORT: (none)",
     "",
     "End with exactly one decision line: `VERDICT: approve` or `VERDICT: issue`.",
-    "Before it, list concrete findings with file paths. Missing evidence is an issue, not an approval.",
+    "Before it, list concrete findings with file paths. An obligation absent from the files is an issue.",
   ].filter(Boolean).join("\n");
 }
 

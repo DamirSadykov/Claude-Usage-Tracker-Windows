@@ -20,6 +20,7 @@ import type { PipelineMode } from "./pipeline/modes";
 import type { BoardChange } from "./pipeline/adapt";
 import { useProjectLinks } from "../projectLinks";
 import { useHotkeys } from "../hotkeys";
+import { BOARD_CURRENT_VERSION } from "../boardVersion";
 import {
   EXT_BUCKETS,
   resolveBucket,
@@ -105,6 +106,7 @@ export interface Todo {
   spec?: string[]; // addressed spec sections, `<domain>#<slug>` (t#339)
   spec_answers?: SpecAnswer[]; // the closing answer per addressed section (t#341)
   spec_seen?: SpecSeen[]; // each addressed section as it was shown (t#352)
+  ext?: Record<string, unknown>;
   imported_at?: string | null; // arrived via a board import (#181); absent = created here
   created_by?: string; // "user" | "claude" ("" / absent = user, no AI badge)
   created_at: string;
@@ -145,8 +147,6 @@ const boardState = ref<BoardStateInfo | null>(null);
 const boardRecovering = computed(
   () => boardState.value !== null && boardState.value.state !== "ok",
 );
-
-const BOARD_CURRENT_VERSION = 2;
 
 async function loadBoardState() {
   try {
@@ -371,6 +371,7 @@ async function submitForm() {
     created_by: existing?.created_by ?? "user",
     created_at: existing?.created_at ?? "",
     updated_at: existing?.updated_at ?? "",
+    ext: existing?.ext,
   };
   try {
     todos.value = await invoke<Todo[]>("upsert_todo", { todo });

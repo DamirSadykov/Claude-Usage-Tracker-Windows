@@ -5,7 +5,7 @@ import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { parseYamlSubset, readDocument, validate } from "./apply.mjs";
-import { withDeferredSave, saveBoard, setField } from "./todos.mjs";
+import { loadBoard, withDeferredSave, saveBoard, setField } from "./todos.mjs";
 
 const cli = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "cli.mjs");
 
@@ -104,8 +104,7 @@ describe("apply refuses an invalid graph", () => {
 describe("apply records the graph", () => {
   let dir;
   const savedAppData = process.env.APPDATA;
-  const board = () =>
-    JSON.parse(readFileSync(path.join(dir, "com.claude-usage-tracker.app", "todos.json"), "utf8"));
+  const board = () => loadBoard(path.join(dir, "com.claude-usage-tracker.app", "todos.json"));
   const todos = (...args) =>
     execFileSync(process.execPath, [cli, "todos", ...args], {
       encoding: "utf8",
@@ -153,7 +152,7 @@ describe("apply records the graph", () => {
   it("writes nothing without --go", () => {
     const out = say(path.join(dir, "graph.yaml"));
     expect(out).toMatch(/DRY RUN, nothing written/);
-    expect(() => board()).toThrow();
+    expect(board().todos).toEqual([]);
   });
 
   it("--go refuses code 4 on an unreadable board and writes nothing", () => {
@@ -276,7 +275,7 @@ describe("apply records the graph", () => {
   it("refuses the whole file when a rule is broken — nothing half-written", () => {
     writeFileSync(path.join(dir, "bad.yaml"), ["steps:", "  1:", "    title: A", "  2:", "    title: B", "    on-issue: 1"].join("\n"));
     expect(() => say(path.join(dir, "bad.yaml"), "--go")).toThrow(/retry limit/);
-    expect(() => board()).toThrow();
+    expect(board().todos).toEqual([]);
   });
 });
 
@@ -328,7 +327,7 @@ describe("a graph is written all at once or not at all", () => {
       expect(JSON.parse(readFileSync(file, "utf8")).todos[0].verify).toBeUndefined();
     });
     const saved = JSON.parse(readFileSync(file, "utf8")).todos[0];
-    expect([saved.verify, saved.retry_limit]).toEqual(["npm test", 2]);
+    expect([saved.ext.process.verify, saved.ext.process.retry_limit]).toEqual(["npm test", 2]);
   });
 });
 
@@ -338,8 +337,7 @@ describe("a graph is written all at once or not at all", () => {
 describe("a step may name the task it IS", () => {
   let dir;
   const savedAppData = process.env.APPDATA;
-  const board = () =>
-    JSON.parse(readFileSync(path.join(dir, "com.claude-usage-tracker.app", "todos.json"), "utf8"));
+  const board = () => loadBoard(path.join(dir, "com.claude-usage-tracker.app", "todos.json"));
   const todos = (...args) =>
     execFileSync(process.execPath, [cli, "todos", ...args], {
       encoding: "utf8",
@@ -428,8 +426,7 @@ describe("a step may name the task it IS", () => {
 describe("apply requires a change for new work", () => {
   let dir;
   const savedAppData = process.env.APPDATA;
-  const board = () =>
-    JSON.parse(readFileSync(path.join(dir, "com.claude-usage-tracker.app", "todos.json"), "utf8"));
+  const board = () => loadBoard(path.join(dir, "com.claude-usage-tracker.app", "todos.json"));
   const todos = (...args) =>
     execFileSync(process.execPath, [cli, "todos", ...args], {
       encoding: "utf8",

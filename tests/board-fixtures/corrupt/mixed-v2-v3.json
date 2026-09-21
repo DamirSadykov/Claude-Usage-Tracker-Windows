@@ -1,0 +1,17 @@
+{
+  "version": 3,
+  "todos": [
+    {
+      "id": "e8888888-0000-4000-8000-000000000001",
+      "number": 62,
+      "subject": "Смешанная форма",
+      "status": "backlog",
+      "verify": "node --version",
+      "ext": {
+        "process": {
+          "verify": "cargo --version"
+        }
+      }
+    }
+  ]
+}

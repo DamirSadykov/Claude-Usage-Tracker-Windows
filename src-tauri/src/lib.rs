@@ -1308,9 +1308,7 @@ fn get_todos(app: AppHandle) -> Result<Vec<todos::Todo>, String> {
     Ok(match todos::load_checked(&path) {
         todos::LoadOutcome::Ok(file) => file.todos,
         todos::LoadOutcome::Missing => Vec::new(),
-        todos::LoadOutcome::Unreadable { .. } | todos::LoadOutcome::FutureVersion { .. } => {
-            todos::load(&path).todos
-        }
+        todos::LoadOutcome::Unreadable { .. } | todos::LoadOutcome::FutureVersion { .. } => Vec::new(),
     })
 }
 
@@ -1323,9 +1321,7 @@ fn get_changes(app: AppHandle) -> Result<Vec<todos::Change>, String> {
     Ok(match todos::load_checked(&path) {
         todos::LoadOutcome::Ok(file) => file.changes,
         todos::LoadOutcome::Missing => Vec::new(),
-        todos::LoadOutcome::Unreadable { .. } | todos::LoadOutcome::FutureVersion { .. } => {
-            todos::load(&path).changes
-        }
+        todos::LoadOutcome::Unreadable { .. } | todos::LoadOutcome::FutureVersion { .. } => Vec::new(),
     })
 }
 

@@ -12,12 +12,13 @@
 //! config). Writes are atomic (temp file + rename) so a crash mid-write can't
 //! corrupt the list shared between the tracker and Claude.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use log::warn;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -33,7 +34,7 @@ use crate::board_lock;
 /// optional field unset — so a caller that cares about three fields can spell
 /// those and leave the rest to `..Default::default()` instead of re-listing the
 /// whole struct every time a field is added.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct Todo {
     pub id: String,
     /// Stable, human-facing task number (like a GitHub issue number) for inline
@@ -125,6 +126,7 @@ pub struct Todo {
     /// step actually produced; anything touched but never declared stays a side
     /// effect. Empty → omitted from the file (no migration).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(skip)]
     pub produces: Vec<String>,
     /// Addresses of the spec sections this task changes (t#339), each
     /// `<domain>#<slug>` into `docs/specs/<domain>/spec.md`. Written by the CLI,
@@ -154,6 +156,7 @@ pub struct Todo {
     /// run reproducible. A node with no `verify` is not auto-executable whatever
     /// its `kind` says. Empty → omitted from the file.
     #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[schemars(skip)]
     pub verify: String,
     /// Retry cap M of the `N/<=M` record (t#302): how many times this node may be
     /// re-run after a failed outcome. Only the cap is stored — the attempt count N
@@ -161,6 +164,7 @@ pub struct Todo {
     /// None = no cap declared, which FORBIDS the retry rather than allowing an
     /// endless one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
     pub retry_limit: Option<u32>,
     /// Id of the task control jumps to when this node's outcome is `issue` (t#302),
     /// e.g. a review node handing work back to the implementation node. This is NOT
@@ -169,16 +173,19 @@ pub struct Todo {
     /// dep graph stays acyclic even when the process itself loops. None = no
     /// transition declared. Empty → omitted from the file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
     pub on_issue: Option<String>,
     /// Spend ceiling for this node in USD (t#302); on a change root (`change`) it is
     /// the ceiling of the whole GROUP. Only the ceiling is stored — actual spend is
     /// derived from the usage blocks. None = no ceiling declared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
     pub budget_usd: Option<f64>,
     /// How many steps of the group a runner may carry at once (t#302). Parallelism
     /// itself is not declared — it is the ABSENCE of an edge; only its limit is,
     /// and only on a change root. None = no limit declared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
     pub parallel_limit: Option<u32>,
     /// Machine predicate of this node's outcome (t#304): `"ok"` | `"issue"`, empty =
     /// NO CHECK HAS RUN. The empty case is deliberately not `ok`: a node nobody
@@ -188,17 +195,20 @@ pub struct Todo {
     /// `issue`. Free judgement is not a predicate here: only a command's exit code
     /// and the produces check write this field. Empty → omitted from the file.
     #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[schemars(skip)]
     pub outcome: String,
     /// Short machine reason behind `outcome` (t#304): `"ok"`, `"verify:issue"`,
     /// `"missing:<path>"`. Written by the same check that writes `outcome` and read
     /// as a pair with it — a reason left over from an earlier check would describe
     /// the wrong verdict. Empty → omitted from the file.
     #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[schemars(skip)]
     pub outcome_reason: String,
     /// When the check that produced `outcome` ran, RFC3339 (t#304). Distinct from
     /// `updated_at`, which any edit bumps: a runner needs to tell a verdict made for
     /// the CURRENT state of the node from one made two edits ago. Empty → omitted.
     #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[schemars(skip)]
     pub outcome_at: String,
     /// Handoff note carried FORWARD along dependency edges (#141): what this task
     /// produced and where it left off, written by the LLM (like a phases handoff).
@@ -224,6 +234,7 @@ pub struct Todo {
     /// for it and never reads it; it must still live here (see `spec`, above) or
     /// a save from the UI would drop it silently. Empty → omitted from the file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
     pub handout_at: Option<String>,
     /// When this todo arrived via an import (#181), RFC3339; None = created here.
     /// Set by [`merge_import`] on every task it brings in, so the board can mark
@@ -241,12 +252,14 @@ pub struct Todo {
     pub created_at: String,
     #[serde(default)]
     pub updated_at: String,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub ext: HashMap<String, Value>,
 }
 
 /// One entry of a todo's transition log: the status entered and when (RFC3339).
 /// Written by [`set_status`], [`upsert`] and the cc-todos CLI; keep the shape in
 /// lockstep with `todos.mjs` (`{ status, at }`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct StatusChange {
     pub status: String,
     #[serde(default)]
@@ -257,7 +270,7 @@ pub struct StatusChange {
 /// string so another source can be added without a migration). `body` is plain
 /// text; the UI renders links in it. `id`/`created_at` are set by whoever appends
 /// (the frontend or the cc-todos CLI).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Comment {
     pub id: String,
     pub author: String,
@@ -272,7 +285,7 @@ pub struct Comment {
 /// `Comment::author`); `note` is what the session said about THAT section; `at`
 /// is when it was answered — the Stop guard compares it against the session's
 /// own start, so an answer inherited from earlier work does not count as one.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SpecAnswer {
     /// Hashes of the section BLOCKS this task moved (t#353) — content-addressed,
     /// never positional, so an inserted neighbour cannot shift the attribution
@@ -299,7 +312,7 @@ pub struct SpecAnswer {
 /// session's context (t#352). `hash` is a short SHA-256 of the section's PROSE
 /// with whitespace normalised — metadata is excluded, since the provenance
 /// stamp itself rewrites those lines.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SpecSeen {
     /// Block hashes as shown, the baseline the closing answer diffs against.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -321,7 +334,11 @@ fn default_version() -> u32 {
     1
 }
 
-pub const CURRENT_VERSION: u32 = 2;
+pub const CURRENT_VERSION: u32 = 3;
+
+pub fn board_json_schema() -> schemars::Schema {
+    schemars::schema_for!(TodoFile)
+}
 
 /// A CHANGE as a RECORD rather than a task (t#360): the delta of one round, the
 /// spec sections it moves and the group's ceilings. A task points at it through
@@ -330,7 +347,7 @@ pub const CURRENT_VERSION: u32 = 2;
 /// status is DERIVED — open while any member is open — and never stored; only
 /// `closed_at` records the moment it was declared finished. Keep in lockstep
 /// with scripts/cli/change.mjs, which writes this shape.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Change {
     pub id: String,
     #[serde(default)]
@@ -342,10 +359,13 @@ pub struct Change {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(skip)]
     pub spec: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
     pub budget_usd: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
     pub parallel_limit: Option<u32>,
     /// Task number this record was migrated from — the only bridge back to the
     /// era when a change was a root task, and what makes the migration idempotent.
@@ -357,11 +377,13 @@ pub struct Change {
     pub updated_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub ext: HashMap<String, Value>,
 }
 
 /// The on-disk shape of `todos.json`. `version` lets us migrate the format
 /// later; unknown/missing fields default so older or hand-edited files load.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TodoFile {
     #[serde(default = "default_version")]
     pub version: u32,
@@ -433,6 +455,7 @@ pub fn load(path: &Path) -> TodoFile {
         t.status = canonical_status(&t.status).to_string();
     }
     migrate_plan_roles(&mut file);
+    hydrate_v3_process_fields(&mut file);
     file
 }
 
@@ -491,8 +514,80 @@ fn detect_issue(raw: &str) -> Issue {
     if version > CURRENT_VERSION as u64 {
         return Issue::FutureVersion(version);
     }
+    if has_mixed_process_forms(obj) {
+        return Issue::Unreadable("mixed-v2-v3-process-fields");
+    }
     parsed["version"] = Value::from(version as u32);
     Issue::Ok(parsed)
+}
+
+const TODO_PROCESS_FIELDS: &[&str] = &[
+    "produces", "verify", "retry_limit", "on_issue", "budget_usd", "parallel_limit",
+    "outcome", "outcome_reason", "outcome_at", "handout_at",
+];
+const CHANGE_PROCESS_FIELDS: &[&str] = &["spec", "budget_usd", "parallel_limit"];
+
+fn has_process_and_legacy(value: &Value, fields: &[&str]) -> bool {
+    let Some(obj) = value.as_object() else { return false };
+    let Some(Value::Object(process)) = obj.get("ext").and_then(Value::as_object).and_then(|e| e.get("process")) else {
+        return false;
+    };
+    fields.iter().any(|field| obj.contains_key(*field) && process.contains_key(*field))
+}
+
+fn has_mixed_process_forms(board: &serde_json::Map<String, Value>) -> bool {
+    board.get("todos").and_then(Value::as_array).is_some_and(|todos| {
+        todos.iter().any(|todo| has_process_and_legacy(todo, TODO_PROCESS_FIELDS))
+    }) || board.get("changes").and_then(Value::as_array).is_some_and(|changes| {
+        changes.iter().any(|change| has_process_and_legacy(change, CHANGE_PROCESS_FIELDS))
+    })
+}
+
+fn hydrate_v3_process_fields(file: &mut TodoFile) {
+    for todo in &mut file.todos {
+        if let Some(Value::Object(process)) = todo.ext.remove("process") {
+            if let Some(v) = process.get("produces").and_then(Value::as_array) { todo.produces = v.iter().filter_map(Value::as_str).map(str::to_string).collect(); }
+            if let Some(v) = process.get("verify").and_then(Value::as_str) { todo.verify = v.to_string(); }
+            if let Some(v) = process.get("retry_limit").and_then(Value::as_u64) { todo.retry_limit = u32::try_from(v).ok(); }
+            if let Some(v) = process.get("on_issue").and_then(Value::as_str) { todo.on_issue = Some(v.to_string()); }
+            if let Some(v) = process.get("budget_usd").and_then(Value::as_f64) { todo.budget_usd = Some(v); }
+            if let Some(v) = process.get("parallel_limit").and_then(Value::as_u64) { todo.parallel_limit = u32::try_from(v).ok(); }
+            if let Some(v) = process.get("outcome").and_then(Value::as_str) { todo.outcome = v.to_string(); }
+            if let Some(v) = process.get("outcome_reason").and_then(Value::as_str) { todo.outcome_reason = v.to_string(); }
+            if let Some(v) = process.get("outcome_at").and_then(Value::as_str) { todo.outcome_at = v.to_string(); }
+            if let Some(v) = process.get("handout_at").and_then(Value::as_str) { todo.handout_at = Some(v.to_string()); }
+        }
+    }
+    for change in &mut file.changes {
+        if let Some(Value::Object(process)) = change.ext.remove("process") {
+            if let Some(v) = process.get("spec").and_then(Value::as_array) { change.spec = v.iter().filter_map(Value::as_str).map(str::to_string).collect(); }
+            if let Some(v) = process.get("budget_usd").and_then(Value::as_f64) { change.budget_usd = Some(v); }
+            if let Some(v) = process.get("parallel_limit").and_then(Value::as_u64) { change.parallel_limit = u32::try_from(v).ok(); }
+        }
+    }
+}
+
+fn move_process_fields(value: &mut Value, fields: &[&str]) {
+    let Some(obj) = value.as_object_mut() else { return };
+    let mut ext = obj.remove("ext").and_then(|v| v.as_object().cloned()).unwrap_or_default();
+    let mut process = ext.remove("process").and_then(|v| v.as_object().cloned()).unwrap_or_default();
+    for field in fields {
+        if let Some(value) = obj.remove(*field) { process.insert((*field).to_string(), value); }
+    }
+    if !process.is_empty() { ext.insert("process".to_string(), Value::Object(process)); }
+    if !ext.is_empty() { obj.insert("ext".to_string(), Value::Object(ext)); }
+}
+
+fn v3_wire_value(file: &TodoFile) -> Result<Value, serde_json::Error> {
+    let mut value = serde_json::to_value(file)?;
+    if let Some(todos) = value.get_mut("todos").and_then(Value::as_array_mut) {
+        for todo in todos { move_process_fields(todo, TODO_PROCESS_FIELDS); }
+    }
+    if let Some(changes) = value.get_mut("changes").and_then(Value::as_array_mut) {
+        for change in changes { move_process_fields(change, CHANGE_PROCESS_FIELDS); }
+    }
+    value["version"] = Value::from(CURRENT_VERSION);
+    Ok(value)
 }
 
 fn corrupt_backup_path(path: &Path) -> PathBuf {
@@ -574,6 +669,7 @@ fn load_checked_with_timeout_versioned(
                         t.status = canonical_status(&t.status).to_string();
                     }
                     migrate_plan_roles(&mut file);
+                    hydrate_v3_process_fields(&mut file);
                     (LoadOutcome::Ok(file), on_disk_version)
                 }
                 Err(e) => {
@@ -717,7 +813,9 @@ fn write_atomic(path: &Path, file: &TodoFile, lock: Option<&board_lock::BoardLoc
     }
     let mut stamped = file.clone();
     stamped.version = CURRENT_VERSION;
-    let mut json = serde_json::to_string_pretty(&stamped).map_err(|e| e.to_string())?;
+    let wire = v3_wire_value(&stamped).map_err(|e| e.to_string())?;
+    let mut json = serde_json::to_string_pretty(&wire)
+        .map_err(|e| e.to_string())?;
     json.push('\n');
     let tmp = tmp_path_for(path);
     std::fs::write(&tmp, json.as_bytes()).map_err(|e| e.to_string())?;
@@ -851,6 +949,9 @@ pub fn upsert(file: &mut TodoFile, mut todo: Todo, now: &str) {
         };
         if todo.number == 0 {
             todo.number = existing.number;
+        }
+        if todo.ext.is_empty() {
+            todo.ext = existing.ext.clone();
         }
         // Provenance is set once (by the CLI) and has no UI field, so a UI edit
         // that doesn't carry it must not erase it.
@@ -1615,6 +1716,35 @@ pub fn merge_import(local: &TodoFile, incoming: &TodoFile, now: &str) -> (TodoFi
 mod tests {
     use super::*;
 
+    #[test]
+    fn board_schema_describes_current_typed_wire_format() {
+        let schema = serde_json::to_value(board_json_schema()).expect("schema serializes");
+        let definitions = schema["$defs"].as_object().expect("schema definitions");
+        assert_eq!(schema["title"], "TodoFile");
+        for name in ["Todo", "Change", "StatusChange", "Comment", "SpecAnswer", "SpecSeen"] {
+            assert!(definitions.contains_key(name), "missing {name} from board schema");
+        }
+
+        let todo = &definitions["Todo"];
+        let properties = todo["properties"].as_object().expect("Todo properties");
+        assert_eq!(properties["number"]["type"], "integer");
+        assert!(!properties.contains_key("budget_usd"));
+        assert_eq!(properties["ext"]["type"], Value::from("object"));
+    }
+
+    #[test]
+    fn board_schema_fixture_is_generated_from_rust_types() {
+        let generated = serde_json::to_value(board_json_schema()).expect("schema serializes");
+        let fixture = fixtures_dir().join("board.schema.json");
+        if std::env::var_os("UPDATE_BOARD_SCHEMA").is_some() {
+            std::fs::write(&fixture, format!("{}\n", serde_json::to_string_pretty(&generated).unwrap()))
+                .expect("write schema fixture");
+        }
+        let committed: Value = serde_json::from_str(&std::fs::read_to_string(&fixture).expect("read schema fixture"))
+            .expect("schema fixture is JSON");
+        assert_eq!(committed, generated, "run UPDATE_BOARD_SCHEMA=1 cargo test board_schema_fixture");
+    }
+
     fn todo(id: &str, status: &str) -> Todo {
         Todo {
             id: id.to_string(),
@@ -2232,6 +2362,24 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    #[test]
+    fn upsert_preserves_ext_across_a_compact_ui_edit() {
+        let mut file = TodoFile::default();
+        let mut stored = todo("a", "queue");
+        stored.ext.insert(
+            "triage".to_string(),
+            serde_json::json!({ "kind": "stale", "note": "сохранить" }),
+        );
+        file.todos.push(stored);
+
+        let edited = todo("a", "in_progress");
+        upsert(&mut file, edited, "T2");
+        assert_eq!(
+            file.todos[0].ext["triage"],
+            serde_json::json!({ "kind": "stale", "note": "сохранить" })
+        );
+    }
+
     /// The predicate is written by whoever ran the check (the CLI today, the runner
     /// later) and must survive the app's rewrite of the store. The row that was never
     /// checked carries NO key at all — an absent predicate must not read as `ok`.
@@ -2763,37 +2911,6 @@ mod tests {
         (dir, path)
     }
 
-    fn json_values_match(a: &Value, b: &Value) -> bool {
-        match (a, b) {
-            (Value::Array(xs), Value::Null) | (Value::Null, Value::Array(xs)) => xs.is_empty(),
-            (Value::Number(x), Value::Number(y)) => x.as_f64() == y.as_f64(),
-            (Value::Array(xs), Value::Array(ys)) => {
-                xs.len() == ys.len() && xs.iter().zip(ys).all(|(x, y)| json_values_match(x, y))
-            }
-            (Value::Object(xs), Value::Object(ys)) => {
-                let keys: std::collections::BTreeSet<_> = xs.keys().chain(ys.keys()).collect();
-                keys.into_iter().all(|k| {
-                    json_values_match(
-                        xs.get(k).unwrap_or(&Value::Null),
-                        ys.get(k).unwrap_or(&Value::Null),
-                    )
-                })
-            }
-            _ => a == b,
-        }
-    }
-
-    fn assert_known_fields_match(context: &str, original: &Value, saved: &Value) {
-        let orig_obj = original.as_object().expect("original must be an object");
-        for (key, orig_val) in orig_obj {
-            let saved_val = saved.get(key).cloned().unwrap_or(Value::Null);
-            assert!(
-                json_values_match(orig_val, &saved_val),
-                "{context}: key {key:?} differs — original {orig_val:?}, saved {saved_val:?}"
-            );
-        }
-    }
-
     #[test]
     fn corrupt_fixtures_are_unreadable() {
         for relative in [
@@ -2802,6 +2919,7 @@ mod tests {
             "corrupt/todos-not-array.json",
             "corrupt/empty-file.json",
             "corrupt/todo-field-type.json",
+            "corrupt/mixed-v2-v3.json",
         ] {
             let (dir, path) = staged_fixture("corrupt", relative);
             match load_checked(&path) {
@@ -2836,7 +2954,7 @@ mod tests {
 
     #[test]
     fn known_good_fixtures_load_ok() {
-        for relative in ["v2/full.json", "v2/unknown-field.json", "v1/full.json"] {
+        for relative in ["v2/full.json", "v2/unknown-field.json", "v3/full.json", "v1/full.json"] {
             let (dir, path) = staged_fixture("ok", relative);
             match load_checked(&path) {
                 LoadOutcome::Ok(file) => assert!(!file.todos.is_empty(), "{relative}: expected todos"),
@@ -3217,7 +3335,7 @@ mod tests {
         assert_eq!(file.version, 2);
 
         let on_disk: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(on_disk["version"], 2);
+        assert_eq!(on_disk["version"], CURRENT_VERSION);
         let on_disk_todos = on_disk["todos"].as_array().unwrap();
         assert_eq!(on_disk_todos.len(), 3);
         assert_eq!(
@@ -3230,7 +3348,7 @@ mod tests {
     }
 
     #[test]
-    fn transact_if_leaves_an_up_to_date_v2_board_untouched_on_a_no_op() {
+    fn transact_if_upgrades_a_v2_board_on_a_no_op() {
         let (dir, path) = staged_fixture("transact-if-v2-noop", "v2/full.json");
         let before = std::fs::read(&path).unwrap();
 
@@ -3238,7 +3356,10 @@ mod tests {
         assert_eq!(file.version, 2);
 
         let after = std::fs::read(&path).unwrap();
-        assert_eq!(before, after, "an already-current board must not be rewritten on a no-op");
+        assert_ne!(before, after);
+        let on_disk: Value = serde_json::from_slice(&after).unwrap();
+        assert_eq!(on_disk["version"], CURRENT_VERSION);
+        assert!(on_disk["todos"][0]["ext"]["process"].is_object());
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -3271,7 +3392,7 @@ mod tests {
             LoadOutcome::Ok(f) => f,
             other => panic!("saved v1/empty.json: expected Ok, got {other:?}"),
         };
-        assert_eq!(reloaded.version, 2);
+        assert_eq!(reloaded.version, CURRENT_VERSION);
         assert!(reloaded.todos.is_empty());
 
         std::fs::remove_dir_all(&dir).ok();
@@ -3315,7 +3436,7 @@ mod tests {
             LoadOutcome::Ok(f) => f,
             other => panic!("saved v1/full.json: expected Ok, got {other:?}"),
         };
-        assert_eq!(reloaded.version, 2);
+        assert_eq!(reloaded.version, CURRENT_VERSION);
         assert_eq!(
             serde_json::to_value(&reloaded.todos).unwrap(),
             serde_json::to_value(&file.todos).unwrap(),
@@ -3341,7 +3462,7 @@ mod tests {
             LoadOutcome::Ok(f) => f,
             other => panic!("saved v2/empty.json: expected Ok, got {other:?}"),
         };
-        assert_eq!(reloaded.version, 2);
+        assert_eq!(reloaded.version, CURRENT_VERSION);
         assert!(reloaded.todos.is_empty());
 
         std::fs::remove_dir_all(&dir).ok();
@@ -3376,11 +3497,15 @@ mod tests {
             "every known change field must survive a write/read cycle"
         );
 
-        let orig_raw: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let saved_raw: Value = serde_json::from_str(&std::fs::read_to_string(&save_path).unwrap()).unwrap();
-        assert_known_fields_match("todos[0]", &orig_raw["todos"][0], &saved_raw["todos"][0]);
-        for (i, change) in orig_raw["changes"].as_array().unwrap().iter().enumerate() {
-            assert_known_fields_match(&format!("changes[{i}]"), change, &saved_raw["changes"][i]);
+        assert_eq!(saved_raw["version"], Value::from(CURRENT_VERSION));
+        for field in TODO_PROCESS_FIELDS {
+            assert!(saved_raw["todos"][0].get(*field).is_none());
+            assert!(saved_raw["todos"][0]["ext"]["process"].get(*field).is_some());
+        }
+        for field in CHANGE_PROCESS_FIELDS {
+            assert!(saved_raw["changes"][0].get(*field).is_none());
+            assert!(saved_raw["changes"][0]["ext"]["process"].get(*field).is_some());
         }
 
         let t0 = &reloaded.todos[0];
@@ -3464,7 +3589,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_unknown_field_fixtures_ext_and_reviewer_note_are_dropped_on_write() {
+    fn v2_unknown_field_fixtures_preserve_ext_and_drop_unknown_top_level_fields() {
         let (dir, path) = staged_fixture("v2-unknown-fixtures", "v2/unknown-field.json");
         let file = match load_checked(&path) {
             LoadOutcome::Ok(f) => f,
@@ -3478,12 +3603,58 @@ mod tests {
         save(&save_path, &file).unwrap();
         let raw = std::fs::read_to_string(&save_path).unwrap();
         assert!(!raw.contains("reviewer_note"), "unknown field must be dropped on write: {raw}");
-        assert!(!raw.contains("\"ext\""), "reserved-but-unimplemented ext must be dropped on write: {raw}");
-
         let saved: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(saved["version"], Value::from(CURRENT_VERSION));
+        assert_eq!(
+            saved["todos"][0]["ext"]["triage"],
+            serde_json::json!({ "kind": "stale", "note": "не двигалась 40 дней" })
+        );
         assert_eq!(saved["todos"][0]["status"], Value::from("backlog"));
         assert_eq!(saved["todos"][0]["number"], Value::from(50));
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn v3_empty_fixtures_round_trip_losslessly() {
+        let (dir, path) = staged_fixture("v3-empty-fixtures", "v3/empty.json");
+        let original: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let file = match load_checked(&path) {
+            LoadOutcome::Ok(f) => f,
+            other => panic!("v3/empty.json: expected Ok, got {other:?}"),
+        };
+        let save_path = dir.join("saved.json");
+        save(&save_path, &file).unwrap();
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&save_path).unwrap()).unwrap();
+        assert_eq!(saved, original);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn v3_full_fixtures_round_trip_losslessly() {
+        let (dir, path) = staged_fixture("v3-full-fixtures", "v3/full.json");
+        let original: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let file = match load_checked(&path) {
+            LoadOutcome::Ok(f) => f,
+            other => panic!("v3/full.json: expected Ok, got {other:?}"),
+        };
+        assert_eq!(file.version, CURRENT_VERSION);
+        assert_eq!(file.todos[0].verify, "cargo test board_schema_fixture");
+        assert_eq!(file.changes[0].spec, vec!["tasks#board-file".to_string()]);
+
+        let save_path = dir.join("saved.json");
+        save(&save_path, &file).unwrap();
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&save_path).unwrap()).unwrap();
+        assert_eq!(saved, original);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn mixed_v2_v3_fixture_refuses_write() {
+        let (dir, path) = staged_fixture("mixed-v2-v3", "corrupt/mixed-v2-v3.json");
+        let before = std::fs::read(&path).unwrap();
+        assert!(load_for_write(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
         std::fs::remove_dir_all(&dir).ok();
     }
 

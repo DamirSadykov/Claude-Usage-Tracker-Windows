@@ -361,6 +361,7 @@ describe("buildExitContext · commands exist in the real CLI", () => {
         encoding: "utf8",
         stdio: "pipe",
         windowsHide: true,
+        env: { ...process.env, APPDATA: os.tmpdir() },
       });
     } catch (e) {
       out = String(e.stderr || "");

@@ -2,7 +2,23 @@ import fs from "node:fs";
 import path from "node:path";
 import { withBoardLock } from "./board-lock.mjs";
 
-export const CURRENT = 2;
+export const CURRENT = 3;
+
+const TODO_PROCESS_FIELDS = [
+  "produces", "verify", "retry_limit", "on_issue", "budget_usd", "parallel_limit",
+  "outcome", "outcome_reason", "outcome_at", "handout_at",
+];
+const CHANGE_PROCESS_FIELDS = ["spec", "budget_usd", "parallel_limit"];
+
+function hasMixedProcessForms(row, fields) {
+  return isPlainObject(row?.ext?.process) &&
+    fields.some((field) => Object.hasOwn(row, field) && Object.hasOwn(row.ext.process, field));
+}
+
+function hasMixedV3Forms(data) {
+  return (data.todos || []).some((row) => hasMixedProcessForms(row, TODO_PROCESS_FIELDS)) ||
+    (data.changes || []).some((row) => hasMixedProcessForms(row, CHANGE_PROCESS_FIELDS));
+}
 
 export class BoardUnreadableError extends Error {
   constructor(message, { file, backup = null, reason } = {}) {
@@ -35,6 +51,9 @@ export function detectBoardIssue(raw) {
 
   const version = Number.isInteger(parsed.version) ? parsed.version : 1;
   if (version > CURRENT) return { kind: "future-version", data: parsed, version };
+  if (hasMixedV3Forms(parsed))
+    return { kind: "unreadable", reason: "mixed-v2-v3-process-fields" };
+  if (version === 2) return { kind: "ok", data: { ...parsed, version } };
   if (version < CURRENT) return { kind: "stale-version", data: parsed, version };
   return { kind: "ok", data: { ...parsed, version } };
 }
