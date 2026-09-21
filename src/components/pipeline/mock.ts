@@ -351,7 +351,7 @@ export const links: TaskLink[] = [
         to: "#345",
         artifact: {
             kind: "file",
-            address: "scripts/cli/spec.mjs",
+            address: "scripts/cli/spec/spec.mjs",
             short: "spec.mjs",
             exists: true,
         },
@@ -689,7 +689,7 @@ export const specLanes: SpecLane[] = [
             { id: "process#language", title: "Язык процесса · другой домен", tone: "spec" },
         ],
         files: [
-            { path: "scripts/cli/spec.mjs", anchor: "#реестр", exists: true },
+            { path: "scripts/cli/spec/spec.mjs", anchor: "#реестр", exists: true },
             { path: "docs/specs/tasks/spec.md", anchor: "#адресация", exists: true },
             { path: "src-tauri/src/todos.rs", anchor: "#поле-spec", exists: true },
             {

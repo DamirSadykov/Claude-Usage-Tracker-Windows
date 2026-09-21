@@ -142,13 +142,13 @@ refs: tasks#plan-mode, tasks#context
   когда режим планирования включён с клавиатуры, а не вызовом инструмента).
   Устройство самого ритуала plan mode и впрыска контекста задачи —
   `tasks#plan-mode` и `tasks#context`.
-- Каждый модуль `scripts/cli/*.mjs` обязан быть перечислен в
+- Модули CLI лежат по слоям в `scripts/cli/<слой>/` — `kernel`, `board`,
+  `process`, `agents`, `spec`, `cc-hooks`, `analytics`; направление импортов
+  между слоями проверяет `scripts/cli/kernel/layers.test.mjs`. Каждый модуль,
+  достижимый из `scripts/cli.mjs` по импортам, обязан быть перечислен в
   `bundle.resources` (`src-tauri/tauri.conf.json`) — установленная сборка,
-  в отличие от dev, не находит неперечисленные модули; на момент этой
-  правки перечислены все 26 модулей `scripts/cli/*.mjs`, включая
-  `plan-guard.mjs`, `run.mjs`, `run-step.mjs`, `adoption.mjs`, `lint.mjs`,
-  `apply.mjs`, `graph-rules.mjs`, `spec.mjs`, `yaml-subset.mjs`,
-  `settings.mjs`, `claude-hooks.mjs`.
+  в отличие от dev, не находит неперечисленные модули; полноту списка
+  проверяет `scripts/cli/kernel/resources.test.mjs` по замыканию импортов.
 - Установка хуков идёт кодом (`install_cc_hook` / `heal_cc_hook` в
   `src-tauri/src/lib.rs`), не руками: пишет и чинит записи в
   `~/.claude/settings.json`, никогда не трогает чужие хуки того же события
@@ -184,9 +184,9 @@ part: устройство
 
 Один файл `settings.json` в каталоге данных читают три стороны: окна
 приложения (`src/settingsStore.ts` и прямые чтения панелей), Rust
-(`src-tauri/src/spec.rs`) и CLI хуков (`scripts/cli/settings.mjs`). Общего
+(`src-tauri/src/spec.rs`) и CLI хуков (`scripts/cli/kernel/settings.mjs`). Общего
 генератора нет намеренно: список ключей записан руками в
-`scripts/cli/settings-contract.json`, и это источник истины.
+`scripts/cli/kernel/settings-contract.json`, и это источник истины.
 
 У каждого ключа:
 

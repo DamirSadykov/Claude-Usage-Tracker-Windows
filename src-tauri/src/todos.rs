@@ -224,7 +224,7 @@ pub struct Todo {
     /// fresh. Set by whoever writes the field (the cc-todos CLI and [`upsert`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff_at: Option<String>,
-    /// When `todos run <change> --next` (scripts/cli/run.mjs, t#520) last handed
+    /// When `todos run <change> --next` (scripts/cli/process/run.mjs, t#520) last handed
     /// this node out to a caller driving the loop itself, RFC3339; None = never
     /// handed out this way. NOT a status move — the node still enters
     /// `in_progress` only on `--report` — it exists so `outcome.mjs`'s weak file
@@ -346,7 +346,7 @@ pub fn board_json_schema() -> schemars::Schema {
 /// missing edge can no longer drop a task out of its change in silence. Its
 /// status is DERIVED — open while any member is open — and never stored; only
 /// `closed_at` records the moment it was declared finished. Keep in lockstep
-/// with scripts/cli/change.mjs, which writes this shape.
+/// with scripts/cli/board/change.mjs, which writes this shape.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Change {
     pub id: String,

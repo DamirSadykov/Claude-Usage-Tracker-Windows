@@ -17,8 +17,8 @@ import { FONT_OPTIONS, applyFont } from "../fontSwitch";
 import { modelFamilyClass } from "../modelFamily";
 import EnrollmentPanel from "./EnrollmentPanel.vue";
 import WorkflowGraph from "./WorkflowGraph.vue";
-import agentProviderManifest from "../../scripts/cli/agent-providers.json";
-import { dutyModeReader } from "../../scripts/cli/duty-mode.mjs";
+import agentProviderManifest from "../../scripts/cli/agents/agent-providers.json";
+import { dutyModeReader } from "../../scripts/cli/agents/duty-mode.mjs";
 
 const TIER_LABELS: Record<AlertTierKey, string> = {
   five_hour: "session5h",

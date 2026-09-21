@@ -139,7 +139,7 @@ const B5 = "72b4e0cd91af";
 const B6 = "e04a6b23c7d8";
 
 const P1 =
-    "Реестр (`scripts/cli/spec.mjs`) читает домен спек `docs/specs/<домен>/spec.md`: шапка даёт `id`, `version`, `updated` и `location` файла, а разделы объявляются в теле — заголовок `## <слаг> — <Название>` и строки метаданных под ним.";
+    "Реестр (`scripts/cli/spec/spec.mjs`) читает домен спек `docs/specs/<домен>/spec.md`: шапка даёт `id`, `version`, `updated` и `location` файла, а разделы объявляются в теле — заголовок `## <слаг> — <Название>` и строки метаданных под ним.";
 const P2 =
     "Адрес раздела — `<домен>#<слаг>` (например `tasks#done-gate`). `resolveAddress` проверяет существование домена и слага и **никогда** — доступность текста удалённого раздела.";
 const P3 =
@@ -489,7 +489,7 @@ export interface MentionedFile {
 }
 
 export const mentionedFiles: MentionedFile[] = [
-    { path: "scripts/cli/spec.mjs", exists: true },
+    { path: "scripts/cli/spec/spec.mjs", exists: true },
     { path: "docs/specs/tasks/spec.md", exists: true },
     { path: "src-tauri/src/todos.rs", exists: true },
     { path: "insightHelp/render.ts", exists: false },
