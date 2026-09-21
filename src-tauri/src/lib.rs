@@ -1,28 +1,19 @@
-pub mod alerts;
-pub mod board_lock;
-pub mod cc;
+pub mod analytics;
+pub mod board;
 pub mod contracts;
-pub mod codex;
-pub mod corrections;
-pub mod domain;
-pub mod enroll;
 pub mod external;
-pub mod graph;
-pub mod identity;
 pub mod kernel;
-pub mod memory;
-pub mod project_groups;
-pub mod report;
-pub mod stats;
 pub mod spec;
-pub mod status;
-pub mod sysmon;
 pub mod task_cost;
-pub mod task_sessions;
-pub mod todos;
 pub mod triage;
-pub mod triage_schedule;
-pub mod usage;
+#[cfg(test)]
+mod layers;
+
+pub use analytics::{alerts, cc, codex, corrections, domain, memory, project_groups, stats, status, usage};
+pub use board::{graph, task_sessions, todos};
+pub use external::{enroll, identity};
+pub use kernel::{board_lock, report, sysmon};
+pub use triage::triage_schedule;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};

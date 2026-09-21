@@ -31,7 +31,11 @@ pub fn cc_hook_script_path(app: &AppHandle) -> Result<String, String> {
             .join("cli.mjs");
         std::fs::canonicalize(&d).ok().filter(|p| p.exists())
     };
-    let chosen = if cfg!(debug_assertions) { dev.or(resource) } else { resource.or(dev) };
+    let chosen = if cfg!(debug_assertions) {
+        dev.or(resource)
+    } else {
+        resource.or(dev)
+    };
     let p = chosen.ok_or_else(|| "cli.mjs not found (resource or dev path)".to_string())?;
     let s = p.to_string_lossy().replace('\\', "/");
     Ok(s.strip_prefix("//?/").map(str::to_string).unwrap_or(s))
