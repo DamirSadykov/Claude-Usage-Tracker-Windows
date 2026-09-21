@@ -5,14 +5,18 @@
 // session's token cost can be split into blocks (task × session × interval).
 // Ambiguity (two in_progress) and repeat hook runs must NOT produce records.
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterEach } from "vitest";
 import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { bindSessionToTask, buildWorkflowContext, buildWorkflowSummary, contractBlock } from "./hook.mjs";
-import { readTaskSessionEvents, taskSessionsPath, appendTaskSessionEvent } from "./todos.mjs";
+import { readTaskSessionEvents, taskSessionsPath, appendTaskSessionEvent, setSpecPort } from "./todos.mjs";
+import { formatSpecSections, recordSpecBaseline } from "./board-ritual.mjs";
+import { resolveAddress } from "./spec.mjs";
+
+beforeAll(() => setSpecPort({ resolveAddress, formatSections: formatSpecSections, recordBaseline: recordSpecBaseline }));
 
 const task = (id, extra = {}) => ({
   id,

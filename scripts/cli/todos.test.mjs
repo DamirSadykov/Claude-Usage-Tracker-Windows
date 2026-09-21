@@ -5,7 +5,7 @@
 // change root(s) along each branch of the reverse dep graph, and the block both
 // `vision <task>` and the in_progress anchor print.
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeAll, beforeEach, afterEach } from "vitest";
 import { execFileSync, spawnSync } from "node:child_process";
 import {
   mkdtempSync,
@@ -25,7 +25,7 @@ import {
   formatChangeVision,
   specAddressesFor,
   specAddressesForManual,
-  formatSpecSections,
+  setSpecPort,
   isChangeRoot,
   formatDeclarations,
   normalizeLimit,
@@ -39,6 +39,10 @@ import {
   lastTaskSessionEvent,
   loadBoard,
 } from "./todos.mjs";
+import { formatSpecSections, recordSpecBaseline } from "./board-ritual.mjs";
+import { resolveAddress } from "./spec.mjs";
+
+beforeAll(() => setSpecPort({ resolveAddress, formatSections: formatSpecSections, recordBaseline: recordSpecBaseline }));
 
 describe("todos list scope and pagination", () => {
   let dir;

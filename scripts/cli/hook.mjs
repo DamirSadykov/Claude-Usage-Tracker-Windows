@@ -27,13 +27,13 @@ import { fileURLToPath } from "node:url";
 import {
   changeRootsFor,
   specAddressesFor,
-  formatSpecSections,
   currentSessionId,
   appendTaskSessionEvent,
   lastTaskSessionEvent,
   loadBoard,
   STATUSES,
 } from "./todos.mjs";
+import { formatSpecSections } from "./board-ritual.mjs";
 import { taskContextMinRank, hookContextEnabled, workflowContextEnabled } from "./settings.mjs";
 import { resolveRoot } from "./spec.mjs";
 import { readAgentConfig } from "./agents.mjs";

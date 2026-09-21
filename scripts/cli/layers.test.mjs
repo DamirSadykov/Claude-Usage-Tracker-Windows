@@ -60,4 +60,8 @@ describe("scripts/cli import graph", () => {
     for (const k of KERNEL) for (const d of g.get(k) ?? []) if (!KERNEL.has(d)) leaks.push(`${k} -> ${d}`);
     expect(leaks).toEqual([]);
   });
+
+  it("keeps the board independent of the spec ritual", () => {
+    expect(g.get("todos")).not.toContain("spec");
+  });
 });

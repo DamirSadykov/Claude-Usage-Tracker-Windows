@@ -46,9 +46,13 @@ import { spawn, execFileSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { matchPlanCli, specsEnabled } from "./settings.mjs";
-import { resolveAddress, showSection, sectionFingerprint, blocksOf } from "./spec.mjs";
 import { findChange, changeAddress, CURRENT, BoardUnreadableError, STATUSES, col, isDone, isChangeRoot, normalizeLimit, todosPath, load, save, boardPath, loadBoard, assertBoardWritable, loadBoardForWrite, saveBoard, withDeferredSave, resolveTask, changeRootsFor, changeAsRoot, specAddressesForManual } from "./board-io.mjs";
 import { withBoardLock } from "./board-lock.mjs";
+
+let specPort = null;
+export function setSpecPort(port) {
+  specPort = port;
+}
 
 export { findChange, changeAddress, CURRENT, BoardUnreadableError, STATUSES, col, isDone, isChangeRoot, normalizeLimit, boardPath, loadBoard, assertBoardWritable, loadBoardForWrite, saveBoard, withDeferredSave, resolveTask, changeRootsFor, changeAsRoot, specAddressesForManual } from "./board-io.mjs";
 
@@ -260,11 +264,11 @@ function cmdTake(args) {
   }
   const specLink = specAddressesFor(todo, roots);
   if (specLink.addresses.length) {
-    process.stdout.write("\n" + formatSpecSections(todo, specLink));
+    process.stdout.write("\n" + (specPort?.formatSections?.(todo, specLink) ?? ""));
     // The baseline is written AFTER the section is shown and needs its own save:
     // `take` writes nothing to the board otherwise, and in `setStatus` the row
     // was already saved before this anchor is reached.
-    recordSpecBaseline(todo, specLink.addresses);
+    specPort?.recordBaseline?.(todo, specLink.addresses);
     save(file, data);
   }
 }
@@ -358,8 +362,8 @@ function setStatus({ data, file, todo, value, flags }) {
     // Silent altogether while `specsEnabled` is off (specAddressesFor).
     const specLink = specAddressesFor(todo, roots);
     if (specLink.addresses.length) {
-      process.stdout.write("\n" + formatSpecSections(todo, specLink));
-      recordSpecBaseline(todo, specLink.addresses);
+      process.stdout.write("\n" + (specPort?.formatSections?.(todo, specLink) ?? ""));
+      specPort?.recordBaseline?.(todo, specLink.addresses);
       save(file, data); // the row was saved above, before this anchor was reached
     }
     // Preventive channel (t#250): "starting this task" is the moment the
@@ -874,10 +878,9 @@ function setSpec({ data, file, todo, value }) {
     return;
   }
   const addresses = v.split(",").map((s) => s.trim()).filter(Boolean);
-  const invalid = addresses
-    .map((a) => ({ a, r: resolveAddress(a) }))
-    .filter(({ r }) => !r.ok)
-    .map(({ a, r }) => `${a} — ${r.reason}`);
+  const invalid = specPort?.resolveAddress
+    ? addresses.map((a) => ({ a, r: specPort.resolveAddress(a) })).filter(({ r }) => !r.ok).map(({ a, r }) => `${a} — ${r.reason}`)
+    : [];
   if (invalid.length) {
     fail(`refusing: invalid spec address(es):\n` + invalid.map((m) => `  ${m}`).join("\n"));
   }
@@ -1750,84 +1753,6 @@ export function specAddressesFor(t, roots, appData) {
   return specAddressesForManual(t, roots);
 }
 
-// One addressed section's block, in the exact three shapes `showSection` can
-// answer (docs/specs/README.md §4's required third answer): found (its ready-
-// to-inject text, heading + part + refs + prose, refs as ADDRESSES only — never
-// expanded to text, per §7), no such address, or declared-but-unavailable
-// (external repo not cloned/configured here) — the last two are printed, not
-// swallowed, so a missing section reads as "missing", never as silence.
-function formatSpecSection(address, opts = {}) {
-  const res = showSection(address, opts.root, opts.appData);
-  if (!res.ok) return `— ${address}: ${res.reason}`;
-  if (res.remote && !res.available) {
-    return (
-      `— ${address}: ${res.unavailable}` +
-      (res.stub && res.stub.trim() ? `\n\n${res.stub.trim()}` : "")
-    );
-  }
-  return res.text && res.text.trim() ? res.text.trim() : `— ${address}: (empty section)`;
-}
-
-// Human-readable block of the spec section(s) addressed by <task>'s (or its
-// change root's) `spec` field — printed WHOLE and NEXT TO the change vision
-// (formatChangeVision), never instead of it: the vision stays the change's
-// delta, this is the spec's long-lived state (docs/specs/README.md §1/§7).
-// `spec` is the `{ source, addresses }` specAddressesFor returns.
-// Fingerprint the addressed sections AS SHOWN, on the task. This is the
-// baseline the closing answer is checked against: `spec answer updated` used to
-// stamp provenance without comparing anything, so a verdict of "the section
-// moved" cost exactly as much as "it did not" — and §7's whole provenance story
-// rested on it. Recorded at the injection anchor because that is the only
-// moment we know what text the session was actually given.
-//
-// Does not save: every caller is already inside a write that saves.
-export function recordSpecBaseline(t, addresses, opts = {}) {
-  if (!Array.isArray(addresses) || !addresses.length) return;
-  const at = new Date().toISOString();
-  const seen = Array.isArray(t.spec_seen) ? t.spec_seen.slice() : [];
-  for (const address of addresses) {
-    const hash = sectionFingerprint(address, opts.root);
-    if (!hash) continue;
-    // Block hashes as well as the whole-section one: the closing answer diffs
-    // against them to record WHICH bullets this task moved, not just that
-    // something moved.
-    //
-    // And the text itself, because hashes can only ever answer "did it move".
-    // Showing WHAT moved — the delta a change is, side by side, the way a diff
-    // shows it — needs the bytes that were there before, and this is the one
-    // moment they exist. Bounded by the section budget (README §7, ~120 lines),
-    // which is what makes keeping a copy per (task, section) affordable at all.
-    const blocks = blocksOf(address, opts.root);
-    const entry = {
-      address,
-      hash,
-      blocks: blocks.map((b) => b.hash),
-      text: blocks.map((b) => b.text).join("\n"),
-      at,
-    };
-    const i = seen.findIndex((x) => x && x.address === address);
-    if (i >= 0) seen[i] = entry;
-    else seen.push(entry);
-  }
-  if (seen.length) t.spec_seen = seen;
-}
-
-export function formatSpecSections(t, spec, opts = {}) {
-  const { source, addresses } = spec;
-  if (!addresses.length) return "";
-  const who =
-    source === "task"
-      ? `#${t.number} "${t.subject}"'s own \`spec\` field`
-      : `the \`spec\` field of #${t.number} "${t.subject}"'s change root(s)`;
-  const blocks = addresses.map((a) => formatSpecSection(a, opts));
-  return (
-    `📘 Spec section(s) addressed by ${who} — read in FULL before touching this area:\n\n` +
-    blocks.join("\n\n") +
-    `\n\n(any \`refs:\` line above names OTHER sections by address only — pull one's own text ` +
-    `only if you actually need it, not preemptively)\n`
-  );
-}
-
 // Human-readable block of what a task inherits from its prerequisites' handoff.
 // Shared by `handoff <task>` and the in_progress anchor so both read identically.
 function formatInheritedHandoff(t, prereqs) {
@@ -1971,7 +1896,7 @@ function cmdVision(args) {
   }
   if (roots.length) process.stdout.write(formatChangeVision(t, roots));
   if (specLink.addresses.length) {
-    process.stdout.write((roots.length ? "\n" : "") + formatSpecSections(t, specLink));
+    process.stdout.write((roots.length ? "\n" : "") + (specPort?.formatSections?.(t, specLink) ?? ""));
   }
 }
 

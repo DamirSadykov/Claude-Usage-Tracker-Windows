@@ -127,6 +127,16 @@ try {
   if (sub) {
     const m = await import(new URL(sub, import.meta.url));
     await m.run(rest.slice(1));
+  } else if (area === "todos") {
+    const ritual = await import(new URL("./cli/board-ritual.mjs", import.meta.url));
+    const spec = await import(new URL("./cli/spec.mjs", import.meta.url));
+    const todos = await import(new URL(mod, import.meta.url));
+    todos.setSpecPort({
+      resolveAddress: spec.resolveAddress,
+      formatSections: ritual.formatSpecSections,
+      recordBaseline: ritual.recordSpecBaseline,
+    });
+    await todos.run(rest);
   } else {
     const m = await import(new URL(mod, import.meta.url));
     await m.run(rest);
