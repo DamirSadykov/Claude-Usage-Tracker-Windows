@@ -1,6 +1,6 @@
 //! Spec registry for the Tasks window (t#346) — a bridge, not a second reader.
 //!
-//! The registry itself lives in `scripts/cli/spec.mjs`: it parses
+//! The registry itself lives in `scripts/cli/spec/spec.mjs`: it parses
 //! `docs/specs/<domain>/spec.md`, resolves `<domain>#<slug>` addresses, and
 //! answers "declared but unavailable" for a section whose text sits in another
 //! repository. Re-implementing that parse here would give the app a second
@@ -38,7 +38,7 @@ pub struct ProjectDir {
     pub has_specs: bool,
 }
 
-/// `specRoot` as the CLI reads it (scripts/cli/settings.mjs) — the same key,
+/// `specRoot` as the CLI reads it (scripts/cli/kernel/settings.mjs) — the same key,
 /// the same default, so the app and the hooks never disagree about where a
 /// project's specs live.
 fn spec_root_setting() -> String {
@@ -193,7 +193,7 @@ fn run_spec(cli: &str, dir: &str, args: &[&str]) -> Result<Value, String> {
     }
     let out = cmd
         .output()
-        .map_err(|e| format!("не удалось запустить node: {e} (реестр спек читает scripts/cli/spec.mjs)"))?;
+        .map_err(|e| format!("не удалось запустить node: {e} (реестр спек читает scripts/cli/spec/spec.mjs)"))?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     if stdout.trim().is_empty() {
         let stderr = String::from_utf8_lossy(&out.stderr);

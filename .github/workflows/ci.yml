@@ -35,7 +35,7 @@ jobs:
               - '.github/workflows/ci.yml'
             specs:
               - 'docs/specs/**'
-              - 'scripts/cli/spec.mjs'
+              - 'scripts/cli/spec/spec.mjs'
 
       - name: Setup Node.js
         if: steps.changes.outputs.code == 'true' || steps.changes.outputs.specs == 'true'

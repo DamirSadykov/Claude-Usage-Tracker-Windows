@@ -8,7 +8,7 @@
 //! triage digest.
 //!
 //! JSON is snake_case to match the app's wire format. The shape mirrors
-//! scripts/cli/corrections.mjs::cmdPublish and docs/corrections-contract.md.
+//! scripts/cli/analytics/corrections.mjs::cmdPublish and docs/corrections-contract.md.
 //! Classifying a candidate further (correction vs refinement/…) is out of scope
 //! for this metric — these numbers are heuristic candidate upper bounds.
 

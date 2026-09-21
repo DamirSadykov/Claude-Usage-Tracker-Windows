@@ -8,7 +8,7 @@
 //! as the cc-todos CLI owns writes to todos.json.
 //!
 //! JSON is snake_case to match the rest of the app's wire format. The shape
-//! mirrors scripts/cli/triage.mjs; keep [`KINDS`] in lockstep with its `KINDS`.
+//! mirrors scripts/cli/analytics/triage.mjs; keep [`KINDS`] in lockstep with its `KINDS`.
 
 use std::path::Path;
 

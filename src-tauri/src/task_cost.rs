@@ -92,7 +92,7 @@ pub struct AttributionSession {
 }
 
 /// The on-disk shape of `task-attribution.json` (schema owned by
-/// scripts/cli/task-cost.mjs). Every field defaults so a partial file loads.
+/// scripts/cli/analytics/task-cost.mjs). Every field defaults so a partial file loads.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttributionFile {
     #[serde(default = "default_version")]

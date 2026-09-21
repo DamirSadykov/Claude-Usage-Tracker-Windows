@@ -2,12 +2,12 @@
 // Unified CLI for the Claude Usage Tracker. ONE entry, area modules loaded
 // LAZILY so adding an area never bloats this file or the startup cost:
 //
-//   node cli.mjs todos  <…>    → ./cli/todos.mjs   (mutate the todo list)
-//   node cli.mjs triage <…>    → ./cli/triage.mjs  (publish the nightly digest)
-//   node cli.mjs spec   <…>    → ./cli/spec.mjs    (spec registry, t#339)
-//   node cli.mjs hook          → ./cli/hook.mjs    (SessionStart hook)
-//   node cli.mjs stop-hook     → ./cli/stop-hook.mjs (Stop hook: HANDOFF guard)
-//   node cli.mjs plan-guard    → ./cli/plan-guard.mjs (PreToolUse: plan format guard)
+//   node cli.mjs todos  <…>    → ./cli/board/todos.mjs       (mutate the todo list)
+//   node cli.mjs triage <…>    → ./cli/analytics/triage.mjs  (publish the nightly digest)
+//   node cli.mjs spec   <…>    → ./cli/spec/spec.mjs         (spec registry, t#339)
+//   node cli.mjs hook          → ./cli/cc-hooks/hook.mjs     (SessionStart hook)
+//   node cli.mjs stop-hook     → ./cli/cc-hooks/stop-hook.mjs (Stop hook: HANDOFF guard)
+//   node cli.mjs plan-guard    → ./cli/process/plan-guard.mjs (PreToolUse: plan format guard)
 //
 // Each area module exports `run(args)`. The tracker bundles this whole tree
 // and the installer wires the hooks into ~/.claude/settings.json.
@@ -19,32 +19,32 @@ import fs from "node:fs";
 import path from "node:path";
 
 const AREAS = {
-  todos: "./cli/todos.mjs",
-  change: "./cli/change.mjs",
-  triage: "./cli/triage.mjs",
-  corrections: "./cli/corrections.mjs",
-  "task-cost": "./cli/task-cost.mjs",
-  agents: "./cli/agents.mjs",
-  spec: "./cli/spec.mjs",
-  hook: "./cli/hook.mjs",
-  "stop-hook": "./cli/stop-hook.mjs",
-  "plan-hook": "./cli/plan-hook.mjs",
-  "plan-guard": "./cli/plan-guard.mjs",
+  todos: "./cli/board/todos.mjs",
+  change: "./cli/board/change.mjs",
+  triage: "./cli/analytics/triage.mjs",
+  corrections: "./cli/analytics/corrections.mjs",
+  "task-cost": "./cli/analytics/task-cost.mjs",
+  agents: "./cli/agents/agents.mjs",
+  spec: "./cli/spec/spec.mjs",
+  hook: "./cli/cc-hooks/hook.mjs",
+  "stop-hook": "./cli/cc-hooks/stop-hook.mjs",
+  "plan-hook": "./cli/process/plan-hook.mjs",
+  "plan-guard": "./cli/process/plan-guard.mjs",
 };
 
 const SUBCOMMANDS = {
   todos: {
-    run: "./cli/run.mjs",
-    apply: "./cli/apply.mjs",
-    lint: "./cli/lint.mjs",
-    outcome: "./cli/outcome.mjs",
-    adoption: "./cli/adoption.mjs",
+    run: "./cli/process/run.mjs",
+    apply: "./cli/process/apply.mjs",
+    lint: "./cli/process/lint.mjs",
+    outcome: "./cli/process/outcome.mjs",
+    adoption: "./cli/process/adoption.mjs",
   },
   spec: {
-    match: "./cli/spec-match.mjs",
+    match: "./cli/spec/spec-match.mjs",
   },
   change: {
-    migrate: "./cli/change-migrate.mjs",
+    migrate: "./cli/board/change-migrate.mjs",
   },
 };
 
@@ -127,6 +127,16 @@ try {
   if (sub) {
     const m = await import(new URL(sub, import.meta.url));
     await m.run(rest.slice(1));
+  } else if (area === "todos") {
+    const ritual = await import(new URL("./cli/spec/board-ritual.mjs", import.meta.url));
+    const spec = await import(new URL("./cli/spec/spec.mjs", import.meta.url));
+    const todos = await import(new URL(mod, import.meta.url));
+    todos.setSpecPort({
+      resolveAddress: spec.resolveAddress,
+      formatSections: ritual.formatSpecSections,
+      recordBaseline: ritual.recordSpecBaseline,
+    });
+    await todos.run(rest);
   } else {
     const m = await import(new URL(mod, import.meta.url));
     await m.run(rest);
