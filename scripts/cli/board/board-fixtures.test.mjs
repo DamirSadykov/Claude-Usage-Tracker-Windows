@@ -128,7 +128,7 @@ describe("matrix row: v2/*.json known fields — CLI v3 writer", () => {
     expect(t0.status_history).toHaveLength(3);
     expect(t0.status_history[0]).toEqual({ status: "backlog", at: "2026-02-01T09:00:00.000Z" });
     expect(t0.status_history[2]).toEqual({ status: "in_progress", at: "2026-02-03T09:00:00.000Z" });
-    expect(t0.verify).toBe("npx vitest run scripts/cli/spec/spec.test.mjs");
+    expect(t0.verify).toBe("npx vitest run scripts/cli/spec.test.mjs");
     expect(t0.retry_limit).toBe(2);
     expect(t0.on_issue).toBe("b2222222-0000-4000-8000-000000000002");
     expect(t0.budget_usd).toBe(5);

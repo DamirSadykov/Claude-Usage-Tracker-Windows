@@ -1,7 +1,7 @@
 {
   "$defs": {
     "Change": {
-      "description": "A CHANGE as a RECORD rather than a task (t#360): the delta of one round, the\nspec sections it moves and the group's ceilings. A task points at it through\n[`Todo::change_id`]; membership is a field, not a `depends_on` edge, so a\nmissing edge can no longer drop a task out of its change in silence. Its\nstatus is DERIVED — open while any member is open — and never stored; only\n`closed_at` records the moment it was declared finished. Keep in lockstep\nwith scripts/cli/change.mjs, which writes this shape.",
+      "description": "A CHANGE as a RECORD rather than a task (t#360): the delta of one round, the\nspec sections it moves and the group's ceilings. A task points at it through\n[`Todo::change_id`]; membership is a field, not a `depends_on` edge, so a\nmissing edge can no longer drop a task out of its change in silence. Its\nstatus is DERIVED — open while any member is open — and never stored; only\n`closed_at` records the moment it was declared finished. Keep in lockstep\nwith scripts/cli/board/change.mjs, which writes this shape.",
       "properties": {
         "closed_at": {
           "type": [

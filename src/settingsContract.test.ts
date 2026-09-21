@@ -15,10 +15,10 @@ type ContractKey = {
 };
 
 const contractModules = import.meta.glob<{ default: { keys: ContractKey[]; legacy: Array<{ key: string }> } }>(
-    "../scripts/cli/settings-contract.json",
+    "../scripts/cli/kernel/settings-contract.json",
     { eager: true },
 );
-const contract = contractModules["../scripts/cli/settings-contract.json"].default;
+const contract = contractModules["../scripts/cli/kernel/settings-contract.json"].default;
 
 const sorted = (keys: Iterable<string>) => [...keys].sort();
 const UI_KEYS = new Set([...SNAPSHOT_KEYS, ...DIRECT_KEYS]);
