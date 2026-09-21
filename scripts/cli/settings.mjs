@@ -14,6 +14,18 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
 
+export const SETTINGS_KEYS = [
+  "taskContextPriority",
+  "hookContextEnabled",
+  "workflowContextEnabled",
+  "taskHandoffGuard",
+  "specDeltaGuard",
+  "specsEnabled",
+  "matchPlanCli",
+  "specRoot",
+  "specRepos",
+];
+
 // The Roaming base that holds the app's data dir. Windows: %APPDATA%, with a
 // USERPROFILE fallback for the rare case APPDATA is unset.
 export function roamingBase(appData) {
@@ -44,10 +56,15 @@ export function readSettings(appData) {
 
 // `taskContextPriority`: the LOWEST priority a task must have to reach a session,
 // mapped to a min rank. all|low|medium|high → 0|1|2|3. Default medium (2).
+const TASK_CONTEXT_PRIORITIES = ["all", "low", "medium", "high"];
+export function taskContextPriority(appData) {
+  const v = readSettings(appData).taskContextPriority;
+  return typeof v === "string" && TASK_CONTEXT_PRIORITIES.includes(v) ? v : "medium";
+}
+
 export function taskContextMinRank(appData) {
   const MIN = { all: 0, low: 1, medium: 2, high: 3 };
-  const v = readSettings(appData).taskContextPriority;
-  return typeof v === "string" && v in MIN ? MIN[v] : MIN.medium;
+  return MIN[taskContextPriority(appData)];
 }
 
 
@@ -128,9 +145,13 @@ export function specRoot(appData) {
 // this machine" — the registry reports that as its own answer (§4/§6), never
 // as a dangling reference. Empty/absent (the default) means no external repo
 // is reachable from here. Set by hand in settings.json.
-export function specRepoPath(repoKey, appData) {
+export function specRepos(appData) {
   const repos = readSettings(appData).specRepos;
-  if (!repos || typeof repos !== "object") return "";
+  return repos && typeof repos === "object" ? repos : {};
+}
+
+export function specRepoPath(repoKey, appData) {
+  const repos = specRepos(appData);
   const v = repos[repoKey];
   return typeof v === "string" && v.trim() ? v.trim() : "";
 }

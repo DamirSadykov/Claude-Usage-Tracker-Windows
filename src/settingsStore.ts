@@ -63,6 +63,54 @@ export interface SettingsSnapshot {
     uiFont: string;
 }
 
+export const SNAPSHOT_KEYS = [
+    "sessionKey",
+    "orgId",
+    "refreshInterval",
+    "autoStartSession",
+    "projectId",
+    "thresholdsSession",
+    "thresholdsWeekly",
+    "notificationsEnabled",
+    "notifyForecastMinutes",
+    "forecastWindowMinutes",
+    "alertTiers",
+    "alertTypes",
+    "quietHoursEnabled",
+    "quietHoursStart",
+    "quietHoursEnd",
+    "ccAnalyticsEnabled",
+    "dailyBudgetEnabled",
+    "dailyBudget",
+    "goalCostPerHourMax",
+    "goalErrorRateMax",
+    "notificationsMutedUntil",
+    "serviceStatusEnabled",
+    "serviceStatusInterval",
+    "serviceStatusNotify",
+    "memoryBloatEnabled",
+    "todoNotificationsEnabled",
+    "runtimeInsightsEnabled",
+    "runtimeInsightKinds",
+    "systemInfoEnabled",
+    "correctionsEnabled",
+    "specsEnabled",
+    "locale",
+    "uiFont",
+] as const;
+
+export const DIRECT_KEYS = [
+    "ignoredInsights",
+    "resolverUrl",
+    "updateCheckHours",
+    "releasesCache",
+    "externalStatusMap",
+    "taskContextPriority",
+    "hookContextEnabled",
+    "workflowContextEnabled",
+    "taskHandoffGuard",
+] as const;
+
 // The values a settings.json that has never been written yields. Kept in one place
 // so App (writer) and every consumer window agree on defaults byte-for-byte.
 export function defaultSettings(): SettingsSnapshot {
