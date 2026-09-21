@@ -1,4 +1,6 @@
-import { createChange, changeAddress, findChangeByTitle } from "./change.mjs";
+import { createChange, changeAddress, findChangeByTitle, parseArgs } from "./change.mjs";
+import { boardPath, loadBoard, loadBoardForWrite, saveBoard } from "./board-io.mjs";
+import { withBoardLock } from "./board-lock.mjs";
 
 const isLegacyRoot = (t) => !!(t && (t.change ?? t.theme));
 
@@ -94,4 +96,28 @@ export function describe(data) {
       lines.push(`    ! ребро на корень #${nested.number} снимается — вложенных change'ей больше нет`);
   }
   return lines;
+}
+
+export function run(args) {
+  const { flags } = parseArgs(args);
+  const file = boardPath();
+  withBoardLock(file, () => {
+    const data = flags.go ? loadBoardForWrite(file) : loadBoard(file);
+    const lines = describe(data);
+    if (!lines.length) {
+      process.stdout.write("нечего мигрировать: ни одного корня с флагом на доске\n");
+      return;
+    }
+    process.stdout.write(lines.join("\n") + "\n");
+    if (!flags.go) {
+      process.stdout.write("\nсухой прогон, ничего не записано — повтори с --go\n");
+      return;
+    }
+    const result = migrate(data);
+    saveBoard(file, data);
+    for (const note of result.notes) process.stdout.write(`note: ${note}\n`);
+    process.stdout.write(
+      `ok: ${result.created.length} запис(и) заведено, ${result.roots} корней снято с доски\n`,
+    );
+  });
 }

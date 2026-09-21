@@ -32,6 +32,22 @@ const AREAS = {
   "plan-guard": "./cli/plan-guard.mjs",
 };
 
+const SUBCOMMANDS = {
+  todos: {
+    run: "./cli/run.mjs",
+    apply: "./cli/apply.mjs",
+    lint: "./cli/lint.mjs",
+    outcome: "./cli/outcome.mjs",
+    adoption: "./cli/adoption.mjs",
+  },
+  spec: {
+    match: "./cli/spec-match.mjs",
+  },
+  change: {
+    migrate: "./cli/change-migrate.mjs",
+  },
+};
+
 // Hook areas run inside Claude Code's session lifecycle: a crash there must never
 // break the session, so an unexpected throw exits clean instead of surfacing.
 // (A DELIBERATE block from the Stop guard is process.exit(2) inside the module —
@@ -107,8 +123,14 @@ if (HOOK_AREAS.has(area) && inSandbox() && process.env.TRACKER_HOOKS_IGNORE_SAND
 }
 
 try {
-  const m = await import(new URL(mod, import.meta.url));
-  await m.run(rest);
+  const sub = SUBCOMMANDS[area]?.[rest[0]];
+  if (sub) {
+    const m = await import(new URL(sub, import.meta.url));
+    await m.run(rest.slice(1));
+  } else {
+    const m = await import(new URL(mod, import.meta.url));
+    await m.run(rest);
+  }
 } catch (err) {
   // A hook must never break a session — swallow and exit clean. Any other area
   // surfaces the error with a non-zero exit.

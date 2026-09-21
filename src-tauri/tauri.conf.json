@@ -95,6 +95,7 @@
     "resources": {
       "../scripts/cli.mjs": "scripts/cli.mjs",
       "../scripts/cli/todos.mjs": "scripts/cli/todos.mjs",
+      "../scripts/cli/board-io.mjs": "scripts/cli/board-io.mjs",
       "../scripts/cli/board-lock.mjs": "scripts/cli/board-lock.mjs",
       "../scripts/cli/board-recover.mjs": "scripts/cli/board-recover.mjs",
       "../scripts/cli/change.mjs": "scripts/cli/change.mjs",
@@ -111,6 +112,7 @@
       "../scripts/cli/adoption.mjs": "scripts/cli/adoption.mjs",
       "../scripts/cli/spec.mjs": "scripts/cli/spec.mjs",
       "../scripts/cli/spec-match.mjs": "scripts/cli/spec-match.mjs",
+      "../scripts/cli/spec-meter.mjs": "scripts/cli/spec-meter.mjs",
       "../scripts/cli/yaml-subset.mjs": "scripts/cli/yaml-subset.mjs",
       "../scripts/cli/hook.mjs": "scripts/cli/hook.mjs",
       "../scripts/cli/stop-hook.mjs": "scripts/cli/stop-hook.mjs",

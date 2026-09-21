@@ -23,6 +23,18 @@ import path from "node:path";
 import { parseYamlSubset } from "./yaml-subset.mjs";
 import { specRoot as specRootSetting, specRepoPath } from "./settings.mjs";
 import { withBoardLock } from "./board-lock.mjs";
+import { readAsks, coverageOf } from "./spec-meter.mjs";
+import {
+  boardPath,
+  changeRootsFor,
+  isChangeRoot,
+  isDone,
+  loadBoard,
+  loadBoardForWrite,
+  resolveTask,
+  saveBoard,
+  specAddressesForManual,
+} from "./board-io.mjs";
 
 const PARTS = ["требования", "устройство", "инварианты"];
 export const SECTION_LINE_CEILING = 120;
@@ -969,8 +981,6 @@ export function stampRefFor(roots, todo) {
 }
 
 async function cmdAnswer(args) {
-  const { resolveTask, loadBoardForWrite, boardPath, saveBoard, changeRootsFor, specAddressesForManual } =
-    await import("./todos.mjs");
   const positional = [];
   const flags = {};
   for (let i = 0; i < args.length; i++) {
@@ -1344,7 +1354,6 @@ function cmdNew(args) {
 // that is catching up shows a falling share and a broken streak; one that is
 // being outrun by the work shows the opposite while its section count grows.
 async function cmdCoverage(args) {
-  const { readAsks, coverageOf } = await import("./spec-match.mjs");
   const json = args.includes("--json");
   const i = args.indexOf("--project");
   const project = i >= 0 ? args[i + 1] : path.basename(process.cwd());
@@ -1425,16 +1434,7 @@ function cmdRefs(args) {
 // board. So the documented safety check passed cleanly while live task links
 // were being broken: the one direction the registry exists to protect.
 //
-// The board is read through todos.mjs (dynamically, so the registry keeps no
-// static dependency on it) and scoped to this project plus the global board —
-// another project's tasks address another project's registry.
-async function boardLinkFindings(root, cwd = process.cwd()) {
-  let mod;
-  try {
-    mod = await import("./todos.mjs");
-  } catch {
-    return []; // no board reachable → nothing to say about it, never a crash
-  }
+function boardLinkFindings(root, cwd = process.cwd()) {
   const project = path.basename(String(cwd).replace(/[\\/]+$/, ""));
   const out = [];
   // Open changes per address — two of them are two deltas being written into
@@ -1442,12 +1442,12 @@ async function boardLinkFindings(root, cwd = process.cwd()) {
   // without saying so. A warning, not an error: it is a legitimate situation
   // that needs to be SEEN, not forbidden.
   const openChanges = new Map();
-  const board = mod.loadBoard();
+  const board = loadBoard();
   for (const c of board.changes ?? []) {
     if (!c || !Array.isArray(c.spec) || !c.spec.length) continue;
     if (c.project && c.project !== project) continue;
     const members = (board.todos ?? []).filter((t) => t && t.change_id === c.id);
-    const open = members.length === 0 || members.some((t) => !mod.isDone(t));
+    const open = members.length === 0 || members.some((t) => !isDone(t));
     for (const address of c.spec) {
       const r = resolveAddress(address, root);
       if (!r.ok) {
@@ -1482,7 +1482,7 @@ async function boardLinkFindings(root, cwd = process.cwd()) {
         );
         continue;
       }
-      if (mod.isChangeRoot(t) && !mod.isDone(t)) {
+      if (isChangeRoot(t) && !isDone(t)) {
         if (!openChanges.has(address)) openChanges.set(address, []);
         openChanges.get(address).push(t);
       }
@@ -1507,7 +1507,7 @@ async function boardLinkFindings(root, cwd = process.cwd()) {
 async function cmdLint(args) {
   const json = args.includes("--json");
   const root = resolveRoot();
-  const findings = [...validateRegistry(root), ...(await boardLinkFindings(root))];
+  const findings = [...validateRegistry(root), ...boardLinkFindings(root)];
   const { errors, warnings } = splitFindings(findings);
   const ids = listDomainIds(root);
   const stray = strayFiles(root);
@@ -1556,11 +1556,6 @@ export async function run(args) {
       break;
     case "refs":
       cmdRefs(rest);
-      break;
-    // Loaded lazily, like the CLI's own areas: the matcher pulls the board in
-    // when asked about a task, and nothing else here should pay for that.
-    case "match":
-      await (await import("./spec-match.mjs")).run(rest);
       break;
     case "lint":
       await cmdLint(rest);

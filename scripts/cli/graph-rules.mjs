@@ -25,7 +25,7 @@
 // faults (an unparsable value, a step declared twice, an unknown key) live in
 // apply.mjs, because a board cannot have them.
 
-import { normalizeLimit } from "./todos.mjs";
+import { normalizeLimit } from "./board-io.mjs";
 
 const blank = (v) => v === undefined || v === null || String(v).trim() === "";
 
