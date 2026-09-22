@@ -192,7 +192,7 @@ fn write_lock_file(lock_path: &Path, pid: u32) -> std::io::Result<()> {
     f.write_all(lock_content(pid, "app").as_bytes())
 }
 
-fn remove_stale(lock_path: &Path) {
+fn remove_stale(lock_path: &Path, expected_content: &str) {
     let pid = std::process::id();
     let mut stale_name = lock_path
         .file_name()
@@ -200,9 +200,16 @@ fn remove_stale(lock_path: &Path) {
         .unwrap_or_default();
     stale_name.push(format!(".stale-{pid}"));
     let stale_path = lock_path.with_file_name(stale_name);
-    if std::fs::rename(lock_path, &stale_path).is_ok() {
-        let _ = std::fs::remove_file(&stale_path);
+    if std::fs::rename(lock_path, &stale_path).is_err() {
+        return;
     }
+    let claimed = std::fs::read_to_string(&stale_path).ok();
+    if claimed.as_deref() == Some(expected_content) {
+        let _ = std::fs::remove_file(&stale_path);
+        return;
+    }
+    let _ = std::fs::hard_link(&stale_path, lock_path);
+    let _ = std::fs::remove_file(&stale_path);
 }
 
 fn busy_error(lock_path: &Path, content: &str) -> LockError {
@@ -286,6 +293,7 @@ fn acquire_impl(board: &Path, timeout: Duration) -> Result<BoardLock, LockError>
             }
         }
 
+        let mut create_permission_err: Option<std::io::Error> = None;
         match write_lock_file(&lock_path, pid) {
             Ok(()) => {
                 registry().lock().unwrap().insert(key.clone(), (me, 1));
@@ -293,13 +301,22 @@ fn acquire_impl(board: &Path, timeout: Duration) -> Result<BoardLock, LockError>
                 return Ok(BoardLock { key, lock_path });
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                create_permission_err = Some(e);
+            }
             Err(e) => return Err(LockError::Io(e)),
         }
 
         match read_lock(&lock_path) {
             ReadOutcome::Missing => {
                 if Instant::now() >= deadline {
-                    return Err(busy_error(&lock_path, ""));
+                    return match create_permission_err {
+                        Some(e) => Err(LockError::Io(e)),
+                        None => Err(busy_error(&lock_path, "")),
+                    };
+                }
+                if create_permission_err.is_some() {
+                    std::thread::sleep(POLL_INTERVAL);
                 }
                 continue;
             }
@@ -314,7 +331,7 @@ fn acquire_impl(board: &Path, timeout: Duration) -> Result<BoardLock, LockError>
             ReadOutcome::Content(content) => {
                 let age = mtime_age(&lock_path);
                 if is_stale(&content, age, pid_alive) {
-                    remove_stale(&lock_path);
+                    remove_stale(&lock_path, &content);
                     if Instant::now() >= deadline {
                         return Err(busy_error(&lock_path, &content));
                     }
@@ -765,5 +782,81 @@ mod tests {
 
         std::fs::remove_file(&lock_path).ok();
         drop(lock);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn create_time_permission_denied_polls_out_the_deadline_then_reports_io() {
+        struct AclGuard {
+            dir: PathBuf,
+            user: String,
+        }
+        impl Drop for AclGuard {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("icacls")
+                    .args([self.dir.to_str().unwrap(), "/remove:d", &self.user])
+                    .status();
+            }
+        }
+
+        let board = unique_board();
+        let dir = board.path().parent().unwrap().to_path_buf();
+        let user = std::env::var("USERNAME").unwrap();
+
+        let status = std::process::Command::new("icacls")
+            .args([
+                dir.to_str().unwrap(),
+                "/deny",
+                &format!("{user}:(OI)(CI)(W)"),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let _guard = AclGuard {
+            dir: dir.clone(),
+            user: user.clone(),
+        };
+
+        let start = Instant::now();
+        let err = acquire_impl(board.path(), Duration::from_millis(300)).unwrap_err();
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed >= Duration::from_millis(250),
+            "expected the loop to poll out the deadline, returned after {elapsed:?}"
+        );
+        match err {
+            LockError::Io(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
+            other => panic!("expected Io(PermissionDenied), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remove_stale_does_not_delete_a_fresh_lock_that_replaced_the_stale_one() {
+        let board = unique_board();
+        let lock_path = lock_path_for(board.path());
+        let stale_content = node_content(9_999_999, "cli", &now_ms());
+        std::fs::write(&lock_path, &stale_content).unwrap();
+
+        let fresh_content = node_content(std::process::id(), "cli", &now_ms());
+        std::fs::write(&lock_path, &fresh_content).unwrap();
+
+        remove_stale(&lock_path, &stale_content);
+
+        let dir = board.path().parent().unwrap();
+        let leftovers: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".stale-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "leftover stale file(s): {leftovers:?}"
+        );
+        assert!(lock_path.exists());
+        assert_eq!(
+            std::fs::read_to_string(&lock_path).unwrap(),
+            fresh_content
+        );
     }
 }

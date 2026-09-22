@@ -81,7 +81,7 @@ function readLockInfo(lock) {
     raw = fs.readFileSync(lock, "utf8");
   } catch (e) {
     if (e.code === "ENOENT") return { missing: true };
-    return { missing: false, parsed: null, mtimeMs: Date.now() };
+    return { missing: false, parsed: null, mtimeMs: Date.now(), raw: null };
   }
   let mtimeMs;
   try {
@@ -94,7 +94,7 @@ function readLockInfo(lock) {
     const obj = JSON.parse(raw);
     if (obj && Number.isInteger(obj.pid) && obj.pid > 0 && typeof obj.at === "string") parsed = obj;
   } catch {}
-  return { missing: false, parsed, mtimeMs };
+  return { missing: false, parsed, mtimeMs, raw };
 }
 
 function isPidAlive(pid) {
@@ -111,17 +111,30 @@ function isStale(info) {
   return !isPidAlive(info.parsed.pid);
 }
 
-function stealStaleLock(lock) {
+export function stealStaleLock(lock, expectedRaw) {
   const claimed = `${lock}.stale-${process.pid}`;
   try {
     fs.renameSync(lock, claimed);
   } catch {
     return false;
   }
+  let claimedRaw = null;
+  try {
+    claimedRaw = fs.readFileSync(claimed, "utf8");
+  } catch {}
+  if (claimedRaw !== null && claimedRaw === expectedRaw) {
+    try {
+      fs.unlinkSync(claimed);
+    } catch {}
+    return true;
+  }
+  try {
+    fs.linkSync(claimed, lock);
+  } catch {}
   try {
     fs.unlinkSync(claimed);
   } catch {}
-  return true;
+  return false;
 }
 
 export function acquireBoardLock(file, { waitMs = BOARD_LOCK_WAIT_MS, writer = "cli" } = {}) {
@@ -137,15 +150,23 @@ export function acquireBoardLock(file, { waitMs = BOARD_LOCK_WAIT_MS, writer = "
       hookExit();
       return { ok: true, lock };
     }
-    if (err !== "EEXIST") return { ok: false, lock, reason: err };
+    const isPermissionError = err === "EPERM" || err === "EACCES" || err === "EBUSY";
+    if (err !== "EEXIST" && !isPermissionError) {
+      return { ok: false, lock, reason: err };
+    }
 
     const info = readLockInfo(lock);
     if (info.missing) {
-      if (Date.now() >= deadline) return { ok: false, lock, reason: "TIMEOUT", info };
+      if (Date.now() >= deadline) {
+        return isPermissionError
+          ? { ok: false, lock, reason: err }
+          : { ok: false, lock, reason: "TIMEOUT", info };
+      }
+      if (isPermissionError) sleepSync(POLL_MS);
       continue;
     }
     if (isStale(info)) {
-      stealStaleLock(lock);
+      stealStaleLock(lock, info.raw);
       if (Date.now() >= deadline) return { ok: false, lock, reason: "TIMEOUT", info };
       continue;
     }
@@ -191,7 +212,7 @@ export function renameWithRetry(tmp, file, { retries = 5, delayMs = 50 } = {}) {
       fs.renameSync(tmp, file);
       return;
     } catch (e) {
-      if (!(e && (e.code === "EPERM" || e.code === "EACCES")) || attempt >= retries) throw e;
+      if (!(e && (e.code === "EPERM" || e.code === "EACCES" || e.code === "EBUSY")) || attempt >= retries) throw e;
       sleepSync(delayMs);
     }
   }
