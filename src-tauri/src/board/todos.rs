@@ -581,7 +581,7 @@ fn has_mixed_process_forms(board: &serde_json::Map<String, Value>) -> bool {
 
 fn hydrate_v3_process_fields(file: &mut TodoFile) {
     for todo in &mut file.todos {
-        if let Some(Value::Object(process)) = todo.ext.remove("process") {
+        if let Some(Value::Object(process)) = todo.ext.get("process") {
             if let Some(v) = process.get("produces").and_then(Value::as_array) {
                 todo.produces = v
                     .iter()
@@ -616,10 +616,21 @@ fn hydrate_v3_process_fields(file: &mut TodoFile) {
             if let Some(v) = process.get("handout_at").and_then(Value::as_str) {
                 todo.handout_at = Some(v.to_string());
             }
+            let unknown: serde_json::Map<String, Value> = process
+                .iter()
+                .filter(|(key, _)| !TODO_PROCESS_FIELDS.contains(&key.as_str()))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            if unknown.is_empty() {
+                todo.ext.remove("process");
+            } else {
+                todo.ext
+                    .insert("process".to_string(), Value::Object(unknown));
+            }
         }
     }
     for change in &mut file.changes {
-        if let Some(Value::Object(process)) = change.ext.remove("process") {
+        if let Some(Value::Object(process)) = change.ext.get("process") {
             if let Some(v) = process.get("spec").and_then(Value::as_array) {
                 change.spec = v
                     .iter()
@@ -632,6 +643,18 @@ fn hydrate_v3_process_fields(file: &mut TodoFile) {
             }
             if let Some(v) = process.get("parallel_limit").and_then(Value::as_u64) {
                 change.parallel_limit = u32::try_from(v).ok();
+            }
+            let unknown: serde_json::Map<String, Value> = process
+                .iter()
+                .filter(|(key, _)| !CHANGE_PROCESS_FIELDS.contains(&key.as_str()))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            if unknown.is_empty() {
+                change.ext.remove("process");
+            } else {
+                change
+                    .ext
+                    .insert("process".to_string(), Value::Object(unknown));
             }
         }
     }
@@ -1074,9 +1097,9 @@ pub fn upsert(file: &mut TodoFile, mut todo: Todo, now: &str) {
         if todo.number == 0 {
             todo.number = existing.number;
         }
-        if todo.ext.is_empty() {
-            todo.ext = existing.ext.clone();
-        }
+        let mut merged_ext = existing.ext.clone();
+        merged_ext.extend(todo.ext);
+        todo.ext = merged_ext;
         // Provenance is set once (by the CLI) and has no UI field, so a UI edit
         // that doesn't carry it must not erase it.
         if todo.from.is_none() {
@@ -2580,6 +2603,68 @@ mod tests {
         assert_eq!(
             file.todos[0].ext["triage"],
             serde_json::json!({ "kind": "stale", "note": "сохранить" })
+        );
+    }
+
+    #[test]
+    fn v3_process_unknown_fields_survive_a_rust_round_trip() {
+        let path = std::env::temp_dir().join("cut_todos_process_unknown_round_trip.json");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(
+            &path,
+            r#"{"version":3,"todos":[{"id":"a","subject":"step","status":"queue","ext":{"process":{"verify":"cargo test --lib","future_flag":{"enabled":true}}}}]}"#,
+        )
+        .unwrap();
+
+        let file = load(&path);
+        assert_eq!(file.todos[0].verify, "cargo test --lib");
+        assert_eq!(
+            file.todos[0].ext["process"]["future_flag"],
+            serde_json::json!({ "enabled": true })
+        );
+        save(&path, &file).unwrap();
+
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved["todos"][0]["ext"]["process"]["verify"],
+            "cargo test --lib"
+        );
+        assert_eq!(
+            saved["todos"][0]["ext"]["process"]["future_flag"],
+            serde_json::json!({ "enabled": true })
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn upsert_merges_ext_namespaces_from_an_outdated_ui_snapshot() {
+        let mut file = TodoFile::default();
+        let mut stored = todo("a", "queue");
+        stored
+            .ext
+            .insert("cli".to_string(), serde_json::json!({ "fresh": true }));
+        stored
+            .ext
+            .insert("shared".to_string(), serde_json::json!({ "source": "cli" }));
+        file.todos.push(stored);
+
+        let mut edited = todo("a", "in_progress");
+        edited
+            .ext
+            .insert("ui".to_string(), serde_json::json!({ "open": true }));
+        edited
+            .ext
+            .insert("shared".to_string(), serde_json::json!({ "source": "ui" }));
+        upsert(&mut file, edited, "T2");
+
+        assert_eq!(
+            file.todos[0].ext["cli"],
+            serde_json::json!({ "fresh": true })
+        );
+        assert_eq!(file.todos[0].ext["ui"], serde_json::json!({ "open": true }));
+        assert_eq!(
+            file.todos[0].ext["shared"],
+            serde_json::json!({ "source": "ui" })
         );
     }
 
