@@ -21,6 +21,7 @@ import {
   sweepOrphanTmp,
   renameWithRetry,
   reaffirmBoardLock,
+  stealStaleLock,
   BoardLockedError,
   BOARD_LOCK_UNREADABLE_STALE_MS,
 } from "./board-lock.mjs";
@@ -240,6 +241,67 @@ describe("board lock — fail-closed on a busy board (t#573)", () => {
       releaseBoardLock(holder.lock);
     }
   });
+});
+
+describe("board lock — stale-lock steal does not clobber a fresh winner (t#730)", () => {
+  let dir;
+  afterEach(() => {
+    if (dir) rmSync(dir, { recursive: true, force: true });
+    dir = null;
+  });
+
+  it("does not delete a fresh lock that replaced the one judged stale", () => {
+    dir = mkdtempSync(path.join(os.tmpdir(), "lock-"));
+    const file = path.join(dir, "todos.json");
+    const lock = boardLockPath(file);
+
+    const staleContent = JSON.stringify({ pid: DEAD_PID, writer: "cli", at: new Date().toISOString() });
+    writeFileSync(lock, staleContent);
+
+    const freshContent = JSON.stringify({ pid: process.pid, writer: "cli", at: new Date().toISOString() });
+    writeFileSync(lock, freshContent);
+
+    const won = stealStaleLock(lock, staleContent);
+
+    expect(won).toBe(false);
+    expect(existsSync(lock)).toBe(true);
+    expect(readFileSync(lock, "utf8")).toBe(freshContent);
+    const leftovers = readdirSync(dir).filter((n) => n.includes(".stale-"));
+    expect(leftovers).toEqual([]);
+  });
+});
+
+describe("board lock — Windows create-time EPERM/EACCES/EBUSY is contention, not fatal (t#704)", () => {
+  let dir;
+  afterEach(() => {
+    if (dir) {
+      try {
+        execFileSync("icacls", [dir, "/remove:d", process.env.USERNAME], { windowsHide: true });
+      } catch {}
+      rmSync(dir, { recursive: true, force: true });
+    }
+    dir = null;
+  });
+
+  const maybeIt = process.platform === "win32" ? it : it.skip;
+
+  maybeIt(
+    "waits out the full deadline polling, then reports the real EPERM instead of a fake TIMEOUT",
+    () => {
+      dir = mkdtempSync(path.join(os.tmpdir(), "lock-"));
+      const file = path.join(dir, "todos.json");
+
+      execFileSync("icacls", [dir, "/deny", `${process.env.USERNAME}:(OI)(CI)(W)`], { windowsHide: true });
+
+      const start = Date.now();
+      const got = acquireBoardLock(file, { waitMs: 300 });
+      const elapsed = Date.now() - start;
+
+      expect(elapsed).toBeGreaterThanOrEqual(250);
+      expect(got.ok).toBe(false);
+      expect(got.reason).toBe("EPERM");
+    },
+  );
 });
 
 describe("sweepOrphanTmp", () => {

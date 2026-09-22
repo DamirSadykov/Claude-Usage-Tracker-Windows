@@ -1,5 +1,6 @@
 import { ref } from "vue";
 import { logError, logInfo } from "./logging";
+import { loadSettingsStoreForWrite } from "./settingsStore";
 
 // State machine for the in-app updater. Module-scoped refs make this a shared
 // singleton so the banner (App.vue) and the settings block (SettingsPanel.vue)
@@ -33,7 +34,7 @@ async function loadStore() {
 }
 
 export async function saveUpdaterSettings() {
-    const store = await loadStore();
+    const store = await loadSettingsStoreForWrite();
     await store.set("updateCheckHours", checkHours.value);
     await store.save();
     schedulePeriodic();

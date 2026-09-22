@@ -151,6 +151,13 @@ export function defaultSettings(): SettingsSnapshot {
     };
 }
 
+export async function loadSettingsStoreForWrite() {
+    const { load } = await import("@tauri-apps/plugin-store");
+    const store = await load("settings.json");
+    await store.reload();
+    return store;
+}
+
 // One-shot read of settings.json → a fully-defaulted, normalized snapshot. This is
 // the single definition of "how a setting is read": consumers that only need a
 // value now (e.g. the writer seeding its editable refs) call this directly.

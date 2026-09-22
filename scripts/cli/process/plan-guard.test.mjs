@@ -15,6 +15,7 @@
 
 import { describe, it, expect } from "vitest";
 import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -78,6 +79,12 @@ steps:
 const fenced = (yaml, lang = "yaml") => "Вот план:\n\n```" + lang + "\n" + yaml + "```\n";
 
 const exitPlan = (plan) => ({ tool_name: "ExitPlanMode", tool_input: { plan } });
+
+describe("the plan-format document", () => {
+  it("exists at the path printed by plan refusals", () => {
+    expect(existsSync(planFormatDoc())).toBe(true);
+  });
+});
 
 // A discussion as it is actually written: the declaration, then prose that has no
 // intention of parsing.

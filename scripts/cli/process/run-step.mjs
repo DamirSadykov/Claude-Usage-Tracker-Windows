@@ -704,11 +704,12 @@ export async function executeStep({
   }
 
   if (execution.provider === "openai") {
-    const { file, args } = providerArgv(execution, { bin: codexBin, sandbox: "workspace-write" });
+    const requestedMode = inherit ? "fork" : "fresh";
+    const { file, args } = providerArgv(execution, { bin: codexBin, inherit, sandbox: "workspace-write" });
     const startedAt = new Date().toISOString();
     let boundSession = "";
     const onStdout = observeCodexThread((session) => {
-      if (bind && !boundSession) {
+      if (bind && !boundSession && session !== inherit) {
         boundSession = session;
         bindSession({ session, task, event: "start", ts: startedAt, execution });
       }
@@ -724,7 +725,8 @@ export async function executeStep({
     const endedAt = new Date().toISOString();
     const parsed = parseCodexResult(run.stdout);
     const actual = parsed?.sessionId || "";
-    if (bind && actual) {
+    const distinctSession = !!actual && actual !== inherit;
+    if (bind && distinctSession) {
       if (boundSession !== actual)
         bindSession({ session: actual, task, event: "start", ts: startedAt, execution });
       bindSession({ session: actual, task, event: "end", ts: endedAt, execution });
@@ -734,12 +736,17 @@ export async function executeStep({
       error = `codex exited ${run.code}${run.stderr.trim() ? `: ${clampOutput(run.stderr.trim(), 2000)}` : ""}`;
     if (!error && !parsed) error = "codex produced no parseable JSONL result — cannot confirm the step ran";
     if (!error && !actual) error = "codex did not report a thread id — usage cannot be attributed to the task";
+    if (!error && inherit && actual === inherit)
+      error = "codex fork reported the parent thread id — child usage cannot be attributed safely";
     const answer = parsed?.answer || "";
     return {
       provider: "openai",
       agent: execution.name,
       model: execution.model,
-      sessionId: actual,
+      sessionId: distinctSession ? actual : "",
+      requestedMode,
+      startMode: distinctSession ? requestedMode : "unknown",
+      parentSession: inherit || null,
       ok: !error,
       error,
       timedOut: !!run.timedOut,

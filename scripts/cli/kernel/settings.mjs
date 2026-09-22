@@ -120,8 +120,7 @@ export function specsEnabled(appData) {
 //                                       — the task-event notify (t#250); the CLI
 //                                         owns matching, dedup and comment posting
 // Empty/absent (the default) disables both — the tracker itself carries no
-// dependency on any knowledge base. Set by hand in settings.json; the UI's
-// plugin-store writes per key, so a hand-added key survives its saves.
+// dependency on any knowledge base. Set by hand in settings.json.
 export function matchPlanCli(appData) {
   const v = readSettings(appData).matchPlanCli;
   return typeof v === "string" && v.trim() ? v.trim() : "";

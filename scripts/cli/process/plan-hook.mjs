@@ -40,7 +40,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { matchPlanCli, roamingBase } from "../kernel/settings.mjs";
 import { readDocument, applyDocument, summarize } from "./apply.mjs";
-import { DISCUSSION_KEY, discussionDeclaration, isReason, planCandidates } from "./plan-guard.mjs";
+import { DISCUSSION_KEY, discussionDeclaration, isReason, planCandidates, planFormatDoc } from "./plan-guard.mjs";
 import { criticRunsAsAgent, invokeDutySync } from "../agents/agents.mjs";
 
 const CLI = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "cli.mjs");
@@ -102,18 +102,11 @@ function markFormatSent(session) {
 // format — the same page of text on entering plan mode and again on every exit.
 // It is now a file in the repo, and both hooks point at it: one Read per session
 // instead of a re-injection per plan. The path resolves identically in the repo
-// (scripts/cli → ../../docs) and in the Tauri bundle (resources/scripts/cli →
+// (scripts/cli/process → ../../../docs) and in the Tauri bundle (resources/scripts/cli/process →
 // resources/docs), because tauri.conf.json maps the file to the same shape.
-const FORMAT_DOC = path.join(
-  path.dirname(fileURLToPath(import.meta.url)),
-  "..",
-  "..",
-  "..",
-  "docs",
-  "plan-format.md",
-);
+const FORMAT_DOC = planFormatDoc();
 
-export const planFormatDoc = () => FORMAT_DOC;
+export { planFormatDoc };
 
 // The critic is optional input before the session makes a plan, not a second
 // planner. It only spends the configured duty when the user deliberately chose

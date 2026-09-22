@@ -42,6 +42,7 @@ const FORMAT_DOC = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
   "..",
   "..",
+  "..",
   "docs",
   "plan-format.md",
 );

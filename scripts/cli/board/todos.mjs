@@ -878,9 +878,13 @@ function setSpec({ data, file, todo, value }) {
     return;
   }
   const addresses = v.split(",").map((s) => s.trim()).filter(Boolean);
-  const invalid = specPort?.resolveAddress
-    ? addresses.map((a) => ({ a, r: specPort.resolveAddress(a) })).filter(({ r }) => !r.ok).map(({ a, r }) => `${a} — ${r.reason}`)
-    : [];
+  if (typeof specPort?.resolveAddress !== "function") {
+    fail("refusing: cannot set spec because the spec registry port is not connected (call setSpecPort with resolveAddress)");
+  }
+  const invalid = addresses
+    .map((a) => ({ a, r: specPort.resolveAddress(a) }))
+    .filter(({ r }) => !r.ok)
+    .map(({ a, r }) => `${a} — ${r.reason}`);
   if (invalid.length) {
     fail(`refusing: invalid spec address(es):\n` + invalid.map((m) => `  ${m}`).join("\n"));
   }
