@@ -31,26 +31,84 @@ mod tests {
     }
 
     fn crate_refs(text: &str) -> Vec<String> {
+        let code: String = text
+            .lines()
+            .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+            .collect::<Vec<_>>()
+            .join("
+");
         let mut out = Vec::new();
-        for line in text.lines() {
-            let code = line.trim_start();
-            if code.starts_with("//") {
-                continue;
+        let mut rest = code.as_str();
+        while let Some(i) = rest.find("crate::") {
+            let after = &rest[i + 7..];
+            if after.trim_start().starts_with('{') {
+                out.extend(group_refs(after));
+            } else if let Some(ident) = path_head(after) {
+                out.push(ident);
             }
-            let mut rest = code;
-            while let Some(i) = rest.find("crate::") {
-                let after = &rest[i + 7..];
-                let ident: String = after
-                    .chars()
-                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-                    .collect();
-                if !ident.is_empty() {
-                    out.push(ident);
+            rest = after;
+        }
+        out
+    }
+
+    fn path_head(path: &str) -> Option<String> {
+        let ident: String = path
+            .trim_start()
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        (!ident.is_empty()).then_some(ident)
+    }
+
+    /// Returns the first path component of each entry in a `use` group.
+    fn group_refs(group: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut depth = 0;
+        let mut entry_start = false;
+        let chars: Vec<char> = group.trim_start().chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            match chars[i] {
+                '{' => {
+                    depth += 1;
+                    if depth == 1 {
+                        entry_start = true;
+                    }
+                    i += 1;
                 }
-                rest = after;
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                    i += 1;
+                }
+                ',' if depth == 1 => {
+                    entry_start = true;
+                    i += 1;
+                }
+                c if depth == 1 && entry_start && (c.is_ascii_alphanumeric() || c == '_') => {
+                    let start = i;
+                    while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                        i += 1;
+                    }
+                    let entry: String = chars[start..i].iter().collect();
+                    if entry != "self" {
+                        out.push(entry);
+                    }
+                    entry_start = false;
+                }
+                _ => i += 1,
             }
         }
         out
+    }
+
+    fn has_super_super_ref(text: &str) -> bool {
+        text.lines().any(|line| {
+            let code = line.split_once("//").map_or(line, |(code, _)| code);
+            code.contains("super::super::")
+        })
     }
 
     fn allowed(layer: &str) -> Option<&'static [&'static str]> {
@@ -69,7 +127,12 @@ mod tests {
             let rel = file.strip_prefix(&root).unwrap();
             let rel_str = rel.to_string_lossy().replace('\\', "/");
             let mut parts = rel.components();
-            let first = parts.next().unwrap().as_os_str().to_string_lossy().to_string();
+            let first = parts
+                .next()
+                .unwrap()
+                .as_os_str()
+                .to_string_lossy()
+                .to_string();
             if rel.components().count() == 1 {
                 if !matches!(first.as_str(), "lib.rs" | "main.rs" | "layers.rs") {
                     stray.push(rel_str);
@@ -81,6 +144,9 @@ mod tests {
                 continue;
             };
             let text = fs::read_to_string(&file).unwrap();
+            if has_super_super_ref(&text) {
+                bad.push(format!("{rel_str} -> super::super"));
+            }
             for target in crate_refs(&text) {
                 if target == first {
                     continue;
@@ -99,11 +165,45 @@ mod tests {
         assert!(bad.is_empty(), "layer violations:\n{}", bad.join("\n"));
         let mut visiting = Vec::new();
         for layer in edges.keys() {
-            assert!(!has_cycle(layer, &edges, &mut visiting), "layer cycle through {layer}: {visiting:?}");
+            assert!(
+                !has_cycle(layer, &edges, &mut visiting),
+                "layer cycle through {layer}: {visiting:?}"
+            );
         }
     }
 
-    fn has_cycle(node: &str, edges: &BTreeMap<String, Vec<String>>, stack: &mut Vec<String>) -> bool {
+    #[test]
+    fn grouped_crate_imports_are_checked_as_layer_references() {
+        let refs = crate_refs("use crate::{board::model::Board, analytics::{Event, Report}};");
+        assert_eq!(refs, vec!["board", "analytics"]);
+        assert!(!allowed("analytics").unwrap().contains(&"board"));
+    }
+
+    #[test]
+    fn multiline_grouped_crate_imports_are_checked_as_layer_references() {
+        let refs = crate_refs("use crate::{
+    board::model::Board,
+    // kernel::x,
+    analytics::{
+        Event,
+    },
+};");
+        assert_eq!(refs, vec!["board", "analytics"]);
+    }
+
+    #[test]
+    fn grandparent_module_imports_are_forbidden() {
+        assert!(has_super_super_ref("use super::super::kernel::Clock;"));
+        assert!(!has_super_super_ref(
+            "use super::kernel::Clock; // super::super is forbidden"
+        ));
+    }
+
+    fn has_cycle(
+        node: &str,
+        edges: &BTreeMap<String, Vec<String>>,
+        stack: &mut Vec<String>,
+    ) -> bool {
         if stack.iter().any(|s| s == node) {
             stack.push(node.to_string());
             return true;

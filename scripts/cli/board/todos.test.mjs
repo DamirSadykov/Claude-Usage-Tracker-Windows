@@ -1110,6 +1110,25 @@ describe("todos set", () => {
     expect(t.priority).toBe("high");
   });
 
+  it("refuses a spec write when a direct run has not connected the spec registry port", () => {
+    const todosModule = new URL("./todos.mjs", import.meta.url).href;
+    const script = `import { run } from ${JSON.stringify(todosModule)}; run(["set", "spec", "1", "tasks#board-file"]);`;
+    const before = readFileSync(file);
+    let error;
+    try {
+      execFileSync(process.execPath, ["--input-type=module", "--eval", script], {
+        env: { ...process.env, APPDATA: dir },
+        encoding: "utf8",
+        stdio: "pipe",
+      });
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeDefined();
+    expect(String(error.stderr)).toContain("spec registry port is not connected");
+    expect(readFileSync(file).equals(before)).toBe(true);
+  });
+
   it("set subject accepts a title exactly at the 150-char cap", () => {
     const title = "x".repeat(150);
     run("set", "subject", "1", title);
