@@ -19,6 +19,7 @@ import EnrollmentPanel from "../external/EnrollmentPanel.vue";
 import WorkflowGraph from "../process/WorkflowGraph.vue";
 import agentProviderManifest from "../../scripts/cli/agents/agent-providers.json";
 import { dutyModeReader } from "../../scripts/cli/agents/duty-mode.mjs";
+import { loadSettingsStoreForWrite } from "../kernel/settingsStore";
 
 const TIER_LABELS: Record<AlertTierKey, string> = {
   five_hour: "session5h",
@@ -252,8 +253,7 @@ async function loadIgnoredInsights() {
 
 async function saveIgnoredInsights() {
   try {
-    const { load: loadStore } = await import("@tauri-apps/plugin-store");
-    const store = await loadStore("settings.json");
+    const store = await loadSettingsStoreForWrite();
     await store.set("ignoredInsights", [...ignoredKinds.value]);
     await store.save();
   } catch {}
@@ -530,8 +530,7 @@ async function loadTaskCtxPrio() {
 async function setTaskCtxPrio(v: string) {
   taskCtxPrio.value = v;
   try {
-    const { load: loadStore } = await import("@tauri-apps/plugin-store");
-    const store = await loadStore("settings.json");
+    const store = await loadSettingsStoreForWrite();
     await store.set("taskContextPriority", v);
     await store.save();
   } catch {}
@@ -560,8 +559,7 @@ async function loadHookContext() {
 async function toggleHookContext() {
   hookContextEnabled.value = !hookContextEnabled.value;
   try {
-    const { load: loadStore } = await import("@tauri-apps/plugin-store");
-    const store = await loadStore("settings.json");
+    const store = await loadSettingsStoreForWrite();
     await store.set("hookContextEnabled", hookContextEnabled.value);
     await store.save();
   } catch {}
@@ -570,8 +568,7 @@ async function toggleHookContext() {
 async function toggleWorkflowContext() {
   workflowContextEnabled.value = !workflowContextEnabled.value;
   try {
-    const { load: loadStore } = await import("@tauri-apps/plugin-store");
-    const store = await loadStore("settings.json");
+    const store = await loadSettingsStoreForWrite();
     await store.set("workflowContextEnabled", workflowContextEnabled.value);
     await store.save();
   } catch {}
@@ -601,8 +598,7 @@ async function loadSpecsEnabled() {
 async function toggleSpecsEnabled() {
   specsEnabled.value = !specsEnabled.value;
   try {
-    const { load: loadStore } = await import("@tauri-apps/plugin-store");
-    const store = await loadStore("settings.json");
+    const store = await loadSettingsStoreForWrite();
     await store.set("specsEnabled", specsEnabled.value);
     await store.save();
     const { emit } = await import("@tauri-apps/api/event");
@@ -639,8 +635,7 @@ async function loadTaskGuard() {
 async function setTaskGuard(v: string) {
   taskHandoffGuard.value = v;
   try {
-    const { load: loadStore } = await import("@tauri-apps/plugin-store");
-    const store = await loadStore("settings.json");
+    const store = await loadSettingsStoreForWrite();
     await store.set("taskHandoffGuard", v);
     await store.save();
   } catch {}

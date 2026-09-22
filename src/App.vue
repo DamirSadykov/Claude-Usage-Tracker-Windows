@@ -26,7 +26,7 @@ import type { AlertTiers, AlertTypes } from "./kernel/thresholds";
 import { localizeAlert } from "./analytics/alertFormat";
 import type { AlertEvent } from "./analytics/alertFormat";
 import { useUpdater, initUpdater } from "./kernel/updater";
-import { readSettingsSnapshot } from "./kernel/settingsStore";
+import { loadSettingsStoreForWrite, readSettingsSnapshot } from "./kernel/settingsStore";
 import { logInfo, logWarn, logError } from "./kernel/logging";
 import type { CodexRateLimits, ForecastData, UsageData, UsageLevels } from "./contracts/types";
 
@@ -244,8 +244,7 @@ async function togglePin() {
 }
 
 async function saveSettings() {
-    const { load } = await import("@tauri-apps/plugin-store");
-    const store = await load("settings.json");
+    const store = await loadSettingsStoreForWrite();
     await store.set("sessionKey", sessionKey.value);
     await store.set("orgId", orgId.value);
     await store.set("refreshInterval", refreshInterval.value);

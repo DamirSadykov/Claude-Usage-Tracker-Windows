@@ -14,6 +14,7 @@ import {
   type StatusMap,
   type ExtBucketId,
 } from "../contracts/externalStatus";
+import { loadSettingsStoreForWrite } from "../kernel/settingsStore";
 
 const { t } = useI18n();
 
@@ -65,7 +66,7 @@ async function onBucketChange(sourceStatus: string, e: Event) {
   const bucket = (e.target as HTMLSelectElement).value as ExtBucketId;
   statusMap.value = { ...statusMap.value, [sourceStatus]: bucket };
   try {
-    const store = await settingsStore();
+    const store = await loadSettingsStoreForWrite();
     await store.set(STATUS_MAP_KEY, statusMap.value);
     await store.save();
   } catch (err) {
@@ -97,7 +98,7 @@ async function refreshStatus() {
 
 async function persistResolverUrl() {
   try {
-    const store = await settingsStore();
+    const store = await loadSettingsStoreForWrite();
     await store.set("resolverUrl", resolverUrl.value.trim());
     await store.save();
   } catch {

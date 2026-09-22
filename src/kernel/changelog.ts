@@ -4,6 +4,7 @@
 // in the settings store so the About panel works offline between fetches.
 import { ref } from "vue";
 import { logError } from "./logging";
+import { loadSettingsStoreForWrite } from "./settingsStore";
 
 export interface Release {
     version: string; // "0.4.7" — tag without the leading "v"
@@ -153,7 +154,7 @@ async function readCache(): Promise<CacheEntry | null> {
 
 async function writeCache(releases: Release[]): Promise<void> {
     try {
-        const store = await loadStore();
+        const store = await loadSettingsStoreForWrite();
         await store.set(CACHE_KEY, { fetchedAt: Date.now(), releases });
         await store.save();
     } catch {

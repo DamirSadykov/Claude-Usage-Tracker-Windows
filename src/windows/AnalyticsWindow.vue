@@ -18,6 +18,7 @@ import { useProjectGroups, type ProjectGroup } from "../analytics/projectGroups"
 import { getInsightHelpHtml, hasInsightHelp } from "../analytics/insightHelp";
 import { renderInsightHelp } from "../kernel/insightRender";
 import { fmtDateTime, fmtDay } from "../kernel/dateFormat";
+import { loadSettingsStoreForWrite } from "../kernel/settingsStore";
 import { useSettings } from "../kernel/settingsStore";
 import {
   Chart,
@@ -839,8 +840,7 @@ async function loadIgnored() {
 }
 async function saveIgnored() {
   try {
-    const { load: loadStore } = await import("@tauri-apps/plugin-store");
-    const store = await loadStore("settings.json");
+    const store = await loadSettingsStoreForWrite();
     await store.set("ignoredInsights", [...ignoredKinds.value]);
     await store.save();
   } catch {}
