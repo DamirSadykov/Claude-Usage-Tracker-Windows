@@ -183,8 +183,8 @@ status.claude.com (`purpose`).
 part: устройство
 
 Один файл `settings.json` в каталоге данных читают три стороны: окна
-приложения (`src/settingsStore.ts` и прямые чтения панелей), Rust
-(`src-tauri/src/spec.rs`) и CLI хуков (`scripts/cli/kernel/settings.mjs`). Общего
+приложения (`src/kernel/settingsStore.ts` и прямые чтения панелей), Rust
+(`src-tauri/src/spec/spec.rs`) и CLI хуков (`scripts/cli/kernel/settings.mjs`). Общего
 генератора нет намеренно: список ключей записан руками в
 `scripts/cli/kernel/settings-contract.json`, и это источник истины.
 
