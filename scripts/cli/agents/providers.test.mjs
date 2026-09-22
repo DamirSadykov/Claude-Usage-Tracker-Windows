@@ -19,6 +19,14 @@ describe("providerArgv · openai", () => {
     expect(args).toEqual(["exec", "--json", "--sandbox", "workspace-write", "-"]);
   });
 
+  it("forks an inherited thread into a new Codex session", () => {
+    const { args } = providerArgv(
+      { provider: "openai" },
+      { bin: "codex", sandbox: "workspace-write", inherit: "parent-thread-1" },
+    );
+    expect(args).toEqual(["exec", "--json", "--sandbox", "workspace-write", "fork", "parent-thread-1", "-"]);
+  });
+
   it("passes the worker's workspace-write sandbox through untouched", () => {
     const { args } = providerArgv(
       { provider: "openai" },

@@ -1468,12 +1468,12 @@ describe("the runs journal", () => {
     const rec = runRecordOf({
       change: { number: 9, subject: "c" },
       members: [{ number: 2 }],
-      steps: [{ task: { number: 2 }, attempt: 1, result: "done", verify: "ok", cost_usd: 0.0413, session: "s-2" }],
+      steps: [{ task: { number: 2 }, attempt: 1, result: "done", verify: "ok", cost_usd: 0.0413, session: "s-2", requested_mode: "fork", start_mode: "fork", parent_session: "s-1" }],
       spend: { usd: 0.0413, unmeasured_steps: 0, group_budget: 1 },
       complete: true,
     }, { inherit: true });
 
-    expect(rec.steps[0]).toMatchObject({ task: 2, cost_usd: 0.0413, session: "s-2", verify: "ok" });
+    expect(rec.steps[0]).toMatchObject({ task: 2, cost_usd: 0.0413, session: "s-2", verify: "ok", requested_mode: "fork", start_mode: "fork", parent_session: "s-1" });
     expect(rec.inherit).toBe(true);
   });
 

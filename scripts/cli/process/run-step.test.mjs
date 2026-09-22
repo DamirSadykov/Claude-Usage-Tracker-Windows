@@ -126,7 +126,7 @@ import path from "node:path";
 const argv = process.argv.slice(2);
 let stdin = "";
 try { stdin = readFileSync(0, "utf8"); } catch {}
-process.stdout.write(JSON.stringify({ type: "thread.started", thread_id: "codex-thread-7" }) + "\\n");
+process.stdout.write(JSON.stringify({ type: "thread.started", thread_id: process.env.FAKE_CODEX_THREAD_ID || "codex-thread-7" }) + "\\n");
 await new Promise((resolve) => setTimeout(resolve, 100));
 const journal = path.join(process.env.APPDATA, "com.claude-usage-tracker.app", "task-sessions.jsonl");
 if (process.env.FAKE_ECHO) writeFileSync(process.env.FAKE_ECHO, JSON.stringify({ argv, stdin, journalBeforeWork: existsSync(journal), brainRole: process.env.TRACKER_DUTY ?? null, brainKind: process.env.TRACKER_SESSION_KIND ?? null }));
@@ -175,6 +175,7 @@ afterEach(() => {
   else process.env.CLAUDE_CODE_SESSION_ID = prevSession;
   delete process.env.FAKE_MODE;
   delete process.env.FAKE_ECHO;
+  delete process.env.FAKE_CODEX_THREAD_ID;
   delete process.env.FAKE_ALIVE;
   rmSync(tmp, { recursive: true, force: true });
 });
@@ -555,6 +556,7 @@ describe("executeStep · OpenAI routing", () => {
       codexBin: [process.execPath, fakeCodex], model: "opus",
     });
     expect(r).toMatchObject({ ok: true, provider: "openai", model: "gpt-5.6-terra", sessionId: "codex-thread-7" });
+    expect(r).toMatchObject({ requestedMode: "fresh", startMode: "fresh", parentSession: null });
     expect(r.handoff).toBe("codex baton");
     const seen = JSON.parse(readFileSync(echo, "utf8"));
     expect(seen.argv).toContain("workspace-write");
@@ -565,6 +567,50 @@ describe("executeStep · OpenAI routing", () => {
     const events = readTaskSessionEvents(journal());
     expect(events.map((e) => e.event)).toEqual(["start", "end"]);
     expect(events.every((e) => e.session === "codex-thread-7" && e.provider === "openai" && e.model === "gpt-5.6-terra")).toBe(true);
+  });
+
+  it("forks the selected parent and binds only the new child thread", async () => {
+    const data = chain();
+    writeFileSync(boardFile(), JSON.stringify(data));
+    saveAgentConfig({
+      version: 2,
+      duties: { worker: { provider: "openai", model: "gpt-5.6-terra", role: "worker" } },
+      hooks: { architect: true, review: true },
+    });
+    const echo = path.join(tmp, "codex-fork-echo.json");
+    process.env.FAKE_ECHO = echo;
+    const r = await executeStep({
+      task: taskOf(data, "id-3"), board: data, cwd: tmp,
+      codexBin: [process.execPath, fakeCodex], inherit: "parent-thread-1",
+    });
+    expect(r).toMatchObject({
+      ok: true, sessionId: "codex-thread-7", requestedMode: "fork",
+      startMode: "fork", parentSession: "parent-thread-1",
+    });
+    const seen = JSON.parse(readFileSync(echo, "utf8"));
+    expect(seen.argv.slice(-3)).toEqual(["fork", "parent-thread-1", "-"]);
+    const events = readTaskSessionEvents(journal());
+    expect(events.map((e) => [e.event, e.session])).toEqual([
+      ["start", "codex-thread-7"], ["end", "codex-thread-7"],
+    ]);
+  });
+
+  it("rejects a fork that reports its parent id instead of a child id", async () => {
+    const data = chain();
+    writeFileSync(boardFile(), JSON.stringify(data));
+    saveAgentConfig({
+      version: 2,
+      duties: { worker: { provider: "openai", model: "gpt-5.6-terra", role: "worker" } },
+      hooks: { architect: true, review: true },
+    });
+    process.env.FAKE_CODEX_THREAD_ID = "parent-thread-1";
+    const r = await executeStep({
+      task: taskOf(data, "id-3"), board: data, cwd: tmp,
+      codexBin: [process.execPath, fakeCodex], inherit: "parent-thread-1",
+    });
+    expect(r).toMatchObject({ ok: false, sessionId: "", requestedMode: "fork", startMode: "unknown" });
+    expect(r.error).toContain("parent thread id");
+    expect(readTaskSessionEvents(journal())).toEqual([]);
   });
 });
 

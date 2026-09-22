@@ -64,6 +64,7 @@ export function providerArgv(profile, {
     if (model) args.push("--model", model);
     if (profile.reasoning_effort)
       args.push("--config", `model_reasoning_effort=\"${profile.reasoning_effort}\"`);
+    if (inherit) args.push("fork", inherit);
     args.push("-");
     return { file, args };
   }
