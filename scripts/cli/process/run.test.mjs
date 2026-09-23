@@ -17,7 +17,7 @@ import {
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawnSync, execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import {
   runChange,
@@ -103,6 +103,12 @@ function harness(overrides = {}) {
       calls.statuses.push([t.number, status]);
     },
     stepCost: async () => 0,
+    // No real git in these tests unless a test opts in: without these stubs a
+    // `dry:false` run falls through to liveEffects (buildRunContext merges it
+    // under the harness), which would snapshot the ACTUAL repo working tree.
+    stepBase: async () => ({ ok: false, error: "harness: no step base in tests" }),
+    priorChanges: async () => ({ ok: true, changes: null }),
+    ownChanges: async () => ({ ok: true, skip: true }),
     ...overrides,
   };
   return { effects, calls, state };
@@ -599,7 +605,7 @@ describe("runChange — the red gate never shares a wave", () => {
       auto(4),
     );
     const h = harness({
-      redBase: async () => ({ ok: true, sha: "base-sha" }),
+      stepBase: async () => ({ ok: true, sha: "base-sha" }),
       redGate: async () => ({ ok: true, field: "failed-on-base", reason: null }),
     });
     const r = await go(data, "1", h.effects);
@@ -611,7 +617,7 @@ describe("runChange — the red gate never shares a wave", () => {
   it("parks a red-declared step instead of starting it when the base cannot be recorded", async () => {
     const data = board(changeRoot(1, [2], { budget_usd: 10 }), redAuto(2));
     const h = harness({
-      redBase: async () => ({ ok: false, error: "not a git repository" }),
+      stepBase: async () => ({ ok: false, error: "not a git repository" }),
     });
     const r = await go(data, "1", h.effects);
 
@@ -626,7 +632,7 @@ describe("runChange — the red gate's verdict", () => {
   it("a failing gate (red passes on base) produces an ISSUE comment with source `red` and is retried per retry_limit", async () => {
     const data = board(changeRoot(1, [2], { budget_usd: 10 }), redAuto(2, { retry_limit: 2 }));
     const h = harness({
-      redBase: async () => ({ ok: true, sha: "base-sha" }),
+      stepBase: async () => ({ ok: true, sha: "base-sha" }),
       redGate: async () => ({
         ok: false,
         field: "passed-on-base",
@@ -652,7 +658,7 @@ describe("runChange — the red gate's verdict", () => {
   it("a passing gate (red fails on base) proceeds to the declared verify and records the field", async () => {
     const data = board(changeRoot(1, [2], { budget_usd: 10 }), redAuto(2));
     const h = harness({
-      redBase: async () => ({ ok: true, sha: "base-sha" }),
+      stepBase: async () => ({ ok: true, sha: "base-sha" }),
       redGate: async () => ({ ok: true, field: "failed-on-base", reason: null }),
     });
     const r = await go(data, "1", h.effects);
@@ -661,6 +667,64 @@ describe("runChange — the red gate's verdict", () => {
     expect(r.steps[0].result).toBe("done");
     expect(r.steps[0].red).toBe("failed-on-base");
     expect(statusOf(r, 2)).toBe("done");
+  });
+});
+
+describe("runChange — neighbour damage ends a step as issue before review", () => {
+  it("a step that reverts or deletes an earlier step's uncommitted work never reaches review", async () => {
+    const data = board(changeRoot(1, [2], { budget_usd: 10 }), auto(2, { produces: ["src/own.js"] }));
+    data.todos[1].step_base = "base-sha";
+    const h = harness({
+      ownChanges: async () => ({
+        ok: true,
+        own: [
+          { status: "M", path: "src/sum.mjs" },
+          { status: "D", path: "test/sum.regression.test.mjs" },
+        ],
+        damaged: [
+          { path: "src/sum.mjs", state: "reverted" },
+          { path: "test/sum.regression.test.mjs", state: "deleted" },
+        ],
+      }),
+    });
+    const r = await go(data, "1", h.effects);
+
+    expect(h.calls.reviews).toEqual([]);
+    expect(r.steps[0].result).toBe("issue");
+    expect(r.steps[0].reason).toMatch(/reverted or deleted/);
+    expect(r.steps[0].own_changes).toBe(2);
+    expect(r.steps[0].neighbour_damage).toBe(2);
+    const t2 = r.board.todos.find((t) => t.number === 2);
+    const comment = (t2.comments || []).find((c) => c.author === "review" && c.body.includes("\nscope\n"));
+    expect(comment).toBeTruthy();
+    expect(comment.body).toContain("src/sum.mjs");
+    expect(comment.body).toContain("test/sum.regression.test.mjs");
+  });
+
+  it("a step that only adds its own file causes no issue", async () => {
+    const data = board(changeRoot(1, [2], { budget_usd: 10 }), auto(2, { produces: ["src/own.js"] }));
+    data.todos[1].step_base = "base-sha";
+    const h = harness({
+      ownChanges: async () => ({ ok: true, own: [{ status: "A", path: "src/own.js" }], damaged: [] }),
+    });
+    const r = await go(data, "1", h.effects);
+
+    expect(h.calls.reviews).toEqual([2]);
+    expect(r.steps[0].result).toBe("done");
+    expect(r.steps[0].own_changes).toBe(1);
+    expect(r.steps[0].neighbour_damage).toBe(0);
+  });
+
+  it("a step that modifies a prior file that IS in its own produces causes no issue", async () => {
+    const data = board(changeRoot(1, [2], { budget_usd: 10 }), auto(2, { produces: ["src/sum.mjs"] }));
+    data.todos[1].step_base = "base-sha";
+    const h = harness({
+      ownChanges: async () => ({ ok: true, own: [{ status: "M", path: "src/sum.mjs" }], damaged: [] }),
+    });
+    const r = await go(data, "1", h.effects);
+
+    expect(h.calls.reviews).toEqual([2]);
+    expect(r.steps[0].result).toBe("done");
   });
 });
 
@@ -1041,8 +1105,17 @@ describe("run(['--next']) — the field wired end to end onto the real board (t#
     mkdirSync(appDir, { recursive: true });
     const initial = board(changeRoot(1, [2, 3], { parallel_limit: 2 }), auto(2), auto(3));
     writeFileSync(path.join(appDir, "todos.json"), JSON.stringify(initial));
+    const gitDir = mkdtempSync(path.join(os.tmpdir(), "cut-run-cmdnext-git-"));
+    execFileSync("git", ["init", "-q"], { cwd: gitDir });
+    execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: gitDir });
+    execFileSync("git", ["config", "user.name", "Test"], { cwd: gitDir });
+    writeFileSync(path.join(gitDir, "a.txt"), "x\n");
+    execFileSync("git", ["add", "-A"], { cwd: gitDir });
+    execFileSync("git", ["commit", "-q", "-m", "base"], { cwd: gitDir });
     const prevAppData = process.env.APPDATA;
+    const prevCwd = process.cwd();
     process.env.APPDATA = dir;
+    process.chdir(gitDir);
     const origWrite = process.stdout.write;
     process.stdout.write = () => true;
     try {
@@ -1063,9 +1136,11 @@ describe("run(['--next']) — the field wired end to end onto the real board (t#
       expect(t2b.status).toBe("queue");
     } finally {
       process.stdout.write = origWrite;
+      process.chdir(prevCwd);
       if (prevAppData === undefined) delete process.env.APPDATA;
       else process.env.APPDATA = prevAppData;
       rmSync(dir, { recursive: true, force: true });
+      rmSync(gitDir, { recursive: true, force: true });
     }
   }, 20000);
 });
@@ -1366,9 +1441,16 @@ function outsideEffects(reconcile) {
       task.handoff = text;
       return { written: true };
     },
+    recordIssue: async () => ({ written: true }),
     runVerify: async () => ({ code: 0 }),
     reconcile,
     stepCost: async ({ result }) => (typeof result?.costUsd === "number" ? result.costUsd : null),
+    // Same reason as harness()'s stubs: an omitted key here falls through to
+    // liveEffects (buildRunContext's dry:false merge), which would snapshot
+    // the ACTUAL repo working tree.
+    stepBase: async () => ({ ok: false, error: "outsideEffects: no step base in tests" }),
+    priorChanges: async () => ({ ok: true, changes: null }),
+    ownChanges: async () => ({ ok: true, skip: true }),
   };
 }
 

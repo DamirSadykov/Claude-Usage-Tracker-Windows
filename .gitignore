@@ -20,3 +20,4 @@ settings.local.json
 *.swp
 .claude/phases/
 src-tauri/target-test/
+target-test/

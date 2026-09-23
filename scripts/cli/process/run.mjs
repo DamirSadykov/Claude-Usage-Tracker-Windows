@@ -84,7 +84,15 @@ import {
 import { findChange } from "../board/change.mjs";
 import { resolveDuty } from "../agents/agents.mjs";
 import { withBoardLock } from "../kernel/board-lock.mjs";
-import { gitBase, runRedGate, recoverMarkers } from "./red-gate.mjs";
+import {
+  gitHead,
+  gitBase,
+  snapshotTree,
+  diffNameStatus,
+  computeNeighbourDamage,
+  runRedGate,
+  recoverMarkers,
+} from "./red-gate.mjs";
 
 export const DEFAULT_PARALLEL_LIMIT = 1;
 
@@ -202,7 +210,9 @@ export function simulationEffects() {
     setStatus: async () => {},
     recordHandoff: async () => ({ written: false }),
     recordIssue: async () => ({ written: false }),
-    redBase: async () => ({ ok: true, sha: "dry" }),
+    stepBase: async () => ({ ok: true, sha: "dry" }),
+    priorChanges: async () => ({ ok: true, changes: null }),
+    ownChanges: async () => ({ ok: true, skip: true }),
     redGate: async () => ({ ok: true, field: "failed-on-base", reason: null }),
     stepCost: async ({ task }) =>
       typeof task.budget_usd === "number" ? task.budget_usd : null,
@@ -302,21 +312,45 @@ export function liveEffects({ cwd } = {}) {
         return { written: true };
       });
     },
-    redBase: async ({ task, cwd }) => {
-      const head = gitBase(cwd);
-      if (!head.ok) return { ok: false, error: head.error };
+    stepBase: async ({ task, cwd }) => {
+      const based = gitBase(cwd);
+      if (!based.ok) return { ok: false, error: based.error };
       const file = appDataFile("todos.json");
       const write = withBoardLock(file, () => {
         const data = loadBoardForWrite(file);
         const todo = data.todos.find((t) => t && t.id === task.id);
         if (!todo) return { written: false, error: `task ${task.id} not found on the board` };
-        todo.red_base = head.sha;
+        todo.step_base = based.sha;
         todo.updated_at = new Date().toISOString();
         saveBoard(file, data);
         return { written: true };
       });
       if (!write.written) return { ok: false, error: write.error };
-      return { ok: true, sha: head.sha };
+      return { ok: true, sha: based.sha };
+    },
+    priorChanges: async ({ task, cwd }) => {
+      if (!task.step_base) return { ok: true, changes: null };
+      const head = gitHead(cwd);
+      if (!head.ok) return { ok: false, error: head.error };
+      const changes = diffNameStatus(cwd, head.sha, task.step_base);
+      if (!Array.isArray(changes)) return { ok: false, error: changes.error };
+      return { ok: true, changes };
+    },
+    ownChanges: async ({ task, cwd }) => {
+      if (!task.step_base) return { ok: true, skip: true };
+      const head = gitHead(cwd);
+      if (!head.ok) return { ok: false, error: head.error };
+      const end = snapshotTree(cwd);
+      if (!end.ok) return { ok: false, error: end.error };
+      const damage = computeNeighbourDamage({
+        cwd,
+        head: head.sha,
+        stepBase: task.step_base,
+        end: end.sha,
+        produces: task.produces,
+      });
+      if (!damage.ok) return { ok: false, error: damage.error };
+      return { ok: true, own: damage.own, damaged: damage.damaged };
     },
     redGate: async ({ task, cwd, timeoutMs }) => {
       let mod;
@@ -415,6 +449,8 @@ export function runRecordOf(report, { inherit = false } = {}) {
       route: s.route || null,
       review: s.review || null,
       reason: s.reason || null,
+      own_changes: typeof s.own_changes === "number" ? s.own_changes : null,
+      neighbour_damage: typeof s.neighbour_damage === "number" ? s.neighbour_damage : null,
     })),
     spend: report.spend || null,
     refused: (report.refused || []).length,
@@ -450,6 +486,8 @@ export function reportRecordOf(report) {
         route: s.route || null,
         review: s.review || null,
         reason: s.reason || null,
+        own_changes: typeof s.own_changes === "number" ? s.own_changes : null,
+        neighbour_damage: typeof s.neighbour_damage === "number" ? s.neighbour_damage : null,
       },
     ],
     refused: (report.refused || []).length,
@@ -514,7 +552,7 @@ export function inheritFrom(ctx, task) {
   return own.length === 1 ? own[0] : "";
 }
 
-export function stepBrief(ctx, task, wave, { attempt, limit } = {}) {
+export function stepBrief(ctx, task, wave, { attempt, limit, priorChanges } = {}) {
   return {
     task,
     board: ctx.data,
@@ -524,6 +562,7 @@ export function stepBrief(ctx, task, wave, { attempt, limit } = {}) {
     inherit: inheritFrom(ctx, task),
     attempt,
     limit,
+    priorChanges,
   };
 }
 
@@ -537,33 +576,56 @@ export async function beginStep(ctx, task, wave = []) {
   if (limit !== null && spent + 1 > limit) {
     return { task, kind: "retry-exhausted", attempt: spent, limit, cost: null, session: null };
   }
-  if (declaredRed(task)) {
-    const based = await recordRedBase(ctx, task);
-    if (!based.ok) {
-      return { task, kind: "red-base-failed", attempt: spent, limit, cost: null, session: null, reason: based.reason };
+  const based = await recordStepBase(ctx, task);
+  if (!based.ok) {
+    if (declaredRed(task)) {
+      return {
+        task,
+        kind: "red-base-failed",
+        attempt: spent,
+        limit,
+        cost: null,
+        session: null,
+        reason: `red declared but ${ctx.cwd} is not a git work tree${based.error ? `: ${based.error}` : ""}`,
+      };
     }
+    if (!ctx.stepBaseWarned) {
+      ctx.stepBaseWarned = true;
+      process.stderr.write(
+        `run: step base unavailable for ${ctx.cwd}${based.error ? `: ${based.error}` : ""} — continuing without it, this run's produces/scope checks are best-effort\n`,
+      );
+    }
+  }
+  let priorChanges = null;
+  if (task.step_base) {
+    try {
+      const pr = (await ctx.effects.priorChanges({ task, cwd: ctx.cwd })) || {};
+      if (pr.ok) priorChanges = pr.changes ?? null;
+    } catch {}
   }
   const attempt = spent + 1;
   ctx.attempts.set(task.id, attempt);
 
   await moveTo(ctx, task, "in_progress");
-  return { task, kind: "begin", attempt, limit, brief: stepBrief(ctx, task, wave, { attempt, limit }) };
+  return {
+    task,
+    kind: "begin",
+    attempt,
+    limit,
+    brief: stepBrief(ctx, task, wave, { attempt, limit, priorChanges }),
+  };
 }
 
-async function recordRedBase(ctx, task) {
-  if (task.red_base) return { ok: true };
+async function recordStepBase(ctx, task) {
+  if (task.step_base) return { ok: true };
   let result;
   try {
-    result = (await ctx.effects.redBase({ task, cwd: ctx.cwd })) || {};
+    result = (await ctx.effects.stepBase({ task, cwd: ctx.cwd })) || {};
   } catch (err) {
     result = { ok: false, error: String((err && err.message) || err) };
   }
-  if (!result.ok)
-    return {
-      ok: false,
-      reason: `red declared but ${ctx.cwd} is not a git work tree${result.error ? `: ${result.error}` : ""}`,
-    };
-  task.red_base = result.sha;
+  if (!result.ok) return { ok: false, error: result.error };
+  task.step_base = result.sha;
   return { ok: true };
 }
 
@@ -617,18 +679,13 @@ async function recordIssueComment(ctx, task, { attempt, limit, source, text }) {
   return comment;
 }
 
-// Everything AFTER the executor and the reviewer have run: the review verdict,
-// its cost added onto what the worker already cost, and the branch into gate /
-// issue / verify+reconcile / close. Anything that moves ANOTHER node (the
-// `?issue` transition) is only RETURNED as an intent here — it is applied in
-// board order afterwards, never from inside a single node's own step.
-export async function finishStep(ctx, task, { result, review, baton, cost }) {
+function resultBase(ctx, task, result, review, baton, cost, ownChanges) {
   const attempt = ctx.attempts.get(task.id);
   const limit = retryLimitOf(task);
   if (typeof review?.costUsd === "number" && Number.isFinite(review.costUsd))
     cost = (typeof cost === "number" ? cost : 0) + review.costUsd;
 
-  const base = {
+  return {
     task, attempt, limit, cost, baton, session: result.sessionId || null,
     requestedMode: result.requestedMode || null,
     startMode: result.startMode || "unknown",
@@ -636,6 +693,8 @@ export async function finishStep(ctx, task, { result, review, baton, cost }) {
     provider: result.provider || null,
     model: result.model || null,
     route: result.route || null,
+    ownChanges: Array.isArray(ownChanges) ? ownChanges.length : null,
+    neighbourDamage: Array.isArray(ownChanges) ? 0 : null,
     review: review ? {
       skipped: !!review.skipped,
       approved: !!review.approved,
@@ -645,6 +704,16 @@ export async function finishStep(ctx, task, { result, review, baton, cost }) {
       route: review.route || null,
     } : null,
   };
+}
+
+// Everything AFTER the executor and the reviewer have run: the review verdict,
+// its cost added onto what the worker already cost, and the branch into gate /
+// issue / verify+reconcile / close. Anything that moves ANOTHER node (the
+// `?issue` transition) is only RETURNED as an intent here — it is applied in
+// board order afterwards, never from inside a single node's own step.
+export async function finishStep(ctx, task, { result, review, baton, cost, ownChanges }) {
+  const base = resultBase(ctx, task, result, review, baton, cost, ownChanges);
+  const { attempt, limit } = base;
 
   if (review && review.skipped !== true && (review.ok === false || review.approved !== true)) {
     await recordIssueComment(ctx, task, {
@@ -723,6 +792,42 @@ export async function finishStep(ctx, task, { result, review, baton, cost }) {
   return { ...base, kind: "undecided", verify, reason };
 }
 
+function formatNeighbourDamage(damaged) {
+  const lines = damaged.map((d) => `${d.state} ${d.path}`).join("\n");
+  return (
+    `this step reverted or deleted work of earlier steps of the run, outside its own produces:\n${lines}`
+  );
+}
+
+async function checkNeighbourDamage(ctx, task, result, baton, cost) {
+  if (result.ok === false || !task.step_base) return null;
+  let damage;
+  try {
+    damage = (await ctx.effects.ownChanges({ task, cwd: ctx.cwd })) || {};
+  } catch (err) {
+    damage = { ok: false, error: String((err && err.message) || err) };
+  }
+  if (!damage.ok || damage.skip) return null;
+  const ownChanges = damage.own || [];
+  if (!Array.isArray(damage.damaged) || !damage.damaged.length) return { ownChanges, issue: null };
+  const base = resultBase(ctx, task, result, null, baton, cost, ownChanges);
+  base.neighbourDamage = damage.damaged.length;
+  await recordIssueComment(ctx, task, {
+    attempt: base.attempt,
+    limit: base.limit,
+    source: "scope",
+    text: formatNeighbourDamage(damage.damaged),
+  });
+  return {
+    ownChanges,
+    issue: {
+      ...base,
+      kind: "issue",
+      reason: `step reverted or deleted work of earlier steps outside its own produces: ${damage.damaged.map((d) => d.path).join(", ")}`,
+    },
+  };
+}
+
 // One attempt at one node, composed from the three phases above: beginStep does
 // the bookkeeping and hands the executor its brief, recordWork puts what the
 // worker produced on the board, then the reviewer runs and finishStep reads
@@ -739,6 +844,11 @@ async function runOne(ctx, task, wave = []) {
   }
   const { baton, cost } = await recordWork(ctx, task, result);
   if (result.sessionId) ctx.sessions.set(task.id, result.sessionId);
+
+  const damage = await checkNeighbourDamage(ctx, task, result, baton, cost);
+  if (damage && damage.issue) return damage.issue;
+  const ownChanges = damage ? damage.ownChanges : null;
+
   let review = null;
   if (result.ok !== false && typeof ctx.effects.reviewStep === "function") {
     try {
@@ -747,12 +857,13 @@ async function runOne(ctx, task, wave = []) {
         workerResult: result.result || "",
         cwd: ctx.cwd,
         timeoutMs: ctx.timeoutMs,
+        ownChanges,
       });
     } catch (err) {
       review = { approved: false, ok: false, error: String(err?.message || err) };
     }
   }
-  return finishStep(ctx, task, { result, review, baton, cost });
+  return finishStep(ctx, task, { result, review, baton, cost, ownChanges });
 }
 
 export async function runReported(ctx, task, wave, { result, review = null }) {
@@ -884,6 +995,7 @@ export function buildRunContext({ data, change, effects = {}, dry = true, cwd = 
     unknownCost: 0,
     stop: null,
     maxParallel: 0,
+    stepBaseWarned: false,
   };
 }
 
@@ -948,6 +1060,8 @@ export async function applyResult(ctx, r, { dry, log }) {
     result: r.kind,
     reason: r.reason || null,
     status: r.task.status,
+    own_changes: typeof r.ownChanges === "number" ? r.ownChanges : null,
+    neighbour_damage: typeof r.neighbourDamage === "number" ? r.neighbourDamage : null,
   };
   ctx.steps.push(record);
   log(formatStepLine(record, dry));
@@ -1389,26 +1503,37 @@ export function stampHandout(file, data, wave) {
   return at;
 }
 
-function attachRedBase(data, wave, cwd) {
+function attachStepBase(data, wave, cwd) {
   if (!wave.length) return { wave, stop: null };
-  const t = wave.find((x) => declaredRed(x));
-  if (!t || t.red_base) return { wave, stop: null };
-  const head = gitBase(cwd);
-  if (!head.ok) {
-    return {
-      wave: [],
-      stop: {
-        kind: "red-base",
-        task: brief(t),
-        status: t.status,
-        reason: `red declared but ${cwd} is not a git work tree${head.error ? `: ${head.error}` : ""}`,
-        parked: true,
-      },
-    };
+  let warned = false;
+  for (const t of wave) {
+    if (t.step_base) continue;
+    const head = gitBase(cwd);
+    if (!head.ok) {
+      if (declaredRed(t)) {
+        return {
+          wave: [],
+          stop: {
+            kind: "red-base",
+            task: brief(t),
+            status: t.status,
+            reason: `red declared but ${cwd} is not a git work tree${head.error ? `: ${head.error}` : ""}`,
+            parked: true,
+          },
+        };
+      }
+      if (!warned) {
+        warned = true;
+        process.stderr.write(
+          `run: step base unavailable for ${cwd}${head.error ? `: ${head.error}` : ""} — continuing without it, this run's produces/scope checks are best-effort\n`,
+        );
+      }
+      continue;
+    }
+    const todo = data.todos.find((x) => x && x.id === t.id);
+    if (todo) todo.step_base = head.sha;
+    t.step_base = head.sha;
   }
-  const todo = data.todos.find((x) => x && x.id === t.id);
-  if (todo) todo.red_base = head.sha;
-  t.red_base = head.sha;
   return { wave, stop: null };
 }
 
@@ -1440,7 +1565,7 @@ async function cmdNext(ref, f) {
     const gb = typeof c.root.budget_usd === "number" ? c.root.budget_usd : null;
     let o = nextFrontier(c, { limit: l, groupBudget: gb, spentKnown });
     if (o.wave) {
-      const based = attachRedBase(data, o.wave, process.cwd());
+      const based = attachStepBase(data, o.wave, process.cwd());
       o = based.stop ? { stop: based.stop } : { ...o, wave: based.wave };
     }
     const at = stampHandout(file, data, o.wave || []);

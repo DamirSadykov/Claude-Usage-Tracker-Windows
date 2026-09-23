@@ -1,6 +1,8 @@
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 
 export function gitHead(cwd) {
   try {
@@ -16,19 +18,133 @@ export function gitHead(cwd) {
   }
 }
 
-export function gitBase(cwd) {
-  const head = gitHead(cwd);
-  if (!head.ok) return head;
+export const UNTRACKED_SNAPSHOT_LIMIT = 2000;
+
+export function snapshotTree(cwd) {
+  let indexRel;
   try {
-    const snap = execFileSync("git", ["stash", "create"], {
+    indexRel = execFileSync("git", ["rev-parse", "--git-path", "index"], {
       cwd,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "pipe"],
     }).trim();
-    return { ok: true, sha: snap || head.sha };
   } catch (err) {
     return { ok: false, error: String((err && err.message) || err) };
   }
+  const realIndex = path.isAbsolute(indexRel) ? indexRel : path.join(cwd, indexRel);
+  const tmpIndex = path.join(os.tmpdir(), `cut-snapshot-index-${process.pid}-${randomUUID()}`);
+  try {
+    fs.copyFileSync(realIndex, tmpIndex);
+  } catch (err) {
+    if (!err || err.code !== "ENOENT") return { ok: false, error: String((err && err.message) || err) };
+  }
+  const env = { ...process.env, GIT_INDEX_FILE: tmpIndex };
+  let untracked = 0;
+  try {
+    untracked = execFileSync("git", ["ls-files", "--others", "--exclude-standard", "-z"], {
+      cwd,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      maxBuffer: 256 * 1024 * 1024,
+    }).split("\0").filter(Boolean).length;
+  } catch {}
+  const trackedOnly = untracked > UNTRACKED_SNAPSHOT_LIMIT;
+  if (trackedOnly && !snapshotTree.warned) {
+    snapshotTree.warned = true;
+    process.stderr.write(
+      `run: ${untracked} untracked files in ${cwd} — the step snapshot keeps tracked files only; add build output to .gitignore\n`,
+    );
+  }
+  try {
+    execFileSync("git", ["add", trackedOnly ? "-u" : "-A"], { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
+    const tree = execFileSync("git", ["write-tree"], {
+      cwd,
+      env,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trim();
+    const sha = execFileSync("git", ["commit-tree", tree, "-p", "HEAD", "-m", "snapshot"], {
+      cwd,
+      env,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trim();
+    return { ok: true, sha };
+  } catch (err) {
+    return { ok: false, error: String((err && err.message) || err) };
+  } finally {
+    try {
+      fs.rmSync(tmpIndex, { force: true });
+    } catch {}
+  }
+}
+
+export function gitBase(cwd) {
+  const head = gitHead(cwd);
+  if (!head.ok) return head;
+  const snap = snapshotTree(cwd);
+  if (!snap.ok) return snap;
+  try {
+    const headTree = execFileSync("git", ["rev-parse", `${head.sha}^{tree}`], {
+      cwd,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trim();
+    const snapTree = execFileSync("git", ["rev-parse", `${snap.sha}^{tree}`], {
+      cwd,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trim();
+    if (headTree === snapTree) return { ok: true, sha: head.sha };
+  } catch {}
+  return snap;
+}
+
+export function diffNameStatus(cwd, from, to) {
+  try {
+    const out = execFileSync("git", ["diff", "--no-renames", "--name-status", from, to], {
+      cwd,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return out
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((line) => {
+        const tab = line.indexOf("\t");
+        return { status: line.slice(0, tab).trim()[0], path: normalizePath(line.slice(tab + 1)) };
+      });
+  } catch (err) {
+    return { ok: false, error: String((err && err.message) || err) };
+  }
+}
+
+export function computeNeighbourDamage({ cwd, head, stepBase, end, produces }) {
+  const own = diffNameStatus(cwd, stepBase, end);
+  if (!Array.isArray(own)) return { ok: false, error: own.error };
+  const prior = diffNameStatus(cwd, head, stepBase);
+  if (!Array.isArray(prior)) return { ok: false, error: prior.error };
+  const producesSet = new Set(
+    (Array.isArray(produces) ? produces : []).map(normalizePath).filter(Boolean),
+  );
+  const priorPaths = new Set(prior.map((c) => c.path));
+  const damaged = [];
+  for (const change of own) {
+    if (!priorPaths.has(change.path) || producesSet.has(change.path)) continue;
+    if (change.status === "D") {
+      damaged.push({ path: change.path, state: "deleted" });
+      continue;
+    }
+    if (!existsAtBase(cwd, end, change.path)) {
+      damaged.push({ path: change.path, state: "deleted" });
+      continue;
+    }
+    if (!existsAtBase(cwd, head, change.path)) continue;
+    const endBuf = readAtBase(cwd, end, change.path);
+    const headBuf = readAtBase(cwd, head, change.path);
+    if (endBuf.equals(headBuf)) damaged.push({ path: change.path, state: "reverted" });
+  }
+  return { ok: true, own, prior, damaged };
 }
 
 const insideCwd = (cwd, rel) => {
@@ -204,12 +320,12 @@ const tailLines = (s, n) => {
 };
 
 export async function runRedGate({ task, cwd, timeoutMs, appDataDir, runCmd }) {
-  const base = task.red_base;
+  const base = task.step_base;
   if (!base)
     return {
       ok: false,
       field: null,
-      reason: "red declared but no red_base was recorded before the step ran",
+      reason: "red declared but no step_base was recorded before the step ran",
     };
   if (!redTestsChanged(task, cwd, base))
     return {

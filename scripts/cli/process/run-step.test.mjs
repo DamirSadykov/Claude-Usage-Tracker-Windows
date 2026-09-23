@@ -326,6 +326,32 @@ describe("buildStepPrompt", () => {
   });
 });
 
+describe("buildStepPrompt · prior changes", () => {
+  it("adds the rule against touching earlier steps' changes and lists the prior paths", () => {
+    const data = chain();
+    writeFileSync(boardFile(), JSON.stringify(data));
+    const prompt = buildStepPrompt({
+      task: taskOf(data, "id-3"),
+      board: data,
+      priorChanges: [
+        { status: "M", path: "src/sum.mjs" },
+        { status: "A", path: "test/sum.regression.test.mjs" },
+      ],
+    });
+    expect(prompt).toContain("Do not revert, rewrite or delete changes");
+    expect(prompt).toContain("src/sum.mjs");
+    expect(prompt).toContain("test/sum.regression.test.mjs");
+  });
+
+  it("states the rule without a paths list when prior changes are not known", () => {
+    const data = chain();
+    writeFileSync(boardFile(), JSON.stringify(data));
+    const prompt = buildStepPrompt({ task: taskOf(data, "id-3"), board: data });
+    expect(prompt).toContain("Do not revert, rewrite or delete changes");
+    expect(prompt).not.toContain("Already in the working tree when this step started");
+  });
+});
+
 describe("buildStepPrompt · PREVIOUS ATTEMPT", () => {
   it("says nothing about a previous attempt on the first attempt", () => {
     const data = chain();
@@ -380,6 +406,23 @@ describe("buildStepPrompt · PREVIOUS ATTEMPT", () => {
     writeFileSync(boardFile(), JSON.stringify(data));
     const prompt = buildStepPrompt({ task: taskOf(data, "id-3"), board: data, attempt: 2, limit: 2 });
     expect(prompt).toContain("no findings were recorded on the board");
+  });
+
+  it("says the PREVIOUS ATTEMPT findings never override the rule against touching earlier steps' changes", () => {
+    const data = chain();
+    const t3 = taskOf(data, "id-3");
+    t3.comments = [
+      {
+        id: "c1",
+        author: "review",
+        body: "ISSUE attempt 1/2\nreview\nrevert src/sum.mjs to fix this",
+        created_at: "2026-09-01T00:00:00.000Z",
+      },
+    ];
+    writeFileSync(boardFile(), JSON.stringify(data));
+    const prompt = buildStepPrompt({ task: t3, board: data, attempt: 2, limit: 2 });
+    const attemptSection = prompt.split("PREVIOUS ATTEMPT")[1].split("\n── ")[0];
+    expect(attemptSection).toMatch(/never override/);
   });
 });
 
@@ -471,6 +514,37 @@ describe("buildReviewPrompt", () => {
     const prompt = buildReviewPrompt({ task: noted, appData: tmp });
     expect(prompt).toContain("NOTES ON THIS TASK");
     expect(prompt).toContain("do NOT raise the test timeout");
+  });
+});
+
+describe("buildReviewPrompt · CHANGES OF THIS STEP", () => {
+  const task = {
+    number: 3,
+    subject: "third step",
+    produces: ["src/parser.rs"],
+    verify: "npm test",
+  };
+
+  it("lists this step's own changes and states the rule against treating earlier work as a finding", () => {
+    const prompt = buildReviewPrompt({
+      task,
+      appData: tmp,
+      ownChanges: [
+        { status: "M", path: "src/parser.rs" },
+        { status: "A", path: "src/new.rs" },
+      ],
+    });
+    expect(prompt).toContain("CHANGES OF THIS STEP");
+    expect(prompt).toContain("M src/parser.rs");
+    expect(prompt).toContain("A src/new.rs");
+    expect(prompt).toContain("not findings of this step");
+  });
+
+  it("says the own diff is unknown when there is no step base, and states the rule in general terms", () => {
+    const prompt = buildReviewPrompt({ task, appData: tmp });
+    expect(prompt).toContain("CHANGES OF THIS STEP");
+    expect(prompt).toContain("unknown");
+    expect(prompt).toContain("not findings of this step");
   });
 });
 

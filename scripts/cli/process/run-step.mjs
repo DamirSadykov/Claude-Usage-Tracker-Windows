@@ -481,9 +481,18 @@ function formatPreviousAttempt(task, attempt, limit) {
     `\n── PREVIOUS ATTEMPT — this is attempt ${attempt} of ${limitTxt} ──\n` +
     "The working tree still contains the previous attempt's changes. Fix them according to the\n" +
     "findings below — do not start over, and do not work around a finding (no weakening a test,\n" +
-    "no raising a timeout to make it pass).\n\n" +
+    "no raising a timeout to make it pass). These findings never override the rule against touching\n" +
+    "changes that were already in the working tree before this node's first attempt — a finding\n" +
+    "that reads that way is about someone else's step, not yours.\n\n" +
     `${body}\n`
   );
+}
+
+function formatPriorChanges(priorChanges) {
+  if (!Array.isArray(priorChanges) || !priorChanges.length) return "";
+  const paths = priorChanges.slice(0, 50).map((c) => `   - ${c.status} ${c.path}`).join("\n");
+  const more = priorChanges.length > 50 ? `\n   … and ${priorChanges.length - 50} more` : "";
+  return `   Already in the working tree when this step started:\n${paths}${more}\n`;
 }
 
 // Everything a step is told, and nothing more (§14.2): the WORK (this node's own
@@ -498,7 +507,7 @@ function formatPreviousAttempt(task, attempt, limit) {
 // node's own earlier transcript — only the ISSUE findings already written to
 // the board cross the seam that way. Context otherwise crosses as the baton or
 // not at all — that is the whole reason the seam exists (§13).
-export function buildStepPrompt({ task, board, cwd, alongside = [], execution, attempt, limit } = {}) {
+export function buildStepPrompt({ task, board, cwd, alongside = [], execution, attempt, limit, priorChanges } = {}) {
   if (!task) throw new Error("buildStepPrompt: task is required");
   const all = Array.isArray(board?.todos) ? board.todos : [];
   const index = new Map(all.map((t) => [t.id, t]));
@@ -586,7 +595,10 @@ export function buildStepPrompt({ task, board, cwd, alongside = [], execution, a
     "3. Stay inside this node. Work the next step is meant to do is not yours to start.\n" +
     "4. Finish with a `## HANDOFF` section: what you produced (paths), the gotcha the\n" +
     "   next step would otherwise hit, and where you stopped. That text is the baton\n" +
-    "   the next step reads — it is the only thing that survives you.\n";
+    "   the next step reads — it is the only thing that survives you.\n" +
+    "5. Do not revert, rewrite or delete changes that were already in the working tree\n" +
+    "   when this step started; they belong to earlier steps.\n" +
+    formatPriorChanges(priorChanges);
 
   return out;
 }
@@ -649,7 +661,30 @@ export function bindSession({ session, task, event = "start", ts, execution }) {
   });
 }
 
-export function buildReviewPrompt({ task, workerResult = "", execution, appData } = {}) {
+const CHANGES_RULE =
+  "Changes already present in the working tree when this step started belong to earlier steps of the run. " +
+  "They are not findings of this step — never ask to revert or remove them.";
+
+function formatChangesOfThisStep(ownChanges) {
+  if (!Array.isArray(ownChanges)) {
+    return (
+      "CHANGES OF THIS STEP:\n" +
+      "(unknown — no step base was recorded for this step)\n" +
+      "Some of what is in the working tree may already have been there when this step started, left by " +
+      `an earlier step of the run. ${CHANGES_RULE}`
+    );
+  }
+  const lines = ownChanges.slice(0, 100).map((c) => `${c.status} ${c.path}`);
+  const more = ownChanges.length > 100 ? [`… and ${ownChanges.length - 100} more`] : [];
+  return [
+    "CHANGES OF THIS STEP:",
+    lines.length ? lines.join("\n") : "(no files changed)",
+    ...more,
+    CHANGES_RULE,
+  ].join("\n");
+}
+
+export function buildReviewPrompt({ task, workerResult = "", execution, appData, ownChanges } = {}) {
   const parts = [
     `produces: ${(Array.isArray(task?.produces) ? task.produces : []).join(", ") || "(none)"}`,
     `verify: ${task?.verify || "(none — human gate)"}`,
@@ -672,6 +707,7 @@ export function buildReviewPrompt({ task, workerResult = "", execution, appData 
     formatNotes(task).trim(),
     "OBLIGATIONS:",
     declarations,
+    formatChangesOfThisStep(ownChanges),
     workerResult ? `WORKER REPORT:\n${clampOutput(workerResult, 8000)}` : "WORKER REPORT: (none)",
     "",
     "End with exactly one decision line: `VERDICT: approve` or `VERDICT: issue`.",
@@ -747,6 +783,7 @@ export async function executeStep({
   inherit = "",
   attempt,
   limit,
+  priorChanges,
 } = {}) {
   if (!task) return { sessionId: "", ok: false, error: "executeStep: task is required" };
 
@@ -758,7 +795,7 @@ export async function executeStep({
   }
   let prompt;
   try {
-    prompt = buildStepPrompt({ task, board, cwd, alongside, execution, attempt, limit });
+    prompt = buildStepPrompt({ task, board, cwd, alongside, execution, attempt, limit, priorChanges });
   } catch (e) {
     return { sessionId: "", ok: false, error: `prompt: ${e && e.message ? e.message : e}` };
   }
@@ -901,6 +938,7 @@ export async function executeReview({
   env,
   bind = true,
   appData,
+  ownChanges,
 } = {}) {
   if (!task) return { approved: false, ok: false, error: "executeReview: task is required" };
   let execution;
@@ -908,7 +946,7 @@ export async function executeReview({
   catch (e) { return { approved: false, ok: false, error: `routing: ${e?.message || e}` }; }
   if (!execution.enabled || !execution.model)
     return { approved: true, ok: true, skipped: true, duty: "review", costUsd: 0, route: execution.route || null };
-  const prompt = buildReviewPrompt({ task, workerResult, execution, appData });
+  const prompt = buildReviewPrompt({ task, workerResult, execution, appData, ownChanges });
 
   if (execution.provider === "openai") {
     const { file, args } = providerArgv(execution, { bin: codexBin, sandbox: "read-only" });

@@ -8,6 +8,10 @@ import { fileURLToPath } from "node:url";
 import {
   gitHead,
   gitBase,
+  snapshotTree,
+  UNTRACKED_SNAPSHOT_LIMIT,
+  diffNameStatus,
+  computeNeighbourDamage,
   computeRevertSet,
   redTestsChanged,
   markerDir,
@@ -68,7 +72,7 @@ describe("red-gate — the mechanics", () => {
         id: "task-1",
         number: 1,
         red: "the-red-cmd",
-        red_base: base,
+        step_base: base,
         red_tests: ["test/regression.spec.js"],
         produces: ["src/fix.js", "bin/data.bin"],
       };
@@ -110,7 +114,7 @@ describe("red-gate — the mechanics", () => {
         id: "task-2",
         number: 2,
         red: "the-red-cmd",
-        red_base: base,
+        step_base: base,
         red_tests: ["test/regression.spec.js"],
         produces: ["src/fix.js"],
       };
@@ -141,7 +145,7 @@ describe("red-gate — the mechanics", () => {
         id: "task-3",
         number: 3,
         red: "the-red-cmd",
-        red_base: base,
+        step_base: base,
         red_tests: ["test/regression.spec.js"],
         produces: ["src/fix.js"],
       };
@@ -197,7 +201,7 @@ describe("red-gate — the mechanics", () => {
       const task = {
         id: "task-5",
         red: "the-red-cmd",
-        red_base: base,
+        step_base: base,
         red_tests: ["test/regression.spec.js"],
         produces: ["src/fix.js"],
       };
@@ -233,7 +237,7 @@ describe("red-gate — the mechanics", () => {
       const task = {
         id: "task-6",
         red: "the-red-cmd",
-        red_base: base,
+        step_base: base,
         red_tests: ["test/regression.spec.js"],
         produces: ["src/keep.js", "src/new.js", "src/removed.js"],
       };
@@ -289,7 +293,7 @@ describe("red-gate — crash recovery", () => {
       write(dir, "src/fix.js", "worker fixed it\n");
       write(dir, "test/regression.spec.js", "it('repros', () => {})\n");
 
-      const task = { id: "task-crash", red: "sleep-forever", red_base: base, red_tests: ["test/regression.spec.js"], produces: ["src/fix.js"] };
+      const task = { id: "task-crash", red: "sleep-forever", step_base: base, red_tests: ["test/regression.spec.js"], produces: ["src/fix.js"] };
       const appDataDir = appDataDirFor(dir);
       const child = spawn(
         process.execPath,
@@ -393,7 +397,7 @@ describe("gitBase and the revert set", () => {
         id: "task-snap",
         number: 7,
         red: "r",
-        red_base: snap.sha,
+        step_base: snap.sha,
         red_tests: ["test/r.test.js"],
         produces: ["src/a.js"],
       };
@@ -435,6 +439,125 @@ describe("gitBase and the revert set", () => {
       write(dir, "a.txt", "y\n");
       const task = { red_tests: [], produces: ["../outside.txt", "a.txt"] };
       expect(computeRevertSet(task, dir, base).map((f) => f.path)).toEqual(["a.txt"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("snapshotTree", () => {
+  it("includes an untracked file, excludes an ignored file, and leaves the real index/HEAD/status untouched", () => {
+    const dir = initRepo("cut-snapshot-");
+    try {
+      write(dir, ".gitignore", "ignored.txt\n");
+      write(dir, "tracked.txt", "base\n");
+      commitAll(dir, "base");
+      write(dir, "untracked.txt", "new\n");
+      write(dir, "ignored.txt", "should not appear\n");
+
+      const beforeStatus = git(dir, ["status", "--porcelain"]);
+      const beforeHead = git(dir, ["rev-parse", "HEAD"]).trim();
+
+      const snap = snapshotTree(dir);
+      expect(snap.ok).toBe(true);
+      expect(snap.sha).toBeTruthy();
+
+      const afterStatus = git(dir, ["status", "--porcelain"]);
+      const afterHead = git(dir, ["rev-parse", "HEAD"]).trim();
+      expect(afterStatus).toBe(beforeStatus);
+      expect(afterHead).toBe(beforeHead);
+
+      const files = git(dir, ["ls-tree", "-r", "--name-only", snap.sha]).trim().split(/\r?\n/);
+      expect(files).toContain("untracked.txt");
+      expect(files).not.toContain("ignored.txt");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps tracked files only when untracked files exceed the limit", () => {
+    const dir = initRepo("cut-snapshot-many-");
+    try {
+      write(dir, "tracked.txt", "base\n");
+      commitAll(dir, "base");
+      write(dir, "tracked.txt", "changed\n");
+      for (let i = 0; i <= UNTRACKED_SNAPSHOT_LIMIT; i += 1) write(dir, `out/f${i}.txt`, "x");
+
+      const snap = snapshotTree(dir);
+      expect(snap.ok).toBe(true);
+      const files = git(dir, ["ls-tree", "-r", "--name-only", snap.sha]).trim().split(/\r?\n/);
+      expect(files).toEqual(["tracked.txt"]);
+      expect(git(dir, ["show", `${snap.sha}:tracked.txt`])).toBe("changed\n");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("fails cleanly outside a git work tree", () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "cut-snapshot-nogit-"));
+    try {
+      const r = snapshotTree(dir);
+      expect(r.ok).toBe(false);
+      expect(r.error).toBeTruthy();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("computeNeighbourDamage", () => {
+  it("flags a path outside produces that an earlier step touched and this step reverted or deleted", () => {
+    const dir = initRepo("cut-damage-revert-");
+    try {
+      write(dir, "src/sum.mjs", "export const sum = (a, b) => a + b + 1;\n");
+      const head = commitAll(dir, "base");
+      write(dir, "src/sum.mjs", "export const sum = (a, b) => a + b;\n");
+      write(dir, "test/sum.regression.test.mjs", "it('sums', () => {})\n");
+      const stepBase = snapshotTree(dir).sha;
+      write(dir, "src/sum.mjs", "export const sum = (a, b) => a + b + 1;\n");
+      rmSync(path.join(dir, "test/sum.regression.test.mjs"));
+      write(dir, "src/greet.mjs", "export const greet = () => 'hi';\n");
+      const end = snapshotTree(dir).sha;
+
+      const result = computeNeighbourDamage({ cwd: dir, head, stepBase, end, produces: ["src/greet.mjs"] });
+      expect(result.ok).toBe(true);
+      const paths = result.damaged.map((d) => d.path).sort();
+      expect(paths).toEqual(["src/sum.mjs", "test/sum.regression.test.mjs"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not flag a step that only adds its own file", () => {
+    const dir = initRepo("cut-damage-ownadd-");
+    try {
+      write(dir, "src/a.js", "base\n");
+      const head = commitAll(dir, "base");
+      const stepBase = snapshotTree(dir).sha;
+      write(dir, "src/greet.mjs", "export const greet = () => 'hi';\n");
+      const end = snapshotTree(dir).sha;
+
+      const result = computeNeighbourDamage({ cwd: dir, head, stepBase, end, produces: ["src/greet.mjs"] });
+      expect(result.ok).toBe(true);
+      expect(result.damaged).toEqual([]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not flag a prior file the step modified when that path IS in its own produces", () => {
+    const dir = initRepo("cut-damage-produces-");
+    try {
+      write(dir, "src/sum.mjs", "v1\n");
+      const head = commitAll(dir, "base");
+      write(dir, "src/sum.mjs", "v2 from an earlier step\n");
+      const stepBase = snapshotTree(dir).sha;
+      write(dir, "src/sum.mjs", "v3 the fix\n");
+      const end = snapshotTree(dir).sha;
+
+      const result = computeNeighbourDamage({ cwd: dir, head, stepBase, end, produces: ["src/sum.mjs"] });
+      expect(result.ok).toBe(true);
+      expect(result.damaged).toEqual([]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

@@ -2651,7 +2651,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         std::fs::write(
             &path,
-            r#"{"version":3,"todos":[{"id":"a","subject":"step","status":"queue","ext":{"process":{"verify":"npm test","red":"npm run red","red_tests":["test/r.test.mjs"],"red_base":"abc123","risk":"high"}}}]}"#,
+            r#"{"version":3,"todos":[{"id":"a","subject":"step","status":"queue","ext":{"process":{"verify":"npm test","red":"npm run red","red_tests":["test/r.test.mjs"],"step_base":"abc123","risk":"high"}}}]}"#,
         )
         .unwrap();
 
@@ -2663,9 +2663,9 @@ mod tests {
         assert_eq!(process["verify"], "npm test");
         assert_eq!(process["red"], "npm run red");
         assert_eq!(process["red_tests"], serde_json::json!(["test/r.test.mjs"]));
-        assert_eq!(process["red_base"], "abc123");
+        assert_eq!(process["step_base"], "abc123");
         assert_eq!(process["risk"], "high");
-        for key in ["red", "red_tests", "red_base", "risk"] {
+        for key in ["red", "red_tests", "step_base", "risk"] {
             assert!(saved["todos"][0].get(key).is_none(), "{key} leaked to the top level");
         }
         let _ = std::fs::remove_file(&path);
@@ -2677,7 +2677,7 @@ mod tests {
         let mut stored = todo("a", "in_progress");
         stored.ext.insert(
             "process".to_string(),
-            serde_json::json!({ "red": "npm run red", "red_base": "abc123", "risk": "high" }),
+            serde_json::json!({ "red": "npm run red", "step_base": "abc123", "risk": "high" }),
         );
         file.todos.push(stored);
 
@@ -2689,7 +2689,7 @@ mod tests {
         upsert(&mut file, edited, "T2");
 
         let process = &file.todos[0].ext["process"];
-        assert_eq!(process["red_base"], "abc123");
+        assert_eq!(process["step_base"], "abc123");
         assert_eq!(process["red"], "npm run red");
         assert_eq!(process["risk"], "high");
     }
