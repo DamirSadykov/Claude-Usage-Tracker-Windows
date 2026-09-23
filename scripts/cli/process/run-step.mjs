@@ -436,16 +436,39 @@ function formatAwaiting(nodes) {
   return out;
 }
 
+function previousIssueComments(task) {
+  return (Array.isArray(task?.comments) ? task.comments : [])
+    .filter((c) => c && c.author === "review" && /^ISSUE attempt/.test(String(c.body || "")))
+    .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
+}
+
+function formatPreviousAttempt(task, attempt, limit) {
+  const comments = previousIssueComments(task).slice(-3);
+  const limitTxt = typeof limit === "number" ? `<=${limit}` : "(no declared limit)";
+  const body = comments.length
+    ? comments.map((c) => c.body.trim()).join("\n\n")
+    : "(the previous attempt ended as issue, but no findings were recorded on the board — re-check the declarations above against the working tree)";
+  return (
+    `\n── PREVIOUS ATTEMPT — this is attempt ${attempt} of ${limitTxt} ──\n` +
+    "The working tree still contains the previous attempt's changes. Fix them according to the\n" +
+    "findings below — do not start over, and do not work around a finding (no weakening a test,\n" +
+    "no raising a timeout to make it pass).\n\n" +
+    `${body}\n`
+  );
+}
+
 // Everything a step is told, and nothing more (§14.2): the WORK (this node's own
 // subject / description / plan), the VISION of the change it serves, the BATON
-// it inherits, the nodes WAITING on it, whatever runs ALONGSIDE it in the same
-// wave, the DECLARATIONS it must satisfy, and the boundary rules of a headless
-// step.
+// it inherits, the RECORD of where earlier steps left their own transcripts, the
+// PREVIOUS ATTEMPT's findings when this node is retrying itself, the nodes
+// WAITING on it, whatever runs ALONGSIDE it in the same wave, the DECLARATIONS
+// it must satisfy, and the boundary rules of a headless step.
 //
-// What is deliberately NOT here: the history of previous steps, the transcript
-// of an earlier attempt. Context crosses the seam as the baton or not at all —
-// that is the whole reason the seam exists (§13).
-export function buildStepPrompt({ task, board, cwd, alongside = [], execution } = {}) {
+// What is deliberately NOT here: the history of OTHER nodes' attempts, or this
+// node's own earlier transcript — only the ISSUE findings already written to
+// the board cross the seam that way. Context otherwise crosses as the baton or
+// not at all — that is the whole reason the seam exists (§13).
+export function buildStepPrompt({ task, board, cwd, alongside = [], execution, attempt, limit } = {}) {
   if (!task) throw new Error("buildStepPrompt: task is required");
   const all = Array.isArray(board?.todos) ? board.todos : [];
   const index = new Map(all.map((t) => [t.id, t]));
@@ -465,6 +488,8 @@ export function buildStepPrompt({ task, board, cwd, alongside = [], execution } 
   if (task.description && task.description.trim())
     out += "\n" + line("Description:", task.description);
   if (task.plan && task.plan.trim()) out += "\n" + line("Plan:", task.plan);
+
+  if (typeof attempt === "number" && attempt > 1) out += formatPreviousAttempt(task, attempt, limit);
 
   const vision = changeVision(task, all, Array.isArray(board?.changes) ? board.changes : []);
   out +=
@@ -687,6 +712,8 @@ export async function executeStep({
   // or "" for a cold start. The DECISION belongs to whoever spawns the step —
   // this function only carries it out (t#543).
   inherit = "",
+  attempt,
+  limit,
 } = {}) {
   if (!task) return { sessionId: "", ok: false, error: "executeStep: task is required" };
 
@@ -698,7 +725,7 @@ export async function executeStep({
   }
   let prompt;
   try {
-    prompt = buildStepPrompt({ task, board, cwd, alongside, execution });
+    prompt = buildStepPrompt({ task, board, cwd, alongside, execution, attempt, limit });
   } catch (e) {
     return { sessionId: "", ok: false, error: `prompt: ${e && e.message ? e.message : e}` };
   }

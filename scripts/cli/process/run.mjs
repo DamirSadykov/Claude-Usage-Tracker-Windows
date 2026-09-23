@@ -65,6 +65,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { readFileSync, appendFileSync, mkdirSync } from "node:fs";
 
 import {
@@ -190,6 +191,7 @@ export function simulationEffects() {
     reconcile: async () => ({ outcome: "ok", outcome_reason: "dry-run" }),
     setStatus: async () => {},
     recordHandoff: async () => ({ written: false }),
+    recordIssue: async () => ({ written: false }),
     stepCost: async ({ task }) =>
       typeof task.budget_usd === "number" ? task.budget_usd : null,
   };
@@ -274,6 +276,19 @@ export function liveEffects({ cwd } = {}) {
         written: r.code === 0,
         error: r.code === 0 ? "" : r.stderr.trim() || r.stdout.trim(),
       };
+    },
+    recordIssue: async ({ task, comment }) => {
+      const file = appDataFile("todos.json");
+      return withBoardLock(file, () => {
+        const data = loadBoardForWrite(file);
+        const todo = data.todos.find((t) => t && t.id === task.id);
+        if (!todo) return { written: false, error: `task ${task.id} not found on the board` };
+        if (!Array.isArray(todo.comments)) todo.comments = [];
+        todo.comments.push(comment);
+        todo.updated_at = comment.created_at;
+        saveBoard(file, data);
+        return { written: true };
+      });
     },
     // What a step really cost lives in the tracker's blocks (SQLite, Rust side),
     // but the headless run already reports its own total — `executeStep` returns
@@ -446,7 +461,7 @@ export function inheritFrom(ctx, task) {
   return own.length === 1 ? own[0] : "";
 }
 
-export function stepBrief(ctx, task, wave) {
+export function stepBrief(ctx, task, wave, { attempt, limit } = {}) {
   return {
     task,
     board: ctx.data,
@@ -454,6 +469,8 @@ export function stepBrief(ctx, task, wave) {
     timeoutMs: ctx.timeoutMs,
     alongside: wave.filter((t) => t !== task).map(brief),
     inherit: inheritFrom(ctx, task),
+    attempt,
+    limit,
   };
 }
 
@@ -471,7 +488,7 @@ export async function beginStep(ctx, task, wave = []) {
   ctx.attempts.set(task.id, attempt);
 
   await moveTo(ctx, task, "in_progress");
-  return { task, kind: "begin", attempt, limit, brief: stepBrief(ctx, task, wave) };
+  return { task, kind: "begin", attempt, limit, brief: stepBrief(ctx, task, wave, { attempt, limit }) };
 }
 
 // The baton the step wrote, put on the board before anything else reads it. A
@@ -488,6 +505,40 @@ async function recordWork(ctx, task, result) {
     cost = null;
   }
   return { baton, cost };
+}
+
+const clampChars = (s, max) => {
+  const t = String(s ?? "").trim();
+  return t.length <= max ? t : `${t.slice(0, max)}\n… [${t.length - max} chars elided] …`;
+};
+
+const tailLines = (s, n) => {
+  const t = String(s ?? "").trim();
+  const lines = t.split(/\r?\n/);
+  return lines.length <= n ? t : lines.slice(-n).join("\n");
+};
+
+async function recordIssueComment(ctx, task, { attempt, limit, source, text }) {
+  const marker = `ISSUE attempt ${attempt}/${limit === null ? "-" : limit}`;
+  const comment = {
+    id: randomUUID(),
+    author: "review",
+    body: `${marker}\n${source}\n${text}`.trim(),
+    created_at: new Date().toISOString(),
+  };
+  (task.comments ??= []).push(comment);
+  if (typeof ctx.effects.recordIssue === "function") {
+    let written;
+    try {
+      written = await ctx.effects.recordIssue({ task, comment });
+    } catch (e) {
+      written = { written: false, error: e && e.message ? e.message : String(e) };
+    }
+    if (written && written.written === false && written.error)
+      process.stderr.write(`run: ISSUE comment for #${task.number} not saved to the board — ${written.error}
+`);
+  }
+  return comment;
 }
 
 // Everything AFTER the executor and the reviewer have run: the review verdict,
@@ -515,6 +566,12 @@ export async function finishStep(ctx, task, { result, review, baton, cost }) {
   };
 
   if (review && review.skipped !== true && (review.ok === false || review.approved !== true)) {
+    await recordIssueComment(ctx, task, {
+      attempt,
+      limit,
+      source: review.model ? `review ${review.model}` : "review",
+      text: clampChars(review.result || review.error || "reviewer did not approve the obligations", 6000),
+    });
     return {
       ...base,
       kind: "issue",
@@ -529,7 +586,9 @@ export async function finishStep(ctx, task, { result, review, baton, cost }) {
     return { ...base, kind: "gate", reason: gateReason(task) };
   }
   if (result.ok === false) {
-    return { ...base, kind: "issue", reason: `step failed: ${result.error || "no error reported"}` };
+    const error = result.error || "no error reported";
+    await recordIssueComment(ctx, task, { attempt, limit, source: "executor", text: clampChars(error, 6000) });
+    return { ...base, kind: "issue", reason: `step failed: ${error}` };
   }
 
   const verdictRun = await ctx.effects.runVerify({
@@ -538,6 +597,10 @@ export async function finishStep(ctx, task, { result, review, baton, cost }) {
     timeoutMs: ctx.timeoutMs,
   });
   const verify = Number(verdictRun?.code) === 0 ? "ok" : "issue";
+  if (verify === "issue") {
+    const combined = [verdictRun?.stdout, verdictRun?.stderr].filter((s) => s && String(s).trim()).join("\n");
+    await recordIssueComment(ctx, task, { attempt, limit, source: "verify", text: tailLines(combined, 60) });
+  }
   const report = (await ctx.effects.reconcile({ task, verify })) || {};
   const outcome = report.outcome ?? null;
   const reason = report.outcome_reason || `verify:${verify}`;
@@ -553,7 +616,10 @@ export async function finishStep(ctx, task, { result, review, baton, cost }) {
       };
     return { ...base, kind: "done", verify, reason };
   }
-  if (outcome === "issue") return { ...base, kind: "issue", verify, reason };
+  if (outcome === "issue") {
+    if (verify === "ok") await recordIssueComment(ctx, task, { attempt, limit, source: "reconcile", text: clampChars(reason, 6000) });
+    return { ...base, kind: "issue", verify, reason };
+  }
   return { ...base, kind: "undecided", verify, reason };
 }
 
@@ -616,17 +682,22 @@ async function applyIssue(ctx, r) {
     park(ctx, "retry", task, `retry limit exhausted — ${r.attempt}/<=${limit}, predicate issue (${r.reason})`);
     return;
   }
-  const target = task.on_issue ? ctx.byId.get(task.on_issue) : null;
+  if (!task.on_issue) {
+    await moveTo(ctx, task, "queue");
+    ctx.transitions.push({
+      from: brief(task),
+      to: brief(task),
+      attempt: r.attempt,
+      limit,
+      reason: r.reason,
+      self: true,
+    });
+    return;
+  }
+  const target = ctx.byId.get(task.on_issue);
   if (!target) {
     await moveTo(ctx, task, "review");
-    park(
-      ctx,
-      "retry",
-      task,
-      task.on_issue
-        ? `outcome issue and the declared ?issue target ${task.on_issue} is not on the board`
-        : `outcome issue (${r.reason}) and no ?issue transition declared — there is nowhere to hand control`,
-    );
+    park(ctx, "retry", task, `outcome issue and the declared ?issue target ${task.on_issue} is not on the board`);
     return;
   }
   // Point return: the transition TARGET is reopened, the `done` nodes between it
@@ -995,6 +1066,8 @@ export function formatStop(stop) {
 }
 
 function formatTransitionLine(t) {
+  if (t.self)
+    return `  ?issue  #${t.from.number} retried in place — ${t.reason} (attempt ${t.attempt}/<=${t.limit}; no ?issue target declared, the node itself is requeued with the findings)\n`;
   return `  ?issue  #${t.from.number} → #${t.to.number} — ${t.reason} (attempt ${t.attempt}/<=${t.limit}; the target is reopened, closed nodes below it stay closed)\n`;
 }
 

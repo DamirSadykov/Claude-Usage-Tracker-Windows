@@ -326,6 +326,62 @@ describe("buildStepPrompt", () => {
   });
 });
 
+describe("buildStepPrompt · PREVIOUS ATTEMPT", () => {
+  it("says nothing about a previous attempt on the first attempt", () => {
+    const data = chain();
+    writeFileSync(boardFile(), JSON.stringify(data));
+    const prompt = buildStepPrompt({ task: taskOf(data, "id-3"), board: data, attempt: 1, limit: 2 });
+    expect(prompt).not.toContain("PREVIOUS ATTEMPT");
+  });
+
+  it("says nothing about a previous attempt when the caller does not report one", () => {
+    const data = chain();
+    writeFileSync(boardFile(), JSON.stringify(data));
+    const prompt = buildStepPrompt({ task: taskOf(data, "id-3"), board: data });
+    expect(prompt).not.toContain("PREVIOUS ATTEMPT");
+  });
+
+  it("carries the ISSUE findings and the fix-in-place instruction from attempt 2 on", () => {
+    const data = chain();
+    const t3 = taskOf(data, "id-3");
+    t3.comments = [
+      {
+        id: "c1",
+        author: "review",
+        body: "ISSUE attempt 1/2\nreview opus\nscope regression: touched files outside the promise",
+        created_at: "2026-09-01T00:00:00.000Z",
+      },
+    ];
+    writeFileSync(boardFile(), JSON.stringify(data));
+    const prompt = buildStepPrompt({ task: t3, board: data, attempt: 2, limit: 2 });
+    expect(prompt).toContain("PREVIOUS ATTEMPT");
+    expect(prompt).toContain("attempt 2 of <=2");
+    expect(prompt).toContain("scope regression: touched files outside the promise");
+    expect(prompt).toContain("do not start over");
+    expect(prompt).toContain("no weakening a test");
+  });
+
+  it("ignores non-review or non-ISSUE comments when assembling the findings", () => {
+    const data = chain();
+    const t3 = taskOf(data, "id-3");
+    t3.comments = [
+      { id: "c0", author: "user", body: "please hurry", created_at: "2026-08-31T00:00:00.000Z" },
+      { id: "c1", author: "review", body: "ISSUE attempt 1/2\nverify\n2 failing\nassertion failed", created_at: "2026-09-01T00:00:00.000Z" },
+    ];
+    writeFileSync(boardFile(), JSON.stringify(data));
+    const prompt = buildStepPrompt({ task: t3, board: data, attempt: 2, limit: 2 });
+    expect(prompt).not.toContain("please hurry");
+    expect(prompt).toContain("assertion failed");
+  });
+
+  it("says no ISSUE comment was found rather than inventing one", () => {
+    const data = chain();
+    writeFileSync(boardFile(), JSON.stringify(data));
+    const prompt = buildStepPrompt({ task: taskOf(data, "id-3"), board: data, attempt: 2, limit: 2 });
+    expect(prompt).toContain("no findings were recorded on the board");
+  });
+});
+
 describe("buildReviewPrompt", () => {
   const task = {
     number: 3,

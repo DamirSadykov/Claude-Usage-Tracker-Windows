@@ -44,6 +44,7 @@ import {
   formatRunHistory,
 } from "./run.mjs";
 import { isReadyNode, loadBoard } from "../board/todos.mjs";
+import { buildStepPrompt } from "./run-step.mjs";
 
 // ── fixtures ─────────────────────────────────────────────────────────────────
 const task = (number, extra = {}) => ({
@@ -471,6 +472,118 @@ describe("runChange — issue, transition and the retry limit", () => {
     expect(r.stop.reason).toMatch(/NO declared retry limit/);
     expect(statusOf(r, 2)).toBe("done");
     expect(statusOf(r, 3)).toBe("review");
+  });
+});
+
+describe("runChange — self-retry when a retry limit is declared but no on_issue is", () => {
+  it("requeues the node itself and runs it a second time, carrying the reviewer's findings forward", async () => {
+    const data = board(changeRoot(1, [2], { budget_usd: 10 }), auto(2, { retry_limit: 2 }));
+    const seen = [];
+    const h = harness({
+      executeStep: async (b) => {
+        seen.push(b);
+        return { sessionId: `s-2-${seen.length}`, ok: true, result: "implemented" };
+      },
+      reviewStep: async () => ({
+        approved: seen.length === 1 ? false : true,
+        ok: true,
+        model: "opus",
+        result: "scope regression: touched files outside the promise\nVERDICT: issue",
+      }),
+    });
+    const r = await go(data, "1", h.effects);
+
+    expect(seen).toHaveLength(2);
+    expect(seen[0].attempt).toBe(1);
+    expect(seen[0].limit).toBe(2);
+    expect(seen[1].attempt).toBe(2);
+    expect(seen[1].limit).toBe(2);
+    expect(r.complete).toBe(true);
+    expect(statusOf(r, 2)).toBe("done");
+    expect(r.transitions).toHaveLength(1);
+    expect(r.transitions[0].from.number).toBe(2);
+    expect(r.transitions[0].to.number).toBe(2);
+    expect(r.transitions[0].self).toBe(true);
+
+    const comment = (seen[1].task.comments || []).find(
+      (c) => c.author === "review" && c.body.startsWith("ISSUE attempt 1/2"),
+    );
+    expect(comment).toBeTruthy();
+    expect(comment.body).toContain("review opus");
+    expect(comment.body).toContain("scope regression: touched files outside the promise");
+
+    const prompt = buildStepPrompt({
+      task: seen[1].task,
+      board: seen[1].board,
+      alongside: seen[1].alongside,
+      attempt: seen[1].attempt,
+      limit: seen[1].limit,
+    });
+    expect(prompt).toContain("PREVIOUS ATTEMPT");
+    expect(prompt).toContain("scope regression: touched files outside the promise");
+  });
+
+  it("adds an ISSUE comment with the verify output tail when the declared check fails", async () => {
+    const data = board(changeRoot(1, [2], { budget_usd: 10 }), auto(2, { retry_limit: 1 }));
+    const h = harness({
+      runVerify: async () => ({
+        code: 1,
+        stdout: "running tests\n...\nFAIL something\n",
+        stderr: "assertion failed at line 12\n",
+      }),
+    });
+    const r = await go(data, "1", h.effects);
+
+    const t2 = r.board.todos.find((t) => t.number === 2);
+    const comment = (t2.comments || []).find(
+      (c) => c.author === "review" && c.body.startsWith("ISSUE attempt 1/1"),
+    );
+    expect(comment).toBeTruthy();
+    expect(comment.body).toContain("verify");
+    expect(comment.body).toContain("assertion failed at line 12");
+    expect(r.stop.kind).toBe("retry");
+    expect(statusOf(r, 2)).toBe("review");
+  });
+
+  it("adds an ISSUE comment with the executor error when the step itself fails", async () => {
+    const data = board(changeRoot(1, [2], { budget_usd: 10 }), auto(2, { retry_limit: 1 }));
+    const h = harness({
+      executeStep: async () => ({ sessionId: "s-2", ok: false, error: "codex exited 3: sandbox denied write" }),
+    });
+    const r = await go(data, "1", h.effects);
+
+    const t2 = r.board.todos.find((t) => t.number === 2);
+    const comment = (t2.comments || []).find((c) => c.author === "review" && c.body.startsWith("ISSUE attempt 1/1"));
+    expect(comment).toBeTruthy();
+    expect(comment.body).toContain("executor");
+    expect(comment.body).toContain("sandbox denied write");
+  });
+
+  it("adds an ISSUE comment with the reconcile reason when verify passes but the outcome is issue", async () => {
+    const data = board(changeRoot(1, [2], { budget_usd: 10 }), auto(2, { retry_limit: 1 }));
+    const h = harness({
+      reconcile: async () => ({ outcome: "issue", outcome_reason: "promised src/a.ts was never written" }),
+    });
+    const r = await go(data, "1", h.effects);
+
+    const t2 = r.board.todos.find((t) => t.number === 2);
+    const comment = (t2.comments || []).find((c) => c.author === "review" && c.body.startsWith("ISSUE attempt 1/1"));
+    expect(comment).toBeTruthy();
+    expect(comment.body).toContain("reconcile");
+    expect(comment.body).toContain("promised src/a.ts was never written");
+  });
+
+  it("never starts a third attempt when the retry limit is 2 and every attempt gets an issue", async () => {
+    const data = board(changeRoot(1, [2], { budget_usd: 10 }), auto(2, { retry_limit: 2 }));
+    const h = harness({
+      reviewStep: async () => ({ approved: false, ok: true, result: "still wrong\nVERDICT: issue" }),
+    });
+    const r = await go(data, "1", h.effects);
+
+    expect(h.calls.steps).toEqual([2, 2]);
+    expect(r.stop.kind).toBe("retry");
+    expect(r.stop.reason).toMatch(/retry limit exhausted/);
+    expect(statusOf(r, 2)).toBe("review");
   });
 });
 
