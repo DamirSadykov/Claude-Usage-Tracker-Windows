@@ -150,11 +150,16 @@ A step already `done` keeps its declarations: they are promises made before the
 work, and re-applying a partly finished plan leaves them alone rather than
 failing.
 
-A task that already carries a description keeps it too — the file's `why` is
-**not** written over it, and `apply` says so in its notes. That is the usual
-case for a step bound by `task: <N>` to older work: if the plan's reasoning is
-the one that should stand, re-apply with `--force`, otherwise the step runs on a
-description written for a different question.
+What happens to an existing description depends on the task's own status. On
+`backlog` or `queue` — nothing downstream has started yet — a `why` that
+disagrees with the description **replaces** it, and the old text is not lost:
+it is filed as a comment on the task (`Описание до плана «…»:` followed by the
+old text), so a step bound by `task: <N>` to a stale plan does not silently run
+on reasoning written for a different question, and nothing that was there
+before is thrown away either. Once a task is `in_progress` or in `review`, its
+description has become the record of what the work was actually understood to
+be while it ran, and `apply` leaves it alone, saying so in its notes; `--force`
+overwrites in either case, without filing a comment.
 
 ## 4. Worked example
 

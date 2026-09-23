@@ -370,8 +370,9 @@ describe("buildStepPrompt · PREVIOUS ATTEMPT", () => {
     ];
     writeFileSync(boardFile(), JSON.stringify(data));
     const prompt = buildStepPrompt({ task: t3, board: data, attempt: 2, limit: 2 });
-    expect(prompt).not.toContain("please hurry");
-    expect(prompt).toContain("assertion failed");
+    const attemptSection = prompt.split("PREVIOUS ATTEMPT")[1].split("\n── ")[0];
+    expect(attemptSection).not.toContain("please hurry");
+    expect(attemptSection).toContain("assertion failed");
   });
 
   it("says no ISSUE comment was found rather than inventing one", () => {
@@ -379,6 +380,61 @@ describe("buildStepPrompt · PREVIOUS ATTEMPT", () => {
     writeFileSync(boardFile(), JSON.stringify(data));
     const prompt = buildStepPrompt({ task: taskOf(data, "id-3"), board: data, attempt: 2, limit: 2 });
     expect(prompt).toContain("no findings were recorded on the board");
+  });
+});
+
+describe("buildStepPrompt · NOTES ON THIS TASK", () => {
+  it("omits the block when the task carries no comments", () => {
+    const data = chain();
+    writeFileSync(boardFile(), JSON.stringify(data));
+    const prompt = buildStepPrompt({ task: taskOf(data, "id-3"), board: data });
+    expect(prompt).not.toContain("NOTES ON THIS TASK");
+  });
+
+  it("carries non-ISSUE comments as notes recorded on the task", () => {
+    const data = chain();
+    const t3 = taskOf(data, "id-3");
+    t3.comments = [
+      { id: "c0", author: "user", body: "do NOT raise the test timeout", created_at: "2026-08-31T00:00:00.000Z" },
+      { id: "c1", author: "claude", body: "picked 400ms from the p95 in prod logs", created_at: "2026-09-01T00:00:00.000Z" },
+    ];
+    writeFileSync(boardFile(), JSON.stringify(data));
+    const prompt = buildStepPrompt({ task: t3, board: data });
+    expect(prompt).toContain("NOTES ON THIS TASK");
+    expect(prompt).toContain("do NOT raise the test timeout");
+    expect(prompt).toContain("picked 400ms from the p95 in prod logs");
+    expect(prompt).toContain("[user · 2026-08-31]");
+  });
+
+  it("excludes ISSUE comments from the notes block — they cross as PREVIOUS ATTEMPT instead", () => {
+    const data = chain();
+    const t3 = taskOf(data, "id-3");
+    t3.comments = [
+      { id: "c0", author: "user", body: "do NOT raise the test timeout", created_at: "2026-08-31T00:00:00.000Z" },
+      { id: "c1", author: "review", body: "ISSUE attempt 1/2\nverify\nfailing", created_at: "2026-09-01T00:00:00.000Z" },
+    ];
+    writeFileSync(boardFile(), JSON.stringify(data));
+    const prompt = buildStepPrompt({ task: t3, board: data });
+    const notesSection = prompt.split("NOTES ON THIS TASK")[1].split("\n── ")[0];
+    expect(notesSection).not.toContain("ISSUE attempt");
+  });
+
+  it("caps the notes to the last 8 and elides a long body", () => {
+    const data = chain();
+    const t3 = taskOf(data, "id-3");
+    t3.comments = Array.from({ length: 10 }, (_, i) => ({
+      id: `c${i}`,
+      author: "user",
+      body: i === 9 ? "x".repeat(2000) : `note ${i}`,
+      created_at: `2026-09-${String(i + 1).padStart(2, "0")}T00:00:00.000Z`,
+    }));
+    writeFileSync(boardFile(), JSON.stringify(data));
+    const prompt = buildStepPrompt({ task: t3, board: data });
+    expect(prompt).not.toContain("note 0");
+    expect(prompt).not.toContain("note 1");
+    expect(prompt).toContain("note 2");
+    expect(prompt).toContain("note 8");
+    expect(prompt).toContain("chars elided");
   });
 });
 
@@ -403,6 +459,18 @@ describe("buildReviewPrompt", () => {
     writeFileSync(path.join(appDir, "settings.json"), JSON.stringify({ specsEnabled: true }));
     const prompt = buildReviewPrompt({ task, appData: tmp });
     expect(prompt).toMatch(/spec: tasks#model/);
+  });
+
+  it("carries the task's notes so the reviewer checks the work against them too", () => {
+    const noted = {
+      ...task,
+      comments: [
+        { id: "c0", author: "user", body: "do NOT raise the test timeout", created_at: "2026-08-31T00:00:00.000Z" },
+      ],
+    };
+    const prompt = buildReviewPrompt({ task: noted, appData: tmp });
+    expect(prompt).toContain("NOTES ON THIS TASK");
+    expect(prompt).toContain("do NOT raise the test timeout");
   });
 });
 

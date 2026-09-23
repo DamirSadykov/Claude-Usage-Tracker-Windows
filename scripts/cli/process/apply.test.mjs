@@ -391,19 +391,23 @@ describe("a step may name the task it IS", () => {
     expect(board().todos).toHaveLength(1);
   });
 
-  // The skip itself is old and deliberate (a description is not overwritten);
-  // saying nothing about it is what let a plan's reasoning vanish into a task
-  // whose description framed the work weeks earlier.
-  it("says out loud that the file's `why` was not recorded over an existing description", () => {
+  // A still-open (backlog/queue) task no longer keeps a stale description —
+  // apply replaces it with the file's `why`, and the old text moves to a
+  // comment instead of being kept silently (t#739).
+  it("replaces a backlog task's description with the file's `why`, keeping the old one as a comment", () => {
     todos("add", "Уже есть", "--description", "Постановка трёхнедельной давности");
     const n = board().todos[0].number;
     const out = say(
       yaml("why.yaml", "steps:", "  1:", `    task: ${n}`, "    why: |", "      Новое обоснование шага", "    retry: 2"),
       "--go",
     );
-    expect(out).toMatch(/`why` for step "1" was NOT recorded/);
-    expect(board().todos[0].description).toBe("Постановка трёхнедельной давности");
-    expect(board().todos[0].retry_limit).toBe(2);
+    expect(out).toMatch(/description replaced for step "1"/);
+    const row = board().todos[0];
+    expect(row.description).toBe("Новое обоснование шага");
+    expect(row.retry_limit).toBe(2);
+    expect(row.comments).toHaveLength(1);
+    expect(row.comments[0].author).toBe("claude");
+    expect(row.comments[0].body).toContain("Постановка трёхнедельной давности");
   });
 
   it("records the why when the task carries no description of its own", () => {
@@ -420,6 +424,101 @@ describe("a step may name the task it IS", () => {
     expect(() =>
       say(yaml("twins.yaml", "steps:", "  1:", `    task: ${n}`, "  2:", `    task: #${n}`), "--go"),
     ).toThrow(/already bound to an earlier step/);
+  });
+});
+
+describe("apply and a stale description (t#739)", () => {
+  let dir;
+  const savedAppData = process.env.APPDATA;
+  const board = () => loadBoard(path.join(dir, "com.claude-usage-tracker.app", "todos.json"));
+  const todos = (...args) =>
+    execFileSync(process.execPath, [cli, "todos", ...args], {
+      encoding: "utf8",
+      env: { ...process.env, APPDATA: dir },
+      windowsHide: true,
+    });
+  const say = (...args) => todos("apply", ...args);
+  const yaml = (name, ...lines) => {
+    const p = path.join(dir, name);
+    writeFileSync(p, lines.join("\n"));
+    return p;
+  };
+
+  beforeEach(() => {
+    dir = mkdtempSync(path.join(os.tmpdir(), "cut-stale-desc-"));
+    mkdirSync(path.join(dir, "com.claude-usage-tracker.app"), { recursive: true });
+  });
+  afterEach(() => {
+    if (savedAppData === undefined) delete process.env.APPDATA;
+    else process.env.APPDATA = savedAppData;
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("keeps the description on an in_progress task and only notes it, unchanged from before", () => {
+    todos("add", "В работе", "--description", "Постановка трёхнедельной давности");
+    const n = board().todos[0].number;
+    todos("set", "status", String(n), "in_progress");
+    const out = say(
+      yaml("wip.yaml", "steps:", "  1:", `    task: ${n}`, "    why: |", "      Новое обоснование шага"),
+      "--go",
+    );
+    expect(out).toMatch(/`why` for step "1" was NOT recorded/);
+    const row = board().todos[0];
+    expect(row.description).toBe("Постановка трёхнедельной давности");
+    expect(row.comments || []).toHaveLength(0);
+  });
+
+  it("does nothing when the file's why already matches the description", () => {
+    todos("add", "Совпадает", "--description", "Одно и то же обоснование");
+    const n = board().todos[0].number;
+    const out = say(
+      yaml("same.yaml", "steps:", "  1:", `    task: ${n}`, "    why: |", "      Одно и то же обоснование"),
+      "--go",
+    );
+    expect(out).not.toMatch(/replace description/);
+    expect(out).not.toMatch(/NOT recorded/);
+    const row = board().todos[0];
+    expect(row.description).toBe("Одно и то же обоснование");
+    expect(row.comments || []).toHaveLength(0);
+  });
+
+  it("re-applying the same plan twice replaces the description once and adds one comment only", () => {
+    todos("add", "Повтор", "--description", "Постановка трёхнедельной давности");
+    const n = board().todos[0].number;
+    const file = yaml("rep.yaml", "steps:", "  1:", `    task: ${n}`, "    why: |", "      Новое обоснование шага");
+    const first = say(file, "--go");
+    const second = say(file, "--go");
+    expect(first).toMatch(/description replaced for step "1"/);
+    expect(second).not.toMatch(/description replaced for step "1"/);
+    const row = board().todos[0];
+    expect(row.description).toBe("Новое обоснование шага");
+    expect(row.comments).toHaveLength(1);
+  });
+
+  it("shows the planned replacement in a dry run without writing anything", () => {
+    todos("add", "Черновик", "--description", "Постановка трёхнедельной давности");
+    const n = board().todos[0].number;
+    const out = say(
+      yaml("dry.yaml", "steps:", "  1:", `    task: ${n}`, "    why: |", "      Новое обоснование шага"),
+    );
+    expect(out).toMatch(/replace description \(old kept as comment\)/);
+    const row = board().todos[0];
+    expect(row.description).toBe("Постановка трёхнедельной давности");
+    expect(row.comments || []).toHaveLength(0);
+  });
+
+  it("--force overwrites the description without recording a comment", () => {
+    todos("add", "Форс", "--description", "Постановка трёхнедельной давности");
+    const n = board().todos[0].number;
+    const out = say(
+      yaml("force.yaml", "steps:", "  1:", `    task: ${n}`, "    why: |", "      Новое обоснование шага"),
+      "--go",
+      "--force",
+    );
+    expect(out).not.toMatch(/replace description/);
+    const row = board().todos[0];
+    expect(row.description).toBe("Новое обоснование шага");
+    expect(row.comments || []).toHaveLength(0);
   });
 });
 

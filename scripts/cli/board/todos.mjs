@@ -1256,6 +1256,15 @@ const COMMENT_USAGE =
   'usage: cli todos comment add <id> --text "<body>" [--by claude|user]\n' +
   "       cli todos comment list <id> [--json]";
 
+export function addComment(todo, { author = "claude", body } = {}) {
+  if (!Array.isArray(todo.comments)) todo.comments = [];
+  const now = new Date().toISOString();
+  const comment = { id: randomUUID(), author, body: String(body ?? ""), created_at: now };
+  todo.comments.push(comment);
+  todo.updated_at = now;
+  return comment;
+}
+
 // Append or list comments on a todo. Mirrors the Comment shape in todos.rs /
 // TodoWindow.vue: { id, author, body, created_at }. The thread is shared with
 // the tracker UI (the user posts there as "user"); this CLI is Claude's path, so
@@ -1272,11 +1281,7 @@ function cmdComment(args) {
     const data = loadBoardForWrite(file);
     const todo = resolveTask(data, id); // id | N | #N, as the help promises
     if (!todo) fail(`no todo with id ${id}`);
-    if (!Array.isArray(todo.comments)) todo.comments = [];
-    const now = new Date().toISOString();
-    const comment = { id: randomUUID(), author, body, created_at: now };
-    todo.comments.push(comment);
-    todo.updated_at = now;
+    const comment = addComment(todo, { author, body });
     save(file, data);
     process.stdout.write(
       `ok: comment ${comment.id} on ${todo.number != null ? `#${todo.number}` : todo.id} by ${author}\n`,

@@ -44,6 +44,7 @@ import {
   newTodo,
   addDepEdge,
   addProduces,
+  addComment,
   setField,
   resolveTask,
   normalizeLimit,
@@ -308,6 +309,14 @@ function matchExisting(data, doc, project) {
   return { record, byStep, adopted, renamed };
 }
 
+function staleDescription(existing, why, force) {
+  if (!existing || force || isDone(existing)) return false;
+  const oldText = String(existing.description || "").trim();
+  const newText = String(why || "").trim();
+  if (!oldText || !newText || sameSubject(oldText, newText)) return false;
+  return existing.status === "backlog" || existing.status === "queue";
+}
+
 const clipLine = (text, max = 60) => {
   const one = String(text).replace(/\s+/g, " ").trim();
   return one.length > max ? one.slice(0, max - 1) + "…" : one;
@@ -384,6 +393,7 @@ export function applyDocument(doc, { go = false, force = false, project, board }
       adopted.has(hit.id) ? "adopted into the change" : "",
       renamed.has(hit.id) ? "title differs from the board — the task keeps its own" : "",
       isDone(hit) ? "closed — declarations left as they are" : "",
+      staleDescription(hit, s.why, force) ? "replace description (old kept as comment)" : "",
     ].filter(Boolean);
     say(`= step ${s.id}  ${fmtTask(hit)}${marks.length ? `  (${marks.join("; ")})` : ""}`);
   }
@@ -512,15 +522,25 @@ export function applyDocument(doc, { go = false, force = false, project, board }
             `ok: #${t.number} produces ${t.produces.join(", ")} (${t.produces.length} declared)`,
           );
         // The reasoning lands in `description`, the field that already holds WHAT &
-        // WHY — and only while it is empty, exactly as the vision of a change root.
-        // Kept quiet, the skip is invisible in the worst case there is: a step
-        // bound by `task: N` to an older task, whose description then frames the
-        // work as it was understood weeks ago and not as this plan reasoned it.
-        if (s.why && (force || !String(t.description || "").trim())) set(t, "description", s.why);
-        else if (s.why && !sameSubject(t.description || "", s.why))
+        // WHY — always while it is empty; on backlog/queue a differing `why` also
+        // replaces it (staleDescription above), old text moved to a comment. Once
+        // work is under way (in_progress, review) the old skip holds instead.
+        if (s.why && (force || !String(t.description || "").trim())) {
+          set(t, "description", s.why);
+        } else if (s.why && staleDescription(t, s.why, force)) {
+          addComment(t, {
+            author: "claude",
+            body: `Описание до плана «${doc.change || (change ? changeAddress(change) : `t#${t.number}`)}»:\n${t.description}`,
+          });
+          set(t, "description", s.why);
+          notes.push(
+            `ok: #${t.number} description replaced for step "${s.id}" — the old one is kept as a comment`,
+          );
+        } else if (s.why && !sameSubject(t.description || "", s.why)) {
           notes.push(
             `keep: #${t.number} already carries a description — the file's \`why\` for step "${s.id}" was NOT recorded (--force overwrites)`,
           );
+        }
         if (s.priority) set(t, "priority", s.priority);
         if (s.verify) set(t, "verify", s.verify);
         if (s.retry) set(t, "retry", s.retry);

@@ -436,10 +436,39 @@ function formatAwaiting(nodes) {
   return out;
 }
 
+function isIssueComment(c) {
+  return !!c && c.author === "review" && /^ISSUE attempt/.test(String(c.body || ""));
+}
+
 function previousIssueComments(task) {
   return (Array.isArray(task?.comments) ? task.comments : [])
-    .filter((c) => c && c.author === "review" && /^ISSUE attempt/.test(String(c.body || "")))
+    .filter(isIssueComment)
     .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
+}
+
+const NOTE_BODY_MAX = 1500;
+const NOTES_LIMIT = 8;
+
+function taskNotes(task) {
+  return (Array.isArray(task?.comments) ? task.comments : [])
+    .filter((c) => c && !isIssueComment(c))
+    .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
+}
+
+function formatNotes(task) {
+  const notes = taskNotes(task).slice(-NOTES_LIMIT);
+  if (!notes.length) return "";
+  const body = notes
+    .map((c) => {
+      const date = String(c.created_at || "").slice(0, 10);
+      return `[${c.author} · ${date}] ${clampOutput(String(c.body || "").trim(), NOTE_BODY_MAX)}`;
+    })
+    .join("\n\n");
+  return (
+    "\n── NOTES ON THIS TASK ──\n" +
+    "Notes recorded on this task by people and sessions — read them as part of the task.\n\n" +
+    `${body}\n`
+  );
 }
 
 function formatPreviousAttempt(task, attempt, limit) {
@@ -458,11 +487,12 @@ function formatPreviousAttempt(task, attempt, limit) {
 }
 
 // Everything a step is told, and nothing more (§14.2): the WORK (this node's own
-// subject / description / plan), the VISION of the change it serves, the BATON
-// it inherits, the RECORD of where earlier steps left their own transcripts, the
-// PREVIOUS ATTEMPT's findings when this node is retrying itself, the nodes
-// WAITING on it, whatever runs ALONGSIDE it in the same wave, the DECLARATIONS
-// it must satisfy, and the boundary rules of a headless step.
+// subject / description / plan), the NOTES already recorded on its comment
+// thread, the VISION of the change it serves, the BATON it inherits, the RECORD
+// of where earlier steps left their own transcripts, the PREVIOUS ATTEMPT's
+// findings when this node is retrying itself, the nodes WAITING on it, whatever
+// runs ALONGSIDE it in the same wave, the DECLARATIONS it must satisfy, and the
+// boundary rules of a headless step.
 //
 // What is deliberately NOT here: the history of OTHER nodes' attempts, or this
 // node's own earlier transcript — only the ISSUE findings already written to
@@ -488,6 +518,8 @@ export function buildStepPrompt({ task, board, cwd, alongside = [], execution, a
   if (task.description && task.description.trim())
     out += "\n" + line("Description:", task.description);
   if (task.plan && task.plan.trim()) out += "\n" + line("Plan:", task.plan);
+
+  out += formatNotes(task);
 
   if (typeof attempt === "number" && attempt > 1) out += formatPreviousAttempt(task, attempt, limit);
 
@@ -637,6 +669,7 @@ export function buildReviewPrompt({ task, workerResult = "", execution, appData 
     `TASK: t#${task?.number ?? "?"} ${task?.subject || ""}`,
     task?.description ? `DESCRIPTION: ${task.description}` : "",
     task?.plan ? `PLAN: ${task.plan}` : "",
+    formatNotes(task).trim(),
     "OBLIGATIONS:",
     declarations,
     workerResult ? `WORKER REPORT:\n${clampOutput(workerResult, 8000)}` : "WORKER REPORT: (none)",
