@@ -267,3 +267,30 @@ describe("matrix row: corrupt/*.json — CLI v3 writer", () => {
     expect(reread.todos[0].number).toBe("42");
   });
 });
+
+describe("runner process fields — CLI v3 writer", () => {
+  it("red, red_tests, red_base and risk read as fields and are written back under ext.process only", () => {
+    const process = {
+      verify: "npm test",
+      red: "npm run red",
+      red_tests: ["test/r.test.mjs"],
+      red_base: "abc123",
+      risk: "high",
+    };
+    writeFileSync(
+      file,
+      JSON.stringify({ version: 3, todos: [{ id: "a", subject: "step", status: "queue", ext: { process } }] }),
+    );
+    const data = loadBoard(file);
+    expect(data.todos[0].red).toBe("npm run red");
+    expect(data.todos[0].red_tests).toEqual(["test/r.test.mjs"]);
+    expect(data.todos[0].red_base).toBe("abc123");
+    expect(data.todos[0].risk).toBe("high");
+
+    data.todos[0].red_base = "def456";
+    saveBoard(file, data);
+    const reread = JSON.parse(readFileSync(file, "utf8"));
+    expect(reread.todos[0].ext.process).toEqual({ ...process, red_base: "def456" });
+    for (const key of ["red", "red_tests", "red_base", "risk"]) expect(reread.todos[0]).not.toHaveProperty(key);
+  });
+});
