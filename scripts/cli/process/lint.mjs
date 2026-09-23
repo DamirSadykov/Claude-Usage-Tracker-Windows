@@ -52,6 +52,7 @@ const boardNode = (t) => ({
   kind: t.kind === "auto" ? "auto" : "",
   red: String(t.red || "").trim(),
   redTests: (Array.isArray(t.red_tests) ? t.red_tests : []).filter(Boolean),
+  risk: String(t.risk || "").trim(),
   closed: isDone(t),
   outcome: String(t.outcome || "").trim(),
 });

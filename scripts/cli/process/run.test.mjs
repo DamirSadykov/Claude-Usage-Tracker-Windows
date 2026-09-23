@@ -1599,6 +1599,63 @@ describe("equivalence — a --next/--report pair walks a graph to --go's own end
   });
 });
 
+// ── risk routing (t#741) ────────────────────────────────────────────────────
+
+describe("risk routing through the run record", () => {
+  it("carries the effective provider/model and the route note into the step record", async () => {
+    const data = board(
+      changeRoot(1, [2], { budget_usd: 10 }),
+      auto(2, { risk: "high" }),
+    );
+    const h = harness({
+      executeStep: async ({ task: t }) => ({
+        sessionId: `s-${t.number}`, ok: true,
+        provider: "openai", model: "gpt-5.6-terra",
+        route: { applied: true, risk: "high", note: "risk high routed worker to openai/gpt-5.6-terra" },
+      }),
+    });
+    const r = await go(data, "1", h.effects);
+
+    expect(r.steps[0]).toMatchObject({
+      provider: "openai", model: "gpt-5.6-terra",
+      route: { applied: true, risk: "high" },
+    });
+    const rec = runRecordOf(r);
+    expect(rec.steps[0]).toMatchObject({
+      provider: "openai", model: "gpt-5.6-terra",
+      route: { applied: true, risk: "high" },
+    });
+  });
+
+  it("mentions the route in the printed step line when risk is high, whether applied or not", async () => {
+    const data = board(
+      changeRoot(1, [2], { budget_usd: 10 }),
+      auto(2, { risk: "high" }),
+    );
+    const lines = [];
+    const h = harness({
+      executeStep: async ({ task: t }) => ({
+        sessionId: `s-${t.number}`, ok: true,
+        provider: "anthropic", model: "opus",
+        route: { applied: false, risk: "high", note: "risk high, no route configured for worker" },
+      }),
+    });
+    await go(data, "1", h.effects, { log: (l) => lines.push(l) });
+
+    expect(lines.join("")).toMatch(/no route configured for worker/);
+  });
+
+  it("leaves the step record without a route when the task carries no risk", async () => {
+    const data = board(changeRoot(1, [2], { budget_usd: 10 }), auto(2));
+    const h = harness({
+      executeStep: async ({ task: t }) => ({ sessionId: `s-${t.number}`, ok: true, provider: "anthropic", model: "sonnet" }),
+    });
+    const r = await go(data, "1", h.effects);
+
+    expect(r.steps[0].route).toBeNull();
+  });
+});
+
 // ── the journal ──────────────────────────────────────────────────────────────
 
 // t#543/t#87: a run used to print its cost and forget it, which is why the

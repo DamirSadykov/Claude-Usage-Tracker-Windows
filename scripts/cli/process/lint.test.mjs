@@ -144,6 +144,13 @@ describe("todos lint checks the recorded graph", () => {
     expect(out).toMatch(/#1: red declared on a manual node — a gate never runs it/);
   });
 
+  it("errors on a risk other than high, and stays quiet on high", () => {
+    board(task(1, { risk: "medium" }));
+    expect(lint().out).toMatch(/#1: invalid risk "medium" — the only accepted value is "high"/);
+    board(task(1, { risk: "high" }));
+    expect(lint().out).toMatch(/nothing violates/);
+  });
+
   it("warns that a change with no budget cannot be run unattended, and stays quiet once it has one", () => {
     board(task(1, { change: true, depends_on: ["t2"] }), task(2));
     expect(lint().out).toMatch(/change #1 "узел 1": no budget declared on the group/);

@@ -28,6 +28,7 @@
 //       budget: 2
 //       red: <cmd>               # MUST fail on the base commit — proves red-tests catches the bug
 //       red-tests: [path, ...]   # the regression test file(s) red is proved against
+//       risk: high               # routes worker/review to agents.json's routes.high, when configured
 //
 // Nothing here writes to the board directly: every task, edge and declaration
 // goes through todos.mjs (newTodo / addDepEdge / addProduces / setField), so a
@@ -64,7 +65,8 @@ const USAGE =
   "       --dry-run is the DEFAULT (prints what would change); --go writes.\n" +
   "       --force overwrites a vision/plan that is already there.\n" +
   "keys:  change, vision, plan, parallel, budget, steps{<id>: {title, needs,\n" +
-  "       produces, verify, retry, on-issue, kind, budget, red, red-tests, why, priority}}";
+  "       produces, verify, retry, on-issue, kind, budget, red, red-tests, risk,\n" +
+  "       why, priority}}";
 
 function fail(msg) {
   process.stderr.write(msg + "\n");
@@ -104,6 +106,7 @@ export const DSL_STEP_FIELDS = [
   "budget",
   "red",
   "red-tests",
+  "risk",
 ];
 
 // `why` is the step's reasoning — what it rests on, where its risk shows. It is
@@ -165,6 +168,7 @@ function readSteps(raw) {
       budget: body.budget == null ? "" : String(body.budget).trim(),
       red: body.red == null ? "" : String(body.red).trim(),
       redTests: asList(body["red-tests"] ?? body.red_tests),
+      risk: body.risk == null ? "" : String(body.risk).trim().toLowerCase(),
       priority: body.priority == null ? "" : String(body.priority).trim(),
       unknown: Object.keys(body).filter(
         (k) =>
@@ -224,6 +228,7 @@ function documentGraph(doc, onBoard) {
       kind: s.kind,
       red: s.red,
       redTests: s.redTests,
+      risk: s.risk,
       closed: false,
       outcome: "",
     })),
@@ -414,6 +419,7 @@ export function applyDocument(doc, { go = false, force = false, project, board }
     if (s.budget) say(`  budget ${s.id}  $${s.budget}`);
     if (s.red) say(`  red    ${s.id}  ${s.red}`);
     if (s.redTests.length) say(`  red-tests ${s.id}  ${s.redTests.join(", ")}`);
+    if (s.risk) say(`  risk   ${s.id}  ${s.risk}`);
     if (s.why) say(`  why    ${s.id}  ${clipLine(s.why)}`);
     if (s.priority) say(`  prio   ${s.id}  ${s.priority}`);
     if (s.onIssue) say(`  ?issue ${s.id} -> ${s.onIssue}  (run layer, not a dep)`);
@@ -522,7 +528,7 @@ export function applyDocument(doc, { go = false, force = false, project, board }
         // the rest of the pass. The closed node keeps what it has; only its edges,
         // which are the graph and not a promise, are still written.
         if (isDone(t)) {
-          if (s.produces.length || s.verify || s.retry || s.kind || s.budget || s.why || s.red || s.redTests.length)
+          if (s.produces.length || s.verify || s.retry || s.kind || s.budget || s.why || s.red || s.redTests.length || s.risk)
             notes.push(`keep: #${t.number} is done — its declarations were left as they are`);
           continue;
         }
@@ -558,6 +564,7 @@ export function applyDocument(doc, { go = false, force = false, project, board }
         if (s.budget) set(t, "budget", s.budget);
         if (s.red) set(t, "red", s.red);
         if (s.redTests.length) set(t, "red-tests", s.redTests.join(","));
+        if (s.risk) set(t, "risk", s.risk);
       }
       if (change) {
         if (doc.parallel) change.parallel_limit = Number(doc.parallel);

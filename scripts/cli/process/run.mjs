@@ -410,6 +410,10 @@ export function runRecordOf(report, { inherit = false } = {}) {
       requested_mode: s.requested_mode || null,
       start_mode: s.start_mode || "unknown",
       parent_session: s.parent_session || null,
+      provider: s.provider || null,
+      model: s.model || null,
+      route: s.route || null,
+      review: s.review || null,
       reason: s.reason || null,
     })),
     spend: report.spend || null,
@@ -441,6 +445,10 @@ export function reportRecordOf(report) {
         requested_mode: s.requested_mode || null,
         start_mode: s.start_mode || "unknown",
         parent_session: s.parent_session || null,
+        provider: s.provider || null,
+        model: s.model || null,
+        route: s.route || null,
+        review: s.review || null,
         reason: s.reason || null,
       },
     ],
@@ -625,11 +633,16 @@ export async function finishStep(ctx, task, { result, review, baton, cost }) {
     requestedMode: result.requestedMode || null,
     startMode: result.startMode || "unknown",
     parentSession: result.parentSession || null,
+    provider: result.provider || null,
+    model: result.model || null,
+    route: result.route || null,
     review: review ? {
       skipped: !!review.skipped,
       approved: !!review.approved,
+      provider: review.provider || null,
       model: review.model || null,
       session: review.sessionId || null,
+      route: review.route || null,
     } : null,
   };
 
@@ -922,6 +935,9 @@ export async function applyResult(ctx, r, { dry, log }) {
     requested_mode: r.requestedMode || null,
     start_mode: r.startMode || "unknown",
     parent_session: r.parentSession || null,
+    provider: r.provider || null,
+    model: r.model || null,
+    route: r.route || null,
     cost_usd: r.cost,
     baton: r.baton ?? null,
     review: r.review ?? null,
@@ -1143,7 +1159,8 @@ function formatStepLine(s, dry) {
       : s.baton === "refused"
         ? " · baton REFUSED by the board"
         : " · NO baton — it wrote no ## HANDOFF";
-  return `  wave ${s.wave}  #${s.task.number} ${s.task.subject} — ${verb}${attempt}${cost}${baton}\n`;
+  const route = s.route ? ` · ${s.route.note}` : "";
+  return `  wave ${s.wave}  #${s.task.number} ${s.task.subject} — ${verb}${attempt}${cost}${baton}${route}\n`;
 }
 
 // All four stops print the SAME shape: the node, the reason, "pipeline parked",

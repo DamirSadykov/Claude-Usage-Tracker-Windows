@@ -160,6 +160,17 @@ describe("apply refuses an invalid graph", () => {
     expect(errors).toEqual([]);
     expect(warnings.join(" ")).toMatch(/red declared on a manual node — a gate never runs it/);
   });
+
+  it("refuses a risk other than high", () => {
+    const { errors } = check(["steps:", "  1:", "    title: A", "    risk: medium"].join("\n"));
+    expect(errors.join(" ")).toMatch(/invalid risk "medium" — the only accepted value is "high"/);
+  });
+
+  it("takes risk: high without complaint", () => {
+    const { errors, warnings } = check(["steps:", "  1:", "    title: A", "    risk: high"].join("\n"));
+    expect(errors).toEqual([]);
+    expect(warnings).toEqual([]);
+  });
 });
 
 describe("apply records the graph", () => {
@@ -188,6 +199,7 @@ describe("apply records the graph", () => {
     "    kind: auto",
     "    red: npm run test:red",
     "    red-tests: [tests/apply.red.spec.js]",
+    "    risk: high",
     "  2:",
     "    title: Пишу тесты",
     "    needs: [1]",
@@ -258,6 +270,7 @@ describe("apply records the graph", () => {
     expect(one.kind).toBe("auto");
     expect(one.red).toBe("npm run test:red");
     expect(one.red_tests).toEqual(["tests/apply.red.spec.js"]);
+    expect(one.risk).toBe("high");
 
     expect(two.depends_on).toContain(one.id);
     expect(three.depends_on).toContain(two.id);

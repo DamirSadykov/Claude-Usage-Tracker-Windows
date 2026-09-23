@@ -91,6 +91,14 @@ function normalizeKind(v) {
   return undefined;
 }
 
+function normalizeRisk(v) {
+  if (v == null) return undefined;
+  const s = String(v).trim().toLowerCase();
+  if (s === "high") return "high";
+  if (s === "none" || s === "clear" || s === "") return "";
+  return undefined;
+}
+
 // Normalize a --priority / set-priority value to a real bucket or "" (unset).
 // "none"/"clear"/"" explicitly clear it. Returns undefined for anything invalid,
 // so the caller can fail with a helpful message instead of writing garbage.
@@ -418,6 +426,16 @@ function setKind({ data, file, todo, value }) {
   todo.updated_at = new Date().toISOString();
   save(file, data);
   process.stdout.write(`ok: #${todo.number} kind -> ${kind || "manual"}\n`);
+}
+
+function setRisk({ data, file, todo, value }) {
+  const risk = normalizeRisk(value);
+  if (risk === undefined) fail(`invalid risk "${value}". valid: high | none`);
+  if (risk) todo.risk = risk;
+  else delete todo.risk;
+  todo.updated_at = new Date().toISOString();
+  save(file, data);
+  process.stdout.write(risk ? `ok: #${todo.number} risk -> ${risk}\n` : `ok: #${todo.number} risk cleared\n`);
 }
 
 // Put a todo INTO a change, or take it out (c#9, formerly the root-task marker
@@ -942,6 +960,11 @@ const SET_FIELDS = {
     values: "auto | manual   (auto with no verify runs as a gate)",
     declaration: true,
     set: setKind,
+  },
+  risk: {
+    values: "high | none   (routes worker/review to agents.json's routes.high, when configured)",
+    declaration: true,
+    set: setRisk,
   },
   change: {
     values: "<c#N> | none   (a change is a record: cli change list --all)",
@@ -2051,6 +2074,7 @@ export function formatDeclarations(t, byId, { ready = false } = {}) {
   if (t.red && String(t.red).trim()) parts.push(`red: ${String(t.red).trim()}`);
   const redTests = (Array.isArray(t.red_tests) ? t.red_tests : []).filter(Boolean);
   if (redTests.length) parts.push(`red-tests: ${redTests.join(", ")}`);
+  if (t.risk && String(t.risk).trim()) parts.push(`risk: ${String(t.risk).trim()}`);
   let out = `  ${ready ? "▸" : " "} #${t.number} [${col(t.status)}] ${t.subject} — ${parts.join(" · ")}\n`;
   if (t.kind === "auto" && !hasVerify(t)) {
     out += `      ⚠ auto without verify — runs as a GATE: todos set verify ${t.number} "<cmd>"\n`;
@@ -2071,7 +2095,8 @@ function hasDeclarations(t) {
     typeof t.parallel_limit === "number" ||
     t.on_issue ||
     (t.red && String(t.red).trim()) ||
-    (Array.isArray(t.red_tests) && t.red_tests.filter(Boolean).length)
+    (Array.isArray(t.red_tests) && t.red_tests.filter(Boolean).length) ||
+    (t.risk && String(t.risk).trim())
   );
 }
 

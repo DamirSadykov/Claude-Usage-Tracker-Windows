@@ -758,6 +758,94 @@ describe("executeReview", () => {
   });
 });
 
+describe("executeStep/executeReview · risk routing (t#741)", () => {
+  it("executeStep routes the worker to the configured pair when the task's risk is high", async () => {
+    const data = chain();
+    writeFileSync(boardFile(), JSON.stringify(data));
+    saveAgentConfig({
+      version: 4,
+      duties: { worker: { mode: "always", provider: "anthropic", model: "sonnet", role: "worker" } },
+      routes: { high: { worker: { provider: "openai", model: "gpt-5.6-terra" } } },
+    });
+    const t = taskOf(data, "id-3");
+    t.risk = "high";
+    const echo = path.join(tmp, "route-worker-echo.json");
+    process.env.FAKE_ECHO = echo;
+    const r = await executeStep({ task: t, board: data, cwd: tmp, codexBin: [process.execPath, fakeCodex] });
+    expect(r).toMatchObject({
+      ok: true, provider: "openai", model: "gpt-5.6-terra",
+      route: { applied: true, risk: "high" },
+    });
+    const seen = JSON.parse(readFileSync(echo, "utf8"));
+    expect(seen.argv[seen.argv.indexOf("--model") + 1]).toBe("gpt-5.6-terra");
+  });
+
+  it("executeStep falls back to the duty profile with a note when risk is high but no route is configured", async () => {
+    const data = chain();
+    writeFileSync(boardFile(), JSON.stringify(data));
+    saveAgentConfig({
+      version: 4,
+      duties: { worker: { mode: "always", provider: "anthropic", model: "sonnet" } },
+    });
+    const t = taskOf(data, "id-3");
+    t.risk = "high";
+    const r = await executeStep({ task: t, board: data, cwd: tmp, claudeBin: [process.execPath, fakeClaude] });
+    expect(r).toMatchObject({ ok: true, provider: "anthropic", model: "sonnet", route: { applied: false, risk: "high" } });
+    expect(r.route.note).toMatch(/no route configured for worker/);
+  });
+
+  it("executeStep ignores a configured route when the task carries no risk", async () => {
+    const data = chain();
+    writeFileSync(boardFile(), JSON.stringify(data));
+    saveAgentConfig({
+      version: 4,
+      duties: { worker: { mode: "always", provider: "anthropic", model: "sonnet" } },
+      routes: { high: { worker: { provider: "openai", model: "gpt-5.6-terra" } } },
+    });
+    const t = taskOf(data, "id-3");
+    const r = await executeStep({ task: t, board: data, cwd: tmp, claudeBin: [process.execPath, fakeClaude] });
+    expect(r.provider).toBe("anthropic");
+    expect(r.model).toBe("sonnet");
+    expect(r.route).toBeNull();
+  });
+
+  it("executeReview routes the reviewer to the configured pair when the task's risk is high", async () => {
+    const data = chain();
+    writeFileSync(boardFile(), JSON.stringify(data));
+    saveAgentConfig({
+      version: 4,
+      duties: { review: { mode: "agent", provider: "anthropic", model: "opus" } },
+      routes: { high: { review: { provider: "openai", model: "gpt-5.6-luna" } } },
+    });
+    const t = taskOf(data, "id-3");
+    t.risk = "high";
+    const r = await executeReview({ task: t, workerResult: "implemented", cwd: tmp, codexBin: [process.execPath, fakeCodex] });
+    expect(r).toMatchObject({
+      duty: "review", provider: "openai", model: "gpt-5.6-luna",
+      route: { applied: true, risk: "high" },
+    });
+  });
+
+  it("executeReview falls back to the duty profile with a note when the routed pair is invalid", async () => {
+    const data = chain();
+    writeFileSync(boardFile(), JSON.stringify(data));
+    saveAgentConfig({
+      version: 4,
+      duties: { review: { mode: "agent", provider: "anthropic", model: "opus" } },
+      routes: { high: { review: { provider: "openai", model: "not-a-real-model" } } },
+    });
+    const t = taskOf(data, "id-3");
+    t.risk = "high";
+    process.env.FAKE_MODE = "review-approve";
+    const r = await executeReview({ task: t, workerResult: "implemented", cwd: tmp, claudeBin: [process.execPath, fakeClaude] });
+    expect(r).toMatchObject({
+      duty: "review", provider: "anthropic", model: "opus",
+      route: { applied: false, risk: "high" },
+    });
+    expect(r.route.note).toMatch(/invalid/);
+  });
+});
+
 describe("clampOutput / parseClaudeResult", () => {
   it("keeps head and tail and marks what it dropped", () => {
     const s = "A".repeat(100) + "B".repeat(1000) + "C".repeat(100);

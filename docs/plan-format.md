@@ -40,6 +40,7 @@ steps:
     budget: <usd>
     red: <cmd>            # bug-fix gate: MUST fail on the base commit — proves red-tests catches it
     red-tests: [<path>]   # the regression test file(s) red is proved against; needs red, and vice versa
+    risk: high            # routes worker/review to agents.json's routes.high, when configured — the only value accepted
 ```
 
 Rules that are not visible in the shape:
@@ -73,7 +74,7 @@ pointing at a step that does not exist; a step with neither a `title` nor a
 `task`; a `task` naming no task on the board, or one already bound to an earlier
 step; an invalid number or an unknown `kind`; `red` declared without
 `red-tests`, or `red-tests` declared without `red` — the gate needs both halves
-or neither.
+or neither; a `risk` other than `high`.
 
 **Prose is refused too.** The language is required of every plan, not only of
 the texts that already look like one — a rule the guard declines to check is a

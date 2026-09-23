@@ -752,7 +752,7 @@ export async function executeStep({
 
   let execution;
   try {
-    execution = resolveDuty("worker");
+    execution = resolveDuty("worker", undefined, { risk: task.risk });
   } catch (e) {
     return { sessionId: "", ok: false, error: `routing: ${e && e.message ? e.message : e}` };
   }
@@ -803,6 +803,7 @@ export async function executeStep({
       provider: "openai",
       agent: execution.name,
       model: execution.model,
+      route: execution.route || null,
       sessionId: distinctSession ? actual : "",
       requestedMode,
       startMode: distinctSession ? requestedMode : "unknown",
@@ -872,6 +873,7 @@ export async function executeStep({
     provider: "anthropic",
     agent: execution.name,
     model: execution.model,
+    route: execution.route || null,
     sessionId: actual,
     ok: !error,
     error,
@@ -902,10 +904,10 @@ export async function executeReview({
 } = {}) {
   if (!task) return { approved: false, ok: false, error: "executeReview: task is required" };
   let execution;
-  try { execution = resolveDuty("review"); }
+  try { execution = resolveDuty("review", appData, { risk: task.risk }); }
   catch (e) { return { approved: false, ok: false, error: `routing: ${e?.message || e}` }; }
   if (!execution.enabled || !execution.model)
-    return { approved: true, ok: true, skipped: true, duty: "review", costUsd: 0 };
+    return { approved: true, ok: true, skipped: true, duty: "review", costUsd: 0, route: execution.route || null };
   const prompt = buildReviewPrompt({ task, workerResult, execution, appData });
 
   if (execution.provider === "openai") {
@@ -930,7 +932,7 @@ export async function executeReview({
     const decision = parseReviewVerdict(answer);
     const error = run.error || parsed?.error || (run.code !== 0 ? `codex review exited ${run.code}` : "");
     return { ...decision, ok: !error, error, result: answer, sessionId: session,
-      duty: "review", provider: "openai", model: execution.model,
+      duty: "review", provider: "openai", model: execution.model, route: execution.route || null,
       costUsd: openAiCost(execution.model, parsed?.usage, execution) };
   }
 
@@ -949,7 +951,7 @@ export async function executeReview({
   const decision = parseReviewVerdict(answer);
   const error = run.error || (run.code !== 0 ? `claude review exited ${run.code}` : "") || (parsed?.is_error ? "review model reported an error" : "");
   return { ...decision, ok: !error, error, result: answer, sessionId: actual,
-    duty: "review", provider: "anthropic", model: execution.model,
+    duty: "review", provider: "anthropic", model: execution.model, route: execution.route || null,
     costUsd: typeof parsed?.total_cost_usd === "number" ? parsed.total_cost_usd : null };
 }
 

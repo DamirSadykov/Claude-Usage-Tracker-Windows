@@ -69,6 +69,15 @@ export const NODE_RULES = [
         .map(([field, value]) => `${n.label}: invalid ${field} "${value}"`),
   },
   {
+    id: "invalid-risk",
+    severity: "error",
+    when: "any",
+    check: (n) =>
+      n.risk && n.risk !== "high"
+        ? `${n.label}: invalid risk "${n.risk}" — the only accepted value is "high"`
+        : null,
+  },
+  {
     id: "needs-self",
     severity: "error",
     when: "open",
