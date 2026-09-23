@@ -55,6 +55,7 @@ import path from "node:path";
 
 import { resolveTask, readTaskSessionEvents, loadBoard, loadBoardForWrite, saveBoard } from "../board/todos.mjs";
 import { withBoardLock } from "../kernel/board-lock.mjs";
+import { snapshotTree, diffNameStatus } from "./red-gate.mjs";
 
 // Tools that CHANGE a file — the only evidence that something was produced.
 // `Read` carries a `file_path` too and is deliberately NOT here: reading a file
@@ -297,6 +298,7 @@ export function buildOutcomeReport({
   verify,
   root = process.cwd(),
   statFile = defaultStatFile,
+  gitChanged = null,
 }) {
   const board = (data && Array.isArray(data.todos) ? data.todos : []).filter(Boolean);
   const own = blocks.filter((b) => b.task === todo.id);
@@ -327,11 +329,13 @@ export function buildOutcomeReport({
   const produces = declared.map((item) => {
     const checkable = isPathLike(item);
     const hit = checkable ? wrote.find((t) => pathMatches(item, t.path)) : undefined;
+    const gitHit =
+      checkable && !hit && gitChanged ? [...gitChanged].find((p) => pathMatches(item, p)) : undefined;
     const fileHit =
-      checkable && !hit
+      checkable && !hit && !gitHit
         ? weakFileEvidence(item, { root, windowStart: window.at, statFile })
         : null;
-    const evidence = hit ? "transcript" : fileHit ? "file" : null;
+    const evidence = hit ? "transcript" : gitHit ? "git" : fileHit ? "file" : null;
     const consumers = checkable
       ? dependents.filter((d) =>
           (seenByDependent.get(d.id) || []).some((t) => pathMatches(item, t.path)),
@@ -340,7 +344,7 @@ export function buildOutcomeReport({
     return {
       path: item,
       checkable,
-      produced: !!hit || !!fileHit,
+      produced: !!hit || !!gitHit || !!fileHit,
       produced_at: hit ? hit.ts : fileHit ? fileHit.at : null,
       produced_by: hit ? hit.tool : null,
       produced_in_session: hit ? hit.session : null,
@@ -511,7 +515,22 @@ function reconcile(ref, verify, write = false) {
     events.filter((e) => sessions.has(e.session)),
     sessionEnd,
   );
-  return { file, data, todo, report: buildOutcomeReport({ data, todo, blocks, touches, verify }) };
+  return {
+    file,
+    data,
+    todo,
+    report: buildOutcomeReport({ data, todo, blocks, touches, verify, gitChanged: stepChanges(todo, process.cwd()) }),
+  };
+}
+
+export function stepChanges(todo, cwd) {
+  const base = typeof todo?.step_base === "string" ? todo.step_base.trim() : "";
+  if (!base) return null;
+  const end = snapshotTree(cwd);
+  if (!end.ok) return null;
+  const diff = diffNameStatus(cwd, base, end.sha);
+  if (!Array.isArray(diff)) return null;
+  return new Set(diff.filter((c) => c.status === "A" || c.status === "M").map((c) => c.path));
 }
 
 function applyOutcome(file, data, todo, report) {
