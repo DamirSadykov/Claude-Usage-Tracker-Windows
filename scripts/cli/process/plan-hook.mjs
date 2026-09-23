@@ -152,7 +152,7 @@ export function buildEnterContext() {
     "as the file the tracker records — YAML, one step per task — instead of prose",
     "that then has to be translated: `change`, `vision`, `steps` with `title`,",
     "`task` (this step IS task #N already on the board), `why`, `needs`,",
-    "`produces`, `verify`, `retry`, `on-issue`, `kind`, `budget`.",
+    "`produces`, `verify`, `retry`, `on-issue`, `kind`, `budget`, `red`, `red-tests`.",
     "",
     "Prose does not disappear, it moves INSIDE: `vision` is the paragraph on what",
     "should exist and why; each step's `why` is what that step rests on and where",

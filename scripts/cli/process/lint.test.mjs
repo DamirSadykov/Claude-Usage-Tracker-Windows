@@ -113,6 +113,37 @@ describe("todos lint checks the recorded graph", () => {
     expect(out).toMatch(/#1: auto with no verify runs as a GATE/);
   });
 
+  it("errors on red declared without red-tests, and on red-tests without red", () => {
+    board(task(1, { kind: "auto", red: "npm run test:red" }));
+    expect(lint().out).toMatch(/#1: red declared without red-tests/);
+    board(task(1, { kind: "auto", red_tests: ["test/a.spec.js"] }));
+    expect(lint().out).toMatch(/#1: red-tests declared without red/);
+  });
+
+  it("only warns when a red-tests path is not also in produces", () => {
+    board(task(1, { kind: "auto", red: "npm run test:red", red_tests: ["test/a.spec.js"], produces: ["src/a.js"] }));
+    const { code, out } = lint();
+    expect(code).toBe(0);
+    expect(out).toMatch(/#1: red-tests path "test\/a\.spec\.js" is not declared in produces/);
+    board(
+      task(1, {
+        kind: "auto",
+        verify: "npm test",
+        red: "npm run test:red",
+        red_tests: ["test/a.spec.js"],
+        produces: ["src/a.js", "test/a.spec.js"],
+      }),
+    );
+    expect(lint().out).toMatch(/nothing violates/);
+  });
+
+  it("only warns when red is declared on a manual node — a gate never runs it", () => {
+    board(task(1, { red: "npm run test:red", red_tests: ["test/a.spec.js"] }));
+    const { code, out } = lint();
+    expect(code).toBe(0);
+    expect(out).toMatch(/#1: red declared on a manual node — a gate never runs it/);
+  });
+
   it("warns that a change with no budget cannot be run unattended, and stays quiet once it has one", () => {
     board(task(1, { change: true, depends_on: ["t2"] }), task(2));
     expect(lint().out).toMatch(/change #1 "узел 1": no budget declared on the group/);

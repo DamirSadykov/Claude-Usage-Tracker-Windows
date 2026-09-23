@@ -99,6 +99,67 @@ describe("apply refuses an invalid graph", () => {
     const { warnings } = check(["parallel: 2", "steps:", "  1: A"].join("\n"));
     expect(warnings.join(" ")).toMatch(/change/);
   });
+
+  it("refuses red declared without red-tests", () => {
+    const { errors } = check(
+      ["steps:", "  1:", "    title: A", "    kind: auto", "    red: npm run test:red"].join("\n"),
+    );
+    expect(errors.join(" ")).toMatch(/red declared without red-tests/);
+  });
+
+  it("refuses red-tests declared without red", () => {
+    const { errors } = check(
+      ["steps:", "  1:", "    title: A", "    kind: auto", "    red-tests: [test/a.spec.js]"].join("\n"),
+    );
+    expect(errors.join(" ")).toMatch(/red-tests declared without red/);
+  });
+
+  it("only WARNS when a red-tests path is not also in produces", () => {
+    const { errors, warnings } = check(
+      [
+        "steps:",
+        "  1:",
+        "    title: A",
+        "    kind: auto",
+        "    red: npm run test:red",
+        "    red-tests: [test/a.spec.js]",
+        "    produces: [src/a.js]",
+      ].join("\n"),
+    );
+    expect(errors).toEqual([]);
+    expect(warnings.join(" ")).toMatch(/red-tests path "test\/a\.spec\.js" is not declared in produces/);
+  });
+
+  it("takes the same red declaration once red-tests is in produces too", () => {
+    const { errors, warnings } = check(
+      [
+        "steps:",
+        "  1:",
+        "    title: A",
+        "    kind: auto",
+        "    red: npm run test:red",
+        "    red-tests: [test/a.spec.js]",
+        "    produces: [src/a.js, test/a.spec.js]",
+      ].join("\n"),
+    );
+    expect(errors).toEqual([]);
+    expect(warnings.join(" ")).not.toMatch(/not declared in produces/);
+  });
+
+  it("only WARNS when red is declared on a manual node — a gate never runs it", () => {
+    const { errors, warnings } = check(
+      [
+        "steps:",
+        "  1:",
+        "    title: A",
+        "    kind: manual",
+        "    red: npm run test:red",
+        "    red-tests: [test/a.spec.js]",
+      ].join("\n"),
+    );
+    expect(errors).toEqual([]);
+    expect(warnings.join(" ")).toMatch(/red declared on a manual node — a gate never runs it/);
+  });
 });
 
 describe("apply records the graph", () => {
@@ -121,10 +182,12 @@ describe("apply records the graph", () => {
     "steps:",
     "  1:",
     "    title: Собираю каркас",
-    "    produces: [scripts/cli/process/apply.mjs]",
+    "    produces: [scripts/cli/process/apply.mjs, tests/apply.red.spec.js]",
     "    verify: npm test",
     "    retry: 3",
     "    kind: auto",
+    "    red: npm run test:red",
+    "    red-tests: [tests/apply.red.spec.js]",
     "  2:",
     "    title: Пишу тесты",
     "    needs: [1]",
@@ -189,10 +252,12 @@ describe("apply records the graph", () => {
     expect(change.budget_usd).toBe(5);
     expect([one, two, three].map((t) => t.change_id)).toEqual([change.id, change.id, change.id]);
 
-    expect(one.produces).toEqual(["scripts/cli/process/apply.mjs"]);
+    expect(one.produces).toEqual(["scripts/cli/process/apply.mjs", "tests/apply.red.spec.js"]);
     expect(one.verify).toBe("npm test");
     expect(one.retry_limit).toBe(3);
     expect(one.kind).toBe("auto");
+    expect(one.red).toBe("npm run test:red");
+    expect(one.red_tests).toEqual(["tests/apply.red.spec.js"]);
 
     expect(two.depends_on).toContain(one.id);
     expect(three.depends_on).toContain(two.id);

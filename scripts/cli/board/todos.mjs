@@ -687,6 +687,32 @@ function setParallel({ data, file, todo, value }) {
   );
 }
 
+function setRed({ data, file, todo, value }) {
+  const cmd = String(value).trim();
+  if (cmd) todo.red = cmd;
+  else delete todo.red;
+  todo.updated_at = new Date().toISOString();
+  save(file, data);
+  process.stdout.write(
+    cmd ? `ok: #${todo.number} red -> ${cmd}\n` : `ok: #${todo.number} red cleared\n`,
+  );
+}
+
+function setRedTests({ data, file, todo, value }) {
+  const v = String(value).trim();
+  const list =
+    v === "" || /^(none|clear)$/i.test(v) ? [] : v.split(",").map((s) => s.trim()).filter(Boolean);
+  if (list.length) todo.red_tests = list;
+  else delete todo.red_tests;
+  todo.updated_at = new Date().toISOString();
+  save(file, data);
+  process.stdout.write(
+    list.length
+      ? `ok: #${todo.number} red-tests -> ${list.join(", ")}\n`
+      : `ok: #${todo.number} red-tests cleared\n`,
+  );
+}
+
 // How an `on_issue` target reads in a message: its board number when the target
 // still exists, the raw id otherwise (a deleted target must stay visible).
 function onIssueLabel(data, todo) {
@@ -946,6 +972,16 @@ const SET_FIELDS = {
     values: "<task> | none   (same board, needs a retry limit; never a dep edge)",
     declaration: true,
     set: setOnIssue,
+  },
+  red: {
+    values: '"<cmd>"   MUST fail (non-zero) on the base commit; proves red-tests catches the bug; "" withdraws it',
+    declaration: true,
+    set: setRed,
+  },
+  "red-tests": {
+    values: "<path1,path2,...> | none   (regression test file(s) red is proved against; pairs with red)",
+    declaration: true,
+    set: setRedTests,
   },
   plan: { values: '--text "<steps + order>"   HOW only', text: true, set: setPlan },
   description: {
@@ -2012,6 +2048,9 @@ export function formatDeclarations(t, byId, { ready = false } = {}) {
     const target = byId?.get?.(t.on_issue);
     parts.push(`?issue -> ${target ? `#${target.number}` : t.on_issue}`);
   }
+  if (t.red && String(t.red).trim()) parts.push(`red: ${String(t.red).trim()}`);
+  const redTests = (Array.isArray(t.red_tests) ? t.red_tests : []).filter(Boolean);
+  if (redTests.length) parts.push(`red-tests: ${redTests.join(", ")}`);
   let out = `  ${ready ? "▸" : " "} #${t.number} [${col(t.status)}] ${t.subject} — ${parts.join(" · ")}\n`;
   if (t.kind === "auto" && !hasVerify(t)) {
     out += `      ⚠ auto without verify — runs as a GATE: todos set verify ${t.number} "<cmd>"\n`;
@@ -2030,7 +2069,9 @@ function hasDeclarations(t) {
     typeof t.retry_limit === "number" ||
     typeof t.budget_usd === "number" ||
     typeof t.parallel_limit === "number" ||
-    t.on_issue
+    t.on_issue ||
+    (t.red && String(t.red).trim()) ||
+    (Array.isArray(t.red_tests) && t.red_tests.filter(Boolean).length)
   );
 }
 

@@ -587,6 +587,83 @@ describe("runChange — self-retry when a retry limit is declared but no on_issu
   });
 });
 
+const redAuto = (number, extra = {}) =>
+  auto(number, { red: "npm run test:red", red_tests: ["test/regression.spec.js"], ...extra });
+
+describe("runChange — the red gate never shares a wave", () => {
+  it("keeps a red-declared step solo even when the parallel limit allows more", async () => {
+    const data = board(
+      changeRoot(1, [2, 3, 4], { parallel_limit: 3, budget_usd: 10 }),
+      auto(2),
+      redAuto(3),
+      auto(4),
+    );
+    const h = harness({
+      redBase: async () => ({ ok: true, sha: "base-sha" }),
+      redGate: async () => ({ ok: true, field: "failed-on-base", reason: null }),
+    });
+    const r = await go(data, "1", h.effects);
+
+    expect(r.waves).toEqual([[2], [3], [4]]);
+    expect(r.complete).toBe(true);
+  });
+
+  it("parks a red-declared step instead of starting it when the base cannot be recorded", async () => {
+    const data = board(changeRoot(1, [2], { budget_usd: 10 }), redAuto(2));
+    const h = harness({
+      redBase: async () => ({ ok: false, error: "not a git repository" }),
+    });
+    const r = await go(data, "1", h.effects);
+
+    expect(h.calls.steps).toEqual([]);
+    expect(r.stop.kind).toBe("red-base");
+    expect(r.stop.reason).toMatch(/not a git work tree/);
+    expect(statusOf(r, 2)).toBe("queue");
+  });
+});
+
+describe("runChange — the red gate's verdict", () => {
+  it("a failing gate (red passes on base) produces an ISSUE comment with source `red` and is retried per retry_limit", async () => {
+    const data = board(changeRoot(1, [2], { budget_usd: 10 }), redAuto(2, { retry_limit: 2 }));
+    const h = harness({
+      redBase: async () => ({ ok: true, sha: "base-sha" }),
+      redGate: async () => ({
+        ok: false,
+        field: "passed-on-base",
+        reason: "the regression test passes on the base code — it does not catch the bug",
+      }),
+    });
+    const r = await go(data, "1", h.effects);
+
+    expect(h.calls.steps).toEqual([2, 2]);
+    expect(h.calls.verifies).toEqual([]);
+    const t2 = r.board.todos.find((t) => t.number === 2);
+    const comment = (t2.comments || []).find(
+      (c) => c.author === "review" && c.body.startsWith("ISSUE attempt 1/2"),
+    );
+    expect(comment).toBeTruthy();
+    expect(comment.body).toContain("red");
+    expect(comment.body).toContain("does not catch the bug");
+    expect(r.stop.kind).toBe("retry");
+    expect(r.stop.reason).toMatch(/retry limit exhausted/);
+    expect(statusOf(r, 2)).toBe("review");
+  });
+
+  it("a passing gate (red fails on base) proceeds to the declared verify and records the field", async () => {
+    const data = board(changeRoot(1, [2], { budget_usd: 10 }), redAuto(2));
+    const h = harness({
+      redBase: async () => ({ ok: true, sha: "base-sha" }),
+      redGate: async () => ({ ok: true, field: "failed-on-base", reason: null }),
+    });
+    const r = await go(data, "1", h.effects);
+
+    expect(h.calls.verifies).toEqual(["npm test"]);
+    expect(r.steps[0].result).toBe("done");
+    expect(r.steps[0].red).toBe("failed-on-base");
+    expect(statusOf(r, 2)).toBe("done");
+  });
+});
+
 // ── whose context a step starts from ─────────────────────────────────────────
 
 // t#543. The choice is the spawner's, never the graph's: `--go` makes it here,

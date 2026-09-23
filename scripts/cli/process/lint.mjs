@@ -50,6 +50,8 @@ const boardNode = (t) => ({
   budget: typeof t.budget_usd === "number" ? String(t.budget_usd) : "",
   onIssue: t.on_issue || "",
   kind: t.kind === "auto" ? "auto" : "",
+  red: String(t.red || "").trim(),
+  redTests: (Array.isArray(t.red_tests) ? t.red_tests : []).filter(Boolean),
   closed: isDone(t),
   outcome: String(t.outcome || "").trim(),
 });

@@ -84,12 +84,14 @@ import {
 import { findChange } from "../board/change.mjs";
 import { resolveDuty } from "../agents/agents.mjs";
 import { withBoardLock } from "../kernel/board-lock.mjs";
+import { gitBase, runRedGate, recoverMarkers } from "./red-gate.mjs";
 
 export const DEFAULT_PARALLEL_LIMIT = 1;
 
 const brief = (t) => (t ? { id: t.id, number: t.number, subject: t.subject } : null);
 const num = (t) => (t && t.number != null ? `#${t.number}` : t ? t.id : "?");
 const declaredVerify = (t) => (t && t.verify && String(t.verify).trim()) || "";
+const declaredRed = (t) => (t && t.red && String(t.red).trim()) || "";
 
 function fail(msg) {
   process.stderr.write(msg + "\n");
@@ -101,6 +103,14 @@ function appDataFile(name) {
     process.env.APPDATA ||
     path.join(process.env.USERPROFILE || "", "AppData", "Roaming");
   return path.join(appData, "com.claude-usage-tracker.app", name);
+}
+
+function redGateDir() {
+  return appDataFile("red-gate");
+}
+
+function recoverRedGate(cwd) {
+  recoverMarkers({ appDataDir: redGateDir(), cwd });
 }
 
 // ── the node ─────────────────────────────────────────────────────────────────
@@ -192,6 +202,8 @@ export function simulationEffects() {
     setStatus: async () => {},
     recordHandoff: async () => ({ written: false }),
     recordIssue: async () => ({ written: false }),
+    redBase: async () => ({ ok: true, sha: "dry" }),
+    redGate: async () => ({ ok: true, field: "failed-on-base", reason: null }),
     stepCost: async ({ task }) =>
       typeof task.budget_usd === "number" ? task.budget_usd : null,
   };
@@ -290,6 +302,37 @@ export function liveEffects({ cwd } = {}) {
         return { written: true };
       });
     },
+    redBase: async ({ task, cwd }) => {
+      const head = gitBase(cwd);
+      if (!head.ok) return { ok: false, error: head.error };
+      const file = appDataFile("todos.json");
+      const write = withBoardLock(file, () => {
+        const data = loadBoardForWrite(file);
+        const todo = data.todos.find((t) => t && t.id === task.id);
+        if (!todo) return { written: false, error: `task ${task.id} not found on the board` };
+        todo.red_base = head.sha;
+        todo.updated_at = new Date().toISOString();
+        saveBoard(file, data);
+        return { written: true };
+      });
+      if (!write.written) return { ok: false, error: write.error };
+      return { ok: true, sha: head.sha };
+    },
+    redGate: async ({ task, cwd, timeoutMs }) => {
+      let mod;
+      try {
+        mod = await import("./run-step.mjs");
+      } catch (err) {
+        return {
+          ok: false,
+          field: null,
+          reason: `the step executor is missing: scripts/cli/process/run-step.mjs could not be loaded (${
+            (err && err.message) || err
+          })`,
+        };
+      }
+      return runRedGate({ task, cwd, timeoutMs, appDataDir: redGateDir(), runCmd: mod.runVerify });
+    },
     // What a step really cost lives in the tracker's blocks (SQLite, Rust side),
     // but the headless run already reports its own total — `executeStep` returns
     // it as `costUsd` (from `total_cost_usd` of the JSON result). Read that name,
@@ -361,6 +404,7 @@ export function runRecordOf(report, { inherit = false } = {}) {
       attempt: s.attempt ?? null,
       result: s.result,
       verify: s.verify ?? null,
+      red: s.red ?? null,
       cost_usd: typeof s.cost_usd === "number" ? s.cost_usd : null,
       session: s.session || null,
       requested_mode: s.requested_mode || null,
@@ -391,6 +435,7 @@ export function reportRecordOf(report) {
         attempt: s.attempt ?? null,
         result: s.result,
         verify: s.verify ?? null,
+        red: s.red ?? null,
         cost_usd: typeof s.cost_usd === "number" ? s.cost_usd : null,
         session: s.session || null,
         requested_mode: s.requested_mode || null,
@@ -484,11 +529,34 @@ export async function beginStep(ctx, task, wave = []) {
   if (limit !== null && spent + 1 > limit) {
     return { task, kind: "retry-exhausted", attempt: spent, limit, cost: null, session: null };
   }
+  if (declaredRed(task)) {
+    const based = await recordRedBase(ctx, task);
+    if (!based.ok) {
+      return { task, kind: "red-base-failed", attempt: spent, limit, cost: null, session: null, reason: based.reason };
+    }
+  }
   const attempt = spent + 1;
   ctx.attempts.set(task.id, attempt);
 
   await moveTo(ctx, task, "in_progress");
   return { task, kind: "begin", attempt, limit, brief: stepBrief(ctx, task, wave, { attempt, limit }) };
+}
+
+async function recordRedBase(ctx, task) {
+  if (task.red_base) return { ok: true };
+  let result;
+  try {
+    result = (await ctx.effects.redBase({ task, cwd: ctx.cwd })) || {};
+  } catch (err) {
+    result = { ok: false, error: String((err && err.message) || err) };
+  }
+  if (!result.ok)
+    return {
+      ok: false,
+      reason: `red declared but ${ctx.cwd} is not a git work tree${result.error ? `: ${result.error}` : ""}`,
+    };
+  task.red_base = result.sha;
+  return { ok: true };
 }
 
 // The baton the step wrote, put on the board before anything else reads it. A
@@ -591,6 +659,25 @@ export async function finishStep(ctx, task, { result, review, baton, cost }) {
     return { ...base, kind: "issue", reason: `step failed: ${error}` };
   }
 
+  if (declaredRed(task)) {
+    let gate;
+    try {
+      gate = (await ctx.effects.redGate({ task, cwd: ctx.cwd, timeoutMs: ctx.timeoutMs })) || {};
+    } catch (err) {
+      gate = { ok: false, field: null, reason: `red gate crashed: ${(err && err.message) || err}` };
+    }
+    if (!gate.ok) {
+      await recordIssueComment(ctx, task, {
+        attempt,
+        limit,
+        source: "red",
+        text: clampChars(gate.reason || "red gate issue", 6000),
+      });
+      return { ...base, kind: "issue", red: gate.field ?? null, reason: gate.reason || "red gate issue" };
+    }
+    base.red = gate.field ?? null;
+  }
+
   const verdictRun = await ctx.effects.runVerify({
     cmd: declaredVerify(task),
     cwd: ctx.cwd,
@@ -629,7 +716,7 @@ export async function finishStep(ctx, task, { result, review, baton, cost }) {
 // its verdict and branches.
 async function runOne(ctx, task, wave = []) {
   const begun = await beginStep(ctx, task, wave);
-  if (begun.kind === "retry-exhausted") return begun;
+  if (begun.kind === "retry-exhausted" || begun.kind === "red-base-failed") return begun;
 
   let result;
   try {
@@ -657,7 +744,7 @@ async function runOne(ctx, task, wave = []) {
 
 export async function runReported(ctx, task, wave, { result, review = null }) {
   const begun = await beginStep(ctx, task, wave);
-  if (begun.kind === "retry-exhausted") return begun;
+  if (begun.kind === "retry-exhausted" || begun.kind === "red-base-failed") return begun;
   const { baton, cost } = await recordWork(ctx, task, result);
   return finishStep(ctx, task, { result, review, baton, cost });
 }
@@ -799,6 +886,17 @@ const budgetExhaustedReason = (spent, budget, notStarted) =>
 const retryExhaustedReason = (attempt, limit) =>
   `attempt ${attempt + 1} would be past the declared limit — ${attempt}/<=${limit}; attempt M+1 never starts`;
 
+export function buildWave(ready, limit) {
+  if (!ready.length) return [];
+  if (declaredRed(ready[0])) return [ready[0]];
+  const wave = [];
+  for (const t of ready) {
+    if (wave.length >= limit || declaredRed(t)) break;
+    wave.push(t);
+  }
+  return wave;
+}
+
 export function resolveParallelLimit(root, override) {
   return (
     (typeof override === "number" && override > 0 && Math.floor(override)) ||
@@ -829,6 +927,7 @@ export async function applyResult(ctx, r, { dry, log }) {
     review: r.review ?? null,
     gate: r.kind === "gate",
     verify: r.verify ?? null,
+    red: r.red ?? null,
     outcome: r.kind === "done" ? "ok" : r.kind === "issue" ? "issue" : null,
     result: r.kind,
     reason: r.reason || null,
@@ -840,6 +939,11 @@ export async function applyResult(ctx, r, { dry, log }) {
   if (r.kind === "gate") {
     ctx.parked.add(r.task.id);
     park(ctx, "gate", r.task, r.reason);
+    return record;
+  }
+  if (r.kind === "red-base-failed") {
+    ctx.parked.add(r.task.id);
+    park(ctx, "red-base", r.task, r.reason);
     return record;
   }
   if (r.kind === "retry-exhausted") {
@@ -908,7 +1012,7 @@ export function nextFrontier(ctx, { limit, groupBudget, spentKnown }) {
     park(ctx, "retry", exhausted, retryExhaustedReason(attemptsSoFar(exhausted), retryLimitOf(exhausted)));
     return { stop: ctx.stop };
   }
-  return { wave: ready.slice(0, limit) };
+  return { wave: buildWave(ready, limit) };
 }
 
 // The run loop. `data` is cloned first, so nothing the engine does is visible on
@@ -969,7 +1073,7 @@ export async function runChange({
       break;
     }
 
-    const wave = ready.slice(0, limit);
+    const wave = buildWave(ready, limit);
     ctx.waves.push(wave.map((t) => t.number));
     if (ctx.steps.length + wave.length > bound) {
       park(ctx, "empty-frontier", null, `runaway guard: more than ${bound} steps in one run — the graph or the seam is looping`);
@@ -1268,7 +1372,31 @@ export function stampHandout(file, data, wave) {
   return at;
 }
 
+function attachRedBase(data, wave, cwd) {
+  if (!wave.length) return { wave, stop: null };
+  const t = wave.find((x) => declaredRed(x));
+  if (!t || t.red_base) return { wave, stop: null };
+  const head = gitBase(cwd);
+  if (!head.ok) {
+    return {
+      wave: [],
+      stop: {
+        kind: "red-base",
+        task: brief(t),
+        status: t.status,
+        reason: `red declared but ${cwd} is not a git work tree${head.error ? `: ${head.error}` : ""}`,
+        parked: true,
+      },
+    };
+  }
+  const todo = data.todos.find((x) => x && x.id === t.id);
+  if (todo) todo.red_base = head.sha;
+  t.red_base = head.sha;
+  return { wave, stop: null };
+}
+
 async function cmdNext(ref, f) {
+  recoverRedGate(process.cwd());
   let parallel;
   if (f.parallel !== undefined) {
     parallel = Number(f.parallel);
@@ -1293,7 +1421,11 @@ async function cmdNext(ref, f) {
     const c = buildRunContext({ data, change: ref, dry: true, cwd: process.cwd(), timeoutMs, spent });
     const l = resolveParallelLimit(c.root, parallel);
     const gb = typeof c.root.budget_usd === "number" ? c.root.budget_usd : null;
-    const o = nextFrontier(c, { limit: l, groupBudget: gb, spentKnown });
+    let o = nextFrontier(c, { limit: l, groupBudget: gb, spentKnown });
+    if (o.wave) {
+      const based = attachRedBase(data, o.wave, process.cwd());
+      o = based.stop ? { stop: based.stop } : { ...o, wave: based.wave };
+    }
     const at = stampHandout(file, data, o.wave || []);
     return { root: c.root, limit: l, groupBudget: gb, ctx: c, outcome: o, handoutAt: at };
   });
@@ -1323,6 +1455,7 @@ async function cmdNext(ref, f) {
 }
 
 async function cmdReport(ref, f) {
+  recoverRedGate(process.cwd());
   const taskRef = f.report;
   if (f.result !== "ok" && f.result !== "issue") fail('--report needs --result "ok" or "issue"');
   let cost;
@@ -1611,6 +1744,7 @@ export async function run(args) {
   if (f.go && f.dry) fail("--go and --dry-run ask for opposite things — pick one");
 
   const dry = !f.go;
+  if (!dry) recoverRedGate(process.cwd());
   const file = appDataFile("todos.json");
   const data = dry ? loadBoard(file) : loadBoardForWrite(file);
   const { root } = collectChange(data, ref);

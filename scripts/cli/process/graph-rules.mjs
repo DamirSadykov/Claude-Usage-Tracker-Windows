@@ -136,6 +136,42 @@ export const NODE_RULES = [
         : null,
   },
   {
+    id: "red-without-red-tests",
+    severity: "error",
+    when: "open",
+    check: (n) =>
+      !blank(n.red) && !(n.redTests && n.redTests.length)
+        ? `${n.label}: red declared without red-tests — the gate needs to know which regression test file(s) prove the bug`
+        : null,
+  },
+  {
+    id: "red-tests-without-red",
+    severity: "error",
+    when: "open",
+    check: (n) =>
+      n.redTests && n.redTests.length && blank(n.red)
+        ? `${n.label}: red-tests declared without red — a regression test with nothing to prove it fails first`
+        : null,
+  },
+  {
+    id: "red-tests-not-in-produces",
+    severity: "warning",
+    when: "open",
+    check: (n) =>
+      (n.redTests || [])
+        .filter((p) => !(n.produces || []).includes(p))
+        .map((p) => `${n.label}: red-tests path "${p}" is not declared in produces`),
+  },
+  {
+    id: "red-on-manual",
+    severity: "warning",
+    when: "open",
+    check: (n) =>
+      !blank(n.red) && n.kind !== "auto"
+        ? `${n.label}: red declared on a manual node — a gate never runs it`
+        : null,
+  },
+  {
     // The reconciliation (t#304) is what turns a promise into an artefact of an
     // edge; a node closed without it leaves the dependents' inputs unproven, and
     // nothing later goes back to check.
