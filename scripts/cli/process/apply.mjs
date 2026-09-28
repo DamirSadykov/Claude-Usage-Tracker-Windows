@@ -238,9 +238,6 @@ function documentGraph(doc, onBoard, lineCount) {
   };
 }
 
-// The graph rules must not acquire filesystem knowledge. Callers provide this
-// narrow probe instead, which also makes the document validator deterministic
-// in tests and lets the plan guard use precisely the same warning.
 export function workspaceLineCount(file) {
   try {
     const text = readFileSync(file, "utf8");
@@ -581,10 +578,6 @@ export function applyDocument(doc, { go = false, force = false, project, board }
           const oldLimit = t.retry_limit;
           const newLimit = Number(s.retry);
           set(t, "retry", s.retry);
-          // Only an exhausted runner park carries its own durable proof: its
-          // LAST issue comment says attempt N/N. A review node can also be a
-          // gate or a manual handoff, so neither its status nor a retry edit
-          // alone is authority to reopen it.
           const lastIssue = [...(t.comments || [])]
             .reverse()
             .find(

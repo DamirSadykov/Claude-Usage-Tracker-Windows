@@ -15,15 +15,9 @@ export function blockingCount(attempt) {
   return (attempt?.findings || []).filter((finding) => finding?.level === "critical" || finding?.level === "high").length;
 }
 
-// `attempts` is in journal order.  Deliberately keep the first equal attempt:
-// it is the stable, earlier checkpoint requested by the retry policy.
 export function bestAttempt(attempts) {
   let best = null;
   for (const attempt of Array.isArray(attempts) ? attempts : []) {
-    // New records explicitly distinguish executor/verify failures from a
-    // reviewer verdict.  Earlier journals predate that field, however, and
-    // their review checkpoints must remain usable after an upgrade.  Missing
-    // therefore means legacy-reviewed; only an explicit false is excluded.
     if (attempt?.reviewed === false) continue;
     if (!best || blockingCount(attempt) < blockingCount(best)) best = attempt;
   }
@@ -61,8 +55,6 @@ function existsInCheckpoint(cwd, sha, rel) {
   }
 }
 
-// Restore only the declared output and the files this attempt actually changed.
-// `git checkout <sha> -- <paths>` neither moves HEAD nor creates a ref.
 export function restoreCheckpoint({ cwd, sha, produces, ownChanges }) {
   if (!sha || !objectExists(cwd, sha)) return { ok: false, lost: true, reason: "контрольная точка потеряна" };
   const paths = rollbackPaths({ cwd, produces, ownChanges });
@@ -71,8 +63,6 @@ export function restoreCheckpoint({ cwd, sha, produces, ownChanges }) {
       if (existsInCheckpoint(cwd, sha, rel)) {
         execFileSync("git", ["checkout", sha, "--", rel], { cwd, stdio: ["ignore", "pipe", "pipe"] });
       } else {
-        // A file created after the checkpoint is not touched by checkout, so
-        // explicitly remove it from both the working tree and index.
         fs.rmSync(path.join(cwd, rel), { force: true });
         try { execFileSync("git", ["rm", "--cached", "--ignore-unmatch", "--", rel], { cwd, stdio: "ignore" }); } catch {}
       }

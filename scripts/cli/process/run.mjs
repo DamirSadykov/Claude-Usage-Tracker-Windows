@@ -101,11 +101,6 @@ const brief = (t) => (t ? { id: t.id, number: t.number, subject: t.subject } : n
 
 const reviewPath = (value) => String(value || "").replace(/\\/g, "/");
 
-// `--name-status` tells the reviewer which files changed, but it cannot answer
-// the more important retry question: did this repair touch the *place* that the
-// preceding reviewer named?  Keep both old and new hunk ranges: a deletion of
-// a previously reported line is a repair attempt too, even though it has no new
-// line number in the resulting tree.
 function retryChangedLocations(cwd, from, to) {
   let output;
   try {
@@ -138,10 +133,6 @@ function retryChangedLocations(cwd, from, to) {
   return byPath;
 }
 
-// The name/status list powers the runner's policy checks, but the reviewer
-// needs the actual patch to judge whether a retry repaired the reported code
-// or introduced a regression.  Keep this separate from `attemptDiff`: callers
-// still need the latter as structured file metadata.
 function retryPatch(cwd, from, to) {
   try {
     return execFileSync("git", ["diff", "--no-renames", "--no-ext-diff", from, to], {
@@ -205,9 +196,6 @@ export function gateReason(t) {
 export function attemptsSoFar(t) {
   const h = Array.isArray(t?.status_history) ? t.status_history : [];
   const mechanical = Array.isArray(t?.attempts) ? t.attempts.filter((a) => a?.mechanics === true).length : 0;
-  // A failed verifier after an approved non-blocking review is a runner
-  // mechanics incident, not an executor retry. Its status transition is still
-  // audited in history, while this derived quota deliberately does not charge it.
   return Math.max(0, h.filter((e) => e && e.status === "in_progress").length - mechanical);
 }
 
@@ -393,8 +381,6 @@ export function liveEffects({ cwd } = {}) {
       if (!write.written) return { ok: false, error: write.error };
       return { ok: true, sha: based.sha };
     },
-    // A per-task, append-only journal. Snapshotting happens here, at the end
-    // of an attempt, so it records precisely the tree the reviewer saw.
     recordAttempt: async ({ task, cwd, entry }) => {
       const snap = snapshotTree(cwd);
       const saved = { ...entry, snapshot: snap.ok ? snap.sha : null };
@@ -434,9 +420,6 @@ export function liveEffects({ cwd } = {}) {
       if (!damage.ok) return { ok: false, error: damage.error };
       return { ok: true, own: damage.own, damaged: damage.damaged };
     },
-    // The reviewer sees a retry as a repair, not a fresh excavation.  Snapshot
-    // the current tree here (after the worker, before review) and compare it to
-    // the previous reviewed attempt's snapshot.
     reviewContext: async ({ task, cwd, neighbours = [] }) => {
       const previousAttempt = priorAttempts(task).at(-1);
       const current = snapshotTree(cwd);
@@ -449,10 +432,6 @@ export function liveEffects({ cwd } = {}) {
         attemptPatch = retryPatch(cwd, previousAttempt.snapshot, current.sha);
         changedLocations = retryChangedLocations(cwd, previousAttempt.snapshot, current.sha);
       }
-      // Deliberately derive this from the preceding-attempt snapshot, rather
-      // than `ownChanges` (which is cumulative from step_base).  A retry must
-      // not be blamed for a file it did not change, nor excused merely because
-      // a finding happened somewhere else in the same file.
       const outsideFindings = (attemptDiff || []).filter((change) => {
         const path = reviewPath(change?.path);
         const findings = (previousAttempt?.findings || []).filter((f) => reviewPath(f?.file) === path);
@@ -721,9 +700,6 @@ export async function beginStep(ctx, task, wave = []) {
   const attempt = spent + 1;
   ctx.attempts.set(task.id, attempt);
   if (task._runner_high_route_pending) {
-    // The routing API deliberately takes risk rather than an arbitrary model
-    // override. This transient board clone turns exactly this retry into the
-    // configured high route; it is never persisted to todos.json.
     task._runner_high_route_pending = false;
     task._runner_high_route_used = true;
     task._runner_high_route_attempt = attempt;
@@ -879,10 +855,6 @@ function convergenceStop(task, base) {
 
 export function shouldEscalate(task, base) {
   const current = blockingFindings(base.review?.findings).length;
-  // finishAttempt has already appended the current journal entry before this
-  // decision runs.  There is nothing to compare on a first attempt: `at(-2)`
-  // is absent, and treating it as zero would falsely call the first failure a
-  // non-converging retry.
   const previousAttempt = priorAttempts(task).at(-2);
   const previous = blockingFindings(previousAttempt?.findings).length;
   if (task._runner_high_route_used || task._runner_high_route_pending) return false;
@@ -907,10 +879,6 @@ async function recordAttempt(ctx, task, base) {
   };
   let written;
   if (typeof ctx.effects.recordAttempt === "function") {
-    // Effects persist the pre-snapshot payload and return the end-tree SHA.
-    // Do not hand the journal's mutable object to an effect: test doubles (and
-    // callers which retain it for audit) must continue to see the payload that
-    // was actually submitted for persistence.
     try { written = await ctx.effects.recordAttempt({ task, cwd: ctx.cwd, entry: { ...entry } }); }
     catch (err) { written = { written: false, error: String(err?.message || err) }; }
   }
@@ -921,9 +889,6 @@ async function recordAttempt(ctx, task, base) {
 
 async function finishAttempt(ctx, task, outcome) {
   const journal = await recordAttempt(ctx, task, outcome);
-  // Compare only a reviewed attempt with older journal entries.  The current
-  // entry has just been appended, so excluding it makes ties retain the older
-  // checkpoint and a regression detectable without a branch or tag.
   if (outcome.review && outcome.review.skipped !== true && outcome.review.ok !== false) {
     const earlier = priorAttempts(task).slice(0, -1);
     const best = bestAttempt(earlier);
@@ -955,9 +920,6 @@ export async function finishStep(ctx, task, { result, review, baton, cost, ownCh
   const findings = Array.isArray(review?.findings) ? review.findings : [];
   const blocking = blockingFindings(findings);
   const architectFindings = findings.filter((f) => f?.level === "medium" || f?.level === "low");
-  // A reviewer may reject solely over medium/low work. It is useful input, but
-  // not a reason to make the worker churn: make it architect-owned and carry on
-  // through the ordinary verify/reconcile gate.
   const onlyArchitectural = review && review.skipped !== true && blocking.length === 0 && architectFindings.length;
   if (onlyArchitectural) {
     await recordArchitectComment(ctx, task, { attempt, findings: architectFindings });
@@ -1109,8 +1071,6 @@ async function retryReviewContext(ctx, task, ownChanges) {
       neighbours: ctx.members.filter((t) => t.id !== task.id),
     })) || null;
   } catch {
-    // Context improves a review but must not turn an otherwise runnable repair
-    // into a failed attempt when git snapshotting is unavailable.
     return null;
   }
 }
@@ -1173,9 +1133,6 @@ export async function runReported(ctx, task, wave, { result, review = null }) {
   const begun = await beginStep(ctx, task, wave);
   if (begun.kind === "retry-exhausted" || begun.kind === "red-base-failed") return begun;
   const { baton, cost } = await recordWork(ctx, task, result);
-  // A driven (--report) attempt modifies the same working tree as an executor
-  // attempt.  Measure its scope as well, so a rollback includes every file it
-  // changed instead of only its declared produces.
   const damage = await checkNeighbourDamage(ctx, task, result, baton, cost);
   if (damage && damage.issue) return damage.issue;
   const ownChanges = damage ? damage.ownChanges : null;

@@ -767,9 +767,6 @@ export function parseReviewVerdict(text) {
     if ((level === "critical" || level === "high") && (!file || !line || !evidence)) level = "medium";
     findings.push({ level, file, line, text, evidence });
   }
-  // Preserve the old, deliberately conservative contract for reviewers that
-  // have not learned the structured format yet: an unlabelled issue is one
-  // high finding, rather than silently becoming an approval.
   if (!findings.length && verdict === "issue") {
     const legacy = source.replace(/^\s*VERDICT:\s*(approve|issue)\s*$/gim, "").trim();
     findings.push({ level: "high", file: null, line: null, text: legacy, evidence: null });
