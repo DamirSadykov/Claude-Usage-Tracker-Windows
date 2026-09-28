@@ -113,6 +113,15 @@ describe("todos lint checks the recorded graph", () => {
     expect(out).toMatch(/#1: auto with no verify runs as a GATE/);
   });
 
+  it("warns when a broad promise includes an existing file over 1500 lines", () => {
+    const large = path.join(dir, "large.mjs");
+    writeFileSync(large, Array.from({ length: 1501 }, () => "x").join("\n"));
+    board(task(1, { produces: [large, "src/a.mjs", "src/b.mjs", "src/c.mjs"] }));
+    const { code, out } = lint();
+    expect(code).toBe(0);
+    expect(out).toMatch(/#1: шаг крупный — разрезать по produces/);
+  });
+
   it("errors on red declared without red-tests, and on red-tests without red", () => {
     board(task(1, { kind: "auto", red: "npm run test:red" }));
     expect(lint().out).toMatch(/#1: red declared without red-tests/);

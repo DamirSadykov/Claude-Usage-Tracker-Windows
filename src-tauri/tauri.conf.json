@@ -68,6 +68,7 @@
       "../scripts/cli/process/run-step.mjs": "scripts/cli/process/run-step.mjs",
       "../scripts/cli/process/run.mjs": "scripts/cli/process/run.mjs",
       "../scripts/cli/process/red-gate.mjs": "scripts/cli/process/red-gate.mjs",
+      "../scripts/cli/process/checkpoint.mjs": "scripts/cli/process/checkpoint.mjs",
       "../scripts/cli/process/apply.mjs": "scripts/cli/process/apply.mjs",
       "../scripts/cli/process/graph-rules.mjs": "scripts/cli/process/graph-rules.mjs",
       "../scripts/cli/process/lint.mjs": "scripts/cli/process/lint.mjs",

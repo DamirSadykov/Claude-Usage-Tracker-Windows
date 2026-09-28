@@ -145,6 +145,20 @@ export const NODE_RULES = [
         : null,
   },
   {
+    id: "large-step",
+    severity: "warning",
+    when: "open",
+    check: (n, g) =>
+      n.produces.length >= 4 &&
+      typeof g.lineCount === "function" &&
+      n.produces.some((p) => {
+        const count = g.lineCount(p);
+        return typeof count === "number" && count > 1500;
+      })
+        ? `${n.label}: шаг крупный — разрезать по produces`
+        : null,
+  },
+  {
     id: "red-without-red-tests",
     severity: "error",
     when: "open",

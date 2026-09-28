@@ -64,7 +64,7 @@
 
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readFileSync, appendFileSync, mkdirSync } from "node:fs";
 
@@ -93,10 +93,62 @@ import {
   runRedGate,
   recoverMarkers,
 } from "./red-gate.mjs";
+import { bestAttempt, blockingCount, restoreCheckpoint } from "./checkpoint.mjs";
 
 export const DEFAULT_PARALLEL_LIMIT = 1;
 
 const brief = (t) => (t ? { id: t.id, number: t.number, subject: t.subject } : null);
+
+const reviewPath = (value) => String(value || "").replace(/\\/g, "/");
+
+function retryChangedLocations(cwd, from, to) {
+  let output;
+  try {
+    output = execFileSync("git", ["diff", "--no-renames", "--no-ext-diff", "--unified=0", from, to], {
+      cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch {
+    return null;
+  }
+  const byPath = new Map();
+  let current = null;
+  for (const line of output.split(/\r?\n/)) {
+    if (line.startsWith("diff --git a/") && line.includes(" b/")) {
+      current = reviewPath(line.slice(line.indexOf(" b/") + 3));
+      if (!byPath.has(current)) byPath.set(current, []);
+      continue;
+    }
+    if (line.startsWith("+++ b/")) {
+      current = reviewPath(line.slice(6));
+      if (!byPath.has(current)) byPath.set(current, []);
+      continue;
+    }
+    const hunk = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line);
+    if (!hunk || !current) continue;
+    byPath.get(current).push({
+      oldStart: Number(hunk[1]), oldCount: Number(hunk[2] || 1),
+      newStart: Number(hunk[3]), newCount: Number(hunk[4] || 1),
+    });
+  }
+  return byPath;
+}
+
+function retryPatch(cwd, from, to) {
+  try {
+    return execFileSync("git", ["diff", "--no-renames", "--no-ext-diff", from, to], {
+      cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch {
+    return null;
+  }
+}
+
+function touchesFinding(ranges, line) {
+  if (!Number.isInteger(line) || line < 1) return false;
+  return (ranges || []).some(({ oldStart, oldCount, newStart, newCount }) =>
+    (oldCount > 0 && line >= oldStart && line < oldStart + oldCount) ||
+    (newCount > 0 && line >= newStart && line < newStart + newCount));
+}
 const num = (t) => (t && t.number != null ? `#${t.number}` : t ? t.id : "?");
 const declaredVerify = (t) => (t && t.verify && String(t.verify).trim()) || "";
 const declaredRed = (t) => (t && t.red && String(t.red).trim()) || "";
@@ -143,7 +195,8 @@ export function gateReason(t) {
 // one attempt at the node.
 export function attemptsSoFar(t) {
   const h = Array.isArray(t?.status_history) ? t.status_history : [];
-  return h.filter((e) => e && e.status === "in_progress").length;
+  const mechanical = Array.isArray(t?.attempts) ? t.attempts.filter((a) => a?.mechanics === true).length : 0;
+  return Math.max(0, h.filter((e) => e && e.status === "in_progress").length - mechanical);
 }
 
 const retryLimitOf = (t) => (typeof t?.retry_limit === "number" ? t.retry_limit : null);
@@ -328,6 +381,21 @@ export function liveEffects({ cwd } = {}) {
       if (!write.written) return { ok: false, error: write.error };
       return { ok: true, sha: based.sha };
     },
+    recordAttempt: async ({ task, cwd, entry }) => {
+      const snap = snapshotTree(cwd);
+      const saved = { ...entry, snapshot: snap.ok ? snap.sha : null };
+      const file = appDataFile("todos.json");
+      return withBoardLock(file, () => {
+        const data = loadBoardForWrite(file);
+        const todo = data.todos.find((t) => t && t.id === task.id);
+        if (!todo) return { written: false, error: `task ${task.id} not found on the board` };
+        if (!Array.isArray(todo.attempts)) todo.attempts = [];
+        todo.attempts.push(saved);
+        todo.updated_at = new Date().toISOString();
+        saveBoard(file, data);
+        return { written: true, snapshot: saved.snapshot };
+      });
+    },
     priorChanges: async ({ task, cwd }) => {
       if (!task.step_base) return { ok: true, changes: null };
       const head = gitHead(cwd);
@@ -351,6 +419,31 @@ export function liveEffects({ cwd } = {}) {
       });
       if (!damage.ok) return { ok: false, error: damage.error };
       return { ok: true, own: damage.own, damaged: damage.damaged };
+    },
+    reviewContext: async ({ task, cwd, neighbours = [] }) => {
+      const previousAttempt = priorAttempts(task).at(-1);
+      const current = snapshotTree(cwd);
+      let attemptDiff = null;
+      let attemptPatch = null;
+      let changedLocations = null;
+      if (previousAttempt?.snapshot && current.ok) {
+        const changed = diffNameStatus(cwd, previousAttempt.snapshot, current.sha);
+        if (Array.isArray(changed)) attemptDiff = changed;
+        attemptPatch = retryPatch(cwd, previousAttempt.snapshot, current.sha);
+        changedLocations = retryChangedLocations(cwd, previousAttempt.snapshot, current.sha);
+      }
+      const outsideFindings = (attemptDiff || []).filter((change) => {
+        const path = reviewPath(change?.path);
+        const findings = (previousAttempt?.findings || []).filter((f) => reviewPath(f?.file) === path);
+        return !findings.some((finding) => touchesFinding(changedLocations?.get(path), Number(finding?.line)));
+      });
+      return {
+        previousAttempt: previousAttempt || null,
+        attemptDiff,
+        attemptPatch,
+        outsideFindings,
+        neighbours: neighbours.map((t) => ({ number: t.number, subject: t.subject, produces: Array.isArray(t.produces) ? t.produces : [] })),
+      };
     },
     redGate: async ({ task, cwd, timeoutMs }) => {
       let mod;
@@ -455,6 +548,7 @@ export function runRecordOf(report, { inherit = false } = {}) {
     spend: report.spend || null,
     refused: (report.refused || []).length,
     transitions: (report.transitions || []).length,
+    architect_findings: report.architect_findings || [],
     stop: report.stop ? { kind: report.stop.kind, task: report.stop.task ? report.stop.task.number : null, reason: report.stop.reason } : null,
     complete: !!report.complete,
     one_pass: !!report.complete && !report.stop && (report.steps || []).every((s) => (s.attempt ?? 1) === 1),
@@ -605,6 +699,12 @@ export async function beginStep(ctx, task, wave = []) {
   }
   const attempt = spent + 1;
   ctx.attempts.set(task.id, attempt);
+  if (task._runner_high_route_pending) {
+    task._runner_high_route_pending = false;
+    task._runner_high_route_used = true;
+    task._runner_high_route_attempt = attempt;
+    task.risk = "high";
+  }
 
   await moveTo(ctx, task, "in_progress");
   return {
@@ -679,6 +779,22 @@ async function recordIssueComment(ctx, task, { attempt, limit, source, text }) {
   return comment;
 }
 
+async function recordArchitectComment(ctx, task, { attempt, findings }) {
+  const comment = {
+    id: randomUUID(),
+    author: "architect",
+    body: `ARCHITECT attempt ${attempt}\n${findings.map((f) =>
+      `[${f.level}]${f.file ? ` ${f.file}${f.line ? `:${f.line}` : ""}` : ""} ${f.text || ""}`.trim(),
+    ).join("\n")}`.trim(),
+    created_at: new Date().toISOString(),
+  };
+  (task.comments ??= []).push(comment);
+  if (typeof ctx.effects.recordIssue === "function") {
+    try { await ctx.effects.recordIssue({ task, comment }); } catch {}
+  }
+  return comment;
+}
+
 function resultBase(ctx, task, result, review, baton, cost, ownChanges) {
   const attempt = ctx.attempts.get(task.id);
   const limit = retryLimitOf(task);
@@ -694,6 +810,7 @@ function resultBase(ctx, task, result, review, baton, cost, ownChanges) {
     model: result.model || null,
     route: result.route || null,
     ownChanges: Array.isArray(ownChanges) ? ownChanges.length : null,
+    rollbackChanges: Array.isArray(ownChanges) ? ownChanges : [],
     neighbourDamage: Array.isArray(ownChanges) ? 0 : null,
     review: review ? {
       skipped: !!review.skipped,
@@ -702,8 +819,93 @@ function resultBase(ctx, task, result, review, baton, cost, ownChanges) {
       model: review.model || null,
       session: review.sessionId || null,
       route: review.route || null,
+      findings: Array.isArray(review.findings) ? review.findings : [],
     } : null,
   };
+}
+
+function findingCounts(findings) {
+  const counts = { critical: 0, high: 0, medium: 0, low: 0 };
+  for (const finding of findings || []) if (Object.hasOwn(counts, finding?.level)) counts[finding.level] += 1;
+  return counts;
+}
+
+const blockingFindings = (findings) => (findings || []).filter((f) => f?.level === "critical" || f?.level === "high");
+const findingKey = (f) => `${f?.file || ""}\u0000${f?.text || ""}`;
+const priorAttempts = (task) => Array.isArray(task?.attempts) ? task.attempts : [];
+
+function convergenceStop(task, base) {
+  const findings = blockingFindings(base.review?.findings);
+  if (!findings.length) return null;
+  const previous = priorAttempts(task).at(-1);
+  const previousBlocking = blockingFindings(previous?.findings);
+  if (findings.length >= 3)
+    return "резать или менять подход: в одной попытке найдено 3+ critical/high";
+  if (base.attempt >= 3) {
+    const known = new Set(priorAttempts(task).flatMap((a) => blockingFindings(a.findings).map(findingKey)));
+    if (findings.some((f) => !known.has(findingKey(f))))
+      return "резать или менять подход: на попытке 3+ появились новые critical/high";
+  }
+  const budget = Number(task.budget_usd);
+  const spent = priorAttempts(task).reduce((sum, a) => sum + (Number.isFinite(a?.cost_usd) ? a.cost_usd : 0), 0) + (Number.isFinite(base.cost) ? base.cost : 0);
+  if (Number.isFinite(budget) && spent > budget * 0.6 && previous && findings.length >= previousBlocking.length)
+    return "порог денег: потрачено больше 60% бюджета шага, а critical/high не уменьшаются";
+  return null;
+}
+
+export function shouldEscalate(task, base) {
+  const current = blockingFindings(base.review?.findings).length;
+  const previousAttempt = priorAttempts(task).at(-2);
+  const previous = blockingFindings(previousAttempt?.findings).length;
+  if (task._runner_high_route_used || task._runner_high_route_pending) return false;
+  return String(task.risk || "").toLowerCase() === "high" || (previousAttempt != null && current > 0 && current >= previous);
+}
+
+function hasHighRoute() {
+  try { return resolveDuty("worker", undefined, { risk: "high" }).route?.applied === true; } catch { return false; }
+}
+
+async function recordAttempt(ctx, task, base) {
+  const findings = base.review?.findings || [];
+  const entry = {
+    attempt: base.attempt,
+    cost_usd: typeof base.cost === "number" && Number.isFinite(base.cost) ? base.cost : null,
+    findings,
+    counts: findingCounts(findings),
+    reviewed: !!base.review && base.review.skipped !== true && base.review.ok !== false,
+    mechanics: base.kind === "mechanics",
+    verify_tail: base.verifyTail ?? null,
+    snapshot: null,
+  };
+  let written;
+  if (typeof ctx.effects.recordAttempt === "function") {
+    try { written = await ctx.effects.recordAttempt({ task, cwd: ctx.cwd, entry: { ...entry } }); }
+    catch (err) { written = { written: false, error: String(err?.message || err) }; }
+  }
+  entry.snapshot = written?.snapshot || null;
+  (task.attempts ??= []).push(entry);
+  return entry;
+}
+
+async function finishAttempt(ctx, task, outcome) {
+  const journal = await recordAttempt(ctx, task, outcome);
+  if (outcome.review && outcome.review.skipped !== true && outcome.review.ok !== false) {
+    const earlier = priorAttempts(task).slice(0, -1);
+    const best = bestAttempt(earlier);
+    if (best && blockingCount(journal) > blockingCount(best)) {
+      const restored = restoreCheckpoint({
+        cwd: ctx.cwd,
+        sha: best.snapshot,
+        produces: task.produces,
+        ownChanges: outcome.rollbackChanges,
+      });
+      if (!restored.ok) {
+        return { ...outcome, kind: "convergence", parkReason: restored.lost ? "контрольная точка потеряна" : `контрольная точка не восстановлена: ${restored.reason}`, attempt_journal: journal };
+      }
+      return { ...outcome, rolledBackTo: best.snapshot, attempt_journal: journal };
+    }
+  }
+  return { ...outcome, attempt_journal: journal };
 }
 
 // Everything AFTER the executor and the reviewer have run: the review verdict,
@@ -715,30 +917,46 @@ export async function finishStep(ctx, task, { result, review, baton, cost, ownCh
   const base = resultBase(ctx, task, result, review, baton, cost, ownChanges);
   const { attempt, limit } = base;
 
-  if (review && review.skipped !== true && (review.ok === false || review.approved !== true)) {
+  const findings = Array.isArray(review?.findings) ? review.findings : [];
+  const blocking = blockingFindings(findings);
+  const architectFindings = findings.filter((f) => f?.level === "medium" || f?.level === "low");
+  const onlyArchitectural = review && review.skipped !== true && blocking.length === 0 && architectFindings.length;
+  if (onlyArchitectural) {
+    await recordArchitectComment(ctx, task, { attempt, findings: architectFindings });
+    base.architectFindings = architectFindings;
+  }
+  if (review && review.skipped !== true && (blocking.length || (!onlyArchitectural && (review.ok === false || review.approved !== true)))) {
     await recordIssueComment(ctx, task, {
       attempt,
       limit,
       source: review.model ? `review ${review.model}` : "review",
       text: clampChars(review.result || review.error || "reviewer did not approve the obligations", 6000),
     });
-    return {
+    const stopped = convergenceStop(task, base);
+    return finishAttempt(ctx, task, {
       ...base,
-      kind: "issue",
+      kind: stopped ? "convergence" : "issue",
+      parkReason: stopped,
+      routeEscalated: task._runner_high_route_attempt === attempt,
       reason: `model review issue: ${review.error || review.result || "reviewer did not approve the obligations"}`,
-    };
+    });
   }
 
   // A gate does the WORK and stops at `review`: the human checks one slice, and
   // the dependents stay blocked by construction.
   if (isGate(task)) {
     await moveTo(ctx, task, "review");
-    return { ...base, kind: "gate", reason: gateReason(task) };
+    return finishAttempt(ctx, task, { ...base, kind: "gate", reason: gateReason(task) });
   }
   if (result.ok === false) {
     const error = result.error || "no error reported";
     await recordIssueComment(ctx, task, { attempt, limit, source: "executor", text: clampChars(error, 6000) });
-    return { ...base, kind: "issue", reason: `step failed: ${error}` };
+    return finishAttempt(ctx, task, {
+      ...base,
+      kind: "issue",
+      routeEscalated: task._runner_high_route_attempt === attempt,
+      reason: `step failed: ${error}`,
+    });
   }
 
   if (declaredRed(task)) {
@@ -755,7 +973,13 @@ export async function finishStep(ctx, task, { result, review, baton, cost, ownCh
         source: "red",
         text: clampChars(gate.reason || "red gate issue", 6000),
       });
-      return { ...base, kind: "issue", red: gate.field ?? null, reason: gate.reason || "red gate issue" };
+      return finishAttempt(ctx, task, {
+        ...base,
+        kind: "issue",
+        routeEscalated: task._runner_high_route_attempt === attempt,
+        red: gate.field ?? null,
+        reason: gate.reason || "red gate issue",
+      });
     }
     base.red = gate.field ?? null;
   }
@@ -768,7 +992,14 @@ export async function finishStep(ctx, task, { result, review, baton, cost, ownCh
   const verify = Number(verdictRun?.code) === 0 ? "ok" : "issue";
   if (verify === "issue") {
     const combined = [verdictRun?.stdout, verdictRun?.stderr].filter((s) => s && String(s).trim()).join("\n");
-    await recordIssueComment(ctx, task, { attempt, limit, source: "verify", text: tailLines(combined, 60) });
+    const tail = tailLines(combined, 60);
+    base.verifyTail = tail;
+    await recordIssueComment(ctx, task, { attempt, limit, source: "verify", text: tail });
+    const repeated = priorAttempts(task).at(-1)?.verify_tail === tail;
+    if (repeated && tail.trim() && review && review.skipped !== true && (review.approved === true || onlyArchitectural) && blocking.length === 0) {
+      ctx.attempts.set(task.id, Math.max(0, attempt - 1));
+      return finishAttempt(ctx, task, { ...base, kind: "mechanics", verify, reason: "механика: verify упал с тем же выводом две попытки подряд при одобренном ревью без critical/high" });
+    }
   }
   const report = (await ctx.effects.reconcile({ task, verify })) || {};
   const outcome = report.outcome ?? null;
@@ -777,19 +1008,20 @@ export async function finishStep(ctx, task, { result, review, baton, cost, ownCh
   if (outcome === "ok") {
     const moved = await moveTo(ctx, task, "done");
     if (!moved.ok)
-      return {
+      return finishAttempt(ctx, task, {
         ...base,
         kind: "undecided",
         verify,
         reason: `the work finished and reconciled, but the board refused to close the node: ${moved.error}`,
-      };
-    return { ...base, kind: "done", verify, reason };
+      });
+    return finishAttempt(ctx, task, { ...base, kind: "done", verify, reason });
   }
   if (outcome === "issue") {
     if (verify === "ok") await recordIssueComment(ctx, task, { attempt, limit, source: "reconcile", text: clampChars(reason, 6000) });
-    return { ...base, kind: "issue", verify, reason };
+    const stopped = convergenceStop(task, base);
+    return finishAttempt(ctx, task, { ...base, kind: stopped ? "convergence" : "issue", parkReason: stopped, routeEscalated: task._runner_high_route_attempt === attempt, verify, reason });
   }
-  return { ...base, kind: "undecided", verify, reason };
+  return finishAttempt(ctx, task, { ...base, kind: "undecided", verify, reason });
 }
 
 function formatNeighbourDamage(damaged) {
@@ -820,12 +1052,40 @@ async function checkNeighbourDamage(ctx, task, result, baton, cost) {
   });
   return {
     ownChanges,
-    issue: {
+    issue: await finishAttempt(ctx, task, {
       ...base,
       kind: "issue",
+      routeEscalated: task._runner_high_route_attempt === base.attempt,
       reason: `step reverted or deleted work of earlier steps outside its own produces: ${damage.damaged.map((d) => d.path).join(", ")}`,
-    },
+    }),
   };
+}
+
+async function retryReviewContext(ctx, task, ownChanges) {
+  if (!priorAttempts(task).length) return null;
+  try {
+    return (await ctx.effects.reviewContext?.({
+      task,
+      cwd: ctx.cwd,
+      ownChanges,
+      neighbours: ctx.members.filter((t) => t.id !== task.id),
+    })) || null;
+  } catch {
+    return null;
+  }
+}
+
+function downgradeUntouchedRetryFindings(review, context) {
+  if (!review || !Array.isArray(review.findings) || !Array.isArray(context?.attemptDiff)) return review;
+  const prior = new Set((context.previousAttempt?.findings || []).map(findingKey));
+  const touched = new Set(context.attemptDiff.map((c) => String(c?.path || "").replace(/\\/g, "/")));
+  const findings = review.findings.map((f) => {
+    const file = String(f?.file || "").replace(/\\/g, "/");
+    if ((f?.level === "critical" || f?.level === "high") && !prior.has(findingKey(f)) && file && !touched.has(file))
+      return { ...f, level: "medium", evidence: `${f.evidence || ""}${f.evidence ? "; " : ""}outside this retry's diff` };
+    return f;
+  });
+  return { ...review, findings };
 }
 
 // One attempt at one node, composed from the three phases above: beginStep does
@@ -848,6 +1108,7 @@ async function runOne(ctx, task, wave = []) {
   const damage = await checkNeighbourDamage(ctx, task, result, baton, cost);
   if (damage && damage.issue) return damage.issue;
   const ownChanges = damage ? damage.ownChanges : null;
+  const retryContext = await retryReviewContext(ctx, task, ownChanges);
 
   let review = null;
   if (result.ok !== false && typeof ctx.effects.reviewStep === "function") {
@@ -858,7 +1119,9 @@ async function runOne(ctx, task, wave = []) {
         cwd: ctx.cwd,
         timeoutMs: ctx.timeoutMs,
         ownChanges,
+        retryContext,
       });
+      review = downgradeUntouchedRetryFindings(review, retryContext);
     } catch (err) {
       review = { approved: false, ok: false, error: String(err?.message || err) };
     }
@@ -870,7 +1133,16 @@ export async function runReported(ctx, task, wave, { result, review = null }) {
   const begun = await beginStep(ctx, task, wave);
   if (begun.kind === "retry-exhausted" || begun.kind === "red-base-failed") return begun;
   const { baton, cost } = await recordWork(ctx, task, result);
-  return finishStep(ctx, task, { result, review, baton, cost });
+  const damage = await checkNeighbourDamage(ctx, task, result, baton, cost);
+  if (damage && damage.issue) return damage.issue;
+  const ownChanges = damage ? damage.ownChanges : null;
+  return finishStep(ctx, task, {
+    result,
+    review,
+    baton,
+    cost,
+    ownChanges,
+  });
 }
 
 // The `?issue` transition and every stop it can produce. All of it runs in board
@@ -878,6 +1150,14 @@ export async function runReported(ctx, task, wave, { result, review = null }) {
 async function applyIssue(ctx, r) {
   const task = r.task;
   const limit = r.limit;
+  if (r.routeEscalated) {
+    await moveTo(ctx, task, "review");
+    park(ctx, "convergence", task, "резать или менять подход: high-маршрут уже был использован для следующей попытки");
+    return;
+  }
+  if (shouldEscalate(task, r) && hasHighRoute()) {
+    task._runner_high_route_pending = true;
+  }
   if (limit === null) {
     await moveTo(ctx, task, "review");
     park(
@@ -989,6 +1269,7 @@ export function buildRunContext({ data, change, effects = {}, dry = true, cwd = 
     sessions: new Map(),
     inherit: !!inherit,
     steps: [],
+    architectFindings: [],
     waves: [],
     spent,
     nodeSpent: new Map(),
@@ -1053,6 +1334,7 @@ export async function applyResult(ctx, r, { dry, log }) {
     cost_usd: r.cost,
     baton: r.baton ?? null,
     review: r.review ?? null,
+    architect_findings: r.architectFindings ?? [],
     gate: r.kind === "gate",
     verify: r.verify ?? null,
     red: r.red ?? null,
@@ -1064,6 +1346,8 @@ export async function applyResult(ctx, r, { dry, log }) {
     neighbour_damage: typeof r.neighbourDamage === "number" ? r.neighbourDamage : null,
   };
   ctx.steps.push(record);
+  if (Array.isArray(r.architectFindings) && r.architectFindings.length)
+    ctx.architectFindings.push({ task: brief(r.task), attempt: r.attempt, findings: r.architectFindings });
   log(formatStepLine(record, dry));
 
   if (r.kind === "gate") {
@@ -1086,6 +1370,20 @@ export async function applyResult(ctx, r, { dry, log }) {
     ctx.parked.add(r.task.id);
     await moveTo(ctx, r.task, "review");
     park(ctx, "outcome", r.task, `the outcome could not be finalized (${r.reason}) — nothing is closed on a guess`);
+    return record;
+  }
+  if (r.kind === "mechanics") {
+    ctx.parked.add(r.task.id);
+    await moveTo(ctx, r.task, "review");
+    park(ctx, "mechanics", r.task, r.reason);
+    record.status = r.task.status;
+    return record;
+  }
+  if (r.kind === "convergence") {
+    ctx.parked.add(r.task.id);
+    await moveTo(ctx, r.task, "review");
+    park(ctx, "convergence", r.task, r.parkReason || r.reason);
+    record.status = r.task.status;
     return record;
   }
   if (r.kind === "issue") {
@@ -1246,6 +1544,7 @@ export async function runChange({
     steps: ctx.steps,
     transitions: ctx.transitions,
     refused: ctx.refused,
+    architect_findings: ctx.architectFindings,
     spend: {
       usd: round(ctx.spent),
       unmeasured_steps: ctx.unknownCost,
@@ -1323,6 +1622,12 @@ export function formatRunReport(r) {
   );
   if (!r.steps.length) out.push("  (nothing to run — the frontier was empty from the start)\n");
   for (const s of r.steps) out.push(formatStepLine(s, r.dry));
+  if (Array.isArray(r.architect_findings) && r.architect_findings.length) {
+    out.push("  архитектору:\n");
+    for (const item of r.architect_findings)
+      for (const finding of item.findings)
+        out.push(`    #${item.task.number} [${finding.level}] ${finding.file || "(file not specified)"}${finding.line ? `:${finding.line}` : ""} ${finding.text || ""}\n`);
+  }
   for (const t of r.transitions) out.push(formatTransitionLine(t));
   for (const f of r.refused || [])
     out.push(`  refused  #${f.task.number} → ${f.status} — ${f.error}

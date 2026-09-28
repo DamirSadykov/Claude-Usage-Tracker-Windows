@@ -95,6 +95,22 @@ describe("apply refuses an invalid graph", () => {
     expect(warnings.join(" ")).toMatch(/runs as a GATE/);
   });
 
+  it("warns before work when four outputs include a large existing file", () => {
+    const { errors, warnings } = validate(
+      readDocument(
+        [
+          "steps:",
+          "  1:",
+          "    title: Большой шаг",
+          "    produces: [src/large.mjs, src/a.mjs, src/b.mjs, src/c.mjs]",
+        ].join("\n"),
+      ),
+      { lineCount: (file) => (file === "src/large.mjs" ? 1501 : null) },
+    );
+    expect(errors).toEqual([]);
+    expect(warnings).toContain('step "1": шаг крупный — разрезать по produces');
+  });
+
   it("warns that parallel/budget land nowhere without a change root", () => {
     const { warnings } = check(["parallel: 2", "steps:", "  1: A"].join("\n"));
     expect(warnings.join(" ")).toMatch(/change/);
@@ -459,6 +475,37 @@ describe("a step may name the task it IS", () => {
     say(yaml("hash.yaml", "steps:", "  1:", `    task: t#${n}`, "    retry: 2"), "--go");
     expect(board().todos).toHaveLength(1);
     expect(board().todos[0].retry_limit).toBe(2);
+  });
+
+  it("returns only a retry-exhausted review node to queue when its limit is raised", () => {
+    todos("add", "Исчерпан");
+    const n = board().todos[0].number;
+    const data = board();
+    Object.assign(data.todos[0], {
+      status: "review",
+      retry_limit: 2,
+      comments: [{ author: "review", body: "ISSUE attempt 2/2\nverify\nfailed" }],
+    });
+    writeFileSync(path.join(dir, "com.claude-usage-tracker.app", "todos.json"), JSON.stringify(data));
+    const out = say(yaml("raise.yaml", "steps:", "  1:", `    task: ${n}`, "    retry: 3"), "--go");
+    expect(out).toMatch(/returned to queue/);
+    expect(board().todos[0].status).toBe("queue");
+    expect(board().todos[0].retry_limit).toBe(3);
+  });
+
+  it("does not reopen a review node whose issue was not written by the runner review", () => {
+    todos("add", "Ручное ревью");
+    const n = board().todos[0].number;
+    const data = board();
+    Object.assign(data.todos[0], {
+      status: "review",
+      retry_limit: 2,
+      comments: [{ author: "manual", body: "ISSUE attempt 2/2\nverify\nfailed" }],
+    });
+    writeFileSync(path.join(dir, "com.claude-usage-tracker.app", "todos.json"), JSON.stringify(data));
+    const out = say(yaml("manual.yaml", "steps:", "  1:", `    task: ${n}`, "    retry: 3"), "--go");
+    expect(out).not.toMatch(/returned to queue/);
+    expect(board().todos[0].status).toBe("review");
   });
 
   it("refuses a binding that points at nothing instead of forking the graph", () => {

@@ -494,6 +494,8 @@ describe("buildReviewPrompt", () => {
     const prompt = buildReviewPrompt({ task, appData: tmp });
     expect(prompt).toContain("produces: src/parser.rs");
     expect(prompt).toContain("verify: npm test");
+    expect(prompt).toContain("- [critical|high|medium|low] file:line — substance — evidence");
+    expect(prompt).toContain("critical = the project does not build");
     expect(prompt).not.toMatch(/spec:/);
     expect(prompt).not.toContain("tasks#model");
   });
@@ -545,6 +547,30 @@ describe("buildReviewPrompt · CHANGES OF THIS STEP", () => {
     expect(prompt).toContain("CHANGES OF THIS STEP");
     expect(prompt).toContain("unknown");
     expect(prompt).toContain("not findings of this step");
+  });
+});
+
+describe("buildReviewPrompt · retry context", () => {
+  it("puts preceding findings first, then the retry diff, unrelated edits, and neighbouring promises", () => {
+    const prompt = buildReviewPrompt({
+      task: { number: 8, subject: "repair parser", produces: ["src/parser.mjs"], verify: "npm test" },
+      appData: tmp,
+      ownChanges: [{ status: "M", path: "src/parser.mjs" }, { status: "M", path: "src/helper.mjs" }],
+      retryContext: {
+        previousAttempt: { findings: [{ level: "high", file: "src/parser.mjs", line: 12, text: "null input fails" }] },
+        attemptDiff: [{ status: "M", path: "src/parser.mjs" }],
+        attemptPatch: "diff --git a/src/parser.mjs b/src/parser.mjs\n@@ -12 +12 @@\n-old\n+fixed",
+        outsideFindings: [{ status: "M", path: "src/helper.mjs" }],
+        neighbours: [{ number: 9, subject: "add CLI", produces: ["src/cli.mjs"] }],
+      },
+    });
+    expect(prompt).toContain("FIRST, re-check these findings");
+    expect(prompt).toContain("[high] src/parser.mjs:12 — null input fails");
+    expect(prompt).toContain("DIFF OF THIS ATTEMPT");
+    expect(prompt).toContain("+fixed");
+    expect(prompt).toContain("CHANGES OUTSIDE PRECEDING FINDINGS");
+    expect(prompt).toContain("M src/helper.mjs");
+    expect(prompt).toContain("t#9 add CLI — produces: src/cli.mjs");
   });
 });
 
@@ -954,10 +980,24 @@ describe("clampOutput / parseClaudeResult", () => {
   });
 
   it("requires an explicit approving review verdict", () => {
-    expect(parseReviewVerdict("looks good\nVERDICT: approve")).toEqual({ approved: true, verdict: "approve" });
-    expect(parseReviewVerdict("finding\nVERDICT: issue")).toEqual({ approved: false, verdict: "issue" });
+    expect(parseReviewVerdict("looks good\nVERDICT: approve")).toEqual({ approved: true, verdict: "approve", findings: [] });
+    expect(parseReviewVerdict("finding\nVERDICT: issue")).toEqual({ approved: false, verdict: "issue", findings: [{ level: "high", file: null, line: null, text: "finding", evidence: null }] });
     expect(parseReviewVerdict("looks good but omitted the contract line"))
-      .toEqual({ approved: false, verdict: "issue" });
+      .toEqual({ approved: false, verdict: "issue", findings: [{ level: "high", file: null, line: null, text: "looks good but omitted the contract line", evidence: null }] });
+  });
+
+  it("parses structured findings and downgrades unsupported critical/high findings", () => {
+    const verdict = parseReviewVerdict([
+      "- [critical] src/data.mjs:42 — deletes records — delete flow drops existing rows",
+      "- [high] src/ui.mjs:8 — button is hidden",
+      "- [low] src/a.mjs:2 — trailing space — cosmetic",
+      "VERDICT: issue",
+    ].join("\n"));
+    expect(verdict.findings).toEqual([
+      { level: "critical", file: "src/data.mjs", line: 42, text: "deletes records", evidence: "delete flow drops existing rows" },
+      { level: "medium", file: "src/ui.mjs", line: 8, text: "button is hidden", evidence: null },
+      { level: "low", file: "src/a.mjs", line: 2, text: "trailing space", evidence: "cosmetic" },
+    ]);
   });
 
   it("prices OpenAI fresh input, cached input and output separately", () => {

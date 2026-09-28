@@ -208,7 +208,7 @@ export function readDocument(text) {
 // done), so the rules about the past never fire, and a reference may point at a
 // step of this file OR at a task already on the board — a plan is allowed to
 // hang off what is already there.
-function documentGraph(doc, onBoard) {
+function documentGraph(doc, onBoard, lineCount) {
   const ids = new Set(doc.steps.map((s) => s.id));
   return {
     changes: doc.change ? [{ label: `change "${doc.change}"`, budget: doc.budget }] : [],
@@ -234,11 +234,25 @@ function documentGraph(doc, onBoard) {
     })),
     resolves: (ref) => ids.has(ref) || onBoard(ref),
     unknownRef: (ref) => `"${ref}", which is neither a step of this file nor a task on the board`,
+    lineCount,
   };
 }
 
-export function validate(doc, { onBoard = () => false, inheritsChange = false, requireChange = false } = {}) {
-  const { errors, warnings } = splitFindings(checkGraph(documentGraph(doc, onBoard)));
+export function workspaceLineCount(file) {
+  try {
+    const text = readFileSync(file, "utf8");
+    if (!text) return 0;
+    return text.split(/\r\n|\r|\n/).length - (/(?:\r\n|\r|\n)$/.test(text) ? 1 : 0);
+  } catch {
+    return null;
+  }
+}
+
+export function validate(
+  doc,
+  { onBoard = () => false, inheritsChange = false, requireChange = false, lineCount = workspaceLineCount } = {},
+) {
+  const { errors, warnings } = splitFindings(checkGraph(documentGraph(doc, onBoard, lineCount)));
   if (!doc.steps.length) errors.push("no steps: the file declares nothing to record");
   // A file that only CONTINUES existing tasks needs no group of its own — the
   // one-step plan bound by `task: <N>` is the format's own normal case. A file
@@ -375,6 +389,7 @@ export function applyDocument(doc, { go = false, force = false, project, board }
     onBoard: (token) => Boolean(resolveTask(data, token)),
     inheritsChange: doc.steps.some((s) => s.task && resolveTask(data, s.task)?.change_id),
     requireChange: true,
+    lineCount: workspaceLineCount,
   });
   if (errors.length)
     return {
@@ -559,7 +574,29 @@ export function applyDocument(doc, { go = false, force = false, project, board }
         }
         if (s.priority) set(t, "priority", s.priority);
         if (s.verify) set(t, "verify", s.verify);
-        if (s.retry) set(t, "retry", s.retry);
+        if (s.retry) {
+          const oldLimit = t.retry_limit;
+          const newLimit = Number(s.retry);
+          set(t, "retry", s.retry);
+          const lastIssue = [...(t.comments || [])]
+            .reverse()
+            .find(
+              (comment) =>
+                comment?.author === "review" && /^ISSUE attempt (\d+)\/(\d+)(?:\s|$)/.test(String(comment?.body || "")),
+            );
+          const marker = lastIssue && /^ISSUE attempt (\d+)\/(\d+)(?:\s|$)/.exec(String(lastIssue.body));
+          if (
+            t.status === "review" &&
+            typeof oldLimit === "number" &&
+            newLimit > oldLimit &&
+            marker &&
+            Number(marker[1]) === Number(marker[2]) &&
+            Number(marker[2]) === oldLimit
+          ) {
+            set(t, "status", "queue");
+            notes.push(`ok: #${t.number} retry raised to <=${newLimit} — exhausted node returned to queue`);
+          }
+        }
         if (s.kind) set(t, "kind", s.kind);
         if (s.budget) set(t, "budget", s.budget);
         if (s.red) set(t, "red", s.red);
