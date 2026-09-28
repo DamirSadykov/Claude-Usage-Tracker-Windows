@@ -506,6 +506,28 @@ describe("snapshotTree", () => {
 });
 
 describe("computeNeighbourDamage", () => {
+  it("separates executor edits from concurrent changes while retaining declared produces", () => {
+    const dir = initRepo("cut-damage-outside-");
+    try {
+      write(dir, "a.txt", "base a\n");
+      write(dir, "b.txt", "base b\n");
+      const head = commitAll(dir, "base");
+      const stepBase = snapshotTree(dir).sha;
+      write(dir, "a.txt", "step a\n");
+      write(dir, "b.txt", "other session b\n");
+      const end = snapshotTree(dir).sha;
+
+      const scoped = computeNeighbourDamage({ cwd: dir, head, stepBase, end, produces: [], edited: ["a.txt"] });
+      expect(scoped.own).toEqual([{ status: "M", path: "a.txt" }]);
+      expect(scoped.outside).toEqual([{ status: "M", path: "b.txt" }]);
+      const legacy = computeNeighbourDamage({ cwd: dir, head, stepBase, end, produces: [], edited: null });
+      expect(legacy.own.map((change) => change.path).sort()).toEqual(["a.txt", "b.txt"]);
+      expect(legacy.outside).toEqual([]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("flags a path outside produces that an earlier step touched and this step reverted or deleted", () => {
     const dir = initRepo("cut-damage-revert-");
     try {

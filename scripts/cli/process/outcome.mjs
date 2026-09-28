@@ -530,7 +530,7 @@ export function stepChanges(todo, cwd) {
   if (!end.ok) return null;
   const diff = diffNameStatus(cwd, base, end.sha);
   if (!Array.isArray(diff)) return null;
-  return new Set(diff.filter((c) => c.status === "A" || c.status === "M").map((c) => c.path));
+  return new Set(diff.filter((c) => c.status === "A" || c.status === "M" || c.status === "D").map((c) => c.path));
 }
 
 function applyOutcome(file, data, todo, report) {

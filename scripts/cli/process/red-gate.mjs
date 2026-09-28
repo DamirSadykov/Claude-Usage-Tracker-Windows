@@ -119,14 +119,23 @@ export function diffNameStatus(cwd, from, to) {
   }
 }
 
-export function computeNeighbourDamage({ cwd, head, stepBase, end, produces }) {
-  const own = diffNameStatus(cwd, stepBase, end);
-  if (!Array.isArray(own)) return { ok: false, error: own.error };
+export function computeNeighbourDamage({ cwd, head, stepBase, end, produces, edited = null }) {
+  const changes = diffNameStatus(cwd, stepBase, end);
+  if (!Array.isArray(changes)) return { ok: false, error: changes.error };
   const prior = diffNameStatus(cwd, head, stepBase);
   if (!Array.isArray(prior)) return { ok: false, error: prior.error };
   const producesSet = new Set(
     (Array.isArray(produces) ? produces : []).map(normalizePath).filter(Boolean),
   );
+  const editedSet = Array.isArray(edited)
+    ? new Set(edited.map(normalizePath).filter(Boolean))
+    : null;
+  const own = editedSet
+    ? changes.filter((change) => editedSet.has(change.path) || producesSet.has(change.path))
+    : changes;
+  const outside = editedSet
+    ? changes.filter((change) => !editedSet.has(change.path) && !producesSet.has(change.path))
+    : [];
   const priorPaths = new Set(prior.map((c) => c.path));
   const damaged = [];
   for (const change of own) {
@@ -144,7 +153,7 @@ export function computeNeighbourDamage({ cwd, head, stepBase, end, produces }) {
     const headBuf = readAtBase(cwd, head, change.path);
     if (endBuf.equals(headBuf)) damaged.push({ path: change.path, state: "reverted" });
   }
-  return { ok: true, own, prior, damaged };
+  return { ok: true, own, outside, prior, damaged };
 }
 
 const insideCwd = (cwd, rel) => {

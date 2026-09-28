@@ -211,6 +211,29 @@ export const NODE_RULES = [
 
 export const GRAPH_RULES = [
   {
+    id: "produces-overlap",
+    severity: "warning",
+    check: (g) => {
+      const nodes = g.nodes.filter((n) => !n.closed);
+      const findings = [];
+      for (let index = 0; index < nodes.length; index += 1) {
+        const left = nodes[index];
+        for (const right of nodes.slice(index + 1)) {
+          if (needsPath(g.nodes, left.id, right.id) || needsPath(g.nodes, right.id, left.id)) continue;
+          const rightPaths = new Map((right.produces || []).map((p) => [normalizeProducesPath(p), p]));
+          for (const rawPath of left.produces || []) {
+            const path = normalizeProducesPath(rawPath);
+            if (!path || !rightPaths.has(path)) continue;
+            findings.push(
+              `${left.label} and ${right.label} both produce "${rightPaths.get(path)}" without a needs path between them — add a needs edge or make one step`,
+            );
+          }
+        }
+      }
+      return findings;
+    },
+  },
+  {
     id: "needs-cycle",
     severity: "error",
     check: (g) => {
@@ -291,4 +314,20 @@ export function findCycle(nodes) {
   };
   for (const n of nodes) walk(n.id);
   return found;
+}
+
+function normalizeProducesPath(value) {
+  return String(value || "").replaceAll("\\", "/");
+}
+
+function needsPath(nodes, from, target) {
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const seen = new Set();
+  const walk = (id) => {
+    if (id === target) return true;
+    if (seen.has(id)) return false;
+    seen.add(id);
+    return (byId.get(id)?.needs || []).some(walk);
+  };
+  return walk(from);
 }

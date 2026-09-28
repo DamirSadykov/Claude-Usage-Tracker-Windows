@@ -39,6 +39,7 @@ import {
   extractHandoff,
   MAX_CAPTURE_CHARS,
   ancestorRecords,
+  editedPathsOf,
   formatRecords,
   transcriptPathFor,
 } from "./run-step.mjs";
@@ -50,6 +51,7 @@ let appDir;
 let prevAppData;
 let prevSession;
 let prevUserProfile;
+let prevCodexHome;
 
 const boardFile = () => path.join(appDir, "todos.json");
 const journal = () => path.join(appDir, "task-sessions.jsonl");
@@ -158,6 +160,8 @@ beforeEach(() => {
   process.env.USERPROFILE = tmp;
   prevSession = process.env.CLAUDE_CODE_SESSION_ID;
   delete process.env.CLAUDE_CODE_SESSION_ID;
+  prevCodexHome = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = path.join(tmp, "codex-home");
   fakeClaude = path.join(tmp, "fake-claude.mjs");
   fakeCodex = path.join(tmp, "fake-codex.mjs");
   fakeVerify = path.join(tmp, "fake-verify.mjs");
@@ -173,6 +177,8 @@ afterEach(() => {
   else process.env.USERPROFILE = prevUserProfile;
   if (prevSession === undefined) delete process.env.CLAUDE_CODE_SESSION_ID;
   else process.env.CLAUDE_CODE_SESSION_ID = prevSession;
+  if (prevCodexHome === undefined) delete process.env.CODEX_HOME;
+  else process.env.CODEX_HOME = prevCodexHome;
   delete process.env.FAKE_MODE;
   delete process.env.FAKE_ECHO;
   delete process.env.FAKE_CODEX_THREAD_ID;
@@ -548,6 +554,19 @@ describe("buildReviewPrompt · CHANGES OF THIS STEP", () => {
     expect(prompt).toContain("unknown");
     expect(prompt).toContain("not findings of this step");
   });
+
+  it("lists outside changes separately only when they are present", () => {
+    const prompt = buildReviewPrompt({
+      task,
+      appData: tmp,
+      outsideChanges: [{ status: "M", path: "src/unrelated.rs" }],
+    });
+    expect(prompt).toContain("CHANGES OUTSIDE THIS STEP");
+    expect(prompt).toContain("M src/unrelated.rs");
+    expect(prompt).toContain("not by this step's executor");
+    expect(buildReviewPrompt({ task, appData: tmp, outsideChanges: [] }))
+      .not.toContain("CHANGES OUTSIDE THIS STEP");
+  });
 });
 
 describe("buildReviewPrompt · retry context", () => {
@@ -765,6 +784,37 @@ describe("executeStep", () => {
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 describe("executeStep · OpenAI routing", () => {
+  it("reads the Codex session's FileChange paths under the workspace", async () => {
+    const data = chain();
+    writeFileSync(boardFile(), JSON.stringify(data));
+    saveAgentConfig({
+      version: 2,
+      duties: { worker: { provider: "openai", model: "gpt-5.6-terra", role: "worker" } },
+    });
+    const sessionDir = path.join(process.env.CODEX_HOME, "sessions", "2026", "09", "28");
+    mkdirSync(sessionDir, { recursive: true });
+    writeFileSync(path.join(sessionDir, "rollout-12-00-00-codex-thread-7.jsonl"), [
+      JSON.stringify({ type: "event_msg", payload: { type: "item_completed", item: { type: "FileChange", changes: {
+        [path.join(tmp, "src", "one.mjs")]: { type: "update" },
+      } } } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "item_completed", item: { type: "FileChange", changes: {
+        [path.join(tmp, "src", "two.mjs")]: { type: "add" },
+      } } } }),
+      JSON.stringify({ type: "event_msg", payload: { type: "item_completed", item: { type: "FileChange", changes: {
+        [path.join(os.tmpdir(), "outside.mjs")]: { type: "delete" },
+      } } } }),
+    ].join("\n"));
+    const r = await executeStep({
+      task: taskOf(data, "id-3"), board: data, cwd: tmp,
+      codexBin: [process.execPath, fakeCodex],
+    });
+    expect(r.editedPaths).toEqual(["src/one.mjs", "src/two.mjs"]);
+  });
+
+  it("returns null when no Codex session file exists", () => {
+    expect(editedPathsOf("no-such-thread", tmp)).toBeNull();
+  });
+
   it("uses the global worker map and binds the Codex thread before work", async () => {
     const data = chain();
     writeFileSync(boardFile(), JSON.stringify(data));
