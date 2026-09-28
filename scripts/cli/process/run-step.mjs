@@ -711,14 +711,37 @@ export function buildReviewPrompt({ task, workerResult = "", execution, appData,
     workerResult ? `WORKER REPORT:\n${clampOutput(workerResult, 8000)}` : "WORKER REPORT: (none)",
     "",
     "End with exactly one decision line: `VERDICT: approve` or `VERDICT: issue`.",
-    "Before it, list concrete findings with file paths. An obligation absent from the files is an issue.",
+    "Before it, list every finding exactly as `- [critical|high|medium|low] file:line — substance — evidence`.",
+    "Levels: critical = the project does not build, data is lost/corrupted, or the function is unavailable; high = a step obligation is unmet or a visible regression; medium = the goal is only partly met or an edge case; low = style or a minor detail.",
+    "Critical and high findings require both file:line and evidence (a concrete scenario); without either, label them medium. An obligation absent from the files is an issue.",
   ].filter(Boolean).join("\n");
 }
 
 export function parseReviewVerdict(text) {
-  const matches = [...String(text || "").matchAll(/^\s*VERDICT:\s*(approve|issue)\s*$/gim)];
+  const source = String(text || "");
+  const matches = [...source.matchAll(/^\s*VERDICT:\s*(approve|issue)\s*$/gim)];
   const verdict = matches.at(-1)?.[1]?.toLowerCase() || "issue";
-  return { approved: verdict === "approve", verdict };
+  const findings = [];
+  for (const match of source.matchAll(/^\s*-\s*\[(critical|high|medium|low)\]\s*(?:(\S+):(\d+)\s*)?(?:—|--)\s*(.*)\s*$/gim)) {
+    let [, level, file, line, detail] = match;
+    const pieces = detail.split(/\s+(?:—|--)\s+/);
+    let text = pieces.shift();
+    let evidence = pieces.join(" — ");
+    file = file || null;
+    line = line ? Number(line) : null;
+    text = (text || "").trim();
+    evidence = (evidence || "").trim() || null;
+    if ((level === "critical" || level === "high") && (!file || !line || !evidence)) level = "medium";
+    findings.push({ level, file, line, text, evidence });
+  }
+  // Preserve the old, deliberately conservative contract for reviewers that
+  // have not learned the structured format yet: an unlabelled issue is one
+  // high finding, rather than silently becoming an approval.
+  if (!findings.length && verdict === "issue") {
+    const legacy = source.replace(/^\s*VERDICT:\s*(approve|issue)\s*$/gim, "").trim();
+    findings.push({ level: "high", file: null, line: null, text: legacy, evidence: null });
+  }
+  return { approved: verdict === "approve", verdict, findings };
 }
 
 // ── the step ────────────────────────────────────────────────────────────────

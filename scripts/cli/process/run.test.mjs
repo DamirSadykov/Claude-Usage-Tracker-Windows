@@ -27,6 +27,7 @@ import {
   liveEffects,
   beginStep,
   finishStep,
+  shouldEscalate,
   buildRunContext,
   nextFrontier,
   runReported,
@@ -99,6 +100,8 @@ function harness(overrides = {}) {
       calls.reconciles.push([t.number, verify]);
       return { outcome: verify, outcome_reason: `verify:${verify}` };
     },
+    recordIssue: async () => ({ written: true }),
+    recordAttempt: async () => ({ written: true, snapshot: null }),
     setStatus: async ({ task: t, status }) => {
       calls.statuses.push([t.number, status]);
     },
@@ -671,6 +674,27 @@ describe("runChange — the red gate's verdict", () => {
 });
 
 describe("runChange — neighbour damage ends a step as issue before review", () => {
+  it("parks scope damage after the one high-route retry instead of queuing another attempt", async () => {
+    const data = board(changeRoot(1, [2], { budget_usd: 10 }), auto(2, {
+      produces: ["src/own.js"],
+      _runner_high_route_attempt: 1,
+    }));
+    data.todos[1].step_base = "base-sha";
+    const h = harness({
+      recordIssue: async () => ({ written: true }),
+      ownChanges: async () => ({
+        ok: true,
+        own: [{ status: "D", path: "src/prior.js" }],
+        damaged: [{ path: "src/prior.js", state: "deleted" }],
+      }),
+    });
+    const r = await go(data, "1", h.effects);
+
+    expect(r.steps[0].result).toBe("issue");
+    expect(r.stop).toMatchObject({ kind: "convergence" });
+    expect(statusOf(r, 2)).toBe("review");
+  });
+
   it("a step that reverts or deletes an earlier step's uncommitted work never reaches review", async () => {
     const data = board(changeRoot(1, [2], { budget_usd: 10 }), auto(2, { produces: ["src/own.js"] }));
     data.todos[1].step_base = "base-sha";
@@ -1241,6 +1265,17 @@ describe("finishStep", () => {
     expect(t.status).toBe("queue");
   });
 
+  it.each([
+    ["executor", {}, { ok: false, error: "boom" }],
+    ["red gate", { red: "npm run test:red" }, { ok: true }],
+  ])("marks a %s failure from the high-route retry as escalated", async (_source, extra, result) => {
+    const t = auto(41, { ...extra, _runner_high_route_attempt: 1 });
+    const ctx = finishCtx(t, { redGate: async () => ({ ok: false, reason: "red failed" }) });
+    const out = await finishStep(ctx, t, { result, review: null });
+
+    expect(out).toMatchObject({ kind: "issue", routeEscalated: true });
+  });
+
   // t#528: the board refusing the close is an outcome, not an exception. The
   // node stays undecided — the work happened, the record of it must survive.
   it("leaves the node undecided when the board refuses to close it", async () => {
@@ -1261,6 +1296,121 @@ describe("finishStep", () => {
     expect(out.reason).toMatch(/depends on unfinished/);
     expect(out.cost).toBe(0.42);
     expect(t.status).not.toBe("done");
+  });
+
+  it("appends structured review findings, total cost, and the end snapshot to the task attempt journal", async () => {
+    const t = auto(6);
+    const entries = [];
+    const ctx = finishCtx(t, {
+      recordAttempt: async ({ entry }) => {
+        entries.push(entry);
+        return { written: true, snapshot: "end-tree-sha" };
+      },
+    });
+    await finishStep(ctx, t, {
+      result: { ok: true },
+      cost: 0.4,
+      review: {
+        approved: true,
+        ok: true,
+        costUsd: 0.1,
+        findings: [{ level: "high", file: "src/a.mjs", line: 7, text: "missing output", evidence: "running the command omits it" }],
+      },
+    });
+
+    expect(entries).toEqual([expect.objectContaining({
+      attempt: 1,
+      cost_usd: 0.5,
+      counts: { critical: 0, high: 1, medium: 0, low: 0 },
+      snapshot: null,
+    })]);
+    expect(t.attempts).toEqual([expect.objectContaining({ snapshot: "end-tree-sha", findings: entries[0].findings })]);
+  });
+
+  it("sends medium/low-only review findings to the architect while continuing to reconciliation", async () => {
+    const t = auto(7);
+    const comments = [];
+    const ctx = finishCtx(t, { recordIssue: async ({ comment }) => { comments.push(comment); return { written: true }; } });
+    const out = await finishStep(ctx, t, {
+      result: { ok: true },
+      review: { approved: false, ok: true, findings: [{ level: "medium", file: "src/a.mjs", line: 3, text: "rename this" }] },
+    });
+
+    expect(out.kind).toBe("done");
+    expect(out.architectFindings).toHaveLength(1);
+    expect(comments[0].author).toBe("architect");
+  });
+
+  it("parks a review with three blocking findings for a changed approach", async () => {
+    const t = auto(8);
+    const ctx = finishCtx(t);
+    const out = await finishStep(ctx, t, {
+      result: { ok: true },
+      review: { approved: false, ok: true, findings: ["a", "b", "c"].map((text) => ({ level: "high", file: "src/a.mjs", text })) },
+    });
+
+    expect(out.kind).toBe("convergence");
+    expect(out.parkReason).toMatch(/резать или менять подход/);
+  });
+
+  it("retries a first verify failure after an approved review", async () => {
+    const t = auto(8, { retry_limit: 2 });
+    const ctx = finishCtx(t, { runVerify: async () => ({ code: 1, stderr: "assertion failed" }) });
+    const out = await finishStep(ctx, t, { result: { ok: true }, review: { approved: true, ok: true } });
+
+    expect(out.kind).not.toBe("mechanics");
+  });
+
+  it("parks a mechanical verify failure without leaving the executor attempt spent", async () => {
+    const t = auto(9, { retry_limit: 1, attempts: [{ attempt: 1, findings: [], verify_tail: "runner unavailable" }] });
+    const ctx = finishCtx(t, { runVerify: async () => ({ code: 1, stderr: "runner unavailable" }) });
+    const out = await finishStep(ctx, t, { result: { ok: true }, review: { approved: true, ok: true } });
+
+    expect(out.kind).toBe("mechanics");
+    expect(ctx.attempts.get(t.id)).toBe(0);
+    expect(out.reason).toMatch(/механика/);
+  });
+
+  it("treats a medium/low-only rejected review followed by verify failure as mechanics", async () => {
+    const t = auto(10, { retry_limit: 1, attempts: [{ attempt: 1, findings: [], verify_tail: "runner unavailable" }] });
+    const ctx = finishCtx(t, { runVerify: async () => ({ code: 1, stderr: "runner unavailable" }) });
+    const out = await finishStep(ctx, t, {
+      result: { ok: true },
+      review: { approved: false, ok: true, findings: [{ level: "low", text: "formatting" }] },
+    });
+
+    expect(out.kind).toBe("mechanics");
+    expect(ctx.attempts.get(t.id)).toBe(0);
+  });
+});
+
+describe("shouldEscalate", () => {
+  it("does not mistake a first blocking failure for non-convergence", () => {
+    const t = auto(42, {
+      attempts: [{ findings: [{ level: "high", file: "src/a.mjs", text: "broken" }] }],
+    });
+    const base = { review: { findings: [{ level: "high", file: "src/a.mjs", text: "broken" }] } };
+
+    expect(shouldEscalate(t, base)).toBe(false);
+  });
+
+  it("escalates only after a prior blocking count is available and did not decrease", () => {
+    const t = auto(43, {
+      attempts: [
+        { findings: [{ level: "high", file: "src/a.mjs", text: "first" }] },
+        { findings: [{ level: "high", file: "src/b.mjs", text: "second" }] },
+      ],
+    });
+    const base = { review: { findings: [{ level: "high", file: "src/b.mjs", text: "second" }] } };
+
+    expect(shouldEscalate(t, base)).toBe(true);
+  });
+
+  it("does not escalate repeated failures that carry no blocking findings", () => {
+    const t = auto(44, { attempts: [{ findings: [] }, { findings: [] }] });
+    const base = { review: { findings: [] } };
+
+    expect(shouldEscalate(t, base)).toBe(false);
   });
 });
 

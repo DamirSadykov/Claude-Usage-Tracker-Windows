@@ -18,6 +18,7 @@
 // Read-only by construction: the board is loaded, never saved.
 
 import path from "node:path";
+import { readFileSync } from "node:fs";
 
 import { boardPath, loadBoard, isDone, isChangeRoot } from "../board/todos.mjs";
 import { collectChange } from "./run.mjs";
@@ -97,7 +98,18 @@ export function boardGraph(data, tasks) {
       const t = (data.todos || []).find((x) => x && x.id === ref);
       return t ? `#${t.number}` : `"${ref}"`;
     },
+    lineCount: workspaceLineCount,
   };
+}
+
+export function workspaceLineCount(file) {
+  try {
+    const text = readFileSync(file, "utf8");
+    if (!text) return 0;
+    return text.split(/\r\n|\r|\n/).length - (/(?:\r\n|\r|\n)$/.test(text) ? 1 : 0);
+  } catch {
+    return null;
+  }
 }
 
 // Scope mirrors `list` / `ready` / `pipeline`: this project plus project-less

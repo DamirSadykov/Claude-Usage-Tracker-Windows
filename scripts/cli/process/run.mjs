@@ -143,7 +143,11 @@ export function gateReason(t) {
 // one attempt at the node.
 export function attemptsSoFar(t) {
   const h = Array.isArray(t?.status_history) ? t.status_history : [];
-  return h.filter((e) => e && e.status === "in_progress").length;
+  const mechanical = Array.isArray(t?.attempts) ? t.attempts.filter((a) => a?.mechanics === true).length : 0;
+  // A failed verifier after an approved non-blocking review is a runner
+  // mechanics incident, not an executor retry. Its status transition is still
+  // audited in history, while this derived quota deliberately does not charge it.
+  return Math.max(0, h.filter((e) => e && e.status === "in_progress").length - mechanical);
 }
 
 const retryLimitOf = (t) => (typeof t?.retry_limit === "number" ? t.retry_limit : null);
@@ -328,6 +332,23 @@ export function liveEffects({ cwd } = {}) {
       if (!write.written) return { ok: false, error: write.error };
       return { ok: true, sha: based.sha };
     },
+    // A per-task, append-only journal. Snapshotting happens here, at the end
+    // of an attempt, so it records precisely the tree the reviewer saw.
+    recordAttempt: async ({ task, cwd, entry }) => {
+      const snap = snapshotTree(cwd);
+      const saved = { ...entry, snapshot: snap.ok ? snap.sha : null };
+      const file = appDataFile("todos.json");
+      return withBoardLock(file, () => {
+        const data = loadBoardForWrite(file);
+        const todo = data.todos.find((t) => t && t.id === task.id);
+        if (!todo) return { written: false, error: `task ${task.id} not found on the board` };
+        if (!Array.isArray(todo.attempts)) todo.attempts = [];
+        todo.attempts.push(saved);
+        todo.updated_at = new Date().toISOString();
+        saveBoard(file, data);
+        return { written: true, snapshot: saved.snapshot };
+      });
+    },
     priorChanges: async ({ task, cwd }) => {
       if (!task.step_base) return { ok: true, changes: null };
       const head = gitHead(cwd);
@@ -455,6 +476,7 @@ export function runRecordOf(report, { inherit = false } = {}) {
     spend: report.spend || null,
     refused: (report.refused || []).length,
     transitions: (report.transitions || []).length,
+    architect_findings: report.architect_findings || [],
     stop: report.stop ? { kind: report.stop.kind, task: report.stop.task ? report.stop.task.number : null, reason: report.stop.reason } : null,
     complete: !!report.complete,
     one_pass: !!report.complete && !report.stop && (report.steps || []).every((s) => (s.attempt ?? 1) === 1),
@@ -605,6 +627,15 @@ export async function beginStep(ctx, task, wave = []) {
   }
   const attempt = spent + 1;
   ctx.attempts.set(task.id, attempt);
+  if (task._runner_high_route_pending) {
+    // The routing API deliberately takes risk rather than an arbitrary model
+    // override. This transient board clone turns exactly this retry into the
+    // configured high route; it is never persisted to todos.json.
+    task._runner_high_route_pending = false;
+    task._runner_high_route_used = true;
+    task._runner_high_route_attempt = attempt;
+    task.risk = "high";
+  }
 
   await moveTo(ctx, task, "in_progress");
   return {
@@ -679,6 +710,22 @@ async function recordIssueComment(ctx, task, { attempt, limit, source, text }) {
   return comment;
 }
 
+async function recordArchitectComment(ctx, task, { attempt, findings }) {
+  const comment = {
+    id: randomUUID(),
+    author: "architect",
+    body: `ARCHITECT attempt ${attempt}\n${findings.map((f) =>
+      `[${f.level}]${f.file ? ` ${f.file}${f.line ? `:${f.line}` : ""}` : ""} ${f.text || ""}`.trim(),
+    ).join("\n")}`.trim(),
+    created_at: new Date().toISOString(),
+  };
+  (task.comments ??= []).push(comment);
+  if (typeof ctx.effects.recordIssue === "function") {
+    try { await ctx.effects.recordIssue({ task, comment }); } catch {}
+  }
+  return comment;
+}
+
 function resultBase(ctx, task, result, review, baton, cost, ownChanges) {
   const attempt = ctx.attempts.get(task.id);
   const limit = retryLimitOf(task);
@@ -702,8 +749,84 @@ function resultBase(ctx, task, result, review, baton, cost, ownChanges) {
       model: review.model || null,
       session: review.sessionId || null,
       route: review.route || null,
+      findings: Array.isArray(review.findings) ? review.findings : [],
     } : null,
   };
+}
+
+function findingCounts(findings) {
+  const counts = { critical: 0, high: 0, medium: 0, low: 0 };
+  for (const finding of findings || []) if (Object.hasOwn(counts, finding?.level)) counts[finding.level] += 1;
+  return counts;
+}
+
+const blockingFindings = (findings) => (findings || []).filter((f) => f?.level === "critical" || f?.level === "high");
+const findingKey = (f) => `${f?.file || ""}\u0000${f?.text || ""}`;
+const priorAttempts = (task) => Array.isArray(task?.attempts) ? task.attempts : [];
+
+function convergenceStop(task, base) {
+  const findings = blockingFindings(base.review?.findings);
+  if (!findings.length) return null;
+  const previous = priorAttempts(task).at(-1);
+  const previousBlocking = blockingFindings(previous?.findings);
+  if (findings.length >= 3)
+    return "резать или менять подход: в одной попытке найдено 3+ critical/high";
+  if (base.attempt >= 3) {
+    const known = new Set(priorAttempts(task).flatMap((a) => blockingFindings(a.findings).map(findingKey)));
+    if (findings.some((f) => !known.has(findingKey(f))))
+      return "резать или менять подход: на попытке 3+ появились новые critical/high";
+  }
+  const budget = Number(task.budget_usd);
+  const spent = priorAttempts(task).reduce((sum, a) => sum + (Number.isFinite(a?.cost_usd) ? a.cost_usd : 0), 0) + (Number.isFinite(base.cost) ? base.cost : 0);
+  if (Number.isFinite(budget) && spent > budget * 0.6 && previous && findings.length >= previousBlocking.length)
+    return "порог денег: потрачено больше 60% бюджета шага, а critical/high не уменьшаются";
+  return null;
+}
+
+export function shouldEscalate(task, base) {
+  const current = blockingFindings(base.review?.findings).length;
+  // finishAttempt has already appended the current journal entry before this
+  // decision runs.  There is nothing to compare on a first attempt: `at(-2)`
+  // is absent, and treating it as zero would falsely call the first failure a
+  // non-converging retry.
+  const previousAttempt = priorAttempts(task).at(-2);
+  const previous = blockingFindings(previousAttempt?.findings).length;
+  if (task._runner_high_route_used || task._runner_high_route_pending) return false;
+  return String(task.risk || "").toLowerCase() === "high" || (previousAttempt != null && current > 0 && current >= previous);
+}
+
+function hasHighRoute() {
+  try { return resolveDuty("worker", undefined, { risk: "high" }).route?.applied === true; } catch { return false; }
+}
+
+async function recordAttempt(ctx, task, base) {
+  const findings = base.review?.findings || [];
+  const entry = {
+    attempt: base.attempt,
+    cost_usd: typeof base.cost === "number" && Number.isFinite(base.cost) ? base.cost : null,
+    findings,
+    counts: findingCounts(findings),
+    mechanics: base.kind === "mechanics",
+    verify_tail: base.verifyTail ?? null,
+    snapshot: null,
+  };
+  let written;
+  if (typeof ctx.effects.recordAttempt === "function") {
+    // Effects persist the pre-snapshot payload and return the end-tree SHA.
+    // Do not hand the journal's mutable object to an effect: test doubles (and
+    // callers which retain it for audit) must continue to see the payload that
+    // was actually submitted for persistence.
+    try { written = await ctx.effects.recordAttempt({ task, cwd: ctx.cwd, entry: { ...entry } }); }
+    catch (err) { written = { written: false, error: String(err?.message || err) }; }
+  }
+  entry.snapshot = written?.snapshot || null;
+  (task.attempts ??= []).push(entry);
+  return entry;
+}
+
+async function finishAttempt(ctx, task, outcome) {
+  const journal = await recordAttempt(ctx, task, outcome);
+  return { ...outcome, attempt_journal: journal };
 }
 
 // Everything AFTER the executor and the reviewer have run: the review verdict,
@@ -715,30 +838,49 @@ export async function finishStep(ctx, task, { result, review, baton, cost, ownCh
   const base = resultBase(ctx, task, result, review, baton, cost, ownChanges);
   const { attempt, limit } = base;
 
-  if (review && review.skipped !== true && (review.ok === false || review.approved !== true)) {
+  const findings = Array.isArray(review?.findings) ? review.findings : [];
+  const blocking = blockingFindings(findings);
+  const architectFindings = findings.filter((f) => f?.level === "medium" || f?.level === "low");
+  // A reviewer may reject solely over medium/low work. It is useful input, but
+  // not a reason to make the worker churn: make it architect-owned and carry on
+  // through the ordinary verify/reconcile gate.
+  const onlyArchitectural = review && review.skipped !== true && blocking.length === 0 && architectFindings.length;
+  if (onlyArchitectural) {
+    await recordArchitectComment(ctx, task, { attempt, findings: architectFindings });
+    base.architectFindings = architectFindings;
+  }
+  if (review && review.skipped !== true && (blocking.length || (!onlyArchitectural && (review.ok === false || review.approved !== true)))) {
     await recordIssueComment(ctx, task, {
       attempt,
       limit,
       source: review.model ? `review ${review.model}` : "review",
       text: clampChars(review.result || review.error || "reviewer did not approve the obligations", 6000),
     });
-    return {
+    const stopped = convergenceStop(task, base);
+    return finishAttempt(ctx, task, {
       ...base,
-      kind: "issue",
+      kind: stopped ? "convergence" : "issue",
+      parkReason: stopped,
+      routeEscalated: task._runner_high_route_attempt === attempt,
       reason: `model review issue: ${review.error || review.result || "reviewer did not approve the obligations"}`,
-    };
+    });
   }
 
   // A gate does the WORK and stops at `review`: the human checks one slice, and
   // the dependents stay blocked by construction.
   if (isGate(task)) {
     await moveTo(ctx, task, "review");
-    return { ...base, kind: "gate", reason: gateReason(task) };
+    return finishAttempt(ctx, task, { ...base, kind: "gate", reason: gateReason(task) });
   }
   if (result.ok === false) {
     const error = result.error || "no error reported";
     await recordIssueComment(ctx, task, { attempt, limit, source: "executor", text: clampChars(error, 6000) });
-    return { ...base, kind: "issue", reason: `step failed: ${error}` };
+    return finishAttempt(ctx, task, {
+      ...base,
+      kind: "issue",
+      routeEscalated: task._runner_high_route_attempt === attempt,
+      reason: `step failed: ${error}`,
+    });
   }
 
   if (declaredRed(task)) {
@@ -755,7 +897,13 @@ export async function finishStep(ctx, task, { result, review, baton, cost, ownCh
         source: "red",
         text: clampChars(gate.reason || "red gate issue", 6000),
       });
-      return { ...base, kind: "issue", red: gate.field ?? null, reason: gate.reason || "red gate issue" };
+      return finishAttempt(ctx, task, {
+        ...base,
+        kind: "issue",
+        routeEscalated: task._runner_high_route_attempt === attempt,
+        red: gate.field ?? null,
+        reason: gate.reason || "red gate issue",
+      });
     }
     base.red = gate.field ?? null;
   }
@@ -768,7 +916,14 @@ export async function finishStep(ctx, task, { result, review, baton, cost, ownCh
   const verify = Number(verdictRun?.code) === 0 ? "ok" : "issue";
   if (verify === "issue") {
     const combined = [verdictRun?.stdout, verdictRun?.stderr].filter((s) => s && String(s).trim()).join("\n");
-    await recordIssueComment(ctx, task, { attempt, limit, source: "verify", text: tailLines(combined, 60) });
+    const tail = tailLines(combined, 60);
+    base.verifyTail = tail;
+    await recordIssueComment(ctx, task, { attempt, limit, source: "verify", text: tail });
+    const repeated = priorAttempts(task).at(-1)?.verify_tail === tail;
+    if (repeated && tail.trim() && review && review.skipped !== true && (review.approved === true || onlyArchitectural) && blocking.length === 0) {
+      ctx.attempts.set(task.id, Math.max(0, attempt - 1));
+      return finishAttempt(ctx, task, { ...base, kind: "mechanics", verify, reason: "механика: verify упал с тем же выводом две попытки подряд при одобренном ревью без critical/high" });
+    }
   }
   const report = (await ctx.effects.reconcile({ task, verify })) || {};
   const outcome = report.outcome ?? null;
@@ -777,19 +932,20 @@ export async function finishStep(ctx, task, { result, review, baton, cost, ownCh
   if (outcome === "ok") {
     const moved = await moveTo(ctx, task, "done");
     if (!moved.ok)
-      return {
+      return finishAttempt(ctx, task, {
         ...base,
         kind: "undecided",
         verify,
         reason: `the work finished and reconciled, but the board refused to close the node: ${moved.error}`,
-      };
-    return { ...base, kind: "done", verify, reason };
+      });
+    return finishAttempt(ctx, task, { ...base, kind: "done", verify, reason });
   }
   if (outcome === "issue") {
     if (verify === "ok") await recordIssueComment(ctx, task, { attempt, limit, source: "reconcile", text: clampChars(reason, 6000) });
-    return { ...base, kind: "issue", verify, reason };
+    const stopped = convergenceStop(task, base);
+    return finishAttempt(ctx, task, { ...base, kind: stopped ? "convergence" : "issue", parkReason: stopped, routeEscalated: task._runner_high_route_attempt === attempt, verify, reason });
   }
-  return { ...base, kind: "undecided", verify, reason };
+  return finishAttempt(ctx, task, { ...base, kind: "undecided", verify, reason });
 }
 
 function formatNeighbourDamage(damaged) {
@@ -820,11 +976,12 @@ async function checkNeighbourDamage(ctx, task, result, baton, cost) {
   });
   return {
     ownChanges,
-    issue: {
+    issue: await finishAttempt(ctx, task, {
       ...base,
       kind: "issue",
+      routeEscalated: task._runner_high_route_attempt === base.attempt,
       reason: `step reverted or deleted work of earlier steps outside its own produces: ${damage.damaged.map((d) => d.path).join(", ")}`,
-    },
+    }),
   };
 }
 
@@ -878,6 +1035,14 @@ export async function runReported(ctx, task, wave, { result, review = null }) {
 async function applyIssue(ctx, r) {
   const task = r.task;
   const limit = r.limit;
+  if (r.routeEscalated) {
+    await moveTo(ctx, task, "review");
+    park(ctx, "convergence", task, "резать или менять подход: high-маршрут уже был использован для следующей попытки");
+    return;
+  }
+  if (shouldEscalate(task, r) && hasHighRoute()) {
+    task._runner_high_route_pending = true;
+  }
   if (limit === null) {
     await moveTo(ctx, task, "review");
     park(
@@ -989,6 +1154,7 @@ export function buildRunContext({ data, change, effects = {}, dry = true, cwd = 
     sessions: new Map(),
     inherit: !!inherit,
     steps: [],
+    architectFindings: [],
     waves: [],
     spent,
     nodeSpent: new Map(),
@@ -1053,6 +1219,7 @@ export async function applyResult(ctx, r, { dry, log }) {
     cost_usd: r.cost,
     baton: r.baton ?? null,
     review: r.review ?? null,
+    architect_findings: r.architectFindings ?? [],
     gate: r.kind === "gate",
     verify: r.verify ?? null,
     red: r.red ?? null,
@@ -1064,6 +1231,8 @@ export async function applyResult(ctx, r, { dry, log }) {
     neighbour_damage: typeof r.neighbourDamage === "number" ? r.neighbourDamage : null,
   };
   ctx.steps.push(record);
+  if (Array.isArray(r.architectFindings) && r.architectFindings.length)
+    ctx.architectFindings.push({ task: brief(r.task), attempt: r.attempt, findings: r.architectFindings });
   log(formatStepLine(record, dry));
 
   if (r.kind === "gate") {
@@ -1086,6 +1255,20 @@ export async function applyResult(ctx, r, { dry, log }) {
     ctx.parked.add(r.task.id);
     await moveTo(ctx, r.task, "review");
     park(ctx, "outcome", r.task, `the outcome could not be finalized (${r.reason}) — nothing is closed on a guess`);
+    return record;
+  }
+  if (r.kind === "mechanics") {
+    ctx.parked.add(r.task.id);
+    await moveTo(ctx, r.task, "review");
+    park(ctx, "mechanics", r.task, r.reason);
+    record.status = r.task.status;
+    return record;
+  }
+  if (r.kind === "convergence") {
+    ctx.parked.add(r.task.id);
+    await moveTo(ctx, r.task, "review");
+    park(ctx, "convergence", r.task, r.parkReason || r.reason);
+    record.status = r.task.status;
     return record;
   }
   if (r.kind === "issue") {
@@ -1246,6 +1429,7 @@ export async function runChange({
     steps: ctx.steps,
     transitions: ctx.transitions,
     refused: ctx.refused,
+    architect_findings: ctx.architectFindings,
     spend: {
       usd: round(ctx.spent),
       unmeasured_steps: ctx.unknownCost,
@@ -1323,6 +1507,12 @@ export function formatRunReport(r) {
   );
   if (!r.steps.length) out.push("  (nothing to run — the frontier was empty from the start)\n");
   for (const s of r.steps) out.push(formatStepLine(s, r.dry));
+  if (Array.isArray(r.architect_findings) && r.architect_findings.length) {
+    out.push("  архитектору:\n");
+    for (const item of r.architect_findings)
+      for (const finding of item.findings)
+        out.push(`    #${item.task.number} [${finding.level}] ${finding.file || "(file not specified)"}${finding.line ? `:${finding.line}` : ""} ${finding.text || ""}\n`);
+  }
   for (const t of r.transitions) out.push(formatTransitionLine(t));
   for (const f of r.refused || [])
     out.push(`  refused  #${f.task.number} → ${f.status} — ${f.error}

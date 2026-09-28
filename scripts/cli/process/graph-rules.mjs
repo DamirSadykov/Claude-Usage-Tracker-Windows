@@ -19,6 +19,7 @@
 //     resolves(ref) -> boolean,         // does this reference point at anything
 //     unknownRef(ref) -> string,        // ...and how to say that it does not
 //     refLabel(ref) -> string,          // how to NAME one in a message (optional)
+//     lineCount(path) -> number | null, // lines in an existing workspace file
 //   }
 //
 // Everything the two worlds do NOT share stays with the caller: the file's own
@@ -142,6 +143,24 @@ export const NODE_RULES = [
       n.kind === "auto" && blank(n.verify)
         ? `${n.label}: auto with no verify runs as a GATE — the authority to close a node comes ` +
           "from the check, not from the flag"
+        : null,
+  },
+  {
+    // A broad promise around a large existing file is how t#755 became one
+    // unreviewable step. This is deliberately a warning: a large file can be
+    // the right unit, but four or more outputs are the cheap signal that the
+    // work should be split before the first attempt.
+    id: "large-step",
+    severity: "warning",
+    when: "open",
+    check: (n, g) =>
+      n.produces.length >= 4 &&
+      typeof g.lineCount === "function" &&
+      n.produces.some((p) => {
+        const count = g.lineCount(p);
+        return typeof count === "number" && count > 1500;
+      })
+        ? `${n.label}: шаг крупный — разрезать по produces`
         : null,
   },
   {
