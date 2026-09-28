@@ -83,6 +83,7 @@
       "../scripts/cli/process/plan-hook.mjs": "scripts/cli/process/plan-hook.mjs",
       "../scripts/cli/process/plan-guard.mjs": "scripts/cli/process/plan-guard.mjs",
       "../scripts/cli/kernel/settings.mjs": "scripts/cli/kernel/settings.mjs",
+      "../scripts/cli/kernel/appdata.mjs": "scripts/cli/kernel/appdata.mjs",
       "../scripts/cli/agents/agents.mjs": "scripts/cli/agents/agents.mjs",
       "../scripts/cli/agents/duty-mode.mjs": "scripts/cli/agents/duty-mode.mjs",
       "../scripts/cli/agents/providers.mjs": "scripts/cli/agents/providers.mjs",

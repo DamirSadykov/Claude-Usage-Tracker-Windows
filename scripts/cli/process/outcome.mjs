@@ -55,6 +55,7 @@ import path from "node:path";
 
 import { resolveTask, readTaskSessionEvents, loadBoard, loadBoardForWrite, saveBoard } from "../board/todos.mjs";
 import { withBoardLock } from "../kernel/board-lock.mjs";
+import { appDataFile } from "../kernel/appdata.mjs";
 import { snapshotTree, diffNameStatus } from "./red-gate.mjs";
 
 // Tools that CHANGE a file — the only evidence that something was produced.
@@ -68,13 +69,6 @@ const LINE_PREFILTER = /"file_path"|"notebook_path"|"is_error":true/;
 function fail(msg) {
   process.stderr.write(msg + "\n");
   process.exit(1);
-}
-
-function appDataFile(name) {
-  const appData =
-    process.env.APPDATA ||
-    path.join(process.env.USERPROFILE || "", "AppData", "Roaming");
-  return path.join(appData, "com.claude-usage-tracker.app", name);
 }
 
 // ── paths ────────────────────────────────────────────────────────────────────

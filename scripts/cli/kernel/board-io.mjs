@@ -1,6 +1,6 @@
 import { writeFileSync } from "node:fs";
-import path from "node:path";
 import { renameWithRetry } from "./board-lock.mjs";
+import { appDataFile } from "./appdata.mjs";
 import {
   CURRENT,
   BoardUnreadableError,
@@ -29,9 +29,7 @@ export function normalizeLimit(value, { integer = true } = {}) {
 }
 
 export function todosPath() {
-  const appData =
-    process.env.APPDATA || path.join(process.env.USERPROFILE || "", "AppData", "Roaming");
-  return path.join(appData, "com.claude-usage-tracker.app", "todos.json");
+  return appDataFile("todos.json");
 }
 
 const printedRecovery = new Set();

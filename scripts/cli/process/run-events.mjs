@@ -1,5 +1,6 @@
 import { appendFileSync, mkdirSync, readFileSync, statSync, watch } from "node:fs";
 import path from "node:path";
+import { appDataFile } from "../kernel/appdata.mjs";
 
 const changeId = (value) => {
   const text = String(value?.number ?? value ?? "").trim();
@@ -16,8 +17,7 @@ export function runEventsPath(runLogFile) {
 }
 
 function defaultEventsPath() {
-  const appData = process.env.APPDATA || path.join(process.env.USERPROFILE || "", "AppData", "Roaming");
-  return path.join(appData, "com.claude-usage-tracker.app", "run-events.jsonl");
+  return appDataFile("run-events.jsonl");
 }
 
 export function appendRunEvent(event, file = defaultEventsPath()) {
@@ -43,7 +43,7 @@ export function formatRunEvent(event) {
   if (kind === "rollback") return `${prefix}${attempt}: rollback to ${event.to ?? "previous attempt"}`.trim();
   if (kind === "park") return `${prefix}: park ${event.park_kind || event.stop_kind || "unknown"}${event.reason ? ` — ${event.reason}` : ""}`.trim();
   if (kind === "step_start") return `${prefix}${attempt}: step start${event.route ? ` (${event.route})` : ""}`.trim();
-  if (kind === "worker_done") return `${prefix}${attempt}: worker done${typeof event.cost === "number" ? ` $${event.cost}` : ""}`.trim();
+  if (kind === "worker_done") return `${prefix}${attempt}: worker done${typeof event.cost === "number" ? ` $${Math.round(event.cost * 10000) / 10000}` : ""}`.trim();
   if (kind === "run_start" || kind === "run_end") return `${changeId(event?.change)}: ${kind.replace("_", " ")}`.trim();
   if (kind === "escalate") return `${prefix}${attempt}: escalate${event.route ? ` (${event.route})` : ""}`.trim();
   return `${prefix}${attempt}: ${kind}`.trim();

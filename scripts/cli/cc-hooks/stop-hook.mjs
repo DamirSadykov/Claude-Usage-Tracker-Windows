@@ -34,6 +34,7 @@ import { readFileSync, openSync, readSync, closeSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { taskHandoffGuard, specDeltaGuard, specsEnabled } from "../kernel/settings.mjs";
+import { appDataDir, appDataFile } from "../kernel/appdata.mjs";
 import { readBoardTolerant, recoveryLine } from "../kernel/board-recover.mjs";
 
 const CLI = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "cli.mjs");
@@ -466,7 +467,7 @@ function specReason(tasks, { blocks = [], omitted = 0, lint = [] } = {}) {
 // The tracker's todos.json — the same file the SessionStart hook reads. Returns
 // the array, or [] when it's missing/unreadable (the guard then only sees plans).
 function readBoard(appData) {
-  const file = path.join(appData, "com.claude-usage-tracker.app", "todos.json");
+  const file = appDataFile("todos.json", appData);
   const { data, issue } = readBoardTolerant(file);
   if (issue) process.stderr.write(recoveryLine(issue) + "\n");
   return {
@@ -581,9 +582,7 @@ async function main() {
   if (input.stop_hook_active) return;
 
   const cwd = typeof input.cwd === "string" && input.cwd ? input.cwd : process.cwd();
-  const appData =
-    process.env.APPDATA ||
-    path.join(process.env.USERPROFILE || "", "AppData", "Roaming");
+  const appData = path.dirname(appDataDir());
   const taskMode = taskHandoffGuard(appData);
   // The spec half of this guard is reachable only while `specsEnabled` is on —
   // off (the default) forces it to "off" regardless of `specDeltaGuard`, same

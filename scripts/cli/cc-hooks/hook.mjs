@@ -35,6 +35,7 @@ import {
 } from "../board/todos.mjs";
 import { formatSpecSections } from "../spec/board-ritual.mjs";
 import { taskContextMinRank, hookContextEnabled, workflowContextEnabled } from "../kernel/settings.mjs";
+import { appDataDir, appDataFile } from "../kernel/appdata.mjs";
 import { resolveRoot } from "../spec/spec.mjs";
 import { readAgentConfig } from "../agents/agents.mjs";
 import { planGuardWired } from "./claude-hooks.mjs";
@@ -272,14 +273,12 @@ function main(args = []) {
   }
   if (!session) session = currentSessionId();
 
-  const appData =
-    process.env.APPDATA ||
-    path.join(process.env.USERPROFILE || "", "AppData", "Roaming");
+  const appData = path.dirname(appDataDir());
   // Master off-switch: the user turned off task-context INJECTION — nothing is
   // printed below it. The binding write is not context, so it still happens
   // (cost attribution must not depend on how chatty the hook is).
   const contextOn = hookContextEnabled(appData);
-  const file = path.join(appData, "com.claude-usage-tracker.app", "todos.json");
+  const file = appDataFile("todos.json");
   const fileLine = `File (don't edit): ${file}`;
 
   let data = null;

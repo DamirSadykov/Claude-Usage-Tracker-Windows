@@ -34,7 +34,6 @@ A dedicated analytics window, fed by your local Claude Code data:
 
 ### Task manager — Claude Code integration
 - **Built-in Kanban board** — 5 columns with drag-and-drop, live-reloading when the backing file changes
-- **Auto-pickup from Claude Code** — TodoWrite tasks from your `.claude` transcripts surface automatically
 - **`cc-todos` CLI + hook** — let a Claude Code session add tasks, move them across columns, and comment on them; install the CLI and hook straight from the app
 - **Project links** — cross-project tasks, project groups, and merging of renamed/absorbed projects so they count as one
 - **Notifications** when a task moves into review or done
@@ -175,7 +174,7 @@ To reference one task from another's description or comment, write **`t#N`** (e.
 
 For a *real* edge on the task graph — not just a mention in prose — use the CLI: `dep add <task> <depends-on>` makes a blocking dependency (kept acyclic, within one board), while `ref add <task> <target>` makes a non-blocking reference (may cross projects). An inline `t#N` only draws a ref edge; a blocking dependency can be created solely through `dep add`.
 
-Tasks created in Claude Code (via TodoWrite) are also picked up automatically, so the board reflects what your agent is working on.
+Use the `cc-todos` CLI from Claude Code to create and manage tasks on the board as your agent works.
 
 ## How Auto-Start Works
 

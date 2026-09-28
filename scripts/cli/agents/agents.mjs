@@ -7,13 +7,11 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
-  renameSync,
-  writeFileSync,
 } from "node:fs";
-import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { READ_ONLY_TOOLS, parseProviderResult, providerArgv } from "./providers.mjs";
 import { dutyModeReader } from "./duty-mode.mjs";
+import { appDataDir, appDataFile, writeJsonAtomic } from "../kernel/appdata.mjs";
 
 export const AGENT_PROVIDER_MANIFEST = JSON.parse(
   readFileSync(new URL("./agent-providers.json", import.meta.url), "utf8"),
@@ -42,20 +40,8 @@ export const dutyModes = dutyMode.dutyModes;
 export const starterMode = dutyMode.starterMode;
 export const cleanMode = dutyMode.cleanMode;
 
-function appDataBase(appData) {
-  return (
-    appData ||
-    process.env.APPDATA ||
-    path.join(process.env.USERPROFILE || "", "AppData", "Roaming")
-  );
-}
-
 export function agentsPath(appData) {
-  return path.join(
-    appDataBase(appData),
-    "com.claude-usage-tracker.app",
-    "agents.json",
-  );
+  return appDataFile("agents.json", appData);
 }
 
 export function emptyAgentConfig() {
@@ -143,10 +129,8 @@ export function readAgentConfig(appData) {
 
 export function saveAgentConfig(config, appData) {
   const file = agentsPath(appData);
-  mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = `${file}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify(config, null, 2) + "\n");
-  renameSync(tmp, file);
+  mkdirSync(appDataDir(appData), { recursive: true });
+  writeJsonAtomic(file, config);
   return file;
 }
 
