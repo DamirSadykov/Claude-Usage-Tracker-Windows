@@ -3,17 +3,11 @@ import { loadRunLayer } from "../../board/graphModel";
 import type { RunGraphNode } from "../../board/graphModel";
 import { boardStore } from "../../board/boardStore";
 import {
-    laneIndex,
-    normalizeShares,
-    toLanes,
-    toProjectBands,
-    toTaskLinks,
-    toTaskNodes,
-    wavesOf,
     type BoardTodo,
     type BoardChange,
     type TaskCostRow,
 } from "./adapt";
+import { visibleGraph } from "./visibleGraph";
 import {
     lanes as mockLanes,
     links as mockLinks,
@@ -44,48 +38,31 @@ export function useBoard(withPorts = false, metricChanges: string[] = []) {
         }
     }
 
-    const index = computed(() => laneIndex(board.value, changes.value));
-
-    const edges = computed(() =>
-        board.value.flatMap((t) =>
-            (t.depends_on ?? []).map((dep) => ({ from: dep, to: t.id })),
-        ),
-    );
-
-    const waves = computed(() =>
-        wavesOf(
-            board.value.map((t) => t.id),
-            edges.value,
-        ),
+    // All lanes consume this one immutable projection.  `revision` is the cache
+    // boundary: selecting a card must never rebuild task/lane indexes.
+    const projection = computed(() =>
+        visibleGraph(boardStore.revision.value, board.value, changes.value, run.value, costs.value, withPorts),
     );
 
     const lanes = computed(() =>
         live.value
-            ? toLanes(board.value, run.value, index.value, waves.value)
+            ? projection.value.lanes
             : mockLanes,
     );
 
     const tasks = computed(() =>
         live.value
-            ? normalizeShares(
-                  toTaskNodes(
-                      board.value,
-                      run.value,
-                      index.value,
-                      waves.value,
-                      withPorts,
-                  ),
-              )
+            ? [...projection.value.tasks]
             : mockTasks,
     );
 
     const links = computed(() =>
-        live.value ? toTaskLinks(board.value, index.value) : mockLinks,
+        live.value ? [...projection.value.links] : mockLinks,
     );
 
     const projects = computed(() =>
         live.value
-            ? toProjectBands(board.value, costs.value, index.value)
+            ? projection.value.projects
             : mockProjects,
     );
 
@@ -106,7 +83,7 @@ export function useBoard(withPorts = false, metricChanges: string[] = []) {
         board,
         changes,
         run,
-        index,
+        projection,
         nodeByLabel,
         lanes,
         tasks,

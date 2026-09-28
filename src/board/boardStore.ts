@@ -19,10 +19,15 @@ export interface BoardRow {
   scheduled_for?: string | null;
   project?: string | null;
   from?: string | null;
+  created_by?: string;
+  imported_at?: string | null;
+  has_plan?: boolean;
+  spec?: string[];
   links: string[];
   depends_on: string[];
   created_at: string;
   updated_at: string;
+  closed_at?: string | null;
   ref_count: number;
   comment_count: number;
 }
@@ -55,6 +60,7 @@ function freezeRow(row: BoardRow): BoardRow {
     ...row,
     links: Object.freeze([...(row.links ?? [])]),
     depends_on: Object.freeze([...(row.depends_on ?? [])]),
+    spec: Object.freeze([...(row.spec ?? [])]),
   }) as unknown as BoardRow;
 }
 

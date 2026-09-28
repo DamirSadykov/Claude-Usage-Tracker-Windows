@@ -22,10 +22,17 @@ pub struct TodoRow {
     pub scheduled_for: Option<String>,
     pub project: Option<String>,
     pub from: Option<String>,
+    pub created_by: String,
+    pub imported_at: Option<String>,
+    /// Board cards only need to know whether a plan exists, never its contents.
+    pub has_plan: bool,
+    /// Own spec addresses are small card affordances, not the full task detail.
+    pub spec: Vec<String>,
     pub links: Vec<String>,
     pub depends_on: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
+    pub closed_at: Option<String>,
     pub ref_count: usize,
     pub comment_count: usize,
 }
@@ -51,10 +58,22 @@ pub fn row(todo: &Todo) -> TodoRow {
         priority: todo.priority.clone(), kind: todo.kind.clone(), change: todo.change,
         change_id: todo.change_id.clone(), scheduled_for: todo.scheduled_for.clone(),
         project: todo.project.clone(), from: todo.from.clone(), links: todo.links.clone(),
+        created_by: todo.created_by.clone(),
+        imported_at: todo.imported_at.clone(), has_plan: !todo.plan.trim().is_empty(),
+        spec: todo.spec.clone(),
         depends_on: todo.depends_on.clone(), created_at: todo.created_at.clone(),
-        updated_at: todo.updated_at.clone(), ref_count: reference_count(todo),
+        updated_at: todo.updated_at.clone(), closed_at: completion_at(todo), ref_count: reference_count(todo),
         comment_count: todo.comments.len(),
     }
+}
+
+/// A task has no denormalized `closed_at`: its transition log is the source of
+/// truth. Later edits must not move a completed card ahead of newer completions.
+fn completion_at(todo: &Todo) -> Option<String> {
+    if todo.status != "done" { return None; }
+    todo.status_history.iter().rev()
+        .find(|entry| entry.status == "done")
+        .map(|entry| entry.at.clone())
 }
 
 pub fn board(revision: u64, file: &TodoFile) -> BoardPayload {

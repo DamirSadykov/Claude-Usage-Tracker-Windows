@@ -21,7 +21,7 @@ interface Segment {
 const props = withDefaults(
     defineProps<{
         container: HTMLElement | null;
-        links: WireLink[];
+        links: readonly WireLink[];
         attr?: string;
         markers?: boolean;
     }>(),
@@ -34,7 +34,45 @@ const uid = Math.random().toString(36).slice(2, 8);
 
 let ro: ResizeObserver | null = null;
 let mo: MutationObserver | null = null;
+let io: IntersectionObserver | null = null;
 let frame = 0;
+const elements = new Map<string, HTMLElement>();
+const visible = new Set<string>();
+
+function scrollViewport(host: HTMLElement) {
+    // The row is the oversized wire canvas; its LaneFrame ancestor owns the
+    // horizontal scrolling and clipping.
+    return host.closest<HTMLElement>(".lane-body") ?? host;
+}
+
+function observeVisible(host: HTMLElement) {
+    io?.disconnect();
+    visible.clear();
+    io = new IntersectionObserver(
+        (entries) => {
+            for (const entry of entries) {
+                const id = (entry.target as HTMLElement).getAttribute(props.attr);
+                if (!id) continue;
+                if (entry.isIntersecting) visible.add(id);
+                else visible.delete(id);
+            }
+            schedule();
+        },
+        { root: scrollViewport(host) },
+    );
+}
+
+function refreshElements(host: HTMLElement) {
+    elements.clear();
+    visible.clear();
+    io?.disconnect();
+    host.querySelectorAll<HTMLElement>(`[${props.attr}]`).forEach((el) => {
+        const id = el.getAttribute(props.attr);
+        if (!id) return;
+        elements.set(id, el);
+        io?.observe(el);
+    });
+}
 
 function rectOf(el: HTMLElement, host: HTMLElement) {
     const r = el.getBoundingClientRect();
@@ -56,12 +94,11 @@ function measure() {
     };
     const out: Segment[] = [];
     for (const link of props.links) {
-        const a = host.querySelector<HTMLElement>(
-            `[${props.attr}="${CSS.escape(link.from)}"]`,
-        );
-        const b = host.querySelector<HTMLElement>(
-            `[${props.attr}="${CSS.escape(link.to)}"]`,
-        );
+        // Wires are meaningful only while both cards are in the scroll viewport.
+        // The element map is refreshed on DOM changes, never once per edge.
+        if (!visible.has(link.from) || !visible.has(link.to)) continue;
+        const a = elements.get(link.from);
+        const b = elements.get(link.to);
         if (!a || !b) continue;
         const ra = rectOf(a, host);
         const rb = rectOf(b, host);
@@ -88,9 +125,7 @@ function measure() {
     if (ro) {
         ro.disconnect();
         ro.observe(host);
-        host
-            .querySelectorAll<HTMLElement>(`[${props.attr}]`)
-            .forEach((el) => ro!.observe(el));
+        elements.forEach((el) => ro!.observe(el));
     }
 }
 
@@ -101,11 +136,16 @@ function schedule() {
 
 onMounted(async () => {
     ro = new ResizeObserver(schedule);
-    mo = new MutationObserver(schedule);
+    if (props.container) observeVisible(props.container);
+    mo = new MutationObserver(() => {
+        if (props.container) refreshElements(props.container);
+        schedule();
+    });
     await nextTick();
     if (props.container) {
+        refreshElements(props.container);
         mo.observe(props.container, { childList: true, subtree: true });
-        props.container.addEventListener("scroll", schedule, { passive: true });
+        scrollViewport(props.container).addEventListener("scroll", schedule, { passive: true });
     }
     window.addEventListener("resize", schedule);
     schedule();
@@ -116,21 +156,31 @@ onBeforeUnmount(() => {
     cancelAnimationFrame(frame);
     ro?.disconnect();
     mo?.disconnect();
+    io?.disconnect();
     window.removeEventListener("resize", schedule);
-    props.container?.removeEventListener("scroll", schedule);
+    if (props.container) scrollViewport(props.container).removeEventListener("scroll", schedule);
 });
 
 watch(() => props.links, schedule, { deep: true });
 watch(
     () => props.container,
-    async (host) => {
+    async (host, previousHost) => {
         await nextTick();
+        if (previousHost) scrollViewport(previousHost).removeEventListener("scroll", schedule);
         if (host && mo) {
             mo.disconnect();
             mo.observe(host, { childList: true, subtree: true });
+            observeVisible(host);
+            refreshElements(host);
+            scrollViewport(host).addEventListener("scroll", schedule, { passive: true });
         }
         schedule();
     },
+);
+
+watch(
+    () => props.container?.childElementCount,
+    () => { if (props.container) refreshElements(props.container); },
 );
 
 defineExpose({ remeasure: schedule });

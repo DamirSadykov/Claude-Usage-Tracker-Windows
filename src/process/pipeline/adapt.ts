@@ -312,6 +312,9 @@ export function sharedSpecArtifact(
 export function toTaskLinks(board: BoardTodo[], index: LaneIndex): TaskLink[] {
     const byId = new Map(board.map((t) => [t.id, t]));
     const label = (t: BoardTodo) => (t.number ? `#${t.number}` : t.id);
+    const laneByLabel = new Map(
+        board.map((t) => [label(t), index.laneOf.get(t.id)]),
+    );
     const links: TaskLink[] = [];
     for (const t of board) {
         for (const dep of t.depends_on ?? []) {
@@ -330,11 +333,7 @@ export function toTaskLinks(board: BoardTodo[], index: LaneIndex): TaskLink[] {
             links.push({ from: label(prev), to: label(t), artifact });
         }
     }
-    return links.filter(
-        (l) =>
-            index.laneOf.get(idOfLabel(board, l.from) ?? "") ===
-            index.laneOf.get(idOfLabel(board, l.to) ?? ""),
-    );
+    return links.filter((l) => laneByLabel.get(l.from) === laneByLabel.get(l.to));
 }
 
 function idOfLabel(board: BoardTodo[], label: string): string | undefined {
