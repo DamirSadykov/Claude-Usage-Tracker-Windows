@@ -33,8 +33,10 @@ import {
   runReported,
   applyResult,
   stepBrief,
+  buildWave,
   resolveParallelLimit,
   formatStop,
+  formatRunReport,
   stampHandout,
   run,
   appendRunRecord,
@@ -127,6 +129,34 @@ const statusOf = (report, number) =>
 // ── the loop ─────────────────────────────────────────────────────────────────
 
 describe("runChange — the frontier", () => {
+  it("passes outside changes from the executor-scoped diff to review", async () => {
+    const data = board(changeRoot(1, [2]), auto(2, { step_base: "base" }));
+    let reviewed;
+    let executorEdits;
+    const h = harness({
+      executeStep: async () => ({ sessionId: "s-2", ok: true, editedPaths: ["a.txt"] }),
+      ownChanges: async ({ editedPaths }) => {
+        executorEdits = editedPaths;
+        return {
+          ok: true,
+          own: [{ status: "M", path: "a.txt" }],
+          outside: [{ status: "M", path: "b.txt" }],
+          damaged: [],
+        };
+      },
+      reviewStep: async (args) => {
+        reviewed = args;
+        return { approved: true, ok: true, costUsd: 0 };
+      },
+    });
+
+    const report = await go(data, "1", h.effects);
+    expect(executorEdits).toEqual(["a.txt"]);
+    expect(reviewed.ownChanges).toEqual([{ status: "M", path: "a.txt" }]);
+    expect(reviewed.outsideChanges).toEqual([{ status: "M", path: "b.txt" }]);
+    expect(report.steps[0].outside_changes).toBe(1);
+  });
+
   it("runs a linear three-step change all the way through", async () => {
     const data = board(
       changeRoot(1, [2, 3, 4], { budget_usd: 10 }),
@@ -198,6 +228,35 @@ describe("runChange — the frontier", () => {
       [3, [2]],
     ]);
     expect(r.complete).toBe(false);
+  });
+});
+
+describe("buildWave — declared output conflicts", () => {
+  it("keeps ready steps with a shared produced path in separate waves", () => {
+    const wave = buildWave([
+      auto(2, { produces: ["src/shared.mjs"] }),
+      auto(3, { produces: ["src/shared.mjs"] }),
+    ], 2);
+
+    expect(wave.map((t) => t.number)).toEqual([2]);
+  });
+
+  it("groups ready steps whose produced paths do not overlap", () => {
+    const wave = buildWave([
+      auto(2, { produces: ["src/first.mjs"] }),
+      auto(3, { produces: ["src/second.mjs"] }),
+    ], 2);
+
+    expect(wave.map((t) => t.number)).toEqual([2, 3]);
+  });
+
+  it("compares produced paths independently of slash direction", () => {
+    const wave = buildWave([
+      auto(2, { produces: ["src\\shared.mjs"] }),
+      auto(3, { produces: ["src/shared.mjs"] }),
+    ], 2);
+
+    expect(wave.map((t) => t.number)).toEqual([2]);
   });
 });
 
@@ -442,6 +501,30 @@ describe("runChange — issue, transition and the retry limit", () => {
     expect(r.stop.task.number).toBe(3);
     expect(r.stop.reason).toMatch(/2\/<=2/);
     expect(statusOf(r, 3)).toBe("review");
+  });
+
+  it("prints and records a retry decision card with the final verify tail and limit plus two", async () => {
+    const data = board(changeRoot(1, [2]), auto(2, { retry_limit: 1, budget_usd: 5 }));
+    const comments = [];
+    const h = harness({
+      runVerify: async () => ({ code: 1, stderr: Array.from({ length: 25 }, (_, i) => `verify line ${i + 1}`).join("\n") }),
+      reconcile: async () => ({ outcome: "issue", outcome_reason: "verify:issue" }),
+      recordIssue: async ({ comment }) => { comments.push(comment); return { written: true }; },
+      stepCost: async () => 1.25,
+    });
+    const r = await go(data, "1", h.effects);
+
+    expect(r.card).toContain("Decision card — retry");
+    expect(r.card).toContain("verify line 6");
+    expect(r.card).not.toContain("verify line 5");
+    expect(r.card).toContain("todos set retry t#2 3");
+    expect(r.card).toContain("todos run c#1 --go");
+    expect(comments.at(-1).body).toContain("Decision card — retry");
+  });
+
+  it("labels the run header with c# for a change", async () => {
+    const r = await runChange({ data: board(changeRoot(1, [2]), auto(2)), change: "1", dry: true });
+    expect(formatRunReport(r)).toMatch(/^change c#1 /);
   });
 
   it("never starts attempt M+1", async () => {
@@ -1123,7 +1206,58 @@ describe("run --next on a future-version board (t#575)", () => {
   });
 });
 
+describe("run change references", () => {
+  it("suggests c#N when #N names an existing change but no task graph", () => {
+    const cli = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "cli.mjs");
+    const dir = mkdtempSync(path.join(os.tmpdir(), "cut-run-change-ref-"));
+    const appDir = path.join(dir, "com.claude-usage-tracker.app");
+    mkdirSync(appDir, { recursive: true });
+    writeFileSync(path.join(appDir, "todos.json"), JSON.stringify({
+      version: 1,
+      todos: [],
+      changes: [{ id: "change-8", number: 8, title: "change eight" }],
+    }));
+    try {
+      const result = spawnSync(process.execPath, [cli, "todos", "run", "#8"], {
+        encoding: "utf8", env: { ...process.env, APPDATA: dir }, windowsHide: true,
+      });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("did you mean c#8?");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("run(['--next']) — the field wired end to end onto the real board (t#520)", () => {
+  it("includes a decision card when a red step cannot record its base", () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "cut-run-next-red-base-"));
+    const appDir = path.join(dir, "com.claude-usage-tracker.app");
+    const cli = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "cli.mjs");
+    mkdirSync(appDir, { recursive: true });
+    writeFileSync(path.join(appDir, "todos.json"), JSON.stringify(board(
+      changeRoot(1, [2]),
+      redAuto(2),
+    )));
+    try {
+      const result = spawnSync(process.execPath, [cli, "todos", "run", "1", "--next", "--json"], {
+        cwd: dir,
+        encoding: "utf8",
+        env: { ...process.env, APPDATA: dir },
+        windowsHide: true,
+      });
+      const report = JSON.parse(result.stdout);
+      expect(result.status).toBe(1);
+      expect(report.stop.kind).toBe("red-base");
+      expect(report.card).toContain("Decision card — red-base");
+      expect(report.stop.card).toContain("Decision card — red-base");
+      const saved = JSON.parse(readFileSync(path.join(appDir, "todos.json"), "utf8"));
+      expect(saved.todos.find((t) => t.number === 2).comments.at(-1).body).toContain("Decision card — red-base");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("writes handout_at through the CLI without moving status, and re-stamps on a second call", async () => {
     const dir = mkdtempSync(path.join(os.tmpdir(), "cut-run-cmdnext-"));
     const appDir = path.join(dir, "com.claude-usage-tracker.app");

@@ -24,7 +24,7 @@
 import { spawn, execFileSync } from "node:child_process";
 import path from "node:path";
 import { homedir } from "node:os";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
@@ -329,6 +329,53 @@ export function transcriptPathFor(session, cwd) {
   if (!session) return "";
   const p = path.join(transcriptDirFor(cwd), `${session}.jsonl`);
   return existsSync(p) ? p : "";
+}
+
+export function editedPathsOf(threadId, cwd) {
+  if (!threadId || !cwd) return null;
+  const sessions = path.join(process.env.CODEX_HOME || path.join(homedir(), ".codex"), "sessions");
+  const suffix = `-${threadId}.jsonl`;
+  const files = [];
+  const visit = (dir) => {
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return false;
+    }
+    for (const entry of entries) {
+      const file = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (!visit(file)) return false;
+      } else if (entry.isFile() && entry.name.startsWith("rollout-") && entry.name.endsWith(suffix)) {
+        files.push(file);
+      }
+    }
+    return true;
+  };
+  if (!visit(sessions) || !files.length) return null;
+  const root = path.resolve(cwd);
+  const paths = new Set();
+  try {
+    for (const file of files) {
+      for (const raw of readFileSync(file, "utf8").split(/\r?\n/)) {
+        if (!raw.trim()) continue;
+        let event;
+        try { event = JSON.parse(raw); } catch { continue; }
+        const changes = event?.type === "event_msg" && event.payload?.type === "item_completed" &&
+          event.payload.item?.type === "FileChange" ? event.payload.item.changes : null;
+        if (!changes || typeof changes !== "object") continue;
+        for (const changed of Object.keys(changes)) {
+          const relative = path.relative(root, changed);
+          if (!relative || relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) continue;
+          paths.add(relative.split(path.sep).join("/"));
+        }
+      }
+    }
+  } catch {
+    return null;
+  }
+  return [...paths];
 }
 
 // The RECORD block (t#562): where the prerequisites' own transcripts are, so
@@ -684,6 +731,16 @@ function formatChangesOfThisStep(ownChanges) {
   ].join("\n");
 }
 
+function formatOutsideChanges(outsideChanges) {
+  if (!Array.isArray(outsideChanges) || !outsideChanges.length) return "";
+  return [
+    "CHANGES OUTSIDE THIS STEP:",
+    ...outsideChanges.slice(0, 100).map((change) => `${change.status} ${change.path}`),
+    outsideChanges.length > 100 ? `… and ${outsideChanges.length - 100} more` : "",
+    "These files changed in the tree during this step, but not by this step's executor. Do not evaluate them as this step's work.",
+  ].filter(Boolean).join("\n");
+}
+
 function formatRetryReviewContext(context) {
   if (!context?.previousAttempt) return "";
   const findings = Array.isArray(context.previousAttempt.findings) ? context.previousAttempt.findings : [];
@@ -716,7 +773,7 @@ function formatRetryReviewContext(context) {
   ].join("\n");
 }
 
-export function buildReviewPrompt({ task, workerResult = "", execution, appData, ownChanges, retryContext } = {}) {
+export function buildReviewPrompt({ task, workerResult = "", execution, appData, ownChanges, outsideChanges, retryContext } = {}) {
   const parts = [
     `produces: ${(Array.isArray(task?.produces) ? task.produces : []).join(", ") || "(none)"}`,
     `verify: ${task?.verify || "(none — human gate)"}`,
@@ -740,6 +797,7 @@ export function buildReviewPrompt({ task, workerResult = "", execution, appData,
     "OBLIGATIONS:",
     declarations,
     formatChangesOfThisStep(ownChanges),
+    formatOutsideChanges(outsideChanges),
     formatRetryReviewContext(retryContext),
     workerResult ? `WORKER REPORT:\n${clampOutput(workerResult, 8000)}` : "WORKER REPORT: (none)",
     "",
@@ -906,6 +964,7 @@ export async function executeStep({
       handoff: extractHandoff(answer),
       costUsd: openAiCost(execution.model, parsed?.usage, execution),
       usage: parsed?.usage || null,
+      editedPaths: distinctSession ? editedPathsOf(actual, cwd) : null,
       stderr: clampOutput(run.stderr, MAX_CAPTURE_CHARS),
       prompt,
     };
@@ -973,6 +1032,7 @@ export async function executeStep({
     handoff: extractHandoff(answer),
     costUsd: parsed && typeof parsed.total_cost_usd === "number" ? parsed.total_cost_usd : null,
     numTurns: parsed && typeof parsed.num_turns === "number" ? parsed.num_turns : null,
+    editedPaths: null,
     stderr: clampOutput(run.stderr, MAX_CAPTURE_CHARS),
     prompt,
   };
@@ -992,6 +1052,7 @@ export async function executeReview({
   bind = true,
   appData,
   ownChanges,
+  outsideChanges,
   retryContext,
 } = {}) {
   if (!task) return { approved: false, ok: false, error: "executeReview: task is required" };
@@ -1000,7 +1061,7 @@ export async function executeReview({
   catch (e) { return { approved: false, ok: false, error: `routing: ${e?.message || e}` }; }
   if (!execution.enabled || !execution.model)
     return { approved: true, ok: true, skipped: true, duty: "review", costUsd: 0, route: execution.route || null };
-  const prompt = buildReviewPrompt({ task, workerResult, execution, appData, ownChanges, retryContext });
+  const prompt = buildReviewPrompt({ task, workerResult, execution, appData, ownChanges, outsideChanges, retryContext });
 
   if (execution.provider === "openai") {
     const { file, args } = providerArgv(execution, { bin: codexBin, sandbox: "read-only" });

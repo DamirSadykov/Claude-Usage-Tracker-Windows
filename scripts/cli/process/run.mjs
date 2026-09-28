@@ -94,6 +94,7 @@ import {
   recoverMarkers,
 } from "./red-gate.mjs";
 import { bestAttempt, blockingCount, restoreCheckpoint } from "./checkpoint.mjs";
+import { appendRunEvent, runEventsPath, watchRunEvents } from "./run-events.mjs";
 
 export const DEFAULT_PARALLEL_LIMIT = 1;
 
@@ -404,7 +405,7 @@ export function liveEffects({ cwd } = {}) {
       if (!Array.isArray(changes)) return { ok: false, error: changes.error };
       return { ok: true, changes };
     },
-    ownChanges: async ({ task, cwd }) => {
+    ownChanges: async ({ task, cwd, editedPaths }) => {
       if (!task.step_base) return { ok: true, skip: true };
       const head = gitHead(cwd);
       if (!head.ok) return { ok: false, error: head.error };
@@ -416,9 +417,10 @@ export function liveEffects({ cwd } = {}) {
         stepBase: task.step_base,
         end: end.sha,
         produces: task.produces,
+        edited: editedPaths,
       });
       if (!damage.ok) return { ok: false, error: damage.error };
-      return { ok: true, own: damage.own, damaged: damage.damaged };
+      return { ok: true, own: damage.own, outside: damage.outside, damaged: damage.damaged };
     },
     reviewContext: async ({ task, cwd, neighbours = [] }) => {
       const previousAttempt = priorAttempts(task).at(-1);
@@ -484,6 +486,12 @@ export function liveEffects({ cwd } = {}) {
 // no business in a file the UI rewrites.
 export function runLogPath() {
   return appDataFile("runs.jsonl");
+}
+
+function emitRunEvent(ctx, event) {
+  if (ctx.dry || !ctx.events) return;
+  const task = event.task == null ? null : `t#${String(event.task).replace(/^t?#/, "")}`;
+  appendRunEvent({ run: ctx.runId, change: `c#${ctx.root.number}`, ...event, task }, runEventsPath(runLogPath()));
 }
 
 export function appendRunRecord(rec, file = runLogPath()) {
@@ -602,6 +610,57 @@ function park(ctx, kind, task, reason, extra = {}) {
     parked: true,
     ...extra,
   };
+  emitRunEvent(ctx, { task: task?.number, kind: "park", park_kind: kind, reason });
+}
+
+function nodeSpend(task, current = 0) {
+  const prior = (task?.attempts || []).reduce(
+    (sum, attempt) => sum + (Number.isFinite(attempt?.cost_usd) ? attempt.cost_usd : 0),
+    0,
+  );
+  return round(prior || (Number.isFinite(current) ? current : 0));
+}
+
+export function formatDecisionCard(stop, { task = null, change = null, spent = 0 } = {}) {
+  if (!stop) return "";
+  const out = [`\nDecision card — ${stop.kind}\n`, `reason: ${stop.reason}\n`];
+  if (!task) return out.join("");
+  const last = (task.attempts || []).at(-1) || {};
+  const tail = String(last.verify_tail || "").trim();
+  const findings = Array.isArray(last.findings) ? last.findings : [];
+  const limit = retryLimitOf(task);
+  out.push(`node: t#${task.number}; spent: $${round(spent)}${typeof task.budget_usd === "number" ? ` of $${task.budget_usd} budget` : " (no node budget declared)"}\n`);
+  if (tail) out.push(`verify tail (last 20 lines):\n${tailLines(tail, 20)}\n`);
+  if (findings.length) {
+    out.push("last review findings:\n");
+    for (const finding of findings)
+      out.push(`  [${finding.level || "unknown"}] ${finding.file || "(file not specified)"}${finding.line ? `:${finding.line}` : ""} ${finding.text || ""}\n`);
+  }
+  const retry = (limit ?? 0) + 2;
+  const changeRef = change?.number == null ? "c#<change>" : `c#${change.number}`;
+  out.push("actions:\n");
+  out.push(`  accept as is: todos set status t#${task.number} done\n`);
+  out.push(`  allow more attempts: todos set retry t#${task.number} ${retry}\n`);
+  out.push(`                       todos run ${changeRef} --go\n`);
+  out.push("  split the work: todos apply <new plan>\n");
+  out.push(`  fix by hand: edit the files, then todos set status t#${task.number} done\n`);
+  return out.join("");
+}
+
+async function attachDecisionCard(ctx) {
+  if (!ctx.stop) return null;
+  const task = ctx.stop.task ? ctx.byId.get(ctx.stop.task.id) : null;
+  const spent = task ? nodeSpend(task, ctx.nodeSpent.get(task.id) || 0) : 0;
+  const card = formatDecisionCard(ctx.stop, { task, change: ctx.root, spent });
+  ctx.stop.card = card;
+  if ((!ctx.dry || ctx.persistDecisionCard) && task) {
+    const comment = {
+      id: randomUUID(), author: "review", body: card.trim(), created_at: new Date().toISOString(),
+    };
+    (task.comments ??= []).push(comment);
+    try { await ctx.effects.recordIssue?.({ task, comment }); } catch {}
+  }
+  return card;
 }
 
 // A refused transition is DATA, not a crash. The board can legitimately say no
@@ -707,6 +766,7 @@ export async function beginStep(ctx, task, wave = []) {
   }
 
   await moveTo(ctx, task, "in_progress");
+  emitRunEvent(ctx, { task: task.number, kind: "step_start", attempt, limit, route: task._runner_high_route_used ? "high" : null });
   return {
     task,
     kind: "begin",
@@ -742,6 +802,7 @@ async function recordWork(ctx, task, result) {
   } catch {
     cost = null;
   }
+  emitRunEvent(ctx, { task: task.number, kind: "worker_done", attempt: ctx.attempts.get(task.id), limit: retryLimitOf(task), cost });
   return { baton, cost };
 }
 
@@ -795,7 +856,7 @@ async function recordArchitectComment(ctx, task, { attempt, findings }) {
   return comment;
 }
 
-function resultBase(ctx, task, result, review, baton, cost, ownChanges) {
+function resultBase(ctx, task, result, review, baton, cost, ownChanges, outsideChanges) {
   const attempt = ctx.attempts.get(task.id);
   const limit = retryLimitOf(task);
   if (typeof review?.costUsd === "number" && Number.isFinite(review.costUsd))
@@ -810,6 +871,7 @@ function resultBase(ctx, task, result, review, baton, cost, ownChanges) {
     model: result.model || null,
     route: result.route || null,
     ownChanges: Array.isArray(ownChanges) ? ownChanges.length : null,
+    outsideChanges: Array.isArray(outsideChanges) ? outsideChanges.length : null,
     rollbackChanges: Array.isArray(ownChanges) ? ownChanges : [],
     neighbourDamage: Array.isArray(ownChanges) ? 0 : null,
     review: review ? {
@@ -902,6 +964,7 @@ async function finishAttempt(ctx, task, outcome) {
       if (!restored.ok) {
         return { ...outcome, kind: "convergence", parkReason: restored.lost ? "контрольная точка потеряна" : `контрольная точка не восстановлена: ${restored.reason}`, attempt_journal: journal };
       }
+      emitRunEvent(ctx, { task: task.number, kind: "rollback", attempt: outcome.attempt, limit: outcome.limit, to: best.attempt ?? best.snapshot });
       return { ...outcome, rolledBackTo: best.snapshot, attempt_journal: journal };
     }
   }
@@ -913,11 +976,12 @@ async function finishAttempt(ctx, task, outcome) {
 // issue / verify+reconcile / close. Anything that moves ANOTHER node (the
 // `?issue` transition) is only RETURNED as an intent here — it is applied in
 // board order afterwards, never from inside a single node's own step.
-export async function finishStep(ctx, task, { result, review, baton, cost, ownChanges }) {
-  const base = resultBase(ctx, task, result, review, baton, cost, ownChanges);
+export async function finishStep(ctx, task, { result, review, baton, cost, ownChanges, outsideChanges }) {
+  const base = resultBase(ctx, task, result, review, baton, cost, ownChanges, outsideChanges);
   const { attempt, limit } = base;
 
   const findings = Array.isArray(review?.findings) ? review.findings : [];
+  if (review) emitRunEvent(ctx, { task: task.number, kind: "review", attempt, limit, counts: findingCounts(findings) });
   const blocking = blockingFindings(findings);
   const architectFindings = findings.filter((f) => f?.level === "medium" || f?.level === "low");
   const onlyArchitectural = review && review.skipped !== true && blocking.length === 0 && architectFindings.length;
@@ -990,6 +1054,7 @@ export async function finishStep(ctx, task, { result, review, baton, cost, ownCh
     timeoutMs: ctx.timeoutMs,
   });
   const verify = Number(verdictRun?.code) === 0 ? "ok" : "issue";
+  emitRunEvent(ctx, { task: task.number, kind: "verify", attempt, limit, ok: verify === "ok" });
   if (verify === "issue") {
     const combined = [verdictRun?.stdout, verdictRun?.stderr].filter((s) => s && String(s).trim()).join("\n");
     const tail = tailLines(combined, 60);
@@ -1035,14 +1100,16 @@ async function checkNeighbourDamage(ctx, task, result, baton, cost) {
   if (result.ok === false || !task.step_base) return null;
   let damage;
   try {
-    damage = (await ctx.effects.ownChanges({ task, cwd: ctx.cwd })) || {};
+    damage = (await ctx.effects.ownChanges({ task, cwd: ctx.cwd, editedPaths: result.editedPaths })) || {};
   } catch (err) {
     damage = { ok: false, error: String((err && err.message) || err) };
   }
   if (!damage.ok || damage.skip) return null;
   const ownChanges = damage.own || [];
-  if (!Array.isArray(damage.damaged) || !damage.damaged.length) return { ownChanges, issue: null };
-  const base = resultBase(ctx, task, result, null, baton, cost, ownChanges);
+  const outsideChanges = Array.isArray(damage.outside) ? damage.outside : [];
+  if (!Array.isArray(damage.damaged) || !damage.damaged.length)
+    return { ownChanges, outsideChanges, issue: null };
+  const base = resultBase(ctx, task, result, null, baton, cost, ownChanges, outsideChanges);
   base.neighbourDamage = damage.damaged.length;
   await recordIssueComment(ctx, task, {
     attempt: base.attempt,
@@ -1052,6 +1119,7 @@ async function checkNeighbourDamage(ctx, task, result, baton, cost) {
   });
   return {
     ownChanges,
+    outsideChanges,
     issue: await finishAttempt(ctx, task, {
       ...base,
       kind: "issue",
@@ -1108,6 +1176,7 @@ async function runOne(ctx, task, wave = []) {
   const damage = await checkNeighbourDamage(ctx, task, result, baton, cost);
   if (damage && damage.issue) return damage.issue;
   const ownChanges = damage ? damage.ownChanges : null;
+  const outsideChanges = damage ? damage.outsideChanges : null;
   const retryContext = await retryReviewContext(ctx, task, ownChanges);
 
   let review = null;
@@ -1119,6 +1188,7 @@ async function runOne(ctx, task, wave = []) {
         cwd: ctx.cwd,
         timeoutMs: ctx.timeoutMs,
         ownChanges,
+        outsideChanges,
         retryContext,
       });
       review = downgradeUntouchedRetryFindings(review, retryContext);
@@ -1126,7 +1196,7 @@ async function runOne(ctx, task, wave = []) {
       review = { approved: false, ok: false, error: String(err?.message || err) };
     }
   }
-  return finishStep(ctx, task, { result, review, baton, cost, ownChanges });
+  return finishStep(ctx, task, { result, review, baton, cost, ownChanges, outsideChanges });
 }
 
 export async function runReported(ctx, task, wave, { result, review = null }) {
@@ -1136,12 +1206,14 @@ export async function runReported(ctx, task, wave, { result, review = null }) {
   const damage = await checkNeighbourDamage(ctx, task, result, baton, cost);
   if (damage && damage.issue) return damage.issue;
   const ownChanges = damage ? damage.ownChanges : null;
+  const outsideChanges = damage ? damage.outsideChanges : null;
   return finishStep(ctx, task, {
     result,
     review,
     baton,
     cost,
     ownChanges,
+    outsideChanges,
   });
 }
 
@@ -1157,6 +1229,7 @@ async function applyIssue(ctx, r) {
   }
   if (shouldEscalate(task, r) && hasHighRoute()) {
     task._runner_high_route_pending = true;
+    emitRunEvent(ctx, { task: task.number, kind: "escalate", attempt: r.attempt, limit: r.limit, route: "high" });
   }
   if (limit === null) {
     await moveTo(ctx, task, "review");
@@ -1239,7 +1312,7 @@ function isNodeParked(t) {
 // spent — a caller resuming a run from outside has no honest way to derive it,
 // and defaulting it to 0 would make that caller silently believe it has spent
 // nothing rather than visibly have no ceiling to check against.
-export function buildRunContext({ data, change, effects = {}, dry = true, cwd = process.cwd(), timeoutMs, spent, inherit = false }) {
+export function buildRunContext({ data, change, effects = {}, dry = true, cwd = process.cwd(), timeoutMs, spent, inherit = false, events = false, persistDecisionCard = false }) {
   const board = structuredClone(data ?? { version: 1, todos: [] });
   const { root, members, byId } = collectChange(board, change);
   if (!root) throw new Error(`no such task: ${change}`);
@@ -1248,6 +1321,7 @@ export function buildRunContext({ data, change, effects = {}, dry = true, cwd = 
   // merged in, so `--dry-run` cannot start a model or move the board even by
   // mistake. Only the cost estimator may be supplied.
   const sim = simulationEffects();
+  const persistedEffects = persistDecisionCard ? { recordIssue: liveEffects({ cwd }).recordIssue } : {};
   return {
     data: board,
     root,
@@ -1257,7 +1331,7 @@ export function buildRunContext({ data, change, effects = {}, dry = true, cwd = 
     cwd,
     timeoutMs,
     effects: dry
-      ? { ...sim, stepCost: effects.stepCost ?? sim.stepCost }
+      ? { ...sim, stepCost: effects.stepCost ?? sim.stepCost, ...persistedEffects }
       : { ...liveEffects({ cwd }), ...effects },
     attempts: new Map(),
     parked: new Set(members.filter(isNodeParked).map((t) => t.id)),
@@ -1277,6 +1351,9 @@ export function buildRunContext({ data, change, effects = {}, dry = true, cwd = 
     stop: null,
     maxParallel: 0,
     stepBaseWarned: false,
+    runId: randomUUID(),
+    events: !!events,
+    persistDecisionCard: !!persistDecisionCard,
   };
 }
 
@@ -1296,9 +1373,15 @@ export function buildWave(ready, limit) {
   if (!ready.length) return [];
   if (declaredRed(ready[0])) return [ready[0]];
   const wave = [];
+  const produced = new Set();
   for (const t of ready) {
     if (wave.length >= limit || declaredRed(t)) break;
+    const paths = (Array.isArray(t.produces) ? t.produces : [])
+      .filter(Boolean)
+      .map((p) => String(p).replace(/\\/g, "/"));
+    if (paths.some((p) => produced.has(p))) continue;
     wave.push(t);
+    for (const p of paths) produced.add(p);
   }
   return wave;
 }
@@ -1343,6 +1426,7 @@ export async function applyResult(ctx, r, { dry, log }) {
     reason: r.reason || null,
     status: r.task.status,
     own_changes: typeof r.ownChanges === "number" ? r.ownChanges : null,
+    outside_changes: typeof r.outsideChanges === "number" ? r.outsideChanges : null,
     neighbour_damage: typeof r.neighbourDamage === "number" ? r.neighbourDamage : null,
   };
   ctx.steps.push(record);
@@ -1460,13 +1544,14 @@ export async function runChange({
   log = () => {},
   maxSteps,
 }) {
-  const ctx = buildRunContext({ data, change, effects, dry, cwd, timeoutMs, spent: 0, inherit });
+  const ctx = buildRunContext({ data, change, effects, dry, cwd, timeoutMs, spent: 0, inherit, events: !dry });
   const { root, members, byId } = ctx;
 
   const limit = resolveParallelLimit(root, parallelLimit);
   const groupBudget = typeof root.budget_usd === "number" ? root.budget_usd : null;
 
   const bound = maxSteps ?? members.length * 8 + 8;
+  emitRunEvent(ctx, { kind: "run_start" });
 
   while (!ctx.stop) {
     // The live loop asks the STRUCTURAL frontier, not the parked-filtered one:
@@ -1526,7 +1611,8 @@ export async function runChange({
   }
 
   const complete = !ctx.stop && members.every((t) => isDone(t));
-  return {
+  const card = await attachDecisionCard(ctx);
+  const report = {
     version: 1,
     kind: "change.run",
     dry,
@@ -1551,9 +1637,12 @@ export async function runChange({
       group_budget: groupBudget,
     },
     stop: ctx.stop,
+    card,
     complete,
     board: ctx.data,
   };
+  emitRunEvent(ctx, { kind: "run_end", complete, stop: ctx.stop?.kind || null });
+  return report;
 }
 
 const round = (n) => Math.round(n * 10000) / 10000;
@@ -1596,6 +1685,7 @@ export function formatStop(stop) {
   out.push(
     "   next:   yours. the runner does not push a node past its check — --force is a human exception, not the runner's.\n",
   );
+  if (stop.card) out.push(stop.card);
   return out.join("");
 }
 
@@ -1609,7 +1699,7 @@ export function formatRunReport(r) {
   const out = [];
   const th = r.change;
   out.push(
-    `change #${th.number} "${th.subject}" — ${r.members.length} node(s), parallel limit ${th.parallel_limit}` +
+    `change c#${th.number} "${th.subject}" — ${r.members.length} node(s), parallel limit ${th.parallel_limit}` +
       `${th.parallel_declared === null ? " (undeclared, default 1)" : ""}` +
       `${th.budget_usd === null ? ", budget UNDECLARED" : `, budget $${th.budget_usd}`}\n`,
   );
@@ -1618,7 +1708,7 @@ export function formatRunReport(r) {
   out.push(
     r.dry
       ? "plan of the run (dry — no model was started, the board was not touched):\n"
-      : "run:\n",
+      : "run (rollback touches only produces and files changed by this step; snapshots are unreferenced local commits, never pushed; unrelated uncommitted work is untouched):\n",
   );
   if (!r.steps.length) out.push("  (nothing to run — the frontier was empty from the start)\n");
   for (const s of r.steps) out.push(formatStepLine(s, r.dry));
@@ -1643,7 +1733,7 @@ export function formatRunReport(r) {
   if (r.stop) out.push(formatStop(r.stop));
   else if (r.complete)
     out.push(
-      `\n✓ every node of the change is closed. The change root #${th.number} stays open — the runner never closes the group.\n`,
+      `\n✓ every node of the change is closed. The change root c#${th.number} stays open — the runner never closes the group.\n`,
     );
   return out.join("");
 }
@@ -1750,7 +1840,7 @@ function formatNextReport(r) {
   const out = [];
   const th = r.change;
   out.push(
-    `change #${th.number} "${th.subject}" — parallel limit ${th.parallel_limit}` +
+    `change c#${th.number} "${th.subject}" — parallel limit ${th.parallel_limit}` +
       `${th.budget_usd === null ? ", budget UNDECLARED" : `, budget $${th.budget_usd}`}\n`,
   );
   out.push("the models this loop must bill to (agents.mjs; read, never hardcoded):\n");
@@ -1865,7 +1955,7 @@ async function cmdNext(ref, f) {
   const file = appDataFile("todos.json");
   const { root, limit, groupBudget, ctx, outcome, handoutAt } = withBoardLock(file, () => {
     const data = loadBoardForWrite(file);
-    const c = buildRunContext({ data, change: ref, dry: true, cwd: process.cwd(), timeoutMs, spent });
+    const c = buildRunContext({ data, change: ref, dry: true, cwd: process.cwd(), timeoutMs, spent, persistDecisionCard: true });
     const l = resolveParallelLimit(c.root, parallel);
     const gb = typeof c.root.budget_usd === "number" ? c.root.budget_usd : null;
     let o = nextFrontier(c, { limit: l, groupBudget: gb, spentKnown });
@@ -1877,6 +1967,7 @@ async function cmdNext(ref, f) {
     return { root: c.root, limit: l, groupBudget: gb, ctx: c, outcome: o, handoutAt: at };
   });
 
+  if (outcome.stop) ctx.stop = outcome.stop;
   const report = {
     version: 1,
     kind: "change.next",
@@ -1892,6 +1983,7 @@ async function cmdNext(ref, f) {
     ready: (outcome.wave || []).map((t) => nodeHandout(t, ctx.byId, handoutAt)),
     handout_at: handoutAt,
     stop: outcome.stop || null,
+    card: outcome.stop ? await attachDecisionCard(ctx) : null,
     complete: !!outcome.complete,
   };
 
@@ -1947,6 +2039,7 @@ async function cmdReport(ref, f) {
   const limit = resolveParallelLimit(ctx.root, undefined);
   const groupBudget = typeof ctx.root.budget_usd === "number" ? ctx.root.budget_usd : null;
   const preview = nextFrontier(ctx, { limit, groupBudget, spentKnown: false });
+  const card = preview.stop ? await attachDecisionCard(ctx) : null;
 
   const report = {
     version: 1,
@@ -1960,6 +2053,7 @@ async function cmdReport(ref, f) {
       stop: preview.stop || null,
       complete: !!preview.complete,
     },
+    card,
   };
 
   appendRunRecord(reportRecordOf(report));
@@ -2089,6 +2183,8 @@ function parseFlags(args) {
     else if (a === "--go") f.go = true;
     else if (a === "--inherit") f.inherit = true;
     else if (a === "--history") f.history = true;
+    else if (a === "--from") f.from = args[++i];
+    else if (a.startsWith("--from=")) f.from = a.slice("--from=".length);
     else if (a === "--force") f.force = true;
     else if (a === "--next") f.next = true;
     else if (a === "--report") f.report = args[++i];
@@ -2120,6 +2216,7 @@ function usage(code) {
   process.stdout.write(
     "usage: cli todos run <change> [--dry-run | --go] [--inherit] [--parallel N] [--timeout <min>] [--json]\n" +
       "       cli todos run <change> --next [--parallel N] [--spent <usd>] [--json]\n" +
+      "       cli todos run watch <change> [--from start]\n" +
       "       cli todos run <change> --report <task> --result ok|issue [--handoff <text>]\n" +
       '                     [--reason <text>] [--cost <usd>] [--review approve|issue] [--json]\n\n' +
       "  Executes a change's task graph: frontier -> step -> verify -> outcome, one\n" +
@@ -2129,7 +2226,9 @@ function usage(code) {
       "  --dry-run      DEFAULT: print the plan — the order of steps, what would run,\n" +
       "                 where it would hit a gate, what it would cost by the DECLARED\n" +
       "                 budgets. Touches neither the board nor a model.\n" +
-      "  --go           actually run it. Requires a budget declared on the change.\n" +
+      "  --go           actually run it. Requires a budget declared on the change. Rollback touches only\n" +
+      "                 produces and files changed by this step; snapshots are unreferenced local commits,\n" +
+      "                 never pushed; unrelated uncommitted work is untouched.\n" +
       "  --inherit      fork each step from its prerequisite's session instead of\n" +
       "                 starting it cold — cheaper, the prefix is already warm, but\n" +
       "                 the step then SEES that session while its brief says there\n" +
@@ -2146,6 +2245,8 @@ function usage(code) {
       "                 what each cost, where it parked, and the share of runs that\n" +
       "                 needed exactly ONE pass over the graph — the number that says\n" +
       "                 whether plans hold up, and which stop eats them when they do not.\n\n" +
+      "  watch <change>       print live events for one change and stop when its run parks or ends\n" +
+      "    --from start       include existing events; otherwise starts at the current end of the journal\n\n" +
       "  --next         hand the frontier to a caller driving the loop itself — the\n" +
       "                 worker/review provider+model to bill (agents.mjs), each ready\n" +
       "                 node's declarations and inherited handoff. Moves no status —\n" +
@@ -2176,6 +2277,12 @@ function usage(code) {
 
 export async function run(args) {
   const f = parseFlags(args);
+  if (f.positional[0] === "watch") {
+    const change = f.positional[1];
+    if (!change || f.positional.length > 2) usage(1);
+    if (f.from !== undefined && f.from !== "start") fail('--from takes "start"');
+    return watchRunEvents({ change, file: runEventsPath(runLogPath()), from: f.from });
+  }
   const ref = f.positional[0];
   if (f.help) usage(0);
   if (f.history) return cmdHistory(ref || "", f);
@@ -2195,7 +2302,11 @@ export async function run(args) {
   const file = appDataFile("todos.json");
   const data = dry ? loadBoard(file) : loadBoardForWrite(file);
   const { root } = collectChange(data, ref);
-  if (!root) fail(`no such task: ${ref}`);
+  if (!root) {
+    const number = String(ref).trim().match(/^#?(\d+)$/)?.[1];
+    const change = number ? findChange(data, number) : null;
+    fail(change ? `no graph for ${ref}; did you mean c#${change.number}?` : `no such task: ${ref}`);
+  }
   if (!dry && typeof root.budget_usd !== "number") {
     fail(
       `refusing to run ${root.address ?? `#${root.number}`} unattended: no budget is declared on the change.\n` +

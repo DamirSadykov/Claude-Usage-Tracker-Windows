@@ -25,6 +25,7 @@ import {
   attemptStartOf,
   handoutStartOf,
   evidenceWindowStartOf,
+  stepChanges,
 } from "./outcome.mjs";
 import { loadBoard } from "../board/todos.mjs";
 
@@ -743,5 +744,35 @@ describe("buildOutcomeReport — git evidence since step_base", () => {
     });
     expect(report.produces[0]).toMatchObject({ produced: false, evidence: null });
     expect(report.outcome).toBe("issue");
+  });
+
+  it("counts a produces file deleted since its step_base as produced", () => {
+    const repo = mkdtempSync(path.join(os.tmpdir(), "cut-outcome-git-"));
+    try {
+      execFileSync("git", ["init"], { cwd: repo, stdio: "pipe" });
+      execFileSync("git", ["config", "core.autocrlf", "false"], { cwd: repo, stdio: "pipe" });
+      execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: repo, stdio: "pipe" });
+      execFileSync("git", ["config", "user.name", "Test"], { cwd: repo, stdio: "pipe" });
+      const file = path.join(repo, "src", "board", "TodoBoard.vue");
+      mkdirSync(path.dirname(file), { recursive: true });
+      writeFileSync(file, "<template />\n");
+      execFileSync("git", ["add", "."], { cwd: repo, stdio: "pipe" });
+      execFileSync("git", ["commit", "-m", "base"], { cwd: repo, stdio: "pipe" });
+      const stepBase = execFileSync("git", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf8" }).trim();
+      rmSync(file);
+      const todo = board([1, { produces: ["src/board/TodoBoard.vue"], step_base: stepBase }]).todos[0];
+      const report = buildOutcomeReport({
+        data: board([1]),
+        todo,
+        blocks: [],
+        touches: touchesOf(),
+        root: repo,
+        gitChanged: stepChanges(todo, repo),
+      });
+      expect(report.produces[0]).toMatchObject({ produced: true, evidence: "git" });
+      expect(report.outcome).toBe("ok");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
   });
 });

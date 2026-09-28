@@ -104,6 +104,28 @@ describe("todos lint checks the recorded graph", () => {
     expect(out).toMatch(/needs form a cycle: #1 -> #2 -> #1/);
   });
 
+  it("warns when independent open nodes promise the same path, regardless of slash style", () => {
+    board(task(1, { produces: ["src\\TodoWindow.vue"] }), task(2, { produces: ["src/TodoWindow.vue"] }));
+    const { code, out } = lint();
+    expect(code).toBe(0);
+    expect(out).toMatch(/#1 and #2 both produce "src\/TodoWindow\.vue" without a needs path between them/);
+    expect(out).toMatch(/add a needs edge or make one step/);
+  });
+
+  it("does not warn about shared produces when needs connect the nodes transitively", () => {
+    board(
+      task(1, { produces: ["src/TodoWindow.vue"] }),
+      task(2, { depends_on: ["t1"] }),
+      task(3, { depends_on: ["t2"], produces: ["src/TodoWindow.vue"] }),
+    );
+    expect(lint().out).toMatch(/nothing violates/);
+  });
+
+  it("does not compare a closed node's produces with open work", () => {
+    board(task(1, { status: "done", produces: ["src/TodoWindow.vue"], outcome: "ok" }), task(2, { produces: ["src/TodoWindow.vue"] }));
+    expect(lint().out).toMatch(/nothing violates/);
+  });
+
   // A gate is a legal graph — the node just cannot close itself, so this is a
   // note about what the runner will do, not a fault.
   it("only warns on auto without a verify, and calls it a gate", () => {
