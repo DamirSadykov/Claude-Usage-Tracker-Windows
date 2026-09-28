@@ -39,6 +39,7 @@
     { "key": "todoNotificationsEnabled", "scope": "ui", "writer": "app", "readers": ["ui"], "default": true },
     { "key": "runtimeInsightsEnabled", "scope": "ui", "writer": "app", "readers": ["ui"], "default": false },
     { "key": "runtimeInsightKinds", "scope": "ui", "writer": "app", "readers": ["ui"], "default": ["long_session", "cold_rewrites"] },
+    { "key": "keepAwakeEnabled", "scope": "ui", "writer": "app", "readers": ["ui"], "default": false },
     { "key": "systemInfoEnabled", "scope": "ui", "writer": "app", "readers": ["ui"], "default": true },
     { "key": "correctionsEnabled", "scope": "ui", "writer": "app", "readers": ["ui"], "default": false },
     { "key": "locale", "scope": "ui", "writer": "app", "readers": ["ui"], "default": null },

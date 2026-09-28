@@ -116,6 +116,11 @@ async function handleRuntimeChange(payload: { enabled: boolean; kinds: string[] 
     await emit("settings-runtime-change", payload);
 }
 
+async function emitKeepAwakeChange(enabled: boolean) {
+    const { emit } = await import("@tauri-apps/api/event");
+    await emit("settings-keep-awake-change", enabled);
+}
+
 const unlisteners: Array<() => void> = [];
 
 onMounted(async () => {
@@ -190,11 +195,13 @@ onUnmounted(() => {
             :corrections-enabled="settings.correctionsEnabled"
             :runtime-insights-enabled="settings.runtimeInsightsEnabled"
             :runtime-insight-kinds="settings.runtimeInsightKinds"
+            :keep-awake-enabled="settings.keepAwakeEnabled"
             :locale="locale"
             :ui-font="settings.uiFont"
             :saved-tick="savedTick"
             @save="handleSave"
             @runtime-change="handleRuntimeChange"
+            @keep-awake-change="emitKeepAwakeChange"
         />
     </div>
 </template>

@@ -36,7 +36,7 @@ use domain::{compute_levels, is_muted, today_spent_for, UsageLevels};
 use report::{DiagReport, DiagStore};
 use stats::StatsDb;
 use usage::UsageData;
-use kernel::paths::{cc_hook_script_path, claude_dir};
+use kernel::{keep_awake, paths::{cc_hook_script_path, claude_dir}};
 
 static TRAY_OK: &[u8] = include_bytes!("../icons/tray-ok.png");
 static TRAY_WARN: &[u8] = include_bytes!("../icons/tray-warn.png");
@@ -1046,6 +1046,9 @@ fn configure(
         config.refresh_interval
     );
     *state.lock().unwrap() = config;
+    if let Some(wake) = app.try_state::<keep_awake::WakeHandle>() {
+        wake.wake();
+    }
     if disable {
         // Turning notifications off re-arms the engine for a clean next enable.
         engine.lock().unwrap().reset();
@@ -1702,6 +1705,89 @@ fn task_sessions_path(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&dir).ok();
     Ok(dir.join("task-sessions.jsonl"))
+}
+
+fn journal_time(ts: &str) -> Option<SystemTime> {
+    let seconds = chrono::DateTime::parse_from_rfc3339(ts)
+        .ok()?
+        .with_timezone(&chrono::Utc)
+        .timestamp();
+    u64::try_from(seconds)
+        .ok()
+        .and_then(|seconds| UNIX_EPOCH.checked_add(Duration::from_secs(seconds)))
+}
+
+fn open_run_step_starts(events: &[task_sessions::TaskSessionEvent]) -> Vec<SystemTime> {
+    let mut ordered: Vec<&task_sessions::TaskSessionEvent> = events.iter().collect();
+    ordered.sort_by(|a, b| a.ts.cmp(&b.ts));
+    let mut open: HashMap<&str, &task_sessions::TaskSessionEvent> = HashMap::new();
+    for event in ordered {
+        if event.event == "start" {
+            open.insert(event.session.as_str(), event);
+        } else if event.event == "end"
+            && open
+                .get(event.session.as_str())
+                .is_some_and(|start| start.task == event.task)
+        {
+            open.remove(event.session.as_str());
+        }
+    }
+    open
+        .into_values()
+        .filter(|event| event.source == "run-step")
+        .filter_map(|event| journal_time(&event.ts))
+        .collect()
+}
+
+fn newest_transcript_mtime(root: &Path) -> Option<SystemTime> {
+    fn visit(dir: &Path, newest: &mut Option<SystemTime>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else { continue };
+            if kind.is_dir() {
+                visit(&path, newest);
+            } else if kind.is_file()
+                && path.extension().and_then(|extension| extension.to_str()) == Some("jsonl")
+            {
+                if let Ok(modified) = std::fs::metadata(&path).and_then(|meta| meta.modified()) {
+                    if newest.is_none_or(|current| modified > current) {
+                        *newest = Some(modified);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut newest = None;
+    visit(root, &mut newest);
+    newest
+}
+
+fn spawn_keep_awake_worker(app: AppHandle) -> keep_awake::WakeHandle {
+    keep_awake::spawn(move || {
+        let enabled = app
+            .state::<Mutex<AppConfig>>()
+            .lock()
+            .unwrap()
+            .keep_awake_enabled;
+        if !enabled {
+            return keep_awake::Activity::default();
+        }
+
+        let claude = claude_dir()
+            .as_deref()
+            .map(|dir| newest_transcript_mtime(&dir.join("projects")));
+        let codex = codex::codex_dir()
+            .as_deref()
+            .map(|dir| newest_transcript_mtime(&dir.join("sessions")));
+        let newest_transcript = [claude.flatten(), codex.flatten()].into_iter().flatten().max();
+        let open_run_steps = task_sessions_path(&app)
+            .map(|path| task_sessions::load(&path))
+            .map(|events| open_run_step_starts(&events))
+            .unwrap_or_default();
+        keep_awake::Activity { enabled, newest_transcript, open_run_steps }
+    })
 }
 
 /// Session ends (last `cc_usage` ts) keyed by session id — what closes the last
@@ -3082,6 +3168,7 @@ pub fn run() {
 
             // Business-logic state, owned by the backend loop.
             app.manage(Mutex::new(AppConfig::default()));
+            app.manage(spawn_keep_awake_worker(app.handle().clone()));
             app.manage(Mutex::new(AlertEngine::new()));
             app.manage(Arc::new(Mutex::new(StatusState::default())));
             app.manage(TodoSnapshot::default());

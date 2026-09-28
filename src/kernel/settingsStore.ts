@@ -54,6 +54,7 @@ export interface SettingsSnapshot {
     todoNotificationsEnabled: boolean;
     runtimeInsightsEnabled: boolean;
     runtimeInsightKinds: string[];
+    keepAwakeEnabled: boolean;
     systemInfoEnabled: boolean;
     correctionsEnabled: boolean;
     specsEnabled: boolean;
@@ -92,6 +93,7 @@ export const SNAPSHOT_KEYS = [
     "todoNotificationsEnabled",
     "runtimeInsightsEnabled",
     "runtimeInsightKinds",
+    "keepAwakeEnabled",
     "systemInfoEnabled",
     "correctionsEnabled",
     "specsEnabled",
@@ -143,6 +145,7 @@ export function defaultSettings(): SettingsSnapshot {
         todoNotificationsEnabled: true,
         runtimeInsightsEnabled: false,
         runtimeInsightKinds: ["long_session", "cold_rewrites"],
+        keepAwakeEnabled: false,
         systemInfoEnabled: true,
         correctionsEnabled: false,
         specsEnabled: false,
@@ -217,6 +220,7 @@ export async function readSettingsSnapshot(): Promise<SettingsSnapshot> {
             s.runtimeInsightKinds = rk.map((k) => (k === "idle_cache_gap" ? "cold_rewrites" : k));
         }
 
+        s.keepAwakeEnabled = (await get<boolean>("keepAwakeEnabled")) ?? s.keepAwakeEnabled;
         s.systemInfoEnabled = (await get<boolean>("systemInfoEnabled")) ?? s.systemInfoEnabled;
         s.correctionsEnabled = (await get<boolean>("correctionsEnabled")) ?? s.correctionsEnabled;
         s.specsEnabled = (await get<boolean>("specsEnabled")) ?? s.specsEnabled;

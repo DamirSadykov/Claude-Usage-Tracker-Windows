@@ -100,6 +100,7 @@ const props = defineProps<{
   correctionsEnabled: boolean;
   runtimeInsightsEnabled: boolean;
   runtimeInsightKinds: string[];
+  keepAwakeEnabled: boolean;
   locale: string;
   uiFont: string;
   // Bumped by the host each time the main window confirms a persisted save
@@ -140,6 +141,7 @@ const emit = defineEmits<{
   }];
   // Runtime-insight settings save immediately (not via the Save button).
   runtimeChange: [settings: { enabled: boolean; kinds: string[] }];
+  keepAwakeChange: [enabled: boolean];
 }>();
 
 const localSessionKey = ref(props.sessionKey);
@@ -278,8 +280,10 @@ const allInsightKinds = INSIGHT_KINDS;
 // emit (the backend reconfigures on the spot), unlike the Save-button settings.
 const localRuntimeEnabled = ref(props.runtimeInsightsEnabled);
 const localRuntimeKinds = ref<string[]>([...props.runtimeInsightKinds]);
+const localKeepAwakeEnabled = ref(props.keepAwakeEnabled);
 watch(() => props.runtimeInsightsEnabled, (v) => (localRuntimeEnabled.value = v));
 watch(() => props.runtimeInsightKinds, (v) => (localRuntimeKinds.value = [...v]));
+watch(() => props.keepAwakeEnabled, (v) => (localKeepAwakeEnabled.value = v));
 
 function isRuntimeOn(kind: string): boolean {
   return localRuntimeEnabled.value && localRuntimeKinds.value.includes(kind);
@@ -295,6 +299,11 @@ function emitRuntime() {
 function toggleRuntimeMaster() {
   localRuntimeEnabled.value = !localRuntimeEnabled.value;
   emitRuntime();
+}
+
+function toggleKeepAwake() {
+  localKeepAwakeEnabled.value = !localKeepAwakeEnabled.value;
+  emit("keepAwakeChange", localKeepAwakeEnabled.value);
 }
 
 function toggleRuntime(kind: string) {
@@ -1220,6 +1229,16 @@ function handleSave() {
           <div class="card-sub">{{ t('miniSystemInfoDesc') }}</div>
         </div>
         <div class="toggle" :class="{ on: localSystemInfo }">
+          <div class="toggle-knob"></div>
+        </div>
+      </div>
+
+      <div class="card toggle-card" @click="toggleKeepAwake">
+        <div style="flex: 1; min-width: 0">
+          <div class="card-title" style="font-size: 13px">{{ t('keepAwakeTitle') }}</div>
+          <div class="card-sub">{{ t('keepAwakeDesc') }}</div>
+        </div>
+        <div class="toggle" :class="{ on: localKeepAwakeEnabled }">
           <div class="toggle-knob"></div>
         </div>
       </div>

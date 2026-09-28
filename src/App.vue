@@ -83,6 +83,7 @@ const memoryBloatEnabled = ref(true);
 const todoNotificationsEnabled = ref(true);
 const runtimeInsightsEnabled = ref(false);
 const runtimeInsightKinds = ref<string[]>(["long_session", "cold_rewrites"]);
+const keepAwakeEnabled = ref(false);
 const systemInfoEnabled = ref(true);
 const correctionsEnabled = ref(false);
 const uiFont = ref(DEFAULT_FONT_ID);
@@ -227,6 +228,7 @@ async function loadSettings() {
     todoNotificationsEnabled.value = s.todoNotificationsEnabled;
     runtimeInsightsEnabled.value = s.runtimeInsightsEnabled;
     runtimeInsightKinds.value = s.runtimeInsightKinds;
+    keepAwakeEnabled.value = s.keepAwakeEnabled;
     systemInfoEnabled.value = s.systemInfoEnabled;
     correctionsEnabled.value = s.correctionsEnabled;
     // An unset locale must not clobber the running one (navigator default).
@@ -273,6 +275,7 @@ async function saveSettings() {
     await store.set("todoNotificationsEnabled", todoNotificationsEnabled.value);
     await store.set("runtimeInsightsEnabled", runtimeInsightsEnabled.value);
     await store.set("runtimeInsightKinds", [...runtimeInsightKinds.value]);
+    await store.set("keepAwakeEnabled", keepAwakeEnabled.value);
     await store.set("systemInfoEnabled", systemInfoEnabled.value);
     await store.set("correctionsEnabled", correctionsEnabled.value);
     await store.set("locale", locale.value);
@@ -312,6 +315,7 @@ function buildConfig() {
         todo_notifications_enabled: todoNotificationsEnabled.value,
         runtime_insights_enabled: runtimeInsightsEnabled.value,
         runtime_insight_kinds: [...runtimeInsightKinds.value],
+        keep_awake_enabled: keepAwakeEnabled.value,
         system_info_enabled: systemInfoEnabled.value,
         corrections_enabled: correctionsEnabled.value,
     };
@@ -651,6 +655,14 @@ async function handleRuntimeChange(payload: { enabled: boolean; kinds: string[] 
     await emit("settings-changed");
 }
 
+async function handleKeepAwakeChange(enabled: boolean) {
+    keepAwakeEnabled.value = enabled;
+    await saveSettings();
+    if (configured.value) await applyConfig();
+    const { emit } = await import("@tauri-apps/api/event");
+    await emit("settings-changed");
+}
+
 function toggleAnalytics() {
     showAnalytics.value = !showAnalytics.value;
     if (showAnalytics.value) {
@@ -809,6 +821,9 @@ onMounted(async () => {
                 void handleRuntimeChange(e.payload);
             },
         ),
+        await listen<boolean>("settings-keep-awake-change", (e) => {
+            void handleKeepAwakeChange(e.payload);
+        }),
     );
 
     void logInfo("[frontend] onMounted: listeners ready");
