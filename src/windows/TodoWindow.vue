@@ -16,6 +16,7 @@ import GraphView from "../board/GraphView.vue";
 import SpecView from "../spec/SpecView.vue";
 import PipelineGraph from "../process/pipeline/PipelineGraph.vue";
 import type { PipelineMode } from "../process/pipeline/modes";
+import { selectChange } from "../process/pipeline/useChange";
 import type { BoardChange, Todo } from "../contracts/board";
 import { boardStore, type BoardMutation } from "../board/boardStore";
 import { useProjectLinks } from "../analytics/projectLinks";
@@ -33,8 +34,10 @@ import i18n from "../kernel/i18n";
 import { useSettings } from "../kernel/settingsStore";
 import type { TriageDigest, DigestItem } from "../contracts/types";
 import TodoFiltersBar from "../board/TodoFiltersBar.vue";
-import TodoBoard from "../board/TodoBoard.vue";
 import TodoDetailPane from "../board/TodoDetailPane.vue";
+import ChangeDetailPane from "../board/ChangeDetailPane.vue";
+import TodoTree from "../board/TodoTree.vue";
+import { buildBoardTree, type BoardTreeNode, type BoardTreeRow } from "../board/boardTree";
 import { defaultTodoFilters, projectTodos, type TodoCardRow, type TodoFilters } from "../board/todoFilter";
 
 const { t, locale } = useI18n();
@@ -150,7 +153,6 @@ function readFilters(): TodoFilters {
 const filters = ref<TodoFilters>(readFilters());
 watch(filters, value => { try { localStorage.setItem(FILTER_STORAGE_KEY, JSON.stringify(value)); } catch {} }, { deep: true });
 const projectFilter = computed({ get: () => filters.value.project, set: value => filters.value = { ...filters.value, project: value } });
-const showDone = computed({ get: () => filters.value.showDone, set: value => filters.value = { ...filters.value, showDone: value } });
 const search = computed({ get: () => filters.value.query, set: value => filters.value = { ...filters.value, query: value } });
 
 // Form state (doubles as create + edit). editingId === null → creating.
@@ -210,6 +212,27 @@ const cardRows = computed<TodoCardRow[]>(() => todos.value.map((todo) => {
   };
 }));
 const projection = computed(() => projectTodos(cardRows.value, filters.value, boardStore.indexes.value));
+const treeRows = computed<BoardTreeRow[]>(() => boardStore.rows.value.map((row) => ({
+  ...row,
+  cost: taskCosts.value.get(row.id)?.cost,
+  filterProject: row.project ? canonicalOf(row.project) ?? row.project : null,
+})));
+const tree = computed(() => buildBoardTree(treeRows.value, changes.value, filters.value, boardStore.indexes.value));
+const selectedTreeNode = ref<BoardTreeNode | null>(null);
+const selectedChange = computed(() => {
+  const node = selectedTreeNode.value;
+  return node?.kind === "change" ? changes.value.find((change) => change.id === node.id) ?? null : null;
+});
+
+function selectTreeNode(node: BoardTreeNode) {
+  selectedTreeNode.value = node;
+}
+
+function selectChangeTask(todo: { id: string }) {
+  const node = tree.value.flatMap((root) => root.children).find((candidate) => candidate.id === todo.id);
+  if (node) selectedTreeNode.value = node;
+}
+
 const doneLimit = ref(50);
 watch(() => projection.value.columns.done.length, () => { doneLimit.value = 50; });
 
@@ -700,6 +723,7 @@ async function openSettings() {
 // the level ABOVE it — the spec section a change points at, with that change's
 // graph under it.
 const viewMode = ref<"board" | "graph" | "specs">("board");
+const graphMode = ref<PipelineMode>("lanes");
 // The graph tab has two renderings while the redesign lands: the new lane/wire
 // screens (default) and the classic force layout. The choice is remembered per
 // machine so a session that prefers the old picture keeps it.
@@ -721,6 +745,12 @@ const specMode = ref<PipelineMode>("reader");
 watch(graphUiNew, (on) =>
   localStorage.setItem("graph-ui", on ? "next" : "classic"),
 );
+function openChangeGraph(change: BoardChange) {
+  selectChange(`c#${change.number}`);
+  graphMode.value = "change";
+  graphUiNew.value = true;
+  viewMode.value = "graph";
+}
 const graphRef = ref<InstanceType<typeof GraphView> | null>(null);
 const pipelineGraphRef = ref<InstanceType<typeof PipelineGraph> | null>(null);
 const pipelineActiveHit = ref<string | null>(null);
@@ -1724,6 +1754,7 @@ onUnmounted(() => {
       v-else-if="viewMode === 'graph' && graphUiNew"
       :query="search"
       :filters="filters"
+      v-model:mode="graphMode"
       v-model:active-hit="pipelineActiveHit"
       @open="onPipelineOpen"
     />
@@ -1756,7 +1787,23 @@ onUnmounted(() => {
       @open="onPipelineOpen"
     />
 
-    <TodoBoard v-else :projection="projection" :show-done="showDone" :done-limit="doneLimit" @add="startNew" @move="moveStatus" @open="openDetail" @remove="removeTodo" @open-spec="openSpecSection" @more-done="doneLimit += 50" />
+    <div v-else class="tw-tree-layout">
+      <TodoTree
+        :tree="tree"
+        :selected-id="selectedTreeNode?.id"
+        @select="selectTreeNode"
+        @open="($event.kind === 'task' || $event.kind === 'legacy') && openDetail($event)"
+      />
+      <ChangeDetailPane
+        v-if="selectedChange && selectedTreeNode"
+        :change="selectedChange"
+        :node="selectedTreeNode"
+        :rows="boardStore.rows.value"
+        @select-task="selectChangeTask"
+        @open-graph="openChangeGraph"
+      />
+      <div v-else class="tw-empty">{{ t("tasks") }}</div>
+    </div>
     </template>
 
     <!-- DETAIL VIEW: master-detail editor (left = project siblings, right = fields) -->
@@ -2772,6 +2819,18 @@ onUnmounted(() => {
 }
 
 /* Board */
+.tw-tree-layout {
+  display: grid;
+  flex: 1;
+  grid-template-columns: minmax(260px, 34%) minmax(0, 1fr);
+  min-height: 0;
+}
+.tw-tree-layout > :first-child { border-right: 1px solid var(--stroke-strong); }
+.tw-tree-layout > :last-child { min-height: 0; overflow: auto; }
+@media (max-width: 720px) {
+  .tw-tree-layout { grid-template-columns: 1fr; grid-template-rows: minmax(180px, 40%) minmax(0, 1fr); }
+  .tw-tree-layout > :first-child { border-bottom: 1px solid var(--stroke-strong); border-right: 0; }
+}
 .tw-board {
   flex: 1;
   min-height: 0;
