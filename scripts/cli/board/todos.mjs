@@ -46,6 +46,7 @@ import { spawn, execFileSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { matchPlanCli, specsEnabled } from "../kernel/settings.mjs";
+import { appDataFile } from "../kernel/appdata.mjs";
 import { findChange, changeAddress, CURRENT, BoardUnreadableError, STATUSES, col, isDone, isChangeRoot, normalizeLimit, todosPath, load, save, boardPath, loadBoard, assertBoardWritable, loadBoardForWrite, saveBoard, withDeferredSave, resolveTask, changeRootsFor, changeAsRoot, specAddressesForManual } from "../kernel/board-io.mjs";
 import { withBoardLock } from "../kernel/board-lock.mjs";
 
@@ -121,10 +122,7 @@ function normalizePriority(v) {
 // Association groups live next to todos.json (project-groups.json), written by
 // the app. Sibling of `todosPath`. See src-tauri/src/project_groups.rs.
 function groupsPath() {
-  const appData =
-    process.env.APPDATA ||
-    path.join(process.env.USERPROFILE || "", "AppData", "Roaming");
-  return path.join(appData, "com.claude-usage-tracker.app", "project-groups.json");
+  return appDataFile("project-groups.json");
 }
 
 // Forgiving load: missing/corrupt yields an empty set (mirrors project_groups.rs).
@@ -157,14 +155,7 @@ function fail(msg) {
 
 
 export function taskSessionsPath() {
-  const appData =
-    process.env.APPDATA ||
-    path.join(process.env.USERPROFILE || "", "AppData", "Roaming");
-  return path.join(
-    appData,
-    "com.claude-usage-tracker.app",
-    "task-sessions.jsonl",
-  );
+  return appDataFile("task-sessions.jsonl");
 }
 
 export function currentSessionId(flags = {}) {

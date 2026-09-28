@@ -63,13 +63,13 @@
 import {
   readFileSync,
   writeFileSync,
-  renameSync,
   readdirSync,
   existsSync,
   statSync,
 } from "node:fs";
 import path from "node:path";
 import os from "node:os";
+import { appDataFile, writeJsonAtomic } from "../kernel/appdata.mjs";
 
 // Versioned wire contract for every `--json` output. Bump on a BREAKING change
 // (removed/renamed/retyped field); additive fields do not bump it.
@@ -695,22 +695,7 @@ function cmdEval(args) {
 // file lives next to todos.json so the app (and any external consumer) finds it
 // without extra config. Mirrors triage.mjs::digestPath.
 function metricsPath() {
-  const appData =
-    process.env.APPDATA ||
-    path.join(process.env.USERPROFILE || "", "AppData", "Roaming");
-  return path.join(
-    appData,
-    "com.claude-usage-tracker.app",
-    "corrections-metrics.json",
-  );
-}
-
-// Atomic write (temp + rename), matching triage.mjs / todos.mjs, so a partial
-// write can never leave the app reading a half file.
-function saveAtomic(file, data) {
-  const tmp = file + ".tmp";
-  writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n");
-  renameSync(tmp, file);
+  return appDataFile("corrections-metrics.json");
 }
 
 // `publish` computes the metric over a scope and writes it to the sink file the
@@ -792,7 +777,7 @@ function cmdPublish(args) {
   };
 
   const file = metricsPath();
-  saveAtomic(file, doc);
+  writeJsonAtomic(file, doc);
   process.stdout.write(
     `ok: published metrics (${totals.sessions} session(s), ` +
       `${totals.candidate_corrections} candidate(s)) -> ${file}\n`,

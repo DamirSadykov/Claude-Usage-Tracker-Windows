@@ -35,9 +35,10 @@
 //
 // The sink lives next to todos.json; schema mirrored by src-tauri/src/task_cost.rs.
 
-import { readFileSync, writeFileSync, renameSync, readdirSync, existsSync, statSync } from "node:fs";
+import { readFileSync, readdirSync, existsSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { appDataFile, writeJsonAtomic } from "../kernel/appdata.mjs";
 
 // ── transcript location (mirrors corrections.mjs) ────────────────────────────
 function claudeProjectsDir() {
@@ -332,17 +333,7 @@ function parseFlags(args) {
 }
 
 function sinkPath() {
-  const appData =
-    process.env.APPDATA ||
-    path.join(process.env.USERPROFILE || "", "AppData", "Roaming");
-  return path.join(appData, "com.claude-usage-tracker.app", "task-attribution.json");
-}
-
-// Atomic write (temp + rename), matching corrections.mjs / todos.mjs.
-function saveAtomic(file, data) {
-  const tmp = `${file}.${process.pid}.tmp`;
-  writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n");
-  renameSync(tmp, file);
+  return appDataFile("task-attribution.json");
 }
 
 function buildDoc(f, sessions) {
@@ -377,7 +368,7 @@ function cmdPublish(args) {
   const f = parseFlags(args);
   const sessions = analyze(resolveTranscripts(f));
   const file = sinkPath();
-  saveAtomic(file, buildDoc(f, sessions));
+  writeJsonAtomic(file, buildDoc(f, sessions));
   process.stdout.write(
     `ok: published attribution (${sessions.length} session(s) with evidence) -> ${file}\n`,
   );

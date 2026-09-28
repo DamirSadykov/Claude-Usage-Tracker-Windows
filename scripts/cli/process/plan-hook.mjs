@@ -38,7 +38,8 @@ import { readFileSync, writeFileSync, mkdirSync, renameSync, appendFileSync } fr
 import { execFileSync } from "node:child_process";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { matchPlanCli, roamingBase } from "../kernel/settings.mjs";
+import { matchPlanCli } from "../kernel/settings.mjs";
+import { appDataDir, appDataFile } from "../kernel/appdata.mjs";
 import { readDocument, applyDocument, summarize } from "./apply.mjs";
 import { DISCUSSION_KEY, discussionDeclaration, isReason, planCandidates, planFormatDoc } from "./plan-guard.mjs";
 import { criticRunsAsAgent, invokeDutySync } from "../agents/agents.mjs";
@@ -54,7 +55,7 @@ const CLI = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", 
 const MARKER_KEEP = 50;
 
 function markerFile() {
-  return path.join(roamingBase(), "com.claude-usage-tracker.app", "plan-format-seen.json");
+  return appDataFile("plan-format-seen.json");
 }
 
 function readMarker() {
@@ -346,7 +347,7 @@ export function readPlanText(input) {
 // instead of writing its own.
 function keepPlanFile(session, text, suffix = "") {
   try {
-    const dir = path.join(roamingBase(), "com.claude-usage-tracker.app", "plans");
+    const dir = path.join(appDataDir(), "plans");
     mkdirSync(dir, { recursive: true });
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
     const name = `${stamp}-${String(session || "session").slice(0, 8)}${suffix}.yaml`;
@@ -394,7 +395,7 @@ function markDiscussion(file) {
 // Append-only JSONL next to todos.json; one short line per plan, so it stays
 // small without trimming. Like everything in a hook: never throws.
 function eventsFile() {
-  return path.join(roamingBase(), "com.claude-usage-tracker.app", "plan-events.jsonl");
+  return appDataFile("plan-events.jsonl");
 }
 
 // Exported for the unit tests.
@@ -536,12 +537,8 @@ function main(args) {
     // carry the format. The tool events cover that: whatever the session reads or
     // greps while planning arrives with permission_mode already "plan". The reply
     // must name the event that actually fired, which the payload carries.
-    const appData =
-      process.env.APPDATA ||
-      path.join(process.env.USERPROFILE || "", "AppData", "Roaming");
     const critic = buildCriticContext(input.prompt, {
       cwd: typeof input.cwd === "string" && input.cwd ? input.cwd : process.cwd(),
-      appData,
     });
     emit(
       typeof input.hook_event_name === "string" ? input.hook_event_name : "UserPromptSubmit",

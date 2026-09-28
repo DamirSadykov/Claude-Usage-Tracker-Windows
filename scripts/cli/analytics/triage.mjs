@@ -34,8 +34,8 @@
 // Exit code is non-zero on any error (bad JSON, bad shape, usage), so the caller
 // (and the triage prompt) can tell success from failure.
 
-import { readFileSync, writeFileSync, renameSync, unlinkSync } from "node:fs";
-import path from "node:path";
+import { readFileSync, unlinkSync } from "node:fs";
+import { appDataFile, writeJsonAtomic } from "../kernel/appdata.mjs";
 
 // Finding kinds the digest understands. Keep in lockstep with triage.rs::KINDS
 // and the in-app digest view. `stale`/`overdue`/`no_priority` are facts the agent
@@ -45,28 +45,12 @@ const KINDS = ["stale", "overdue", "no_priority", "suggestion"];
 // Same app data dir the tracker, todos CLI, and hook use; the digest lives next
 // to todos.json so the tracker finds it without extra config.
 function digestPath() {
-  const appData =
-    process.env.APPDATA ||
-    path.join(process.env.USERPROFILE || "", "AppData", "Roaming");
-  return path.join(
-    appData,
-    "com.claude-usage-tracker.app",
-    "triage-digest.json",
-  );
+  return appDataFile("triage-digest.json");
 }
 
 function fail(msg) {
   process.stderr.write(msg + "\n");
   process.exit(1);
-}
-
-// Atomic write: serialize to a sibling temp file, then rename over the target
-// (rename replaces the destination on Windows). 2-space pretty-print matches the
-// tracker's serde output so the file stays hand-readable.
-function save(file, data) {
-  const tmp = file + ".tmp";
-  writeFileSync(tmp, JSON.stringify(data, null, 2) + "\n");
-  renameSync(tmp, file);
 }
 
 // Forgiving read: a missing/corrupt file yields null (no digest yet), mirroring
@@ -202,7 +186,7 @@ function cmdPublish(args) {
   };
 
   const file = digestPath();
-  save(file, digest);
+  writeJsonAtomic(file, digest);
   process.stdout.write(
     `ok: published digest (${items.length} item(s)) -> ${file}\n`,
   );

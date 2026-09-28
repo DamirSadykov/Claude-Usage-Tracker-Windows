@@ -84,6 +84,7 @@ import {
 import { findChange } from "../board/change.mjs";
 import { resolveDuty } from "../agents/agents.mjs";
 import { withBoardLock } from "../kernel/board-lock.mjs";
+import { appDataFile } from "../kernel/appdata.mjs";
 import {
   gitHead,
   gitBase,
@@ -157,13 +158,6 @@ const declaredRed = (t) => (t && t.red && String(t.red).trim()) || "";
 function fail(msg) {
   process.stderr.write(msg + "\n");
   process.exit(1);
-}
-
-function appDataFile(name) {
-  const appData =
-    process.env.APPDATA ||
-    path.join(process.env.USERPROFILE || "", "AppData", "Roaming");
-  return path.join(appData, "com.claude-usage-tracker.app", name);
 }
 
 function redGateDir() {
@@ -551,6 +545,7 @@ export function runRecordOf(report, { inherit = false } = {}) {
       review: s.review || null,
       reason: s.reason || null,
       own_changes: typeof s.own_changes === "number" ? s.own_changes : null,
+      outside_changes: typeof s.outside_changes === "number" ? s.outside_changes : null,
       neighbour_damage: typeof s.neighbour_damage === "number" ? s.neighbour_damage : null,
     })),
     spend: report.spend || null,
@@ -589,6 +584,7 @@ export function reportRecordOf(report) {
         review: s.review || null,
         reason: s.reason || null,
         own_changes: typeof s.own_changes === "number" ? s.own_changes : null,
+        outside_changes: typeof s.outside_changes === "number" ? s.outside_changes : null,
         neighbour_damage: typeof s.neighbour_damage === "number" ? s.neighbour_damage : null,
       },
     ],
