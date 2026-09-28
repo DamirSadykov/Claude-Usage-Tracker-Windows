@@ -46,6 +46,7 @@ import {
 } from "./run.mjs";
 import { isReadyNode, loadBoard } from "../board/todos.mjs";
 import { buildStepPrompt } from "./run-step.mjs";
+import { snapshotTree } from "./red-gate.mjs";
 
 // ── fixtures ─────────────────────────────────────────────────────────────────
 const task = (number, extra = {}) => ({
@@ -1229,9 +1230,9 @@ describe("beginStep", () => {
 });
 
 describe("finishStep", () => {
-  const finishCtx = (t, overrides = {}) => ({
+  const finishCtx = (t, { cwd = process.cwd(), ...overrides } = {}) => ({
     dry: false,
-    cwd: process.cwd(),
+    cwd,
     timeoutMs: undefined,
     attempts: new Map([[t.id, 1]]),
     effects: {
@@ -1325,6 +1326,69 @@ describe("finishStep", () => {
       snapshot: null,
     })]);
     expect(t.attempts).toEqual([expect.objectContaining({ snapshot: "end-tree-sha", findings: entries[0].findings })]);
+  });
+
+  it("rolls a worse reviewed retry back to the earlier journal checkpoint", async () => {
+    const cwd = mkdtempSync(path.join(os.tmpdir(), "cut-run-checkpoint-"));
+    try {
+      execFileSync("git", ["init", "-q"], { cwd }); execFileSync("git", ["config", "core.autocrlf", "false"], { cwd });
+      execFileSync("git", ["config", "user.email", "test@example.com"], { cwd });
+      execFileSync("git", ["config", "user.name", "Test"], { cwd });
+      writeFileSync(path.join(cwd, "output.txt"), "base\n");
+      execFileSync("git", ["add", "-A"], { cwd }); execFileSync("git", ["commit", "-qm", "base"], { cwd });
+      writeFileSync(path.join(cwd, "output.txt"), "best\n");
+      const best = snapshotTree(cwd).sha;
+      writeFileSync(path.join(cwd, "output.txt"), "worse\n");
+      const t = auto(61, { produces: ["output.txt"], attempts: [{ attempt: 1, reviewed: true, counts: { critical: 0, high: 0 }, snapshot: best }] });
+      const ctx = finishCtx(t, {
+        cwd,
+        recordAttempt: async () => ({ written: true, snapshot: snapshotTree(cwd).sha }),
+      });
+      ctx.attempts.set(t.id, 2);
+      const out = await finishStep(ctx, t, {
+        result: { ok: true },
+        ownChanges: [{ path: "output.txt" }],
+        review: { approved: false, ok: true, findings: [{ level: "high", file: "output.txt", line: 1, text: "regressed", evidence: "output is worse" }] },
+      });
+
+      expect(out.rolledBackTo).toBe(best);
+      expect(readFileSync(path.join(cwd, "output.txt"), "utf8")).toBe("best\n");
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
+  });
+
+  it("includes a reported attempt's own changes when rolling it back", async () => {
+    const cwd = mkdtempSync(path.join(os.tmpdir(), "cut-reported-checkpoint-"));
+    try {
+      execFileSync("git", ["init", "-q"], { cwd }); execFileSync("git", ["config", "core.autocrlf", "false"], { cwd });
+      execFileSync("git", ["config", "user.email", "test@example.com"], { cwd });
+      execFileSync("git", ["config", "user.name", "Test"], { cwd });
+      writeFileSync(path.join(cwd, "output.txt"), "base\n");
+      writeFileSync(path.join(cwd, "helper.mjs"), "base helper\n");
+      execFileSync("git", ["add", "-A"], { cwd }); execFileSync("git", ["commit", "-qm", "base"], { cwd });
+      writeFileSync(path.join(cwd, "output.txt"), "best\n");
+      writeFileSync(path.join(cwd, "helper.mjs"), "best helper\n");
+      const best = snapshotTree(cwd).sha;
+      writeFileSync(path.join(cwd, "output.txt"), "worse\n");
+      writeFileSync(path.join(cwd, "helper.mjs"), "worse helper\n");
+      const t = auto(62, {
+        produces: ["output.txt"],
+        step_base: "base-sha",
+        attempts: [{ attempt: 1, reviewed: true, counts: { critical: 0, high: 0 }, snapshot: best }],
+      });
+      const ctx = finishCtx(t, {
+        cwd,
+        ownChanges: async () => ({ ok: true, own: [{ path: "output.txt" }, { path: "helper.mjs" }], damaged: [] }),
+        recordAttempt: async () => ({ written: true, snapshot: snapshotTree(cwd).sha }),
+      });
+      ctx.attempts.set(t.id, 2);
+      const out = await runReported(ctx, t, [t], {
+        result: { ok: true },
+        review: { approved: false, ok: true, findings: [{ level: "high", file: "output.txt", line: 1, text: "regressed", evidence: "output is worse" }] },
+      });
+
+      expect(out.rolledBackTo).toBe(best);
+      expect(readFileSync(path.join(cwd, "helper.mjs"), "utf8")).toBe("best helper\n");
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
   });
 
   it("sends medium/low-only review findings to the architect while continuing to reconciliation", async () => {

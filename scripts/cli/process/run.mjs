@@ -93,6 +93,7 @@ import {
   runRedGate,
   recoverMarkers,
 } from "./red-gate.mjs";
+import { bestAttempt, blockingCount, restoreCheckpoint } from "./checkpoint.mjs";
 
 export const DEFAULT_PARALLEL_LIMIT = 1;
 
@@ -741,6 +742,7 @@ function resultBase(ctx, task, result, review, baton, cost, ownChanges) {
     model: result.model || null,
     route: result.route || null,
     ownChanges: Array.isArray(ownChanges) ? ownChanges.length : null,
+    rollbackChanges: Array.isArray(ownChanges) ? ownChanges : [],
     neighbourDamage: Array.isArray(ownChanges) ? 0 : null,
     review: review ? {
       skipped: !!review.skipped,
@@ -806,6 +808,7 @@ async function recordAttempt(ctx, task, base) {
     cost_usd: typeof base.cost === "number" && Number.isFinite(base.cost) ? base.cost : null,
     findings,
     counts: findingCounts(findings),
+    reviewed: !!base.review && base.review.skipped !== true && base.review.ok !== false,
     mechanics: base.kind === "mechanics",
     verify_tail: base.verifyTail ?? null,
     snapshot: null,
@@ -826,6 +829,25 @@ async function recordAttempt(ctx, task, base) {
 
 async function finishAttempt(ctx, task, outcome) {
   const journal = await recordAttempt(ctx, task, outcome);
+  // Compare only a reviewed attempt with older journal entries.  The current
+  // entry has just been appended, so excluding it makes ties retain the older
+  // checkpoint and a regression detectable without a branch or tag.
+  if (outcome.review && outcome.review.skipped !== true && outcome.review.ok !== false) {
+    const earlier = priorAttempts(task).slice(0, -1);
+    const best = bestAttempt(earlier);
+    if (best && blockingCount(journal) > blockingCount(best)) {
+      const restored = restoreCheckpoint({
+        cwd: ctx.cwd,
+        sha: best.snapshot,
+        produces: task.produces,
+        ownChanges: outcome.rollbackChanges,
+      });
+      if (!restored.ok) {
+        return { ...outcome, kind: "convergence", parkReason: restored.lost ? "контрольная точка потеряна" : `контрольная точка не восстановлена: ${restored.reason}`, attempt_journal: journal };
+      }
+      return { ...outcome, rolledBackTo: best.snapshot, attempt_journal: journal };
+    }
+  }
   return { ...outcome, attempt_journal: journal };
 }
 
@@ -1027,7 +1049,18 @@ export async function runReported(ctx, task, wave, { result, review = null }) {
   const begun = await beginStep(ctx, task, wave);
   if (begun.kind === "retry-exhausted" || begun.kind === "red-base-failed") return begun;
   const { baton, cost } = await recordWork(ctx, task, result);
-  return finishStep(ctx, task, { result, review, baton, cost });
+  // A driven (--report) attempt modifies the same working tree as an executor
+  // attempt.  Measure its scope as well, so a rollback includes every file it
+  // changed instead of only its declared produces.
+  const damage = await checkNeighbourDamage(ctx, task, result, baton, cost);
+  if (damage && damage.issue) return damage.issue;
+  return finishStep(ctx, task, {
+    result,
+    review,
+    baton,
+    cost,
+    ownChanges: damage ? damage.ownChanges : null,
+  });
 }
 
 // The `?issue` transition and every stop it can produce. All of it runs in board
