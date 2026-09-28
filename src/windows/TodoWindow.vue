@@ -33,9 +33,9 @@ import { useSettings } from "../kernel/settingsStore";
 import type { TriageDigest, DigestItem } from "../contracts/types";
 import TodoFiltersBar from "../board/TodoFiltersBar.vue";
 import TodoDetailPane from "../board/TodoDetailPane.vue";
-import ChangeDetailPane from "../board/ChangeDetailPane.vue";
+import ChangeDetail from "../process/pipeline/ChangeDetail.vue";
 import TodoTree from "../board/TodoTree.vue";
-import { buildBoardTree, type BoardTreeNode, type BoardTreeRow } from "../board/boardTree";
+import { buildBoardTree, findBoardTreeNode, type BoardTreeNode, type BoardTreeRow } from "../board/boardTree";
 import { defaultTodoFilters, type TodoFilters } from "../board/todoFilter";
 
 const { t, locale } = useI18n();
@@ -210,8 +210,10 @@ function selectTreeNode(node: BoardTreeNode) {
   else closeDetail();
 }
 
-function selectChangeTask(todo: { id: string }) {
-  const node = tree.value.flatMap((root) => root.children).find((candidate) => candidate.id === todo.id);
+function selectChangeTask(address: string) {
+  const number = Number(address.replace(/^#/, ""));
+  const row = boardStore.rows.value.find((candidate) => candidate.number === number);
+  const node = row ? findBoardTreeNode(tree.value, row.id) : null;
   if (node) selectTreeNode(node);
 }
 
@@ -703,11 +705,14 @@ const specMode = ref<PipelineMode>("reader");
 watch(graphUiNew, (on) =>
   localStorage.setItem("graph-ui", on ? "next" : "classic"),
 );
+const graphFocusLane = ref("");
 function openChangeGraph(change: BoardChange) {
   selectChange(`c#${change.number}`);
-  graphMode.value = "change";
+  graphMode.value = "lanes";
   graphUiNew.value = true;
   viewMode.value = "graph";
+  graphFocusLane.value = "";
+  void nextTick(() => { graphFocusLane.value = change.id; });
 }
 const graphRef = ref<InstanceType<typeof GraphView> | null>(null);
 const pipelineGraphRef = ref<InstanceType<typeof PipelineGraph> | null>(null);
@@ -1722,6 +1727,7 @@ onUnmounted(() => {
       v-else-if="viewMode === 'graph' && graphUiNew"
       :query="search"
       :filters="filters"
+      :focus-lane="graphFocusLane"
       v-model:mode="graphMode"
       v-model:active-hit="pipelineActiveHit"
       @open="onPipelineOpen"
@@ -1811,13 +1817,13 @@ onUnmounted(() => {
         </section>
         <section v-else class="tw-detail-main tw-detail-empty">{{ detailLoading ? t('loading') : t('todoDetailLoadFailed') }}</section>
       </TodoDetailPane>
-      <ChangeDetailPane
+      <ChangeDetail
         v-if="selectedChange && selectedTreeNode"
-        :change="selectedChange"
-        :node="selectedTreeNode"
-        :rows="boardStore.rows.value"
-        @select-task="selectChangeTask"
-        @open-graph="openChangeGraph"
+        :address="`c#${selectedChange.number}`"
+        show-graph
+        show-heading
+        @open="selectChangeTask"
+        @graph="openChangeGraph(selectedChange)"
       />
       <div v-if="!detailId && !selectedChange" class="tw-empty">{{ t("tasks") }}</div>
     </div>

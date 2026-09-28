@@ -21,9 +21,11 @@ describe("buildBoardTree", () => {
       row({ id: "b", number: 1, subject: "Open", change_id: "c-1", cost: 2 }),
       row({ id: "c", number: 3, change_id: "c-2" }),
     ], [change(), change({ id: "c-2", number: 2, title: "Newest", updated_at: "2026-09-03" })], defaultTodoFilters());
-    expect(tree.map((node) => node.title)).toEqual(["Newest", "Modern change"]);
-    expect(tree[1]).toMatchObject({ kind: "change", progress: { done: 1, total: 2 }, cost: 3.25, closed: false });
-    expect(tree[1].children.map((node) => node.number)).toEqual([1, 2]);
+    expect(tree.map((node) => node.id)).toEqual(["project:app"]);
+    const changes = tree[0].children;
+    expect(changes.map((node) => node.title)).toEqual(["Newest", "Modern change"]);
+    expect(changes[1]).toMatchObject({ kind: "change", progress: { done: 1, total: 2 }, cost: 3.25, closed: false });
+    expect(changes[1].children.map((node) => node.number)).toEqual([1, 2]);
   });
 
   it("represents old change roots and puts unassigned tasks in canonical project groups", () => {
@@ -32,9 +34,12 @@ describe("buildBoardTree", () => {
       row({ id: "member", number: 11, change_id: "root" }),
       row({ id: "alias", number: 12, filterProject: "canonical", project: "old-name", cost: 4 }),
     ], [], defaultTodoFilters());
-    expect(tree[0]).toMatchObject({ kind: "legacy", id: "root", title: "Old root", closed: true });
-    expect(tree[0].children.map((node) => node.id)).toEqual(["member"]);
-    expect(tree[1]).toMatchObject({ kind: "group", id: "project:canonical", title: "canonical", cost: 4 });
+    const app = tree.find((node) => node.id === "project:app")!;
+    const canonical = tree.find((node) => node.id === "project:canonical")!;
+    expect(app.children[0]).toMatchObject({ kind: "legacy", id: "root", title: "Old root", closed: true });
+    expect(app.children[0].children.map((node) => node.id)).toEqual(["member"]);
+    expect(canonical).toMatchObject({ kind: "group", title: "canonical", cost: 4 });
+    expect(canonical.children.map((node) => node.id)).toEqual(["alias"]);
   });
 
   it("filters tasks through projectTodos while retaining their non-empty parent", () => {
@@ -46,14 +51,15 @@ describe("buildBoardTree", () => {
       row({ id: "hidden", status: "backlog" }),
     ], [change()], filters);
     expect(tree).toHaveLength(1);
-    expect(tree[0].children.map((node) => node.id)).toEqual(["queue"]);
+    expect(tree[0].children.map((node) => node.id)).toEqual(["c-1"]);
+    expect(tree[0].children[0].children.map((node) => node.id)).toEqual(["queue"]);
   });
 });
 
 describe("visibleBoardTreeRows", () => {
   it("flattens expanded branches with depth and skips collapsed descendants", () => {
     const tree = buildBoardTree([row({ id: "a", change_id: "c-1" })], [change()], defaultTodoFilters());
-    expect(visibleBoardTreeRows(tree, new Set()).map(({ node, depth }) => [node.id, depth])).toEqual([["c-1", 0], ["a", 1]]);
-    expect(visibleBoardTreeRows(tree, new Set(["c-1"])).map(({ node }) => node.id)).toEqual(["c-1"]);
+    expect(visibleBoardTreeRows(tree, new Set()).map(({ node, depth }) => [node.id, depth])).toEqual([["project:app", 0], ["c-1", 1], ["a", 2]]);
+    expect(visibleBoardTreeRows(tree, new Set(["c-1"])).map(({ node }) => node.id)).toEqual(["project:app", "c-1"]);
   });
 });

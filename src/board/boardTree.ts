@@ -113,13 +113,14 @@ export function buildBoardTree(
     groups.set(project, members);
   }
 
-  const changeNodes: Array<{ node: BoardTreeNode; activity: string }> = [];
+  const changeNodes: Array<{ node: BoardTreeNode; activity: string; project: string }> = [];
   for (const change of changes) {
     const members = memberRows.get(change.id) ?? [];
     if (!members.length) continue;
     changeNodes.push({
       node: membersNode("change", change.id, change.number, change.title, members, !!change.closed_at),
       activity: change.updated_at ?? members.reduce((latest, row) => latest > activityOf(row) ? latest : activityOf(row), ""),
+      project: members[0].filterProject ?? change.project ?? members[0].project ?? "",
     });
   }
   for (const legacy of legacyById.values()) {
@@ -129,28 +130,42 @@ export function buildBoardTree(
     changeNodes.push({
       node: membersNode("legacy", legacy.id, legacy.number, legacy.subject, allRows, closedTask(legacy)),
       activity: activityOf(legacy),
+      project: legacy.filterProject ?? legacy.project ?? "",
     });
   }
+  changeNodes.sort((left, right) => Number(left.node.closed) - Number(right.node.closed)
+    || right.activity.localeCompare(left.activity) || (right.node.number ?? 0) - (left.node.number ?? 0));
 
-  const projectNodes = [...groups.entries()].map(([project, members]) => {
-    const children = [...members].sort(taskSort).map(taskNode);
+  const projects = new Set<string>([...groups.keys(), ...changeNodes.map((entry) => entry.project)]);
+  const projectNodes = [...projects].map((project) => {
+    const loose = [...(groups.get(project) ?? [])].sort(taskSort);
+    const changeChildren = changeNodes.filter((entry) => entry.project === project).map((entry) => entry.node);
+    const children = [...changeChildren, ...loose.map(taskNode)];
+    const done = changeChildren.reduce((sum, node) => sum + node.progress.done, 0) + loose.filter(closedTask).length;
+    const total = changeChildren.reduce((sum, node) => sum + node.progress.total, 0) + loose.length;
     return {
       kind: "group" as const,
       id: `project:${project}`,
       number: null,
       title: project,
       status: null,
-      progress: progress(members),
-      cost: members.reduce((total, row) => total + costOf(row), 0),
+      progress: { done, total },
+      cost: children.reduce((sum, node) => sum + node.cost, 0),
       children,
-      closed: members.every(closedTask),
+      closed: children.every((node) => node.closed),
     };
   });
-
-  changeNodes.sort((left, right) => Number(left.node.closed) - Number(right.node.closed)
-    || right.activity.localeCompare(left.activity) || (right.node.number ?? 0) - (left.node.number ?? 0));
   projectNodes.sort((left, right) => Number(left.closed) - Number(right.closed) || left.title.localeCompare(right.title));
-  return [...changeNodes.map(({ node }) => node), ...projectNodes];
+  return projectNodes;
+}
+
+export function findBoardTreeNode(tree: readonly BoardTreeNode[], id: string): BoardTreeNode | null {
+  for (const node of tree) {
+    if (node.id === id) return node;
+    const hit = findBoardTreeNode(node.children, id);
+    if (hit) return hit;
+  }
+  return null;
 }
 
 export function visibleBoardTreeRows(

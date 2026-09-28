@@ -135,7 +135,7 @@ watch(() => props.tree, (tree) => {
   const saved = readCollapsed();
   const defaults = new Set<string>();
   const visit = (node: BoardTreeNode) => {
-    if (node.children.length && (node.closed || node.kind === "group")) defaults.add(node.id);
+    if (node.children.length && node.closed) defaults.add(node.id);
     node.children.forEach(visit);
   };
   tree.forEach(visit);
@@ -167,7 +167,7 @@ watch(rows, () => scrollSelected(selectedId.value), { flush: "post" });
       v-for="row in rows"
       :key="row.node.id"
       class="todo-tree-row"
-      :class="{ selected: row.node.id === selectedId, closed: row.node.closed, group: row.node.kind === 'group' }"
+      :class="{ selected: row.node.id === selectedId, closed: row.node.closed, group: row.node.kind === 'group', change: row.node.kind === 'change', legacy: row.node.kind === 'legacy' }"
       :data-tree-id="row.node.id"
       :style="{ '--tree-depth': row.depth }"
       @click="select(row.node)"
@@ -185,7 +185,7 @@ watch(rows, () => scrollSelected(selectedId.value), { flush: "post" });
 <style scoped>
 .todo-tree { min-width: 0; overflow: auto; background: var(--card-bg); color: var(--text); font-family: var(--segoe); outline: none; }
 .todo-tree:focus-visible { box-shadow: inset 0 0 0 1px var(--accent); }
-.todo-tree-row { --tree-indent: calc(var(--tree-depth) * 16px); align-items: center; background: transparent; border: 0; color: inherit; cursor: pointer; display: flex; gap: 6px; min-height: 30px; padding: 4px 8px 4px calc(8px + var(--tree-indent)); text-align: left; width: 100%; }
+.todo-tree-row { --tree-indent: calc(var(--tree-depth) * 16px); font: inherit; font-size: 13px; line-height: 1.35; align-items: center; background: transparent; border: 0; color: inherit; cursor: pointer; display: flex; gap: 6px; min-height: 30px; padding: 4px 8px 4px calc(8px + var(--tree-indent)); text-align: left; width: 100%; }
 .todo-tree-row:hover { background: var(--card-bg-hover); }
 .todo-tree-row.selected { background: var(--accent-soft); box-shadow: inset 2px 0 0 var(--accent); }
 .todo-tree-row.closed:not(.selected) { color: var(--text-3); }
@@ -203,5 +203,6 @@ watch(rows, () => scrollSelected(selectedId.value), { flush: "post" });
 .todo-tree-number { color: var(--text-3); font-family: var(--mono, monospace); margin-right: 5px; }
 .todo-tree-progress, .todo-tree-cost { color: var(--text-3); flex: 0 0 auto; font-family: var(--mono, monospace); font-size: 11px; }
 .todo-tree-cost { margin-left: auto; }
-.todo-tree-row.group .todo-tree-title { color: var(--text-2); }
+.todo-tree-row.group .todo-tree-title { color: var(--text-2); font-size: 12px; font-weight: 600; letter-spacing: 0.02em; }
+.todo-tree-row.change .todo-tree-title, .todo-tree-row.legacy .todo-tree-title { font-weight: 500; }
 </style>
