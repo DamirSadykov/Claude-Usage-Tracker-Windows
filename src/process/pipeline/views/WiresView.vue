@@ -294,6 +294,7 @@ function onGraphMode(value: string) {
         </template>
     </LegendBar>
 
+    <div class="pipe-stage">
     <div ref="canvas" class="pipe-canvas" @click="onCanvasClick">
         <div class="wires-caption">
             <span
@@ -384,6 +385,7 @@ function onGraphMode(value: string) {
             @pick="selected = $event"
             @open="emit('open', $event)"
         />
+    </div>
     </div>
 </template>
 

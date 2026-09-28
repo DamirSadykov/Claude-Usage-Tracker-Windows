@@ -1,4 +1,5 @@
 import { ref, computed, onMounted } from "vue";
+import { invoke } from "@tauri-apps/api/core";
 import { loadRunLayer } from "../../board/graphModel";
 import type { RunGraphNode } from "../../board/graphModel";
 import { boardStore } from "../../board/boardStore";
@@ -27,11 +28,42 @@ export function useBoard(withPorts = false, metricChanges: string[] = []) {
         await boardStore.start();
         live.value = boardStore.error.value === "";
         error.value = boardStore.error.value;
+        void loadCosts();
+        const refs = metricChanges.length ? { open: metricChanges, closed: [] } : changeRefs();
         try {
-            run.value = await loadRunLayer(metricChanges);
+            run.value = await loadRunLayer(refs.open);
         } catch {
             run.value = new Map();
         }
+        if (!refs.closed.length) return;
+        try {
+            const closed = await loadRunLayer(refs.closed);
+            run.value = new Map([...closed, ...run.value]);
+        } catch {
+        }
+    }
+
+    async function loadCosts() {
+        try {
+            const payload = await invoke<{ tasks: TaskCostRow[] } | null>("get_task_costs");
+            costs.value = payload?.tasks ?? [];
+        } catch {
+            costs.value = [];
+        }
+    }
+
+    function changeRefs() {
+        const open: string[] = [];
+        const closed: string[] = [];
+        const openChanges = new Set(
+            board.value.filter((t) => t.status !== "done" && t.change_id).map((t) => t.change_id as string),
+        );
+        for (const c of changes.value) (openChanges.has(c.id) ? open : closed).push(`c#${c.number}`);
+        for (const t of board.value) {
+            if (t.change !== true || !t.number) continue;
+            (t.status !== "done" ? open : closed).push(`#${t.number}`);
+        }
+        return { open, closed };
     }
 
     const projection = computed(() =>

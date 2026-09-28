@@ -2351,7 +2351,17 @@ onUnmounted(() => {
   gap: 6px;
   min-width: 0;
 }
-.tw-filter-date { max-width: 126px; }
+.tw-filter-date {
+  max-width: 126px;
+  background: var(--card-bg);
+  color: var(--text-2);
+  border: 1px solid var(--stroke-strong);
+  border-radius: 6px;
+  padding: 3px 6px;
+  font-size: 11px;
+  font-family: var(--segoe);
+  color-scheme: dark;
+}
 .tw-more {
   width: 100%;
   margin-top: 8px;

@@ -467,6 +467,7 @@ function resetView() {
         </template>
     </LegendBar>
 
+    <div class="pipe-stage">
     <div
         ref="pipeCanvas"
         class="pipe-canvas"
@@ -745,6 +746,7 @@ function resetView() {
             @pick="selected = $event"
             @open="emit('open', $event)"
         />
+    </div>
     </div>
 </template>
 
