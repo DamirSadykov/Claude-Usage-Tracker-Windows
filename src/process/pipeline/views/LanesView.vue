@@ -26,7 +26,8 @@ const props = withDefaults(defineProps<{
     query?: string;
     filters?: TodoFilters;
     activeHit?: string | null;
-}>(), { query: "", activeHit: null });
+    focusLane?: string;
+}>(), { query: "", activeHit: null, focusLane: "" });
 
 const emit = defineEmits<{
     (e: "mode", value: "lanes" | "wires" | "bubbles" | "rings" | "specs"): void;
@@ -173,6 +174,13 @@ watch(() => props.activeHit, async () => {
     await nextTick();
     updateMatchClasses();
 });
+watch(() => props.focusLane, async (lane) => {
+    if (!lane) return;
+    if (doneLanes.value.some((item) => item.id === lane)) showDoneLanes.value = true;
+    await nextTick();
+    const row = pipeCanvas.value?.querySelector<HTMLElement>(`[data-lane="${CSS.escape(lane)}"]`);
+    (row?.closest<HTMLElement>(".lane-frame") ?? row)?.scrollIntoView({ behavior: "smooth", block: "start" });
+}, { immediate: true });
 function cycleHit(direction: 1 | -1 = 1) {
     const hit = stepGraphHit(hits.value, props.activeHit, direction);
     emit("update:activeHit", hit);
@@ -467,6 +475,7 @@ function resetView() {
         </template>
     </LegendBar>
 
+    <div class="pipe-stage">
     <div
         ref="pipeCanvas"
         class="pipe-canvas"
@@ -745,6 +754,7 @@ function resetView() {
             @pick="selected = $event"
             @open="emit('open', $event)"
         />
+    </div>
     </div>
 </template>
 

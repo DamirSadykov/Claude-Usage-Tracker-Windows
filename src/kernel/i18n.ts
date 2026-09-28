@@ -314,7 +314,7 @@ const messages = {
     statusMapHint:
       "Source statuses are collected from received tasks. Map each one to a board column.",
     statusMapEmpty: "Statuses will appear here after the first external-task poll.",
-    viewBoard: "Board",
+    viewBoard: "Tasks",
     viewGraph: "Graph",
     viewSpecs: "Specs",
     graphUiNew: "New layout",
@@ -1151,7 +1151,7 @@ const messages = {
     statusMapHint:
       "Статусы источника собираются из полученных задач. Свяжите каждый с колонкой доски.",
     statusMapEmpty: "Статусы появятся здесь после первого поллинга внешних задач.",
-    viewBoard: "Доска",
+    viewBoard: "Задачи",
     viewGraph: "Граф",
     viewSpecs: "Спеки",
     graphUiNew: "Новый вид",
