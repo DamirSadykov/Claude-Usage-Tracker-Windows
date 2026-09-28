@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, watch, nextTick } from "vue";
+import { projectTodos, type TodoFilters } from "../../../board/todoFilter";
 import ToolBar from "../../atoms/ToolBar.vue";
 import LegendBar from "../../atoms/LegendBar.vue";
 import ToolButton from "../../atoms/ToolButton.vue";
@@ -14,24 +15,33 @@ import NodeCard from "../../atoms/NodeCard.vue";
 import CollapsedCard from "../../atoms/CollapsedCard.vue";
 import WireLayer from "../../atoms/WireLayer.vue";
 import NodeInspector from "../NodeInspector.vue";
-import { graphStats, chainOf } from "../mock";
+import LaneRow from "./LaneRow.vue";
+import { graphStats } from "../mock";
 import { useBoard } from "../useBoard";
 import { isFreeLane } from "../adapt";
 import type { ProjectBand as ProjectRow, TaskNode } from "../types";
+import { graphHits, stepGraphHit } from "../graphNavigation";
+
+const props = withDefaults(defineProps<{
+    query?: string;
+    filters?: TodoFilters;
+    activeHit?: string | null;
+}>(), { query: "", activeHit: null });
 
 const emit = defineEmits<{
     (e: "mode", value: "lanes" | "wires" | "bubbles" | "rings" | "specs"): void;
     (e: "open", id: string): void;
+    (e: "update:activeHit", id: string | null): void;
 }>();
 
-const { lanes, tasks, links, projects, nodeByLabel } = useBoard();
+const { lanes, tasks, links, projects, nodeByLabel, projection, live, board } = useBoard();
 
 const linkMode = ref("deps");
 const layoutMode = ref("lanes");
 const costLayer = ref(false);
 const hideDone = ref(false);
 const selected = ref("");
-const bodies = ref<Record<string, HTMLElement | null>>({});
+const pipeCanvas = ref<HTMLElement | null>(null);
 const freeBodies = ref<Record<string, HTMLElement | null>>({});
 const slots = ref<Record<string, HTMLElement | null>>({});
 const flashed = ref("");
@@ -41,6 +51,31 @@ const shownFlat = ref<Record<string, number>>({});
 const FLAT_STEP = 12;
 const groupOpen = ref(false);
 const showDoneLanes = ref(false);
+const laneLinks = new Map<string, readonly { from: string; to: string; tone: string }[]>();
+const projectLinks = new Map<string, readonly { from: string; to: string; tone: string }[]>();
+
+const renderIndex = computed(() => {
+    if (live.value) return projection.value;
+    const byId = new Map<string, TaskNode>();
+    const tasksByLane = new Map<string, TaskNode[]>();
+    const tasksByLaneWave = new Map<string, Map<number, TaskNode[]>>();
+    const wavesByLane = new Map<string, number[]>();
+    for (const task of tasks.value) {
+        byId.set(task.id, task);
+        const laneTasks = tasksByLane.get(task.lane) ?? [];
+        laneTasks.push(task);
+        tasksByLane.set(task.lane, laneTasks);
+        const byWave = tasksByLaneWave.get(task.lane) ?? new Map<number, TaskNode[]>();
+        const waveTasks = byWave.get(task.wave) ?? [];
+        waveTasks.push(task);
+        byWave.set(task.wave, waveTasks);
+        tasksByLaneWave.set(task.lane, byWave);
+    }
+    for (const [lane, byWave] of tasksByLaneWave) {
+        wavesByLane.set(lane, [...byWave.keys()].sort((a, b) => a - b));
+    }
+    return { byId, tasksByLane, tasksByLaneWave, wavesByLane };
+});
 
 const allWaves = computed(() =>
     [...new Set(tasks.value.map((task) => task.wave))].sort((a, b) => a - b),
@@ -77,11 +112,6 @@ watch(linkMode, (value) => {
     if (value === "refs") emit("mode", "bubbles");
 });
 
-function bindLane(id: string, el: unknown) {
-    const frame = el as { body?: HTMLElement | null } | null;
-    bodies.value[id] = frame?.body ?? null;
-}
-
 function laneById(id: string) {
     return lanes.value.find((lane) => lane.id === id);
 }
@@ -104,27 +134,72 @@ function projectOfLane(laneId: string) {
     return projects.value.find((p) => p.lanes.includes(laneId))?.name ?? "";
 }
 
+const filteredIds = computed(() => {
+    if (!props.filters || !live.value) return null;
+    const filters = { ...props.filters, query: "", showDone: true };
+    return new Set(projectTodos(board.value as any[], filters).visible.map((todo) =>
+        todo.number ? `#${todo.number}` : todo.id,
+    ));
+});
 function visible(task: TaskNode) {
+    if (filteredIds.value && !filteredIds.value.has(task.id)) return false;
     if (hideDone.value && task.done) return false;
     return shownWaves.value.includes(task.wave);
 }
+const hits = computed(() => graphHits(tasks.value.filter(visible), props.query));
+function isMatch(id: string) { return hits.value.includes(id); }
+
+async function scrollToHit(id: string) {
+    await nextTick();
+    selectedCard(id)?.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
+}
+function updateMatchClasses() {
+    for (const card of pipeCanvas.value?.querySelectorAll<HTMLElement>("[data-node]") ?? []) {
+        const id = card.dataset.node ?? "";
+        card.classList.toggle("match", isMatch(id));
+        card.classList.toggle("current", props.activeHit === id);
+    }
+}
+watch([() => props.query, hits], async ([query], [previousQuery]) => {
+    const first = hits.value[0] ?? null;
+    const reset = query !== previousQuery || !hits.value.includes(props.activeHit ?? "");
+    if (reset && props.activeHit !== first)
+        emit("update:activeHit", first);
+    await nextTick();
+    updateMatchClasses();
+    if (reset && first) void scrollToHit(first);
+}, { immediate: true });
+watch(() => props.activeHit, async () => {
+    await nextTick();
+    updateMatchClasses();
+});
+function cycleHit(direction: 1 | -1 = 1) {
+    const hit = stepGraphHit(hits.value, props.activeHit, direction);
+    emit("update:activeHit", hit);
+    if (hit) void scrollToHit(hit);
+}
+defineExpose({ cycleHit });
 
 function tasksOf(laneId: string) {
-    return tasks.value.filter((task) => task.lane === laneId && visible(task));
+    return (renderIndex.value.tasksByLane.get(laneId) ?? []).filter(visible);
 }
 
 function projectTasks(project: ProjectRow) {
-    return tasks.value.filter(
-        (task) => project.lanes.includes(task.lane) && visible(task),
-    );
+    return project.lanes.flatMap((lane) => tasksOf(lane));
 }
 
 function wavesOf(laneId: string) {
-    return [...new Set(tasksOf(laneId).map((task) => task.wave))].sort((a, b) => a - b);
+    return (renderIndex.value.wavesByLane.get(laneId) ?? []).filter((wave) =>
+        shownWaves.value.includes(wave) && (!hideDone.value || (renderIndex.value.tasksByLaneWave.get(laneId)?.get(wave) ?? []).some((task) => !task.done)),
+    );
 }
 
 function cardsOf(laneId: string, wave: number) {
-    return tasksOf(laneId).filter((task) => task.wave === wave);
+    return (renderIndex.value.tasksByLaneWave.get(laneId)?.get(wave) ?? []).filter(visible);
+}
+
+function visibleCardsByWave(laneId: string) {
+    return new Map(wavesOf(laneId).map((wave) => [wave, cardsOf(laneId, wave)]));
 }
 
 function freeWaves(project: ProjectRow) {
@@ -137,45 +212,56 @@ function freeCards(project: ProjectRow, wave: number) {
     return projectTasks(project).filter((task) => task.wave === wave);
 }
 
-const chain = computed(() => chainOf(selected.value, links.value));
-
-function dimmed(id: string) {
-    return Boolean(selected.value) && !chain.value.has(id);
-}
-
-function chained(link: { from: string; to: string }) {
-    return (
-        Boolean(selected.value) &&
-        chain.value.has(link.from) &&
-        chain.value.has(link.to)
-    );
-}
-
 function linksOf(laneId: string) {
+    const cached = laneLinks.get(laneId);
+    if (cached) return cached;
     const ids = new Set(tasksOf(laneId).map((task) => task.id));
-    return links.value
+    const result = links.value
         .filter((link) => ids.has(link.from) && ids.has(link.to))
         .map((link) => ({
             from: link.from,
             to: link.to,
-            tone: chained(link) ? "spec" : "dep",
+            tone: "dep",
         }));
+    laneLinks.set(laneId, result);
+    return result;
 }
 
 function freeLinks(project: ProjectRow) {
+    const cached = projectLinks.get(project.name);
+    if (cached) return cached;
     const ids = new Set(projectTasks(project).map((task) => task.id));
-    return links.value
+    const result = links.value
         .filter((link) => ids.has(link.from) && ids.has(link.to))
         .map((link) => ({
             from: link.from,
             to: link.to,
-            tone: chained(link)
-                ? "spec"
-                : laneOfTask(link.from) === laneOfTask(link.to)
-                  ? "dep"
-                  : "spec",
+            tone: laneOfTask(link.from) === laneOfTask(link.to) ? "dep" : "spec",
         }));
+    projectLinks.set(project.name, result);
+    return result;
 }
+
+watch([links, hideDone, shownWaves], () => {
+    laneLinks.clear();
+    projectLinks.clear();
+});
+
+function selectedCard(id: string) {
+    return id
+        ? pipeCanvas.value?.querySelector<HTMLElement>(`[data-node="${CSS.escape(id)}"]`)
+        : null;
+}
+
+watch(selected, (next, previous) => {
+    selectedCard(previous)?.classList.remove("selected");
+    selectedCard(next)?.classList.add("selected");
+});
+
+watch(layoutMode, async () => {
+    await nextTick();
+    selectedCard(selected.value)?.classList.add("selected");
+});
 
 function onCanvasClick(event: MouseEvent) {
     wavePickerOpen.value = false;
@@ -185,7 +271,7 @@ function onCanvasClick(event: MouseEvent) {
 }
 
 function laneOfTask(id: string) {
-    return tasks.value.find((task) => task.id === id)?.lane ?? "";
+    return renderIndex.value.byId.get(id)?.lane ?? "";
 }
 
 function crossCount(laneId: string) {
@@ -382,6 +468,7 @@ function resetView() {
     </LegendBar>
 
     <div
+        ref="pipeCanvas"
         class="pipe-canvas"
         :class="{ 'lanes-shifted': selected }"
         @click="onCanvasClick"
@@ -411,7 +498,6 @@ function resetView() {
                             <NodeCard
                                 v-for="task in freeCards(project, wave)"
                                 :key="task.id"
-                                :class="{ 'lanes-dim': dimmed(task.id) }"
                                 :data-node="task.id"
                                 :id="task.id"
                                 :title="task.title"
@@ -419,7 +505,7 @@ function resetView() {
                                 :auto="task.auto"
                                 :done="task.done"
                                 :active="task.active"
-                                :selected="selected === task.id"
+                                :class="{ match: isMatch(task.id), current: props.activeHit === task.id }"
                                 :cost="costLayer ? task.cost : undefined"
                                 :cost-note="costLayer ? task.costNote : undefined"
                                 :cost-share="costLayer ? task.costShare : undefined"
@@ -446,7 +532,6 @@ function resetView() {
                     :ref="(el: unknown) => (slots[lane.id] = el as HTMLElement)"
                 >
                     <LaneFrame
-                        :ref="(el: unknown) => bindLane(lane.id, el)"
                         :class="{ 'lanes-done': lane.done }"
                         :tone="lane.tone ?? 'plain'"
                     >
@@ -481,7 +566,6 @@ function resetView() {
                                 <NodeCard
                                     v-for="task in flatShown(lane.id)"
                                     :key="task.id"
-                                    :class="{ 'lanes-dim': dimmed(task.id) }"
                                     :data-node="task.id"
                                     :id="task.id"
                                     :title="task.title"
@@ -489,7 +573,7 @@ function resetView() {
                                     :auto="task.auto"
                                     :done="task.done"
                                     :active="task.active"
-                                    :selected="selected === task.id"
+                                    :class="{ match: isMatch(task.id), current: props.activeHit === task.id }"
                                     :cost="costLayer ? task.cost : undefined"
                                     :cost-note="costLayer ? task.costNote : undefined"
                                     :cost-share="costLayer ? task.costShare : undefined"
@@ -514,38 +598,15 @@ function resetView() {
                         </div>
 
                         <template v-else>
-                        <WireLayer
-                            :container="bodies[lane.id] ?? null"
+                        <LaneRow
+                            :lane-id="lane.id"
+                            :waves="wavesOf(lane.id)"
+                            :cards-by-wave="visibleCardsByWave(lane.id)"
                             :links="linksOf(lane.id)"
-                        />
-
-                        <div class="lanes-waves">
-                            <WaveColumn
-                                v-for="wave in wavesOf(lane.id)"
-                                :key="wave"
-                                :head="`Волна ${wave}`"
-                            >
-                                <NodeCard
-                                    v-for="task in cardsOf(lane.id, wave)"
-                                    :key="task.id"
-                                    :class="{ 'lanes-dim': dimmed(task.id) }"
-                                    :data-node="task.id"
-                                    :id="task.id"
-                                    :title="task.title"
-                                    :status="task.status"
-                                    :auto="task.auto"
-                                    :done="task.done"
-                                    :active="task.active"
-                                    :selected="selected === task.id"
-                                    :cost="costLayer ? task.cost : undefined"
-                                    :cost-note="costLayer ? task.costNote : undefined"
-                                    :cost-share="
-                                        costLayer ? task.costShare : undefined
-                                    "
-                                    @click="selected = task.id"
-                                    @dblclick="emit('open', task.id)"
-                                />
-                            </WaveColumn>
+                            :cost-layer="costLayer"
+                            @pick="selected = $event"
+                            @open="emit('open', $event)"
+                        >
 
                             <div
                                 v-for="(port, i) in (lane.ports ?? []).filter(
@@ -578,7 +639,7 @@ function resetView() {
                                     >{{ lane.more.action }}</span
                                 >
                             </div>
-                        </div>
+                        </LaneRow>
                         </template>
                     </LaneFrame>
 
@@ -655,18 +716,6 @@ function resetView() {
             </div>
         </template>
 
-        <NodeInspector
-            v-if="selected"
-            class="lanes-inspector"
-            :id="selected"
-            :node="nodeByLabel.get(selected) ?? null"
-            :cards="tasks"
-            :edges="links"
-            @close="selected = ''"
-            @pick="selected = $event"
-            @open="emit('open', $event)"
-        />
-
         <div v-if="groupOpen" class="lanes-group">
             <div class="lanes-group-head">Сгруппировать свободные задачи</div>
             <p class="lanes-group-text">
@@ -685,6 +734,17 @@ function resetView() {
         </div>
 
         <div class="pipe-spacer" />
+    </div>
+    <div v-if="selected" class="pipe-inspector-layer">
+        <NodeInspector
+            :id="selected"
+            :node="nodeByLabel.get(selected) ?? null"
+            :cards="tasks"
+            :edges="links"
+            @close="selected = ''"
+            @pick="selected = $event"
+            @open="emit('open', $event)"
+        />
     </div>
 </template>
 
@@ -823,12 +883,8 @@ function resetView() {
 .lanes-dim {
     opacity: 0.4;
 }
-.lanes-inspector {
-    position: absolute;
-    right: 20px;
-    top: 14px;
-    z-index: 7;
-}
+.node-card.match { box-shadow: 0 0 0 2px rgba(255, 193, 7, 0.72); }
+.node-card.current { box-shadow: 0 0 0 3px var(--accent); }
 .lanes-picker {
     position: relative;
 }

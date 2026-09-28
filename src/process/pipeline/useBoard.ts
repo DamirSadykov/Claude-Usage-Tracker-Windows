@@ -1,19 +1,13 @@
 import { ref, computed, onMounted } from "vue";
-import { invoke } from "@tauri-apps/api/core";
 import { loadRunLayer } from "../../board/graphModel";
 import type { RunGraphNode } from "../../board/graphModel";
+import { boardStore } from "../../board/boardStore";
 import {
-    laneIndex,
-    normalizeShares,
-    toLanes,
-    toProjectBands,
-    toTaskLinks,
-    toTaskNodes,
-    wavesOf,
     type BoardTodo,
     type BoardChange,
     type TaskCostRow,
 } from "./adapt";
+import { visibleGraph } from "./visibleGraph";
 import {
     lanes as mockLanes,
     links as mockLinks,
@@ -21,91 +15,48 @@ import {
     tasks as mockTasks,
 } from "./mock";
 
-export function useBoard(withPorts = false) {
-    const board = ref<BoardTodo[]>([]);
-    const changes = ref<BoardChange[]>([]);
+export function useBoard(withPorts = false, metricChanges: string[] = []) {
+    const board = computed(() => boardStore.rows.value as unknown as BoardTodo[]);
+    const changes = computed(() => boardStore.changes.value as BoardChange[]);
     const costs = ref<TaskCostRow[]>([]);
     const run = ref<Map<string, RunGraphNode>>(new Map());
     const live = ref(false);
     const error = ref("");
 
     async function load() {
+        await boardStore.start();
+        live.value = boardStore.error.value === "";
+        error.value = boardStore.error.value;
         try {
-            board.value = await invoke<BoardTodo[]>("get_todos");
-            live.value = true;
-        } catch (e) {
-            error.value = String(e);
-            live.value = false;
-            return;
-        }
-        try {
-            changes.value = await invoke<BoardChange[]>("get_changes");
-        } catch {
-            changes.value = [];
-        }
-        try {
-            const payload = await invoke<{ tasks: TaskCostRow[] } | null>(
-                "get_task_costs",
-            );
-            costs.value = payload?.tasks ?? [];
-        } catch {
-            costs.value = [];
-        }
-        try {
-            const refs = [
-                ...changes.value.map((c) => `c#${c.number}`),
-                ...board.value
-                    .filter((t) => t.change === true && t.number)
-                    .map((t) => `#${t.number}`),
-            ];
-            run.value = await loadRunLayer(refs);
+            run.value = await loadRunLayer(metricChanges);
         } catch {
             run.value = new Map();
         }
     }
 
-    const index = computed(() => laneIndex(board.value, changes.value));
-
-    const edges = computed(() =>
-        board.value.flatMap((t) =>
-            (t.depends_on ?? []).map((dep) => ({ from: dep, to: t.id })),
-        ),
-    );
-
-    const waves = computed(() =>
-        wavesOf(
-            board.value.map((t) => t.id),
-            edges.value,
-        ),
+    const projection = computed(() =>
+        visibleGraph(boardStore.revision.value, board.value, changes.value, run.value, costs.value, withPorts),
     );
 
     const lanes = computed(() =>
         live.value
-            ? toLanes(board.value, run.value, index.value, waves.value)
+            ? projection.value.lanes
             : mockLanes,
     );
 
     const tasks = computed(() =>
         live.value
-            ? normalizeShares(
-                  toTaskNodes(
-                      board.value,
-                      run.value,
-                      index.value,
-                      waves.value,
-                      withPorts,
-                  ),
-              )
+            ? [...projection.value.tasks]
             : mockTasks,
     );
 
     const links = computed(() =>
-        live.value ? toTaskLinks(board.value, index.value) : mockLinks,
+        live.value ? [...projection.value.links] : mockLinks,
     );
 
     const projects = computed(() =>
         live.value
-            ? toProjectBands(board.value, costs.value, index.value)
+            ? projection.value.projects
             : mockProjects,
     );
 
@@ -118,7 +69,7 @@ export function useBoard(withPorts = false) {
         return out;
     });
 
-    onMounted(load);
+    onMounted(() => void load());
 
     return {
         live,
@@ -126,7 +77,7 @@ export function useBoard(withPorts = false) {
         board,
         changes,
         run,
-        index,
+        projection,
         nodeByLabel,
         lanes,
         tasks,

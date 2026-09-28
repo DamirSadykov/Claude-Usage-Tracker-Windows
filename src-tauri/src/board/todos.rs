@@ -397,6 +397,10 @@ pub struct TodoFile {
 }
 
 impl TodoFile {
+    pub fn find_todo(&self, id: &str) -> Option<&Todo> {
+        self.todos.iter().find(|todo| todo.id == id)
+    }
+
     /// Resolve `c#N`, `cN`, a bare number or an id to a change record.
     pub fn find_change(&self, change_ref: &str) -> Option<&Change> {
         let r = change_ref.trim();

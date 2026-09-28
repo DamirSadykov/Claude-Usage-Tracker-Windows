@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
 import ToolBar from "../../atoms/ToolBar.vue";
 import LegendBar from "../../atoms/LegendBar.vue";
 import SegControl from "../../atoms/SegControl.vue";
@@ -19,20 +19,25 @@ import {
 } from "../adapt";
 import { board as mockBoard } from "../boardMock";
 import { useBoard } from "../useBoard";
+import { stableBubbleRoots } from "../changeSelectors";
+import { projectTodos, type FilterableTodoRow, type TodoFilters } from "../../../board/todoFilter";
+import { graphHits, stepGraphHit } from "../graphNavigation";
+
+const props = withDefaults(defineProps<{
+    query?: string;
+    filters?: TodoFilters;
+    activeHit?: string | null;
+}>(), { query: "", activeHit: null });
 
 const emit = defineEmits<{
     (e: "mode", value: "lanes" | "wires" | "rings" | "specs"): void;
     (e: "open", id: string): void;
+    (e: "update:activeHit", id: string | null): void;
 }>();
 
 const R_MIN = 84;
 const R_MAX = 220;
 const R_SCALE = 42;
-const BUBBLE_GAP = 26;
-const RELAX_ITERS = 56;
-const RELAX_GUARD = 40;
-const RELAX_PULL = 0.018;
-const RELAX_CALM = 14;
 const THEME_RING = 170;
 const THEME_SLOT = 196;
 const THEME_WIDTH = 140;
@@ -91,6 +96,7 @@ interface Shape {
     dense: boolean;
     nodes: InnerNode[];
     r: number;
+    collapsedR: number;
 }
 
 interface Bubble extends Shape {
@@ -133,6 +139,15 @@ const board = computed(() => (live.value ? liveBoard.value : mockBoard));
 const changes = computed(() => (live.value ? liveChanges.value : []));
 const byId = computed(() => new Map(board.value.map((t) => [t.id, t])));
 const tree = computed(() => specTree(board.value, changes.value));
+
+const filteredIds = computed(() => {
+    if (!props.filters || !live.value) return null;
+    const filters = { ...props.filters, query: "", showDone: true };
+    return new Set(projectTodos(board.value as unknown as FilterableTodoRow[], filters).visible.map((todo) => todo.id));
+});
+const visibleTasks = computed(() => board.value.filter((todo) => !filteredIds.value || filteredIds.value.has(todo.id)));
+const hits = computed(() => graphHits(visibleTasks.value.map((todo) => ({ id: todo.id, title: todo.subject })), props.query));
+function isMatch(id: string) { return hits.value.includes(id); }
 
 const opened = ref<string[]>([]);
 const picked = ref<string | null>(null);
@@ -284,7 +299,7 @@ function themeLayout(root: TreeNode, dense: boolean): { nodes: InnerNode[]; r: n
     const t = tree.value;
     const kids = t.children.get(root.id) ?? [];
     const themes = kids.filter((id) => t.byId.get(id)?.kind === "theme");
-    const direct = kids.filter((id) => t.byId.get(id)?.kind === "task");
+    const direct = kids.filter((id) => t.byId.get(id)?.kind === "task" && (!filteredIds.value || filteredIds.value.has(id)));
     const nodes: InnerNode[] = [];
 
     const seatOf = (id: string) => {
@@ -337,7 +352,7 @@ function themeLayout(root: TreeNode, dense: boolean): { nodes: InnerNode[]; r: n
         nodes.push(
             decorate(id, "theme", ring * Math.cos(angle), ring * Math.sin(angle)),
         );
-        const own = t.children.get(id) ?? [];
+        const own = (t.children.get(id) ?? []).filter((kid) => !filteredIds.value || t.byId.get(kid)?.kind !== "task" || filteredIds.value.has(kid));
         const span = (TAU * orbit) / themes.length - CHIP_PITCH;
         const shown: string[] = [];
         let used = 0;
@@ -390,19 +405,18 @@ function themeLayout(root: TreeNode, dense: boolean): { nodes: InnerNode[]; r: n
     return { nodes, r: radius };
 }
 
-const shapes = computed<Shape[]>(() =>
+const rootSeeds = computed(() =>
     roots.value.map((root) => {
         const kids = tree.value.children.get(root.id) ?? [];
         const inside = subtreeOf(tree.value, root.id);
-        const tasks = inside.filter((id) => tree.value.byId.get(id)?.kind === "task");
+        const tasks = inside.filter((id) => tree.value.byId.get(id)?.kind === "task" && (!filteredIds.value || filteredIds.value.has(id)));
         const themes = kids.filter((id) => tree.value.byId.get(id)?.kind === "theme");
         const split = { done: 0, wait: 0, blocked: 0 };
         for (const id of tasks) split[healthOf(id)] += 1;
-        const open = opened.value.includes(root.id);
         const dense = tasks.length + themes.length > DENSE_LIMIT;
-        const inner = open ? themeLayout(root, dense) : { nodes: [], r: 0 };
         const collapsed = clamp(R_SCALE * Math.sqrt(tasks.length), R_MIN, R_MAX);
         return {
+            root,
             id: root.id,
             kind: root.kind,
             address:
@@ -414,67 +428,50 @@ const shapes = computed<Shape[]>(() =>
             themes: themes.length,
             split,
             loop: innerCross.value.get(root.id) ?? 0,
-            open,
             dense,
-            nodes: inner.nodes,
-            r: open ? Math.max(collapsed, inner.r) : collapsed,
+            collapsedR: collapsed,
         };
     }),
 );
 
-function relax(list: Shape[], w: number, h: number): Bubble[] {
-    const cx = w / 2;
-    const cy = h / 2;
-    const n = list.length;
-    const total = list.reduce((sum, s) => sum + s.r, 0);
-    const ring = n > 1 ? Math.max(240, (total * 2.2) / Math.PI) : 0;
-    const placed: Bubble[] = list.map((s, i) => {
-        const angle = -Math.PI / 2 + (i * TAU) / n;
-        return { ...s, x: cx + ring * Math.cos(angle), y: cy + ring * Math.sin(angle) };
-    });
+const innerLayouts = shallowRef(
+    new Map<string, { root: TreeNode; dense: boolean; layout: { nodes: InnerNode[]; r: number } }>(),
+);
 
-    const separate = (): boolean => {
-        let moved = false;
-        for (let i = 0; i < n; i += 1) {
-            for (let j = i + 1; j < n; j += 1) {
-                const a = placed[i];
-                const b = placed[j];
-                let dx = b.x - a.x;
-                let dy = b.y - a.y;
-                let d = Math.hypot(dx, dy);
-                const need = a.r + b.r + BUBBLE_GAP;
-                if (d >= need) continue;
-                if (d < 0.001) {
-                    const angle = (((i * 37 + j * 61) % 360) * Math.PI) / 180;
-                    dx = Math.cos(angle);
-                    dy = Math.sin(angle);
-                    d = 0.001;
-                }
-                const push = (need - d) / 2;
-                a.x -= (dx / d) * push;
-                a.y -= (dy / d) * push;
-                b.x += (dx / d) * push;
-                b.y += (dy / d) * push;
-                moved = true;
-            }
-        }
-        return moved;
-    };
-
-    for (let step = 0; step < RELAX_ITERS; step += 1) {
-        if (step < RELAX_ITERS - RELAX_CALM) {
-            for (const p of placed) {
-                p.x += (cx - p.x) * RELAX_PULL;
-                p.y += (cy - p.y) * RELAX_PULL;
-            }
-        }
-        separate();
-    }
-    for (let step = 0; step < RELAX_GUARD; step += 1) if (!separate()) break;
-    return placed;
+function innerLayout(seed: { id: string; root: TreeNode; dense: boolean }) {
+    const cached = innerLayouts.value.get(seed.id);
+    if (cached && cached.root === seed.root && cached.dense === seed.dense) return cached.layout;
+    const layout = themeLayout(seed.root, seed.dense);
+    innerLayouts.value.set(seed.id, { root: seed.root, dense: seed.dense, layout });
+    return layout;
 }
 
-const bubbles = computed(() => relax(shapes.value, size.value.w, size.value.h));
+const shapes = computed<Shape[]>(() =>
+    rootSeeds.value.map((seed) => {
+        const open = opened.value.includes(seed.id);
+        const inner = open ? innerLayout(seed) : { nodes: [], r: 0 };
+        return {
+            ...seed,
+            open,
+            nodes: inner.nodes,
+            r: open ? Math.max(seed.collapsedR, inner.r) : seed.collapsedR,
+        };
+    }),
+);
+
+const rootPositions = computed(() =>
+    stableBubbleRoots(
+        rootSeeds.value.map((shape) => ({ id: shape.id, radius: shape.collapsedR })),
+        size.value.w,
+        size.value.h,
+    ),
+);
+const bubbles = computed<Bubble[]>(() =>
+    shapes.value.map((shape) => ({
+        ...shape,
+        ...(rootPositions.value.get(shape.id) ?? { x: size.value.w / 2, y: size.value.h / 2 }),
+    })),
+);
 
 const bubbleById = computed(() => new Map(bubbles.value.map((b) => [b.id, b])));
 
@@ -762,6 +759,28 @@ function selectNode(id: string) {
     picked.value = id;
     pickedEdge.value = null;
 }
+
+async function scrollToHit(id: string) {
+    const home = rootOf.value.get(id);
+    if (home) opened.value = [...new Set([...opened.value, home])];
+    picked.value = id;
+    await nextTick();
+    frame.value?.querySelector<HTMLElement>(`[data-node="${CSS.escape(id)}"]`)
+        ?.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
+}
+function cycleHit(direction: 1 | -1 = 1) {
+    const hit = stepGraphHit(hits.value, props.activeHit, direction);
+    emit("update:activeHit", hit);
+    if (hit) void scrollToHit(hit);
+}
+defineExpose({ cycleHit });
+watch([() => props.query, hits], ([query], [previousQuery]) => {
+    const first = hits.value[0] ?? null;
+    const reset = query !== previousQuery || !hits.value.includes(props.activeHit ?? "");
+    if (reset && props.activeHit !== first) emit("update:activeHit", first);
+    if (reset && first) void scrollToHit(first);
+}, { immediate: true });
+watch(() => props.activeHit, (id) => { if (id) void scrollToHit(id); });
 
 function focusRow(id: string) {
     const home = rootOf.value.get(id);
@@ -1069,7 +1088,8 @@ watch([bounds, () => size.value.w, () => size.value.h], fit, { immediate: true }
                             v-for="node in b.nodes"
                             :key="node.id"
                             class="bub-node"
-                            :class="{ marked: picked === node.id }"
+                            :class="{ marked: picked === node.id, match: isMatch(node.id), current: props.activeHit === node.id }"
+                            :data-node="node.kind === 'more' ? undefined : node.id"
                             :style="{
                                 left: `${b.r + node.x}px`,
                                 top: `${b.r + node.y}px`,
@@ -1393,6 +1413,15 @@ watch([bounds, () => size.value.w, () => size.value.h], fit, { immediate: true }
 .bub-node.marked .bub-chip {
     border-color: var(--accent);
     color: var(--accent);
+}
+.bub-node.match .bub-chip {
+    border-color: var(--warn);
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--warn) 45%, transparent);
+}
+.bub-node.current .bub-chip,
+.bub-node.current {
+    border-radius: var(--r-pill);
+    box-shadow: 0 0 0 2px var(--accent);
 }
 .bub-chip {
     display: inline-flex;

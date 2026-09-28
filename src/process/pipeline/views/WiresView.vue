@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, ref, watch, nextTick } from "vue";
+import { projectTodos, type FilterableTodoRow, type TodoFilters } from "../../../board/todoFilter";
 import ToolBar from "../../atoms/ToolBar.vue";
 import LegendBar from "../../atoms/LegendBar.vue";
 import ToolButton from "../../atoms/ToolButton.vue";
@@ -12,34 +13,81 @@ import WireLayer from "../../atoms/WireLayer.vue";
 import WireLabel from "../../atoms/WireLabel.vue";
 import Kicker from "../../atoms/Kicker.vue";
 import NodeInspector from "../NodeInspector.vue";
-import { lanes, tasks, links, wireLegend, graphStats, chainOf } from "../mock";
+import { lanes as mockLanes, wireLegend, graphStats } from "../mock";
 import type { Artifact, ArtifactKind, TaskNode } from "../types";
+import { graphHits, stepGraphHit } from "../graphNavigation";
+import { useBoard } from "../useBoard";
+
+const props = withDefaults(defineProps<{
+    query?: string;
+    filters?: TodoFilters;
+    activeHit?: string | null;
+}>(), { query: "", activeHit: null });
 
 const emit = defineEmits<{
     (e: "mode", value: "lanes" | "wires" | "rings" | "specs"): void;
     (e: "open", id: string): void;
+    (e: "update:activeHit", id: string | null): void;
 }>();
 
 const graphMode = ref("both");
 const labelFilter = ref("all");
 const portsOn = ref(true);
 const costOn = ref(false);
-const selected = ref(tasks.find((task) => task.selected)?.id ?? "");
+const selected = ref("");
+const { board, lanes, tasks, links, live } = useBoard();
+const canvas = ref<HTMLElement | null>(null);
+async function scrollToHit(id: string) {
+    await nextTick();
+    canvas.value?.querySelector<HTMLElement>(`[data-node="${CSS.escape(id)}"]`)
+        ?.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
+}
+function cycleHit(direction: 1 | -1 = 1) {
+    const hit = stepGraphHit(hits.value, props.activeHit, direction);
+    emit("update:activeHit", hit);
+    if (hit) void scrollToHit(hit);
+}
+defineExpose({ cycleHit });
 
-const lane = lanes[0];
-const visibleWaves = [2, 3, 4, 5];
+const lane = computed(() => lanes.value[0] ?? mockLanes[0]);
+const visibleWaves = computed(() =>
+    [...new Set(tasks.value.filter((task) => task.lane === lane.value.id).map((task) => task.wave))]
+        .sort((left, right) => left - right),
+);
 const columnWidth = 196;
 
 const frame = ref<InstanceType<typeof LaneFrame> | null>(null);
 const body = computed(() => frame.value?.body ?? null);
 
 const laneTasks = computed(() =>
-    tasks.filter((task) => task.lane === lane.id && visibleWaves.includes(task.wave)),
+    tasks.value.filter((task) => task.lane === lane.value.id && visibleWaves.value.includes(task.wave) && visible(task)),
 );
+
+const filteredIds = computed(() => {
+    if (!props.filters || !live.value || !board.value.length) return null;
+    const filters = { ...props.filters, query: "", showDone: true };
+    return new Set(projectTodos(board.value as unknown as FilterableTodoRow[], filters).visible.map((todo) =>
+        todo.number ? `#${todo.number}` : todo.id,
+    ));
+});
+
+function visible(task: TaskNode) {
+    return !filteredIds.value || filteredIds.value.has(task.id);
+}
+
+const hits = computed(() => graphHits(tasks.value.filter(visible), props.query));
+function isMatch(id: string) { return hits.value.includes(id); }
+watch([() => props.query, hits], ([query], [previousQuery]) => {
+    const first = hits.value[0] ?? null;
+    const reset = query !== previousQuery || !hits.value.includes(props.activeHit ?? "");
+    if (reset && props.activeHit !== first)
+        emit("update:activeHit", first);
+    if (reset && first) void scrollToHit(first);
+}, { immediate: true });
 
 const laneLinks = computed(() => {
     const ids = new Set(laneTasks.value.map((task) => task.id));
-    return links.filter((link) => ids.has(link.from) && ids.has(link.to));
+    return links.value.filter((link) => ids.has(link.from) && ids.has(link.to));
 });
 
 const columns = computed(() => {
@@ -69,7 +117,22 @@ const columns = computed(() => {
         });
 });
 
-const chain = computed(() => chainOf(selected.value));
+const chain = computed(() => {
+    const selectedId = selected.value;
+    const connected = new Set<string>();
+    if (!selectedId) return connected;
+    const pending = [selectedId];
+    while (pending.length) {
+        const id = pending.pop()!;
+        if (connected.has(id)) continue;
+        connected.add(id);
+        for (const link of laneLinks.value) {
+            if (link.from === id) pending.push(link.to);
+            if (link.to === id) pending.push(link.from);
+        }
+    }
+    return connected;
+});
 
 function dimmed(id: string) {
     return Boolean(selected.value) && !chain.value.has(id);
@@ -150,11 +213,11 @@ const selectedWire = computed(() =>
 );
 
 const captionParts = computed(() => {
-    const change = lane.kicker.match(/#\d+/)?.[0] ?? "";
+    const change = lane.value.kicker.match(/#\d+/)?.[0] ?? "";
     const parts: { text: string; mono?: boolean }[] = [
         { text: "ТЕМА · change" },
         { text: change, mono: true },
-        { text: `· ${lane.title.toLowerCase()}` },
+        { text: `· ${lane.value.title.toLowerCase()}` },
     ];
     for (const stat of graphStats.artifacts.split(" · ")) {
         const parsed = stat.match(/^(\d+)\s+(.+)$/);
@@ -231,7 +294,7 @@ function onGraphMode(value: string) {
         </template>
     </LegendBar>
 
-    <div class="pipe-canvas" @click="onCanvasClick">
+    <div ref="canvas" class="pipe-canvas" @click="onCanvasClick">
         <div class="wires-caption">
             <span
                 v-for="(part, i) in captionParts"
@@ -290,7 +353,7 @@ function onGraphMode(value: string) {
                     <NodeCard
                         v-for="task in column.tasks"
                         :key="task.id"
-                        :class="{ 'wires-dim': dimmed(task.id) }"
+                        :class="{ 'wires-dim': dimmed(task.id), match: isMatch(task.id), current: props.activeHit === task.id }"
                         :data-node="task.id"
                         :id="task.id"
                         :title="task.title"
@@ -311,10 +374,12 @@ function onGraphMode(value: string) {
             </div>
         </LaneFrame>
 
+    </div>
+    <div v-if="selected" class="pipe-inspector-layer">
         <NodeInspector
-            v-if="selected"
-            class="wires-inspector"
             :id="selected"
+            :cards="tasks"
+            :edges="links"
             @close="selected = ''"
             @pick="selected = $event"
             @open="emit('open', $event)"
@@ -356,12 +421,8 @@ function onGraphMode(value: string) {
 .wires-dim {
     opacity: 0.4;
 }
-.wires-inspector {
-    position: absolute;
-    right: 20px;
-    top: 14px;
-    z-index: 7;
-}
+.node-card.match { box-shadow: 0 0 0 2px rgba(255, 193, 7, 0.72); }
+.node-card.current { box-shadow: 0 0 0 3px var(--accent); }
 .wires-columns {
     display: flex;
     align-items: flex-start;

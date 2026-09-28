@@ -155,6 +155,10 @@ onMounted(async () => {
             savedTick.value++;
         }),
     );
+    try {
+        activeTab.value = await invoke<SettingsTab>("get_settings_open_tab");
+    } catch {
+    }
 });
 
 onUnmounted(() => {

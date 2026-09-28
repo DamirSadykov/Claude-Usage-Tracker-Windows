@@ -12,12 +12,12 @@ import { ref, computed, watch, onMounted, onUnmounted, nextTick } from "vue";
 import { useI18n, type Composer } from "vue-i18n";
 import { invoke } from "@tauri-apps/api/core";
 import ProjectAutocomplete from "../kernel/ProjectAutocomplete.vue";
-import ProjectLabel from "../kernel/ProjectLabel.vue";
 import GraphView from "../board/GraphView.vue";
 import SpecView from "../spec/SpecView.vue";
 import PipelineGraph from "../process/pipeline/PipelineGraph.vue";
 import type { PipelineMode } from "../process/pipeline/modes";
 import type { BoardChange, Todo } from "../contracts/board";
+import { boardStore, type BoardMutation } from "../board/boardStore";
 import { useProjectLinks } from "../analytics/projectLinks";
 import { useHotkeys } from "../kernel/hotkeys";
 import { BOARD_CURRENT_VERSION } from "../board/boardVersion";
@@ -32,6 +32,10 @@ import {
 import i18n from "../kernel/i18n";
 import { useSettings } from "../kernel/settingsStore";
 import type { TriageDigest, DigestItem } from "../contracts/types";
+import TodoFiltersBar from "../board/TodoFiltersBar.vue";
+import TodoBoard from "../board/TodoBoard.vue";
+import TodoDetailPane from "../board/TodoDetailPane.vue";
+import { defaultTodoFilters, projectTodos, type TodoCardRow, type TodoFilters } from "../board/todoFilter";
 
 const { t, locale } = useI18n();
 
@@ -69,10 +73,23 @@ const COL_BY_ID: Record<string, Column> = Object.fromEntries(
   COLUMNS.map((c) => [c.id, c]),
 );
 
-const todos = ref<Todo[]>([]);
-const changes = ref<BoardChange[]>([]);
+const todos = computed(() => boardStore.rows.value as unknown as Todo[]);
+const changes = computed(() => boardStore.changes.value as unknown as BoardChange[]);
 const loading = ref(true);
 const errorMsg = ref("");
+const detailRecord = ref<Todo | null>(null);
+const detailLoading = ref(false);
+const detailLoadFailed = ref(false);
+
+type TodoMutation = BoardMutation;
+
+async function applyTodoMutation(result: TodoMutation, refreshDetail = false) {
+  boardStore.applyMutation(result);
+  if (!result.row || (!refreshDetail && detailRecord.value?.id !== result.row.id)) return;
+  const id = result.row.id;
+  const updated = await invoke<Todo | null>("get_task_detail", { id });
+  if (updated && detailId.value === id) detailRecord.value = updated;
+}
 
 interface BoardStateInfo {
   state: "ok" | "unreadable" | "future-version";
@@ -125,19 +142,16 @@ async function restoreBoardFromBackup() {
   }
 }
 
-// Filters
-const projectFilter = ref<string>(""); // "" = all
-const showDone = ref(false);
-const search = ref("");
-
-// Drag-and-drop state: id of the card being dragged + id of the column hovered.
-const dragId = ref<string | null>(null);
-const overCol = ref<string | null>(null);
-
-// Live reload: a watcher in the backend emits `todos-file-changed` when
-// todos.json changes on disk (CLI / Claude / hand-edit). We defer the reload
-// while a drag or the form is open so it never yanks state from under the user.
-const pendingReload = ref(false);
+const FILTER_STORAGE_KEY = "todo-board-filters-v1";
+function readFilters(): TodoFilters {
+  try { return { ...defaultTodoFilters(), ...JSON.parse(localStorage.getItem(FILTER_STORAGE_KEY) ?? "{}") }; }
+  catch { return defaultTodoFilters(); }
+}
+const filters = ref<TodoFilters>(readFilters());
+watch(filters, value => { try { localStorage.setItem(FILTER_STORAGE_KEY, JSON.stringify(value)); } catch {} }, { deep: true });
+const projectFilter = computed({ get: () => filters.value.project, set: value => filters.value = { ...filters.value, project: value } });
+const showDone = computed({ get: () => filters.value.showDone, set: value => filters.value = { ...filters.value, showDone: value } });
+const search = computed({ get: () => filters.value.query, set: value => filters.value = { ...filters.value, query: value } });
 
 // Form state (doubles as create + edit). editingId === null → creating.
 const editingId = ref<string | null>(null);
@@ -163,6 +177,7 @@ const fSubjectOverLimit = computed(() => fSubjectRemaining.value < 0);
 // Projects the tracker has seen (from cc_usage), so the picker offers real
 // projects even before any todo uses them.
 const knownProjects = ref<string[]>([]);
+const taskCosts = ref<Map<string, TaskCostRow>>(new Map());
 
 // Merge-link badges (issue #13). A task's `project` is stored raw, so it may be a
 // canonical (absorbed others) or an alias (folded into a canonical) — need both.
@@ -179,49 +194,24 @@ const projects = computed(() => {
 });
 
 
-// Todos passing the active filters (project + search + show-done), the pool the
-// board draws from. Per-column ordering is applied in `itemsFor`.
-const visible = computed(() => {
-  let list = todos.value.slice();
-  if (projectFilter.value) {
-    // Resolve through merge links so the canonical filter also catches tasks
-    // still tagged with a merged-away alias name.
-    list = list.filter((t) => (canonicalOf(t.project) ?? t.project ?? "") === projectFilter.value);
-  }
-  if (!showDone.value) list = list.filter((t) => t.status !== "done");
-  const q = search.value.trim().toLowerCase();
-  if (q) {
-    // A bare number or `#N` query also matches the task NUMBER (substring, so
-    // "10" surfaces #10/#102/…) — searching by number, not just title/text.
-    const qNum = q.replace(/^#/, "");
-    const numeric = /^\d+$/.test(qNum);
-    list = list.filter(
-      (t) =>
-        t.subject.toLowerCase().includes(q) ||
-        t.description.toLowerCase().includes(q) ||
-        (t.project ?? "").toLowerCase().includes(q) ||
-        (numeric && String(t.number ?? "").includes(qNum)),
-    );
-  }
-  return list;
-});
-
-// Hide the Done column when "show done" is off — there's nothing to show there.
-const boardColumns = computed(() =>
-  showDone.value ? COLUMNS : COLUMNS.filter((c) => c.id !== "done"),
-);
-
-// Cards for one column, scheduled-first then most-recently-updated.
-function itemsFor(colId: string): Todo[] {
-  return visible.value
-    .filter((t) => t.status === colId)
-    .sort((a, b) => {
-      const da = a.scheduled_for || "9999-99-99";
-      const db = b.scheduled_for || "9999-99-99";
-      if (da !== db) return da < db ? -1 : 1;
-      return (b.updated_at || "").localeCompare(a.updated_at || "");
-    });
-}
+const cardRows = computed<TodoCardRow[]>(() => todos.value.map((todo) => {
+  const cost = taskCosts.value.get(todo.id);
+  return {
+    ...todo,
+    filterProject: todo.project ? canonicalOf(todo.project) ?? todo.project : null,
+    aliases: todo.project ? aliasesOf(todo.project) : [],
+    mergedInto: todo.project ? canonicalOf(todo.project) : null,
+    refCount: (todo as Todo & { ref_count?: number }).ref_count ?? 0,
+    cost: cost?.cost,
+    costTitle: cost ? `${t("todoCostHint")}: ${cost.sessions} ${t("todoCostSessions")} · ${fmtTok(cost.total_tokens)} ${t("todoCostTokens")}` : "",
+    importedAt: (todo as Todo & { imported_at?: string | null }).imported_at,
+    hasPlan: !!(todo as Todo & { has_plan?: boolean }).has_plan,
+    spec: [...((todo as Todo & { spec?: string[] }).spec ?? [])],
+  };
+}));
+const projection = computed(() => projectTodos(cardRows.value, filters.value, boardStore.indexes.value));
+const doneLimit = ref(50);
+watch(() => projection.value.columns.done.length, () => { doneLimit.value = 50; });
 
 const openCount = computed(
   () => todos.value.filter((t) => t.status !== "done").length,
@@ -230,34 +220,20 @@ const openCount = computed(
 async function loadTodos(silent = false) {
   if (!silent) loading.value = true;
   try {
-    todos.value = await invoke<Todo[]>("get_todos");
+    await boardStore.start();
+    if (boardStore.stale.value) await boardStore.reload();
     errorMsg.value = "";
   } catch (e) {
     errorMsg.value = String(e);
   } finally {
     if (!silent) loading.value = false;
   }
-  try {
-    changes.value = await invoke<BoardChange[]>("get_changes");
-  } catch {
-    changes.value = [];
-  }
   void loadBoardState();
 }
 
-// Reload now if it's safe; otherwise mark it pending until the drag/form ends.
-function requestReload() {
-  if (dragId.value || formOpen.value) {
-    pendingReload.value = true;
-    return;
-  }
-  void loadTodos(true);
-}
-// Run a deferred reload once the user is no longer mid-interaction.
 function flushPendingReload() {
-  if (pendingReload.value && !dragId.value && !formOpen.value) {
-    pendingReload.value = false;
-    void loadTodos(true);
+  if (boardStore.stale.value && !formOpen.value) {
+    void boardStore.reload();
   }
 }
 
@@ -312,7 +288,8 @@ async function submitForm() {
     ext: existing?.ext,
   };
   try {
-    todos.value = await invoke<Todo[]>("upsert_todo", { todo });
+    await invoke<Todo[]>("upsert_todo", { todo });
+    await boardStore.reload(true);
     resetForm();
   } catch (e) {
     errorMsg.value = String(e);
@@ -321,27 +298,25 @@ async function submitForm() {
 
 // Move a card to a new column. Update the local list first so the card jumps
 // instantly, then persist; on failure reload from disk to undo the optimism.
-async function moveStatus(todo: Todo, status: string) {
+async function moveStatus(todo: Pick<Todo, "id" | "status">, status: string) {
   if (todo.status === status) return;
-  todos.value = todos.value.map((t) =>
-    t.id === todo.id ? { ...t, status } : t,
-  );
   try {
-    todos.value = await invoke<Todo[]>("set_todo_status", {
+    const result = await invoke<TodoMutation>("set_todo_status", {
       id: todo.id,
       status,
     });
+    await applyTodoMutation(result);
   } catch (e) {
     errorMsg.value = String(e);
-    await loadTodos();
+    await boardStore.reload(true);
   }
 }
 
 // Deleting a task asks first (issue #21): the card's trash opens a confirm
 // dialog; the actual removal happens in confirmDelete. `pendingDelete` holds the
 // task awaiting confirmation (null = no dialog open).
-const pendingDelete = ref<Todo | null>(null);
-function removeTodo(todo: Todo) {
+const pendingDelete = ref<{ id: string; subject: string } | null>(null);
+function removeTodo(todo: { id: string; subject: string }) {
   pendingDelete.value = todo;
 }
 function cancelDelete() {
@@ -352,7 +327,8 @@ async function confirmDelete() {
   if (!todo) return;
   pendingDelete.value = null;
   try {
-    todos.value = await invoke<Todo[]>("delete_todo", { id: todo.id });
+    await invoke<Todo[]>("delete_todo", { id: todo.id });
+    await boardStore.reload(true);
     if (editingId.value === todo.id) resetForm();
     if (detailId.value === todo.id) closeDetail();
   } catch (e) {
@@ -368,7 +344,28 @@ async function confirmDelete() {
 // (preserving id / comments / links / created_at) and persists via `upsert_todo`.
 const view = ref<"board" | "detail">("board");
 const detailId = ref<string | null>(null);
-const detail = computed(() => todos.value.find((t) => t.id === detailId.value) ?? null);
+interface BoardScrollPosition { left: number; top: number }
+let boardScrollPosition: BoardScrollPosition[] = [];
+
+function rememberBoardScroll() {
+  boardScrollPosition = Array.from(document.querySelectorAll<HTMLElement>(".tw-board, .tw-col-body"))
+    .map((element) => ({ left: element.scrollLeft, top: element.scrollTop }));
+}
+
+function restoreBoardScroll() {
+  const current = document.querySelectorAll<HTMLElement>(".tw-board, .tw-col-body");
+  boardScrollPosition.forEach((position, index) => {
+    const element = current[index];
+    if (element) element.scrollTo({ left: position.left, top: position.top });
+  });
+  boardScrollPosition = [];
+}
+
+const detail = computed(() => {
+  const row = todos.value.find((t) => t.id === detailId.value);
+  if (!row) return null;
+  return detailRecord.value?.id === row.id ? { ...row, ...detailRecord.value } : row;
+});
 
 // Transient "Saved ✓" confirmation shown after a successful detail save.
 const saved = ref(false);
@@ -402,20 +399,6 @@ const draft = ref<Draft>({
 const draftSubjectRemaining = computed(() => SUBJECT_LIMIT - draft.value.subject.trim().length);
 const draftSubjectOverLimit = computed(() => draftSubjectRemaining.value < 0);
 
-function rankStatus(s: string): number {
-  const i = COLUMNS.findIndex((c) => c.id === s);
-  return i < 0 ? COLUMNS.length : i;
-}
-// Left-rail tasks: same project as the open task (project-less tasks group
-// together), ordered by board column so the rail reads like a mini board.
-const detailSiblings = computed(() => {
-  const p = detail.value?.project ?? null;
-  return todos.value
-    .filter((t) => (t.project ?? null) === p)
-    .slice()
-    .sort((a, b) => rankStatus(a.status) - rankStatus(b.status));
-});
-
 // Handoff the open task INHERITS from its direct prerequisites (#141): the same
 // view `cc-todos todos handoff <task>` gives an agent, surfaced read-only in the
 // card. Only direct `depends_on` — cumulative context rides authored handoff text.
@@ -435,8 +418,7 @@ const inheritedHandoff = computed(() => {
     }));
 });
 
-function openDetail(todo: Todo) {
-  detailId.value = todo.id;
+function fillDraft(todo: Todo) {
   draft.value = {
     subject: todo.subject,
     description: todo.description ?? "",
@@ -447,20 +429,58 @@ function openDetail(todo: Todo) {
     status: todo.status,
     priority: todo.priority ?? "",
   };
+}
+
+function clearDetailDraft() {
+  draft.value = {
+    subject: "",
+    description: "",
+    plan: "",
+    handoff: "",
+    project: "",
+    scheduled_for: "",
+    status: "backlog",
+    priority: "",
+  };
+}
+
+async function openDetail(todo: { id: string }) {
+  if (view.value === "board") rememberBoardScroll();
+  detailId.value = todo.id;
+  detailRecord.value = null;
+  clearDetailDraft();
+  detailLoading.value = true;
+  detailLoadFailed.value = false;
   descMode.value = "edit";
   mention.value = null;
   saved.value = false;
   view.value = "detail";
+  try {
+    const full = await invoke<Todo | null>("get_task_detail", { id: todo.id });
+    if (full && detailId.value === todo.id) {
+      detailRecord.value = full;
+      fillDraft(full);
+    }
+  } catch {
+    if (detailId.value === todo.id) detailLoadFailed.value = true;
+  } finally {
+    if (detailId.value === todo.id) detailLoading.value = false;
+  }
 }
 
 function closeDetail() {
   view.value = "board";
   detailId.value = null;
+  detailRecord.value = null;
+  detailLoading.value = false;
+  detailLoadFailed.value = false;
+  void nextTick().then(restoreBoardScroll);
 }
 
 async function saveDetail() {
   const cur = detail.value;
-  if (!cur) return;
+  if (!cur || !detailRecord.value || detailLoading.value) return;
+  const id = cur.id;
   const d = draft.value;
   if (!d.subject.trim() || d.subject.trim().length > SUBJECT_LIMIT) return;
   const todo: Todo = {
@@ -475,8 +495,12 @@ async function saveDetail() {
     priority: d.priority || "",
   };
   try {
-    todos.value = await invoke<Todo[]>("upsert_todo", { todo });
-    flashSaved();
+    await invoke<Todo[]>("upsert_todo", { todo });
+    await boardStore.reload(true);
+    if (detailId.value === id) {
+      detailRecord.value = todo;
+      flashSaved();
+    }
   } catch (e) {
     errorMsg.value = String(e);
   }
@@ -489,16 +513,24 @@ async function saveDetail() {
 // todo, so we merge onto that — never onto the draft.
 const newComment = ref("");
 
-const detailComments = computed(() => detail.value?.comments ?? []);
+const detailComments = computed(() => detailRecord.value?.comments ?? []);
+const renderedDetailComments = ref<Array<{ id: string; author: string; created_at: string; body: string; segments: ReturnType<typeof tokenize> }>>([]);
+watch(detailRecord, (record) => {
+  renderedDetailComments.value = (record?.comments ?? []).map((comment) => ({
+    ...comment,
+    segments: tokenize(comment.body),
+  }));
+});
 
 async function addComment() {
   const body = newComment.value.trim();
   if (!body || !detail.value) return;
   try {
-    todos.value = await invoke<Todo[]>("add_todo_comment", {
+    const result = await invoke<TodoMutation>("add_todo_comment", {
       id: detail.value.id,
       body,
     });
+    await applyTodoMutation(result, true);
     newComment.value = "";
   } catch (e) {
     errorMsg.value = String(e);
@@ -508,10 +540,11 @@ async function addComment() {
 async function removeComment(id: string) {
   if (!detail.value) return;
   try {
-    todos.value = await invoke<Todo[]>("remove_todo_comment", {
+    const result = await invoke<TodoMutation>("remove_todo_comment", {
       id: detail.value.id,
       commentId: id,
     });
+    await applyTodoMutation(result, true);
   } catch (e) {
     errorMsg.value = String(e);
   }
@@ -688,25 +721,28 @@ const specMode = ref<PipelineMode>("reader");
 watch(graphUiNew, (on) =>
   localStorage.setItem("graph-ui", on ? "next" : "classic"),
 );
-// In graph view the ONE shared search box (below) highlights matching nodes instead
-// of filtering; Enter cycles to the next hit via GraphView's exposed `cycleNext`.
 const graphRef = ref<InstanceType<typeof GraphView> | null>(null);
-function onSearchEnter() {
-  if (viewMode.value === "graph") graphRef.value?.cycleNext();
+const pipelineGraphRef = ref<InstanceType<typeof PipelineGraph> | null>(null);
+const pipelineActiveHit = ref<string | null>(null);
+function onSearchEnter(event?: KeyboardEvent) {
+  if (viewMode.value !== "graph") return;
+  if (graphUiNew.value) pipelineGraphRef.value?.cycleHit(event?.shiftKey ? -1 : 1);
+  else graphRef.value?.cycleNext();
 }
 
 // Keyboard shortcuts (registry in ../hotkeys): Ctrl+F → search, Ctrl+P → project.
 const searchInputRef = ref<HTMLInputElement | null>(null);
-const projectAcRef = ref<InstanceType<typeof ProjectAutocomplete> | null>(null);
+const filtersBarRef = ref<InstanceType<typeof TodoFiltersBar> | null>(null);
 useHotkeys({
-  search: () => searchInputRef.value?.focus(),
-  project: () => projectAcRef.value?.focus(),
+  search: () => (viewMode.value === "board" ? filtersBarRef.value?.focusSearch() : searchInputRef.value?.focus()),
+  project: () => filtersBarRef.value?.focusProject(),
 });
 
 // GraphView mutates dependencies through the backend and hands back the fresh
 // list; adopt it so both views stay in lockstep without a reload round-trip.
 function onGraphUpdate(list: Todo[]) {
-  todos.value = list;
+  void list;
+  void boardStore.reload(true);
 }
 
 // --- the spec a task is about (t#339/t#346) ----------------------------------
@@ -878,23 +914,6 @@ function triageGoToTask(num?: number) {
 // The audit SCHEDULE controls (enable/time/model/run-now, #35) moved to
 // Settings → Tasks. This window keeps only the READ-ONLY digest chip/popover
 // below; the schedule config now lives in the settings panel.
-
-// Distinct other tasks this one references inline (t#N) across its description and
-// comments — drives the card's link chip. Uses tokenize so it counts exactly
-// what renders as a reference (a #frag inside a URL isn't one) and only resolved
-// numbers.
-function refCount(todo: Todo): number {
-  const nums = new Set<number>();
-  const scan = (text: string | undefined) => {
-    if (!text) return;
-    for (const s of tokenize(text)) {
-      if (s.kind === "task" && s.number !== todo.number) nums.add(s.number);
-    }
-  };
-  scan(todo.description);
-  for (const c of todo.comments ?? []) scan(c.body);
-  return nums.size;
-}
 
 // Description has an edit/preview toggle: edit = textarea, preview = the same
 // text with links/references rendered. Reset to edit whenever a task opens.
@@ -1070,45 +1089,6 @@ function onMentionBlur() {
   }, 120);
 }
 
-// --- Drag and drop (native HTML5) ---
-function onDragStart(todo: Todo, e: DragEvent) {
-  dragId.value = todo.id;
-  if (e.dataTransfer) {
-    e.dataTransfer.effectAllowed = "move";
-    // Some browsers require data to be set for the drag to start at all.
-    e.dataTransfer.setData("text/plain", todo.id);
-  }
-}
-function onDragEnd() {
-  dragId.value = null;
-  overCol.value = null;
-  flushPendingReload();
-}
-function onColDragOver(colId: string, e: DragEvent) {
-  if (!dragId.value) return;
-  e.preventDefault();
-  if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
-  if (overCol.value !== colId) overCol.value = colId;
-}
-function onColDragLeave(colId: string, e: DragEvent) {
-  // Ignore leaves into child elements of the same column body.
-  const related = e.relatedTarget as Node | null;
-  if (related && (e.currentTarget as HTMLElement).contains(related)) return;
-  if (overCol.value === colId) overCol.value = null;
-}
-function onColDrop(colId: string) {
-  const id = dragId.value;
-  overCol.value = null;
-  dragId.value = null;
-  if (!id) return;
-  const todo = todos.value.find((t) => t.id === id);
-  if (todo) void moveStatus(todo, colId);
-}
-
-function statusLabel(s: string) {
-  const c = COL_BY_ID[s];
-  return c ? t(c.labelKey) : s;
-}
 function columnColor(s: string) {
   return COL_BY_ID[s]?.dot ?? "var(--text-4)";
 }
@@ -1356,7 +1336,6 @@ function relTime(iso: string | undefined | null): string {
 }
 
 let unlistenLocale: (() => void) | null = null;
-let unlistenTodos: (() => void) | null = null;
 let unlistenFocus: (() => void) | null = null;
 let unlistenTriage: (() => void) | null = null;
 let unlistenExternal: (() => void) | null = null;
@@ -1391,8 +1370,6 @@ interface TaskCostsPayload {
   ambiguous_tokens: number;
   ambiguous_cost: number;
 }
-const taskCosts = ref<Map<string, TaskCostRow>>(new Map());
-
 async function loadTaskCosts() {
   try {
     const res = await invoke<TaskCostsPayload | null>("get_task_costs");
@@ -1410,13 +1387,8 @@ function costOf(todo: Todo | null | undefined): TaskCostRow | null {
 }
 
 const fmtCost = (c: number) => "$" + (c >= 100 ? String(Math.round(c)) : c.toFixed(2));
-const fmtTok = (n: number) =>
-  n >= 1_000_000 ? (n / 1_000_000).toFixed(1) + "M" : n >= 1_000 ? Math.round(n / 1_000) + "k" : String(n);
-
-function costTitle(todo: Todo): string {
-  const r = costOf(todo);
-  if (!r) return "";
-  return `${t("todoCostHint")}: ${r.sessions} ${t("todoCostSessions")} · ${fmtTok(r.total_tokens)} ${t("todoCostTokens")}`;
+function fmtTok(n: number) {
+  return n >= 1_000_000 ? (n / 1_000_000).toFixed(1) + "M" : n >= 1_000 ? Math.round(n / 1_000) + "k" : String(n);
 }
 
 // ── cost by block (t#298) ─────────────────────────────────────────────────────
@@ -1510,12 +1482,6 @@ onMounted(async () => {
   unlistenLocale = await listen<string>("todos-locale", (e) => {
     applyLocale(e.payload);
   });
-  // Live reload: the backend watcher fires this whenever todos.json changes on
-  // disk (CLI / Claude / hand-edit), so the board stays in sync without a manual
-  // refresh.
-  unlistenTodos = await listen("todos-file-changed", () => {
-    requestReload();
-  });
   // A fresh nightly-triage digest landed (the backend broadcasts to all
   // windows); refresh the chip so it reflects the latest run.
   unlistenTriage = await listen("triage-alert", () => {
@@ -1548,13 +1514,13 @@ onMounted(async () => {
       // Pick up a status remap done in the Settings → Integrations window.
       void loadStatusMap();
       void loadExternalTasks();
+      if (boardStore.stale.value) void boardStore.reload();
     }
   });
 });
 
 onUnmounted(() => {
   if (unlistenLocale) unlistenLocale();
-  if (unlistenTodos) unlistenTodos();
   if (unlistenFocus) unlistenFocus();
   if (unlistenTriage) unlistenTriage();
   if (unlistenExternal) unlistenExternal();
@@ -1643,34 +1609,10 @@ onUnmounted(() => {
         </div>
       </div>
       <div class="tw-spacer"></div>
-      <div class="tw-search">
-        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4">
-          <circle cx="7" cy="7" r="4.5" />
-          <line x1="10.5" y1="10.5" x2="14" y2="14" stroke-linecap="round" />
-        </svg>
-        <input
-          ref="searchInputRef"
-          v-model="search"
-          class="tw-search-input"
-          :placeholder="viewMode === 'graph' ? t('graphSearch') : t('todoSearch')"
-          :title="viewMode === 'graph' ? t('graphSearchHint') : undefined"
-          @keydown.enter="onSearchEnter"
-          @keydown.esc="search = ''"
-        />
+      <TodoFiltersBar v-if="viewMode === 'board'" ref="filtersBarRef" v-model="filters" :projects="projects" />
+      <div v-else class="tw-search">
+        <input ref="searchInputRef" v-model="search" class="tw-search-input" :placeholder="t('graphSearch')" @keydown.enter="onSearchEnter" @keydown.esc="search = ''" />
       </div>
-      <ProjectAutocomplete
-        ref="projectAcRef"
-        v-model="projectFilter"
-        :options="projects"
-        :placeholder="t('todoFilterAll')"
-        clearable
-        commit-on="select"
-        width="170px"
-      />
-      <label class="tw-toggle">
-        <input type="checkbox" v-model="showDone" />
-        {{ t("todoShowDone") }}
-      </label>
       <div class="tw-viewtoggle" role="tablist">
         <button
           class="tw-vt"
@@ -1778,7 +1720,11 @@ onUnmounted(() => {
 
     <!-- Task graph, new rendering: lanes by theme, artifacts on wires, ref rings -->
     <PipelineGraph
+      ref="pipelineGraphRef"
       v-else-if="viewMode === 'graph' && graphUiNew"
+      :query="search"
+      :filters="filters"
+      v-model:active-hit="pipelineActiveHit"
       @open="onPipelineOpen"
     />
 
@@ -1810,118 +1756,7 @@ onUnmounted(() => {
       @open="onPipelineOpen"
     />
 
-    <!-- Kanban board -->
-    <main v-else class="tw-board">
-      <section
-        v-for="col in boardColumns"
-        :key="col.id"
-        class="tw-col"
-        :class="{ over: overCol === col.id }"
-        @dragover="onColDragOver(col.id, $event)"
-        @dragleave="onColDragLeave(col.id, $event)"
-        @drop.prevent="onColDrop(col.id)"
-      >
-        <div class="tw-col-head">
-          <span class="tw-col-dot" :style="{ background: col.dot }"></span>
-          <span class="tw-col-name">{{ t(col.labelKey) }}</span>
-          <span class="tw-col-count">{{ itemsFor(col.id).length }}</span>
-          <button class="tw-col-add" :title="t('todoAdd')" @click="startNew(col.id)">
-            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round">
-              <path d="M8 3v10M3 8h10" />
-            </svg>
-          </button>
-        </div>
-
-        <div class="tw-col-body scroll">
-          <div v-if="!itemsFor(col.id).length" class="tw-col-empty">
-            {{ overCol === col.id ? t("todoDropHere") : t("todoColEmpty") }}
-          </div>
-
-          <article
-            v-for="todo in itemsFor(col.id)"
-            :key="todo.id"
-            class="tw-card"
-            :class="{ dragging: dragId === todo.id, done: todo.status === 'done' }"
-            :style="{ borderLeftColor: columnColor(todo.status) }"
-            draggable="true"
-            @dragstart="onDragStart(todo, $event)"
-            @dragend="onDragEnd"
-          >
-            <div class="tw-card-title"><span v-if="todo.number" class="tw-card-num">#{{ todo.number }}</span>{{ todo.subject }}</div>
-            <p v-if="todo.description" class="tw-card-desc">{{ todo.description }}</p>
-
-            <div class="tw-card-meta">
-              <span
-                v-if="todo.priority"
-                class="tw-chip tw-prio"
-                :class="'tw-prio-' + todo.priority"
-                :title="t('todoPriority')"
-                >{{ priorityLabel(todo.priority) }}</span
-              >
-              <span v-if="todo.created_by === 'claude'" class="tw-ai sm" :title="t('todoAiHint')">{{ t("todoAi") }}</span>
-              <span v-if="todo.project" class="tw-tag">
-                <ProjectLabel
-                  :name="todo.project"
-                  :aliases="aliasesOf(todo.project)"
-                  :merged-into="canonicalOf(todo.project)"
-                />
-              </span>
-              <span
-                v-if="todo.from && todo.from !== todo.project"
-                class="tw-chip tw-from"
-                :title="t('todoFromHint')"
-              >↘ {{ t("todoFrom") }} {{ todo.from }}</span>
-              <span
-                v-if="todo.imported_at"
-                class="tw-chip tw-imported"
-                :title="t('todoImportedHint')"
-              >⤓ {{ t("todoImported") }}</span>
-              <span v-if="todo.scheduled_for" class="tw-chip">📅 {{ todo.scheduled_for }}</span>
-              <span v-if="todo.plan" class="tw-chip" :title="todo.plan">📝</span>
-              <!-- Only the task's OWN link on the card: an inherited one would
-                   repeat the change root's chip on every step under it. -->
-              <span
-                v-for="a in todo.spec ?? []"
-                :key="a"
-                class="tw-chip tw-spec"
-                :title="t('todoSpecHint')"
-                @click.stop="openSpecSection(a)"
-              >📘 {{ a }}</span>
-              <span v-if="refCount(todo)" class="tw-chip" :title="t('todoRefs')">🔗 {{ refCount(todo) }}</span>
-              <span v-if="costOf(todo)" class="tw-chip" :title="costTitle(todo)">⚡ {{ fmtCost(costOf(todo)!.cost) }}</span>
-            </div>
-
-            <div class="tw-card-foot">
-              <select
-                :value="todo.status"
-                class="tw-select sm"
-                @click.stop
-                @mousedown.stop
-                @change="moveStatus(todo, ($event.target as HTMLSelectElement).value)"
-              >
-                <option v-for="c in COLUMNS" :key="c.id" :value="c.id">{{ statusLabel(c.id) }}</option>
-              </select>
-              <div class="tw-card-actions">
-                <button class="tw-icon" :title="t('todoEdit')" @click.stop="openDetail(todo)" @mousedown.stop>
-                  <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M11.5 2.5l2 2L6 12l-2.5.5L4 10z" />
-                    <path d="M10.5 3.5l2 2" />
-                  </svg>
-                </button>
-                <button class="tw-icon danger" :title="t('todoDelete')" @click.stop="removeTodo(todo)" @mousedown.stop>
-                  <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
-                    <path d="M3 4.5h10" />
-                    <path d="M6.5 4.5V3.2a.7.7 0 0 1 .7-.7h1.6a.7.7 0 0 1 .7.7v1.3" />
-                    <path d="M4.3 4.5l.5 8a1 1 0 0 0 1 .95h4.4a1 1 0 0 0 1-.95l.5-8" />
-                    <path d="M6.6 7v4M9.4 7v4" />
-                  </svg>
-                </button>
-              </div>
-            </div>
-          </article>
-        </div>
-      </section>
-    </main>
+    <TodoBoard v-else :projection="projection" :show-done="showDone" :done-limit="doneLimit" @add="startNew" @move="moveStatus" @open="openDetail" @remove="removeTodo" @open-spec="openSpecSection" @more-done="doneLimit += 50" />
     </template>
 
     <!-- DETAIL VIEW: master-detail editor (left = project siblings, right = fields) -->
@@ -1932,7 +1767,7 @@ onUnmounted(() => {
           {{ t("todoBack") }}
         </button>
         <div class="tw-title">
-          <h1><span v-if="detail?.number" class="tw-detail-num">#{{ detail.number }}</span>{{ draft.subject || t("todoNew") }}</h1>
+          <h1><span v-if="detail?.number" class="tw-detail-num">#{{ detail.number }}</span>{{ detail?.subject || t("todoNew") }}</h1>
           <span v-if="detail && detail.created_by === 'claude'" class="tw-ai" :title="t('todoAiHint')">{{ t("todoAi") }}</span>
         </div>
         <div class="tw-spacer"></div>
@@ -1942,28 +1777,23 @@ onUnmounted(() => {
             {{ t("todoSaved") }}
           </span>
         </transition>
-        <button class="tw-btn" :disabled="!draft.subject.trim() || draftSubjectOverLimit" @click="saveDetail">{{ t("save") }}</button>
+        <button class="tw-btn" :disabled="detailLoading || !detailRecord || !draft.subject.trim() || draftSubjectOverLimit" @click="saveDetail">{{ t("save") }}</button>
       </header>
 
       <div v-if="errorMsg" class="tw-error">{{ errorMsg }}</div>
 
-      <div class="tw-detail">
-        <aside class="tw-detail-list">
-          <div class="tw-detail-list-hd">{{ detail && detail.project ? detail.project : t("todoNoProject") }}</div>
-          <button
-            v-for="td in detailSiblings"
-            :key="td.id"
-            class="tw-detail-item"
-            :class="{ active: td.id === detailId }"
-            @click="openDetail(td)"
-          >
-            <span class="tw-detail-item-dot" :style="{ background: columnColor(td.status) }"></span>
-            <span class="tw-detail-item-subj" :class="{ done: td.status === 'done' }"><span v-if="td.number" class="tw-detail-item-num">#{{ td.number }}</span>{{ td.subject }}</span>
-            <span v-if="td.created_by === 'claude'" class="tw-ai sm" :title="t('todoAiHint')">{{ t("todoAi") }}</span>
-          </button>
-        </aside>
-
-        <section v-if="detail" class="tw-detail-main">
+      <TodoDetailPane
+        :rows="todos"
+        :detail="detail"
+        :active-id="detailId"
+        :project-label="detail?.project || t('todoNoProject')"
+        :more-label="t('todoMore')"
+        :ai-label="t('todoAi')"
+        :ai-hint="t('todoAiHint')"
+        :column-color="columnColor"
+        @open="openDetail"
+      >
+        <section v-if="detail && detailRecord && !detailLoading" class="tw-detail-main">
           <label class="tw-field">
             <span>{{ t("todoSubject") }}</span>
             <input v-model="draft.subject" class="tw-input" maxlength="200" />
@@ -2116,7 +1946,7 @@ onUnmounted(() => {
               </span>
             </transition>
             <button type="button" class="tw-btn ghost" @click="closeDetail">{{ t("todoBack") }}</button>
-            <button type="button" class="tw-btn" :disabled="!draft.subject.trim() || draftSubjectOverLimit" @click="saveDetail">{{ t("save") }}</button>
+            <button type="button" class="tw-btn" :disabled="detailLoading || !detailRecord || !draft.subject.trim() || draftSubjectOverLimit" @click="saveDetail">{{ t("save") }}</button>
           </div>
 
           <!-- Cost by block: the task's spend split by (session x interval) -->
@@ -2159,7 +1989,7 @@ onUnmounted(() => {
             <div v-if="!detailComments.length" class="tw-comments-empty">{{ t("todoCommentsEmpty") }}</div>
             <ul v-else class="tw-comment-list">
               <li
-                v-for="c in detailComments"
+                v-for="c in renderedDetailComments"
                 :key="c.id"
                 class="tw-comment"
                 :class="{ ai: c.author === 'claude' }"
@@ -2172,7 +2002,7 @@ onUnmounted(() => {
                   </button>
                 </div>
                 <p class="tw-comment-body"
-                  ><template v-for="(s, i) in tokenize(c.body)" :key="i"
+                  ><template v-for="(s, i) in c.segments" :key="i"
                     ><a v-if="s.kind === 'url'" class="tw-link" @click.prevent="openLink(s.href)">{{ s.text }}</a
                     ><a v-else-if="s.kind === 'task'" class="tw-ref" :title="s.subject" @click.prevent="openTask(s.number)">{{ s.text }}<span class="tw-ref-title">{{ s.subject }}</span></a
                     ><a v-else-if="s.kind === 'project'" class="tw-ref tw-ref-proj" @click.prevent="openProject(s.project)">{{ s.text }}</a
@@ -2212,8 +2042,8 @@ onUnmounted(() => {
             </div>
           </div>
         </section>
-        <section v-else class="tw-detail-main tw-detail-empty">{{ t("todoColEmpty") }}</section>
-      </div>
+        <section v-else class="tw-detail-main tw-detail-empty">{{ detailLoading ? t("loading") : (detailLoadFailed ? t("todoDetailLoadFailed") : t("todoColEmpty")) }}</section>
+      </TodoDetailPane>
     </template>
 
     <!-- EXTERNAL VIEW: readonly mirror of external tasks, grouped by source (ph6) -->
@@ -2448,7 +2278,9 @@ onUnmounted(() => {
   </div>
 </template>
 
-<style scoped>
+<!-- These rules style the extracted board/card components too. The `tw-` prefix
+     is exclusive to this window, so they can safely cross component boundaries. -->
+<style>
 .tw-root {
   height: 100vh;
   display: flex;
@@ -2512,6 +2344,22 @@ onUnmounted(() => {
   font-family: var(--segoe);
   padding: 6px 0;
   width: 150px;
+}
+.tw-filters {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.tw-filter-date { max-width: 126px; }
+.tw-more {
+  width: 100%;
+  margin-top: 8px;
+  padding: 6px;
+  border: 1px solid var(--stroke-strong);
+  border-radius: 6px;
+  color: var(--text-2);
+  background: var(--card-bg);
 }
 .tw-select {
   background: var(--card-bg);
@@ -3167,10 +3015,10 @@ onUnmounted(() => {
 }
 /* In the card, a long project name should wrap inside the tag rather than be
    ellipsised (ProjectLabel truncates by default for table cells). */
-.tw-tag :deep(.pl) {
+.tw-tag .pl {
   max-width: 100%;
 }
-.tw-tag :deep(.pl-name) {
+.tw-tag .pl-name {
   white-space: normal;
   overflow: visible;
   text-overflow: clip;

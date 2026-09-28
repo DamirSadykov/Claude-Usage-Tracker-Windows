@@ -188,6 +188,74 @@ pub struct TaskGraph {
     pub text: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphBatchGraph {
+    pub nodes: Vec<GraphBatchNode>,
+    pub edges: Vec<GraphEdge>,
+    pub groups: Vec<GraphGroup>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GraphBatchNode {
+    pub id: String,
+    pub number: u32,
+    pub subject: String,
+    pub status: String,
+    pub kind: String,
+    pub gate: bool,
+    pub change: bool,
+    pub outcome: String,
+    pub outcome_reason: String,
+    pub duration_minutes: Option<i64>,
+    pub duration_calendar: bool,
+    pub measurability: Measurability,
+    pub blocks: u32,
+    pub cost: Option<f64>,
+    pub total_tokens: Option<i64>,
+    pub messages: Option<i64>,
+    pub tool_calls: Option<i64>,
+    pub tool_errors: Option<i64>,
+    pub task_cost: Option<f64>,
+    pub unattributed_cost: Option<f64>,
+}
+
+impl From<GraphNode> for GraphBatchNode {
+    fn from(node: GraphNode) -> Self {
+        Self {
+            id: node.id,
+            number: node.number,
+            subject: node.subject,
+            status: node.status,
+            kind: node.kind,
+            gate: node.gate,
+            change: node.change,
+            outcome: node.outcome,
+            outcome_reason: node.outcome_reason,
+            duration_minutes: node.duration_minutes,
+            duration_calendar: node.duration_calendar,
+            measurability: node.measurability,
+            blocks: node.blocks,
+            cost: node.cost,
+            total_tokens: node.total_tokens,
+            messages: node.messages,
+            tool_calls: node.tool_calls,
+            tool_errors: node.tool_errors,
+            task_cost: node.task_cost,
+            unattributed_cost: node.unattributed_cost,
+        }
+    }
+}
+
+impl From<TaskGraph> for GraphBatchGraph {
+    fn from(graph: TaskGraph) -> Self {
+        Self {
+            nodes: graph.nodes.into_iter().map(GraphBatchNode::from).collect(),
+            edges: graph.edges,
+            groups: graph.groups,
+        }
+    }
+}
+
 /// Task ids of a change's run: the root plus everything it reaches through
 /// `depends_on`, ordered by task number. An unresolvable ref yields nothing.
 pub fn subtree(board: &TodoFile, change_ref: &str) -> Vec<String> {

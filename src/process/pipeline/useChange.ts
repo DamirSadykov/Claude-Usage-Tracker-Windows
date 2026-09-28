@@ -1,12 +1,12 @@
-import { ref, computed, watch, onMounted } from "vue";
+import { ref, computed, onMounted, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { loadRunGraph, type RunGraph } from "../../board/graphModel";
+import { boardStore } from "../../board/boardStore";
 import {
     blockersFor,
     changeAddress,
     changeIsOpen,
     changeMembers,
-    changeProgress,
     costFor,
     historyFor,
     passedFor,
@@ -18,6 +18,7 @@ import {
     type ChangeTask,
 } from "./changeAdapt";
 import { mockChange, mockTasks, mockNodes } from "./changeMock";
+import { changeHeaderSummary } from "./changeSelectors";
 
 const EMPTY_GRAPH: RunGraph = { nodes: [], edges: [], groups: [], mermaid: "" };
 
@@ -28,12 +29,13 @@ export function selectChange(address: string) {
 }
 
 export function useChange() {
-    const board = ref<ChangeTask[]>([]);
-    const changesRaw = ref<ChangeRecord[]>([]);
+    const board = computed(() => boardStore.rows.value as unknown as ChangeTask[]);
+    const changesRaw = computed(() => boardStore.changes.value as ChangeRecord[]);
     const live = ref(false);
     const error = ref("");
     const graph = ref<RunGraph>(EMPTY_GRAPH);
     const graphLoading = ref(false);
+    const activeTab = ref("delta");
     const closing = ref(false);
     const closeError = ref("");
 
@@ -50,52 +52,47 @@ export function useChange() {
     }
 
     async function load() {
-        try {
-            board.value = await invoke<ChangeTask[]>("get_todos");
-            live.value = true;
-        } catch (e) {
-            error.value = String(e);
-            live.value = false;
-            board.value = [];
-        }
-        if (live.value) {
-            try {
-                changesRaw.value = await invoke<ChangeRecord[]>("get_changes");
-            } catch {
-                changesRaw.value = [];
-            }
-        }
+        await boardStore.start();
+        live.value = boardStore.error.value === "";
+        error.value = boardStore.error.value;
         pickDefault();
     }
 
-    async function loadGraph() {
-        if (!live.value) {
-            graph.value = { nodes: mockNodes, edges: [], groups: [], mermaid: "" };
-            return;
-        }
-        if (!selected.value) {
-            graph.value = EMPTY_GRAPH;
-            return;
-        }
-        graphLoading.value = true;
-        graph.value = await loadRunGraph(selected.value);
-        graphLoading.value = false;
-    }
-
-    watch(selected, loadGraph);
     onMounted(async () => {
         await load();
-        await loadGraph();
     });
 
     const current = computed(
         () => changes.value.find((c) => changeAddress(c) === selected.value) ?? null,
     );
+
+    let metricRequest = 0;
+    async function loadVisibleMetrics(change: ChangeRecord | null) {
+        const request = ++metricRequest;
+        if (!live.value) {
+            graph.value = { nodes: mockNodes, edges: [], groups: [], mermaid: "" };
+            return;
+        }
+        if (!change) {
+            graph.value = EMPTY_GRAPH;
+            return;
+        }
+        graphLoading.value = true;
+        try {
+            const loaded = await loadRunGraph(changeAddress(change));
+            if (request === metricRequest) graph.value = loaded;
+        } finally {
+            if (request === metricRequest) graphLoading.value = false;
+        }
+    }
+
+    watch(current, (change) => { void loadVisibleMetrics(change); }, { immediate: true });
     const members = computed(() =>
         current.value ? changeMembers(effectiveBoard.value, current.value) : [],
     );
-    const progress = computed(() => changeProgress(members.value));
-    const open = computed(() => changeIsOpen(members.value));
+    const header = computed(() => changeHeaderSummary(current.value, effectiveBoard.value));
+    const progress = computed(() => ({ total: header.value.total, done: header.value.done }));
+    const open = computed(() => header.value.open);
 
     const blockers = computed(() =>
         current.value ? blockersFor(current.value, members.value, changes.value, effectiveBoard.value) : [],
@@ -117,9 +114,12 @@ export function useChange() {
         selected.value = address;
     }
 
+    function setActiveTab(tab: string) {
+        activeTab.value = tab;
+    }
+
     async function reload() {
         await load();
-        await loadGraph();
     }
 
     async function closeChange() {
@@ -128,7 +128,7 @@ export function useChange() {
         closeError.value = "";
         try {
             await invoke<string>("close_change", { change: changeAddress(current.value) });
-            await reload();
+            await boardStore.reload(true);
         } catch (e) {
             closeError.value = String(e);
         } finally {
@@ -146,6 +146,7 @@ export function useChange() {
         open,
         selected,
         select,
+        setActiveTab,
         blockers,
         waiting,
         passed,

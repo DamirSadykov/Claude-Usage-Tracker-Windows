@@ -678,10 +678,6 @@ async function openSettings(tab: string) {
 
 async function openTodos() {
     await invoke("open_todo_window");
-    // The todos window is a separate WebView (may detect a different navigator
-    // language); push our current locale so it always matches this window.
-    const { emit } = await import("@tauri-apps/api/event");
-    await emit("todos-locale", locale.value);
 }
 
 function toggleAbout() {

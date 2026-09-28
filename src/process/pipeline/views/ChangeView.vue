@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, ref, watch } from "vue";
 import AppBar from "../../atoms/AppBar.vue";
 import SegControl from "../../atoms/SegControl.vue";
 import StatusChip from "../../atoms/StatusChip.vue";
@@ -26,6 +26,7 @@ const cc = useChange();
 
 const tab = ref("delta");
 const passedOpen = ref(false);
+watch(tab, (value) => cc.setActiveTab(value), { immediate: true });
 
 const address = computed(() => (cc.current.value ? changeAddress(cc.current.value) : ""));
 const headline = computed(() =>
@@ -33,11 +34,8 @@ const headline = computed(() =>
 );
 
 const budgetText = computed(() => {
-    const c = cc.cost.value;
-    const fact = c.known ? formatMoney(c.cost) : "неизвестно";
     const ceiling = cc.current.value?.budget_usd;
-    const base = ceiling !== undefined ? `${fact} / $${ceiling}` : fact;
-    return c.unknownCount ? `${base} · ${c.unknownCount} без замера` : base;
+    return ceiling !== undefined ? `лимит ${formatMoney(ceiling)}` : "лимит не задан";
 });
 
 const blockerLabel: Record<string, string> = {
@@ -127,13 +125,13 @@ const passedNote = computed(() =>
 
         <template v-else>
             <div class="metrics-row">
-                <span class="metric" :class="{ crit: cc.blockers.value.length }">
+                <span v-if="tab === 'delta'" class="metric" :class="{ crit: cc.blockers.value.length }">
                     {{ cc.blockers.value.length }} {{ cc.blockers.value.length === 1 ? "блокер мешает" : "блокеров мешают" }} закрыть
                 </span>
-                <span class="metric" :class="{ warn: cc.waiting.value.length }">
+                <span v-if="tab === 'delta'" class="metric" :class="{ warn: cc.waiting.value.length }">
                     {{ cc.waiting.value.length }} ждёт тебя
                 </span>
-                <span class="metric ok">{{ cc.passed.value.length }} проверок пройдено</span>
+                <span v-if="tab === 'delta'" class="metric ok">{{ cc.passed.value.length }} проверок пройдено</span>
                 <span class="metric">
                     прогресс {{ cc.progress.value.done }} / {{ cc.progress.value.total }} задач
                     · {{ cc.edits.value }} правок спеки
@@ -203,48 +201,6 @@ const passedNote = computed(() =>
                     </div>
                 </section>
 
-                <section class="change-col col-spec">
-                    <Kicker>Спека</Kicker>
-                    <div class="col-body">
-                        <SectionCard
-                            v-for="row in cc.specSummary.value"
-                            :key="row.address"
-                            :address="row.address"
-                            :title="`+${row.added} / -${row.removed} строк`"
-                            :tone="row.concurrent ? 'warn' : 'spec'"
-                        >
-                            <template #chips>
-                                <MetaChip
-                                    v-for="t in row.tasks"
-                                    :key="t.taskNumber"
-                                    :tone="t.verdict ? 'ok' : 'muted'"
-                                >
-                                    #{{ t.taskNumber }} {{ t.verdict ?? "без ответа" }}
-                                </MetaChip>
-                                <MetaChip v-if="row.concurrent" tone="warn">
-                                    делит с {{ row.openOthers.join(", ") }}
-                                </MetaChip>
-                            </template>
-                        </SectionCard>
-                        <div v-if="!cc.specSummary.value.length" class="change-empty-note">
-                            Ни change, ни его задачи не ссылаются на раздел спеки
-                        </div>
-                    </div>
-
-                    <Kicker class="history-kicker">История change'а</Kicker>
-                    <div class="col-body history-body">
-                        <PanelRow
-                            v-for="(e, i) in cc.history.value.slice(0, 12)"
-                            :key="i"
-                            :text="e.label"
-                            :meta="e.at.slice(0, 10)"
-                            mono
-                        />
-                        <div v-if="!cc.history.value.length" class="change-empty-note">
-                            Нет событий с датами
-                        </div>
-                    </div>
-                </section>
             </div>
 
             <div v-else-if="tab === 'tasks'" class="change-flat">

@@ -13,13 +13,22 @@ import ClusterBubble from "../../atoms/ClusterBubble.vue";
 import SidePanel from "../../atoms/SidePanel.vue";
 import FocusRowItem from "../../atoms/FocusRowItem.vue";
 import MiniMap from "../../atoms/MiniMap.vue";
-import { focusRows, hubIds, refEdges, ringsAround } from "../adapt";
+import { indexedRings, referenceIndex } from "../changeSelectors";
 import { board as mockBoard } from "../boardMock";
 import { useBoard } from "../useBoard";
+import { projectTodos, type FilterableTodoRow, type TodoFilters } from "../../../board/todoFilter";
+import { graphHits, stepGraphHit } from "../graphNavigation";
+
+const props = withDefaults(defineProps<{
+    query?: string;
+    filters?: TodoFilters;
+    activeHit?: string | null;
+}>(), { query: "", activeHit: null });
 
 const emit = defineEmits<{
     (e: "mode", value: "lanes" | "wires" | "bubbles" | "rings" | "specs"): void;
     (e: "open", id: string): void;
+    (e: "update:activeHit", id: string | null): void;
 }>();
 
 const ROOT_FOCUS = "t337";
@@ -45,35 +54,45 @@ const { board: liveBoard, live } = useBoard();
 const board = computed(() => (live.value ? liveBoard.value : mockBoard));
 
 const byId = computed(() => new Map(board.value.map((t) => [t.id, t])));
-const edges = computed(() => refEdges(board.value));
-const hubs = computed(() => hubIds(board.value));
+const reference = computed(() => referenceIndex(board.value));
+const edges = computed(() => reference.value.edges);
+const hubs = computed(() => reference.value.hubs);
 
-const incoming = computed(() => {
-    const map = new Map<string, number>();
-    for (const e of edges.value) map.set(e.to, (map.get(e.to) ?? 0) + 1);
-    return map;
-});
-
-const outgoing = computed(() => {
-    const map = new Map<string, number>();
-    for (const e of edges.value) map.set(e.from, (map.get(e.from) ?? 0) + 1);
-    return map;
-});
-
-const adjacency = computed(() => {
-    const map = new Map<string, Set<string>>();
-    for (const e of edges.value) {
-        if (!map.has(e.from)) map.set(e.from, new Set());
-        if (!map.has(e.to)) map.set(e.to, new Set());
-        map.get(e.from)!.add(e.to);
-        map.get(e.to)!.add(e.from);
-    }
-    return map;
-});
+const incoming = computed(() => reference.value.incoming);
+const outgoing = computed(() => reference.value.outgoing);
+const adjacency = computed(() => reference.value.adjacency);
 
 const idOfLabel = computed(
     () => new Map(board.value.map((t) => [t.number ? `#${t.number}` : t.id, t.id])),
 );
+
+const filteredIds = computed(() => {
+    if (!props.filters || !live.value) return null;
+    const filters = { ...props.filters, query: "", showDone: true };
+    return new Set(projectTodos(board.value as unknown as FilterableTodoRow[], filters).visible.map((todo) => todo.id));
+});
+const visibleTasks = computed(() => board.value.filter((todo) => !filteredIds.value || filteredIds.value.has(todo.id)));
+const hits = computed(() => graphHits(visibleTasks.value.map((todo) => ({ id: todo.id, title: todo.subject })), props.query));
+function isMatch(id: string) { return hits.value.includes(id); }
+
+async function scrollToHit(id: string) {
+    focusId.value = id;
+    await nextTick();
+    fit();
+}
+function cycleHit(direction: 1 | -1 = 1) {
+    const hit = stepGraphHit(hits.value, props.activeHit, direction);
+    emit("update:activeHit", hit);
+    if (hit) void scrollToHit(hit);
+}
+defineExpose({ cycleHit });
+watch([() => props.query, hits], ([query], [previousQuery]) => {
+    const first = hits.value[0] ?? null;
+    const reset = query !== previousQuery || !hits.value.includes(props.activeHit ?? "");
+    if (reset && props.activeHit !== first) emit("update:activeHit", first);
+    if (reset && first) void scrollToHit(first);
+}, { immediate: true });
+watch(() => props.activeHit, (id) => { if (id) void scrollToHit(id); });
 
 interface PlacedNode {
     id: string;
@@ -221,9 +240,8 @@ function distancesFor(limit: number) {
     const map = new Map<string, number>();
     if (!focusId.value) return map;
     for (let d = 1; d <= limit; d += 1) {
-        for (const node of ringsAround(board.value, focusId.value, d).nodes) {
-            if (!map.has(node.id)) map.set(node.id, d);
-        }
+        for (const [id, distance] of indexedRings(reference.value, focusId.value, d).distances)
+            if (distance) map.set(id, distance);
     }
     return map;
 }
@@ -244,6 +262,7 @@ function labelOf(id: string): string {
 }
 
 function passes(id: string): boolean {
+    if (filteredIds.value && !filteredIds.value.has(id)) return false;
     if (specOnly.value && !SPEC_ID.test(id)) return false;
     if (onlyProject.value) return (byId.value.get(id)?.project ?? null) === onlyProject.value;
     if (collapseForeign.value && (byId.value.get(id)?.project ?? null) !== pivotProject.value)
@@ -424,7 +443,7 @@ const scene = computed(() => {
     if (focusId.value) alive.add(focusId.value);
     const raw = free
         ? edges.value.map((e) => ({ from: e.from, to: e.to }))
-        : ringsAround(board.value, focusId.value ?? "", source.rings).links;
+        : indexedRings(reference.value, focusId.value ?? "", source.rings).links;
     const links = raw
         .filter((l) => alive.has(l.from) && alive.has(l.to))
         .map((l) => ({
@@ -450,11 +469,21 @@ const scene = computed(() => {
     };
 });
 
-const rows = computed(() =>
-    focusId.value
-        ? focusRows(board.value, focusId.value)
-        : { outgoing: [], incoming: [] },
-);
+const rows = computed(() => {
+    const focus = focusId.value;
+    if (!focus) return { outgoing: [], incoming: [] };
+    const makeRows = (ids: readonly string[]) =>
+        ids.flatMap((id) => {
+            const todo = byId.value.get(id);
+            return todo
+                ? [{ id: todo.number ? `#${todo.number}` : todo.id, title: todo.subject, count: 1 }]
+                : [];
+        });
+    return {
+        outgoing: makeRows(reference.value.outgoingNodes.get(focus) ?? []),
+        incoming: makeRows(reference.value.incomingNodes.get(focus) ?? []),
+    };
+});
 
 const deeper = computed(() => {
     if (!focusId.value || depthValue.value >= 4) return 0;
@@ -740,7 +769,8 @@ watch(
             <span class="rings-field">Фокус</span>
             <StatusChip
                 v-if="focusTodo"
-                class="rings-focus"
+                    class="rings-focus"
+                    :class="{ match: isMatch(focusTodo.id), current: props.activeHit === focusTodo.id }"
                 tone="spec"
                 :title="`${focusNumber} · ${focusTodo.subject}`"
             >
@@ -894,7 +924,7 @@ watch(
                 >
                     <RingCard
                         :data-node="node.id"
-                        :class="{ 'rings-marked': picked === node.id }"
+                        :class="{ 'rings-marked': picked === node.id, match: isMatch(node.id), current: props.activeHit === node.id }"
                         :label="node.label"
                         :title="node.title"
                         :tone="node.tone"
@@ -1134,6 +1164,14 @@ watch(
     transform: translate(-50%, -50%);
 }
 .rings-node .rings-marked {
+    box-shadow: 0 0 0 2px var(--accent);
+}
+.rings-node :deep(.match),
+.rings-focus.match {
+    box-shadow: 0 0 0 1px var(--warn);
+}
+.rings-node :deep(.current),
+.rings-focus.current {
     box-shadow: 0 0 0 2px var(--accent);
 }
 .rings-cluster {

@@ -182,10 +182,18 @@ export function normalizeGraph(raw: unknown): RunGraph {
 export async function loadRunGraph(change: string): Promise<RunGraph> {
   if (!change) return EMPTY;
   try {
-    return normalizeGraph(await invoke("get_task_graph", { change }));
+    const graphs = await loadRunGraphs([change]);
+    return graphs[0] ?? EMPTY;
   } catch {
     return EMPTY;
   }
+}
+
+async function loadRunGraphs(changes: string[]): Promise<RunGraph[]> {
+  const change_refs = [...new Set(changes.map((change) => change.trim()).filter(Boolean))];
+  if (!change_refs.length) return [];
+  const result = await invoke<{ graphs?: unknown[] }>("get_graph_batch", { changeRefs: change_refs });
+  return Array.isArray(result.graphs) ? result.graphs.map(normalizeGraph) : [];
 }
 
 /// One block of a task: the stretch a single session worked it. Mirrors
@@ -209,10 +217,19 @@ export interface RunLayer {
   groups: Map<string, RunGraphGroup>;
 }
 
+export interface RunNodeDetail {
+  blocks: RunBlock[];
+  agents: NodeAgent[];
+}
+
 export async function loadRunGroups(changes: string[]): Promise<RunLayer> {
   const nodes = new Map<string, RunGraphNode>();
   const groups = new Map<string, RunGraphGroup>();
-  const graphs = await Promise.all([...new Set(changes)].filter(Boolean).map(loadRunGraph));
+  let graphs: RunGraph[] = [];
+  try {
+    graphs = await loadRunGraphs(changes);
+  } catch {
+  }
   for (const g of graphs) {
     for (const n of g.nodes) {
       const prev = nodes.get(n.id);
@@ -236,6 +253,36 @@ export async function loadTaskBlocks(task: string): Promise<RunBlock[]> {
     return Array.isArray(res?.blocks) ? (res!.blocks as RunBlock[]) : [];
   } catch {
     return [];
+  }
+}
+
+export async function loadGraphNodeDetail(task: string): Promise<RunNodeDetail> {
+  if (!task) return { blocks: [], agents: [] };
+  try {
+    const res = await invoke<{ blocks?: { blocks?: unknown[] }; agents?: unknown[][] } | null>(
+      "get_graph_node_detail",
+      { task },
+    );
+    const blocks = Array.isArray(res?.blocks?.blocks) ? (res.blocks.blocks as RunBlock[]) : [];
+    const rows = Array.isArray(res?.agents)
+      ? res.agents.flatMap((rows) => Array.isArray(rows)
+        ? rows.map((row) => agent(row as Record<string, unknown>))
+        : [])
+      : [];
+    const byAgent = new Map<string, NodeAgent>();
+    for (const row of rows) {
+      const key = row.agent_id ?? "__main__";
+      const current = byAgent.get(key);
+      if (current) {
+        current.cost += row.cost;
+        current.messages += row.messages;
+      } else {
+        byAgent.set(key, { ...row });
+      }
+    }
+    return { blocks, agents: [...byAgent.values()].sort((a, b) => b.cost - a.cost) };
+  } catch {
+    return { blocks: [], agents: [] };
   }
 }
 

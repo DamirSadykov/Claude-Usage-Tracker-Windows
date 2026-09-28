@@ -21,7 +21,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { Todo } from "../contracts/board";
 import {
   loadRunGroups,
-  loadTaskBlocks,
+  loadGraphNodeDetail,
   revealTranscript,
   type RunGraphNode,
   type RunGraphGroup,
@@ -287,9 +287,6 @@ const shownTasks = computed(() =>
 // share/clobber coordinates).
 // --- Run layer (t#307) -----------------------------------------------------
 // What each task actually cost, drawn ON the existing graph rather than in a
-// second picture: `get_task_graph` (t#306) per change, keyed by task id. Off by
-// default — it costs a backend round trip per change and only tasks inside a
-// change carry blocks at all.
 const runOn = ref(false);
 const runLoading = ref(false);
 const runLayer = ref<Map<string, RunGraphNode>>(new Map());
@@ -1154,9 +1151,6 @@ async function reloadRun() {
 }
 watch([runOn, () => runChanges.value.join(",")], () => void reloadRun());
 
-// Blocks of the selected node, loaded on demand: the graph payload carries the
-// per-agent split but not the individual blocks (a task can have several), and
-// only a block knows WHICH session ran it — which is what opens a transcript.
 const runBlocks = ref<RunBlock[]>([]);
 const runPathMsg = ref("");
 const runNode = computed<RunGraphNode | null>(() =>
@@ -1167,7 +1161,14 @@ const runGroupNode = computed<RunGraphGroup | null>(() =>
 );
 watch([selected, runOn], async ([id, on]) => {
   runPathMsg.value = "";
-  runBlocks.value = on && id ? await loadTaskBlocks(id) : [];
+  if (!on || !id) {
+    runBlocks.value = [];
+    return;
+  }
+  const detail = await loadGraphNodeDetail(id);
+  runBlocks.value = detail.blocks;
+  const node = runLayer.value.get(id);
+  if (node) node.agents = detail.agents;
 });
 
 // A single block means the agents of this task all ran in that one session, so
