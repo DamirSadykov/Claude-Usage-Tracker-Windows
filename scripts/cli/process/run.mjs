@@ -64,7 +64,7 @@
 
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readFileSync, appendFileSync, mkdirSync } from "node:fs";
 
@@ -98,6 +98,66 @@ import { bestAttempt, blockingCount, restoreCheckpoint } from "./checkpoint.mjs"
 export const DEFAULT_PARALLEL_LIMIT = 1;
 
 const brief = (t) => (t ? { id: t.id, number: t.number, subject: t.subject } : null);
+
+const reviewPath = (value) => String(value || "").replace(/\\/g, "/");
+
+// `--name-status` tells the reviewer which files changed, but it cannot answer
+// the more important retry question: did this repair touch the *place* that the
+// preceding reviewer named?  Keep both old and new hunk ranges: a deletion of
+// a previously reported line is a repair attempt too, even though it has no new
+// line number in the resulting tree.
+function retryChangedLocations(cwd, from, to) {
+  let output;
+  try {
+    output = execFileSync("git", ["diff", "--no-renames", "--no-ext-diff", "--unified=0", from, to], {
+      cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch {
+    return null;
+  }
+  const byPath = new Map();
+  let current = null;
+  for (const line of output.split(/\r?\n/)) {
+    if (line.startsWith("diff --git a/") && line.includes(" b/")) {
+      current = reviewPath(line.slice(line.indexOf(" b/") + 3));
+      if (!byPath.has(current)) byPath.set(current, []);
+      continue;
+    }
+    if (line.startsWith("+++ b/")) {
+      current = reviewPath(line.slice(6));
+      if (!byPath.has(current)) byPath.set(current, []);
+      continue;
+    }
+    const hunk = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line);
+    if (!hunk || !current) continue;
+    byPath.get(current).push({
+      oldStart: Number(hunk[1]), oldCount: Number(hunk[2] || 1),
+      newStart: Number(hunk[3]), newCount: Number(hunk[4] || 1),
+    });
+  }
+  return byPath;
+}
+
+// The name/status list powers the runner's policy checks, but the reviewer
+// needs the actual patch to judge whether a retry repaired the reported code
+// or introduced a regression.  Keep this separate from `attemptDiff`: callers
+// still need the latter as structured file metadata.
+function retryPatch(cwd, from, to) {
+  try {
+    return execFileSync("git", ["diff", "--no-renames", "--no-ext-diff", from, to], {
+      cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch {
+    return null;
+  }
+}
+
+function touchesFinding(ranges, line) {
+  if (!Number.isInteger(line) || line < 1) return false;
+  return (ranges || []).some(({ oldStart, oldCount, newStart, newCount }) =>
+    (oldCount > 0 && line >= oldStart && line < oldStart + oldCount) ||
+    (newCount > 0 && line >= newStart && line < newStart + newCount));
+}
 const num = (t) => (t && t.number != null ? `#${t.number}` : t ? t.id : "?");
 const declaredVerify = (t) => (t && t.verify && String(t.verify).trim()) || "";
 const declaredRed = (t) => (t && t.red && String(t.red).trim()) || "";
@@ -373,6 +433,38 @@ export function liveEffects({ cwd } = {}) {
       });
       if (!damage.ok) return { ok: false, error: damage.error };
       return { ok: true, own: damage.own, damaged: damage.damaged };
+    },
+    // The reviewer sees a retry as a repair, not a fresh excavation.  Snapshot
+    // the current tree here (after the worker, before review) and compare it to
+    // the previous reviewed attempt's snapshot.
+    reviewContext: async ({ task, cwd, neighbours = [] }) => {
+      const previousAttempt = priorAttempts(task).at(-1);
+      const current = snapshotTree(cwd);
+      let attemptDiff = null;
+      let attemptPatch = null;
+      let changedLocations = null;
+      if (previousAttempt?.snapshot && current.ok) {
+        const changed = diffNameStatus(cwd, previousAttempt.snapshot, current.sha);
+        if (Array.isArray(changed)) attemptDiff = changed;
+        attemptPatch = retryPatch(cwd, previousAttempt.snapshot, current.sha);
+        changedLocations = retryChangedLocations(cwd, previousAttempt.snapshot, current.sha);
+      }
+      // Deliberately derive this from the preceding-attempt snapshot, rather
+      // than `ownChanges` (which is cumulative from step_base).  A retry must
+      // not be blamed for a file it did not change, nor excused merely because
+      // a finding happened somewhere else in the same file.
+      const outsideFindings = (attemptDiff || []).filter((change) => {
+        const path = reviewPath(change?.path);
+        const findings = (previousAttempt?.findings || []).filter((f) => reviewPath(f?.file) === path);
+        return !findings.some((finding) => touchesFinding(changedLocations?.get(path), Number(finding?.line)));
+      });
+      return {
+        previousAttempt: previousAttempt || null,
+        attemptDiff,
+        attemptPatch,
+        outsideFindings,
+        neighbours: neighbours.map((t) => ({ number: t.number, subject: t.subject, produces: Array.isArray(t.produces) ? t.produces : [] })),
+      };
     },
     redGate: async ({ task, cwd, timeoutMs }) => {
       let mod;
@@ -1007,6 +1099,35 @@ async function checkNeighbourDamage(ctx, task, result, baton, cost) {
   };
 }
 
+async function retryReviewContext(ctx, task, ownChanges) {
+  if (!priorAttempts(task).length) return null;
+  try {
+    return (await ctx.effects.reviewContext?.({
+      task,
+      cwd: ctx.cwd,
+      ownChanges,
+      neighbours: ctx.members.filter((t) => t.id !== task.id),
+    })) || null;
+  } catch {
+    // Context improves a review but must not turn an otherwise runnable repair
+    // into a failed attempt when git snapshotting is unavailable.
+    return null;
+  }
+}
+
+function downgradeUntouchedRetryFindings(review, context) {
+  if (!review || !Array.isArray(review.findings) || !Array.isArray(context?.attemptDiff)) return review;
+  const prior = new Set((context.previousAttempt?.findings || []).map(findingKey));
+  const touched = new Set(context.attemptDiff.map((c) => String(c?.path || "").replace(/\\/g, "/")));
+  const findings = review.findings.map((f) => {
+    const file = String(f?.file || "").replace(/\\/g, "/");
+    if ((f?.level === "critical" || f?.level === "high") && !prior.has(findingKey(f)) && file && !touched.has(file))
+      return { ...f, level: "medium", evidence: `${f.evidence || ""}${f.evidence ? "; " : ""}outside this retry's diff` };
+    return f;
+  });
+  return { ...review, findings };
+}
+
 // One attempt at one node, composed from the three phases above: beginStep does
 // the bookkeeping and hands the executor its brief, recordWork puts what the
 // worker produced on the board, then the reviewer runs and finishStep reads
@@ -1027,6 +1148,7 @@ async function runOne(ctx, task, wave = []) {
   const damage = await checkNeighbourDamage(ctx, task, result, baton, cost);
   if (damage && damage.issue) return damage.issue;
   const ownChanges = damage ? damage.ownChanges : null;
+  const retryContext = await retryReviewContext(ctx, task, ownChanges);
 
   let review = null;
   if (result.ok !== false && typeof ctx.effects.reviewStep === "function") {
@@ -1037,7 +1159,9 @@ async function runOne(ctx, task, wave = []) {
         cwd: ctx.cwd,
         timeoutMs: ctx.timeoutMs,
         ownChanges,
+        retryContext,
       });
+      review = downgradeUntouchedRetryFindings(review, retryContext);
     } catch (err) {
       review = { approved: false, ok: false, error: String(err?.message || err) };
     }
@@ -1054,12 +1178,13 @@ export async function runReported(ctx, task, wave, { result, review = null }) {
   // changed instead of only its declared produces.
   const damage = await checkNeighbourDamage(ctx, task, result, baton, cost);
   if (damage && damage.issue) return damage.issue;
+  const ownChanges = damage ? damage.ownChanges : null;
   return finishStep(ctx, task, {
     result,
     review,
     baton,
     cost,
-    ownChanges: damage ? damage.ownChanges : null,
+    ownChanges,
   });
 }
 

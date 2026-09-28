@@ -684,7 +684,39 @@ function formatChangesOfThisStep(ownChanges) {
   ].join("\n");
 }
 
-export function buildReviewPrompt({ task, workerResult = "", execution, appData, ownChanges } = {}) {
+function formatRetryReviewContext(context) {
+  if (!context?.previousAttempt) return "";
+  const findings = Array.isArray(context.previousAttempt.findings) ? context.previousAttempt.findings : [];
+  const closed = findings.length
+    ? findings.map((f) => `- [${f.level || "medium"}] ${f.file || "(no file)"}${f.line ? `:${f.line}` : ""} — ${f.text || "(no detail)"}`).join("\n")
+    : "(the preceding review recorded no structured findings)";
+  const changed = typeof context.attemptPatch === "string" && context.attemptPatch.trim()
+    ? context.attemptPatch.trim()
+    : Array.isArray(context.attemptDiff) && context.attemptDiff.length
+    ? context.attemptDiff.map((c) => `${c.status} ${c.path}`).join("\n")
+    : "(no file changes between the preceding snapshot and this review)";
+  const outside = Array.isArray(context.outsideFindings) && context.outsideFindings.length
+    ? context.outsideFindings.map((c) => `${c.status || "M"} ${c.path}`).join("\n")
+    : "(none)";
+  const neighbours = Array.isArray(context.neighbours) && context.neighbours.length
+    ? context.neighbours.map((t) => `- t#${t.number} ${t.subject || ""} — produces: ${(t.produces || []).join(", ") || "(none)"}`).join("\n")
+    : "(no other steps in this change)";
+  return [
+    "── RETRY REVIEW CONTEXT ──",
+    "FIRST, re-check these findings from the preceding attempt. Do not rediscover old code as a new regression; say whether each remains.",
+    closed,
+    "DIFF OF THIS ATTEMPT (preceding snapshot → current tree):",
+    changed,
+    "CHANGES OUTSIDE PRECEDING FINDINGS:",
+    outside,
+    "These are not automatically wrong, but inspect and call them out if they are unrelated to the repair.",
+    "NEIGHBOURING STEPS IN THIS CHANGE:",
+    neighbours,
+    "Do not require work promised by a neighbouring step from this task.",
+  ].join("\n");
+}
+
+export function buildReviewPrompt({ task, workerResult = "", execution, appData, ownChanges, retryContext } = {}) {
   const parts = [
     `produces: ${(Array.isArray(task?.produces) ? task.produces : []).join(", ") || "(none)"}`,
     `verify: ${task?.verify || "(none — human gate)"}`,
@@ -708,6 +740,7 @@ export function buildReviewPrompt({ task, workerResult = "", execution, appData,
     "OBLIGATIONS:",
     declarations,
     formatChangesOfThisStep(ownChanges),
+    formatRetryReviewContext(retryContext),
     workerResult ? `WORKER REPORT:\n${clampOutput(workerResult, 8000)}` : "WORKER REPORT: (none)",
     "",
     "End with exactly one decision line: `VERDICT: approve` or `VERDICT: issue`.",
@@ -962,6 +995,7 @@ export async function executeReview({
   bind = true,
   appData,
   ownChanges,
+  retryContext,
 } = {}) {
   if (!task) return { approved: false, ok: false, error: "executeReview: task is required" };
   let execution;
@@ -969,7 +1003,7 @@ export async function executeReview({
   catch (e) { return { approved: false, ok: false, error: `routing: ${e?.message || e}` }; }
   if (!execution.enabled || !execution.model)
     return { approved: true, ok: true, skipped: true, duty: "review", costUsd: 0, route: execution.route || null };
-  const prompt = buildReviewPrompt({ task, workerResult, execution, appData, ownChanges });
+  const prompt = buildReviewPrompt({ task, workerResult, execution, appData, ownChanges, retryContext });
 
   if (execution.provider === "openai") {
     const { file, args } = providerArgv(execution, { bin: codexBin, sandbox: "read-only" });

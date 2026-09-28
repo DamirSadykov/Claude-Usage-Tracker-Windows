@@ -550,6 +550,30 @@ describe("buildReviewPrompt · CHANGES OF THIS STEP", () => {
   });
 });
 
+describe("buildReviewPrompt · retry context", () => {
+  it("puts preceding findings first, then the retry diff, unrelated edits, and neighbouring promises", () => {
+    const prompt = buildReviewPrompt({
+      task: { number: 8, subject: "repair parser", produces: ["src/parser.mjs"], verify: "npm test" },
+      appData: tmp,
+      ownChanges: [{ status: "M", path: "src/parser.mjs" }, { status: "M", path: "src/helper.mjs" }],
+      retryContext: {
+        previousAttempt: { findings: [{ level: "high", file: "src/parser.mjs", line: 12, text: "null input fails" }] },
+        attemptDiff: [{ status: "M", path: "src/parser.mjs" }],
+        attemptPatch: "diff --git a/src/parser.mjs b/src/parser.mjs\n@@ -12 +12 @@\n-old\n+fixed",
+        outsideFindings: [{ status: "M", path: "src/helper.mjs" }],
+        neighbours: [{ number: 9, subject: "add CLI", produces: ["src/cli.mjs"] }],
+      },
+    });
+    expect(prompt).toContain("FIRST, re-check these findings");
+    expect(prompt).toContain("[high] src/parser.mjs:12 — null input fails");
+    expect(prompt).toContain("DIFF OF THIS ATTEMPT");
+    expect(prompt).toContain("+fixed");
+    expect(prompt).toContain("CHANGES OUTSIDE PRECEDING FINDINGS");
+    expect(prompt).toContain("M src/helper.mjs");
+    expect(prompt).toContain("t#9 add CLI — produces: src/cli.mjs");
+  });
+});
+
 // ── the check ────────────────────────────────────────────────────────────────
 
 describe("runVerify", () => {

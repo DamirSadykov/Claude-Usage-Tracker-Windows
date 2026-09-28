@@ -1299,6 +1299,64 @@ describe("finishStep", () => {
     expect(t.status).not.toBe("done");
   });
 
+  it("downgrades a new blocking finding outside a retry diff and gives the reviewer its repair context", async () => {
+    const data = board(changeRoot(1, [2]), auto(2, { retry_limit: 2 }));
+    const contexts = [];
+    const h = harness({
+      reviewContext: async ({ task: t, neighbours }) => ({
+        previousAttempt: t.attempts.at(-1),
+        attemptDiff: [{ status: "M", path: "src/repaired.mjs" }],
+        outsideFindings: [{ status: "M", path: "src/unrelated.mjs" }],
+        neighbours: neighbours.map((n) => ({ number: n.number, subject: n.subject, produces: n.produces || [] })),
+      }),
+      reviewStep: async ({ task: t, retryContext }) => {
+        contexts.push(retryContext);
+        return {
+          approved: false, ok: true,
+          findings: t.attempts.length
+            ? [{ level: "high", file: "src/old-code.mjs", line: 4, text: "old defect", evidence: "scenario" }]
+            : [{ level: "high", file: "src/repaired.mjs", line: 4, text: "repair missing", evidence: "scenario" }],
+        };
+      },
+    });
+    const result = await go(data, "1", h.effects);
+
+    expect(statusOf(result, 2)).toBe("done");
+    expect(contexts[0]).toBeNull();
+    expect(contexts[1]).toMatchObject({ attemptDiff: [{ path: "src/repaired.mjs" }], outsideFindings: [{ path: "src/unrelated.mjs" }] });
+    expect(result.board.todos.find((t) => t.number === 2).attempts.at(-1).findings[0].level).toBe("medium");
+  });
+
+  it("marks only this retry's changed finding locations as in-scope", async () => {
+    const cwd = mkdtempSync(path.join(os.tmpdir(), "cut-retry-locations-"));
+    try {
+      execFileSync("git", ["init", "-q"], { cwd }); execFileSync("git", ["config", "core.autocrlf", "false"], { cwd });
+      execFileSync("git", ["config", "user.email", "test@example.com"], { cwd });
+      execFileSync("git", ["config", "user.name", "Test"], { cwd });
+      mkdirSync(path.join(cwd, "src"));
+      writeFileSync(path.join(cwd, "src/a.mjs"), Array.from({ length: 240 }, (_, i) => `line ${i + 1}`).join("\n") + "\n");
+      execFileSync("git", ["add", "-A"], { cwd }); execFileSync("git", ["commit", "-qm", "base"], { cwd });
+      const preceding = snapshotTree(cwd).sha;
+      const task = auto(63, { attempts: [{ snapshot: preceding, findings: [{ level: "high", file: "src/a.mjs", line: 10, text: "reported location" }] }] });
+      const lines = readFileSync(path.join(cwd, "src/a.mjs"), "utf8").trimEnd().split("\n");
+      lines[199] = "retry changed line 200";
+      writeFileSync(path.join(cwd, "src/a.mjs"), `${lines.join("\n")}\n`);
+
+      const first = await liveEffects({ cwd }).reviewContext({ task, cwd });
+      expect(first.attemptDiff).toEqual([{ status: "M", path: "src/a.mjs" }]);
+      expect(first.attemptPatch).toContain("-line 200");
+      expect(first.attemptPatch).toContain("+retry changed line 200");
+      expect(first.outsideFindings).toEqual([{ status: "M", path: "src/a.mjs" }]);
+
+      const secondSnapshot = snapshotTree(cwd).sha;
+      task.attempts = [{ snapshot: secondSnapshot, findings: [{ level: "high", file: "src/a.mjs", line: 10, text: "reported location" }] }];
+      lines[9] = "retry changed reported line 10";
+      writeFileSync(path.join(cwd, "src/a.mjs"), `${lines.join("\n")}\n`);
+      const second = await liveEffects({ cwd }).reviewContext({ task, cwd });
+      expect(second.outsideFindings).toEqual([]);
+    } finally { rmSync(cwd, { recursive: true, force: true }); }
+  });
+
   it("appends structured review findings, total cost, and the end snapshot to the task attempt journal", async () => {
     const t = auto(6);
     const entries = [];
