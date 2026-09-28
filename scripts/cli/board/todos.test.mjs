@@ -627,6 +627,9 @@ describe("formatDeclarations", () => {
         retry_limit: 2,
         budget_usd: 2,
         on_issue: "impl-id",
+        red: "npm run test:red",
+        red_tests: ["test/regression.spec.js"],
+        risk: "high",
       },
       new Map([["impl-id", { number: 2 }]]),
     );
@@ -637,6 +640,9 @@ describe("formatDeclarations", () => {
     expect(out).toContain("retry: <=2");
     expect(out).toContain("budget: $2");
     expect(out).toContain("?issue -> #2");
+    expect(out).toContain("red: npm run test:red");
+    expect(out).toContain("red-tests: test/regression.spec.js");
+    expect(out).toContain("risk: high");
     expect(out.trimEnd().split("\n")).toHaveLength(1);
   });
 
@@ -756,6 +762,34 @@ describe("declaration commands", () => {
     expect(read(1)).not.toHaveProperty("verify");
   });
 
+  it("set red declares the gate command and an empty string clears the field", () => {
+    run("set", "red", "1", "npm run test:red");
+    expect(read(1).red).toBe("npm run test:red");
+    expect(run("set", "red", "1", "")).toContain("red cleared");
+    expect(read(1)).not.toHaveProperty("red");
+  });
+
+  it("set red-tests stores a comma-separated list, and none withdraws it", () => {
+    run("set", "red-tests", "1", "test/a.spec.js, test/b.spec.js");
+    expect(read(1).red_tests).toEqual(["test/a.spec.js", "test/b.spec.js"]);
+    expect(run("set", "red-tests", "1", "none")).toContain("cleared");
+    expect(read(1)).not.toHaveProperty("red_tests");
+  });
+
+  it("set risk declares high and an empty string clears the field", () => {
+    run("set", "risk", "1", "high");
+    expect(read(1).risk).toBe("high");
+    expect(run("set", "risk", "1", "")).toContain("risk cleared");
+    expect(read(1)).not.toHaveProperty("risk");
+  });
+
+  it("set risk refuses any value other than high or none/clear", () => {
+    for (const bad of ["medium", "low", "yes", "1"]) {
+      expect(refuse("set", "risk", "1", bad)).toContain("invalid risk");
+    }
+    expect(read(1)).not.toHaveProperty("risk");
+  });
+
   it("set retry stores a positive limit, takes <=M, and none withdraws it", () => {
     run("set", "retry", "1", "3");
     expect(read(1).retry_limit).toBe(3);
@@ -867,14 +901,30 @@ describe("declaration commands", () => {
     run("set", "retry", "1", "2");
     run("set", "budget", "1", "2");
     run("set", "on-issue", "1", "2");
+    run("set", "red", "1", "npm run test:red");
+    run("set", "red-tests", "1", "test/a.spec.js");
+    run("set", "risk", "1", "high");
     run("produces", "rm", "1", "out.mjs");
     run("set", "verify", "1", "");
     run("set", "retry", "1", "none");
     run("set", "budget", "1", "none");
     run("set", "parallel", "1", "none");
     run("set", "on-issue", "1", "none");
+    run("set", "red", "1", "");
+    run("set", "red-tests", "1", "none");
+    run("set", "risk", "1", "none");
     const raw = readFileSync(file, "utf8");
-    for (const field of ["produces", "verify", "retry_limit", "on_issue", "budget_usd", "parallel_limit"]) {
+    for (const field of [
+      "produces",
+      "verify",
+      "retry_limit",
+      "on_issue",
+      "budget_usd",
+      "parallel_limit",
+      "red_tests",
+      "\"red\"",
+      "\"risk\"",
+    ]) {
       expect(raw).not.toContain(field);
     }
   });
@@ -1091,6 +1141,13 @@ describe("todos set", () => {
     ["verify", "npm test", (t) => expect(t.verify).toBe("npm test")],
     ["retry", "3", (t) => expect(t.retry_limit).toBe(3)],
     ["budget", "$2.5", (t) => expect(t.budget_usd).toBe(2.5)],
+    ["red", "npm run test:red", (t) => expect(t.red).toBe("npm run test:red")],
+    [
+      "red-tests",
+      "test/a.spec.js,test/b.spec.js",
+      (t) => expect(t.red_tests).toEqual(["test/a.spec.js", "test/b.spec.js"]),
+    ],
+    ["risk", "high", (t) => expect(t.risk).toBe("high")],
   ];
 
   for (const [field, value, check] of scalars) {
@@ -1419,6 +1476,9 @@ describe("rules the CLI enforces instead of explaining", () => {
       ["retry", "2"],
       ["budget", "1"],
       ["kind", "auto"],
+      ["red", "npm run test:red"],
+      ["red-tests", "test/a.spec.js"],
+      ["risk", "high"],
     ]) {
       const err = refuse("set", field, "1", value);
       expect(err).toContain("BEFORE the work");
@@ -1494,7 +1554,7 @@ describe("the text and the CLI agree", () => {
 
   it("lists in --help exactly the fields `set` accepts", () => {
     const help = say("--help");
-    expect(fields).toHaveLength(14);
+    expect(fields).toHaveLength(17);
     for (const f of fields) expect(help).toContain(f);
   });
 

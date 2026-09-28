@@ -436,16 +436,78 @@ function formatAwaiting(nodes) {
   return out;
 }
 
+function isIssueComment(c) {
+  return !!c && c.author === "review" && /^ISSUE attempt/.test(String(c.body || ""));
+}
+
+function previousIssueComments(task) {
+  return (Array.isArray(task?.comments) ? task.comments : [])
+    .filter(isIssueComment)
+    .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
+}
+
+const NOTE_BODY_MAX = 1500;
+const NOTES_LIMIT = 8;
+
+function taskNotes(task) {
+  return (Array.isArray(task?.comments) ? task.comments : [])
+    .filter((c) => c && !isIssueComment(c))
+    .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
+}
+
+function formatNotes(task) {
+  const notes = taskNotes(task).slice(-NOTES_LIMIT);
+  if (!notes.length) return "";
+  const body = notes
+    .map((c) => {
+      const date = String(c.created_at || "").slice(0, 10);
+      return `[${c.author} · ${date}] ${clampOutput(String(c.body || "").trim(), NOTE_BODY_MAX)}`;
+    })
+    .join("\n\n");
+  return (
+    "\n── NOTES ON THIS TASK ──\n" +
+    "Notes recorded on this task by people and sessions — read them as part of the task.\n\n" +
+    `${body}\n`
+  );
+}
+
+function formatPreviousAttempt(task, attempt, limit) {
+  const comments = previousIssueComments(task).slice(-3);
+  const limitTxt = typeof limit === "number" ? `<=${limit}` : "(no declared limit)";
+  const body = comments.length
+    ? comments.map((c) => c.body.trim()).join("\n\n")
+    : "(the previous attempt ended as issue, but no findings were recorded on the board — re-check the declarations above against the working tree)";
+  return (
+    `\n── PREVIOUS ATTEMPT — this is attempt ${attempt} of ${limitTxt} ──\n` +
+    "The working tree still contains the previous attempt's changes. Fix them according to the\n" +
+    "findings below — do not start over, and do not work around a finding (no weakening a test,\n" +
+    "no raising a timeout to make it pass). These findings never override the rule against touching\n" +
+    "changes that were already in the working tree before this node's first attempt — a finding\n" +
+    "that reads that way is about someone else's step, not yours.\n\n" +
+    `${body}\n`
+  );
+}
+
+function formatPriorChanges(priorChanges) {
+  if (!Array.isArray(priorChanges) || !priorChanges.length) return "";
+  const paths = priorChanges.slice(0, 50).map((c) => `   - ${c.status} ${c.path}`).join("\n");
+  const more = priorChanges.length > 50 ? `\n   … and ${priorChanges.length - 50} more` : "";
+  return `   Already in the working tree when this step started:\n${paths}${more}\n`;
+}
+
 // Everything a step is told, and nothing more (§14.2): the WORK (this node's own
-// subject / description / plan), the VISION of the change it serves, the BATON
-// it inherits, the nodes WAITING on it, whatever runs ALONGSIDE it in the same
-// wave, the DECLARATIONS it must satisfy, and the boundary rules of a headless
-// step.
+// subject / description / plan), the NOTES already recorded on its comment
+// thread, the VISION of the change it serves, the BATON it inherits, the RECORD
+// of where earlier steps left their own transcripts, the PREVIOUS ATTEMPT's
+// findings when this node is retrying itself, the nodes WAITING on it, whatever
+// runs ALONGSIDE it in the same wave, the DECLARATIONS it must satisfy, and the
+// boundary rules of a headless step.
 //
-// What is deliberately NOT here: the history of previous steps, the transcript
-// of an earlier attempt. Context crosses the seam as the baton or not at all —
-// that is the whole reason the seam exists (§13).
-export function buildStepPrompt({ task, board, cwd, alongside = [], execution } = {}) {
+// What is deliberately NOT here: the history of OTHER nodes' attempts, or this
+// node's own earlier transcript — only the ISSUE findings already written to
+// the board cross the seam that way. Context otherwise crosses as the baton or
+// not at all — that is the whole reason the seam exists (§13).
+export function buildStepPrompt({ task, board, cwd, alongside = [], execution, attempt, limit, priorChanges } = {}) {
   if (!task) throw new Error("buildStepPrompt: task is required");
   const all = Array.isArray(board?.todos) ? board.todos : [];
   const index = new Map(all.map((t) => [t.id, t]));
@@ -465,6 +527,10 @@ export function buildStepPrompt({ task, board, cwd, alongside = [], execution } 
   if (task.description && task.description.trim())
     out += "\n" + line("Description:", task.description);
   if (task.plan && task.plan.trim()) out += "\n" + line("Plan:", task.plan);
+
+  out += formatNotes(task);
+
+  if (typeof attempt === "number" && attempt > 1) out += formatPreviousAttempt(task, attempt, limit);
 
   const vision = changeVision(task, all, Array.isArray(board?.changes) ? board.changes : []);
   out +=
@@ -529,7 +595,10 @@ export function buildStepPrompt({ task, board, cwd, alongside = [], execution } 
     "3. Stay inside this node. Work the next step is meant to do is not yours to start.\n" +
     "4. Finish with a `## HANDOFF` section: what you produced (paths), the gotcha the\n" +
     "   next step would otherwise hit, and where you stopped. That text is the baton\n" +
-    "   the next step reads — it is the only thing that survives you.\n";
+    "   the next step reads — it is the only thing that survives you.\n" +
+    "5. Do not revert, rewrite or delete changes that were already in the working tree\n" +
+    "   when this step started; they belong to earlier steps.\n" +
+    formatPriorChanges(priorChanges);
 
   return out;
 }
@@ -592,7 +661,30 @@ export function bindSession({ session, task, event = "start", ts, execution }) {
   });
 }
 
-export function buildReviewPrompt({ task, workerResult = "", execution, appData } = {}) {
+const CHANGES_RULE =
+  "Changes already present in the working tree when this step started belong to earlier steps of the run. " +
+  "They are not findings of this step — never ask to revert or remove them.";
+
+function formatChangesOfThisStep(ownChanges) {
+  if (!Array.isArray(ownChanges)) {
+    return (
+      "CHANGES OF THIS STEP:\n" +
+      "(unknown — no step base was recorded for this step)\n" +
+      "Some of what is in the working tree may already have been there when this step started, left by " +
+      `an earlier step of the run. ${CHANGES_RULE}`
+    );
+  }
+  const lines = ownChanges.slice(0, 100).map((c) => `${c.status} ${c.path}`);
+  const more = ownChanges.length > 100 ? [`… and ${ownChanges.length - 100} more`] : [];
+  return [
+    "CHANGES OF THIS STEP:",
+    lines.length ? lines.join("\n") : "(no files changed)",
+    ...more,
+    CHANGES_RULE,
+  ].join("\n");
+}
+
+export function buildReviewPrompt({ task, workerResult = "", execution, appData, ownChanges } = {}) {
   const parts = [
     `produces: ${(Array.isArray(task?.produces) ? task.produces : []).join(", ") || "(none)"}`,
     `verify: ${task?.verify || "(none — human gate)"}`,
@@ -612,8 +704,10 @@ export function buildReviewPrompt({ task, workerResult = "", execution, appData 
     `TASK: t#${task?.number ?? "?"} ${task?.subject || ""}`,
     task?.description ? `DESCRIPTION: ${task.description}` : "",
     task?.plan ? `PLAN: ${task.plan}` : "",
+    formatNotes(task).trim(),
     "OBLIGATIONS:",
     declarations,
+    formatChangesOfThisStep(ownChanges),
     workerResult ? `WORKER REPORT:\n${clampOutput(workerResult, 8000)}` : "WORKER REPORT: (none)",
     "",
     "End with exactly one decision line: `VERDICT: approve` or `VERDICT: issue`.",
@@ -687,18 +781,21 @@ export async function executeStep({
   // or "" for a cold start. The DECISION belongs to whoever spawns the step —
   // this function only carries it out (t#543).
   inherit = "",
+  attempt,
+  limit,
+  priorChanges,
 } = {}) {
   if (!task) return { sessionId: "", ok: false, error: "executeStep: task is required" };
 
   let execution;
   try {
-    execution = resolveDuty("worker");
+    execution = resolveDuty("worker", undefined, { risk: task.risk });
   } catch (e) {
     return { sessionId: "", ok: false, error: `routing: ${e && e.message ? e.message : e}` };
   }
   let prompt;
   try {
-    prompt = buildStepPrompt({ task, board, cwd, alongside, execution });
+    prompt = buildStepPrompt({ task, board, cwd, alongside, execution, attempt, limit, priorChanges });
   } catch (e) {
     return { sessionId: "", ok: false, error: `prompt: ${e && e.message ? e.message : e}` };
   }
@@ -743,6 +840,7 @@ export async function executeStep({
       provider: "openai",
       agent: execution.name,
       model: execution.model,
+      route: execution.route || null,
       sessionId: distinctSession ? actual : "",
       requestedMode,
       startMode: distinctSession ? requestedMode : "unknown",
@@ -812,6 +910,7 @@ export async function executeStep({
     provider: "anthropic",
     agent: execution.name,
     model: execution.model,
+    route: execution.route || null,
     sessionId: actual,
     ok: !error,
     error,
@@ -839,14 +938,15 @@ export async function executeReview({
   env,
   bind = true,
   appData,
+  ownChanges,
 } = {}) {
   if (!task) return { approved: false, ok: false, error: "executeReview: task is required" };
   let execution;
-  try { execution = resolveDuty("review"); }
+  try { execution = resolveDuty("review", appData, { risk: task.risk }); }
   catch (e) { return { approved: false, ok: false, error: `routing: ${e?.message || e}` }; }
   if (!execution.enabled || !execution.model)
-    return { approved: true, ok: true, skipped: true, duty: "review", costUsd: 0 };
-  const prompt = buildReviewPrompt({ task, workerResult, execution, appData });
+    return { approved: true, ok: true, skipped: true, duty: "review", costUsd: 0, route: execution.route || null };
+  const prompt = buildReviewPrompt({ task, workerResult, execution, appData, ownChanges });
 
   if (execution.provider === "openai") {
     const { file, args } = providerArgv(execution, { bin: codexBin, sandbox: "read-only" });
@@ -870,7 +970,7 @@ export async function executeReview({
     const decision = parseReviewVerdict(answer);
     const error = run.error || parsed?.error || (run.code !== 0 ? `codex review exited ${run.code}` : "");
     return { ...decision, ok: !error, error, result: answer, sessionId: session,
-      duty: "review", provider: "openai", model: execution.model,
+      duty: "review", provider: "openai", model: execution.model, route: execution.route || null,
       costUsd: openAiCost(execution.model, parsed?.usage, execution) };
   }
 
@@ -889,7 +989,7 @@ export async function executeReview({
   const decision = parseReviewVerdict(answer);
   const error = run.error || (run.code !== 0 ? `claude review exited ${run.code}` : "") || (parsed?.is_error ? "review model reported an error" : "");
   return { ...decision, ok: !error, error, result: answer, sessionId: actual,
-    duty: "review", provider: "anthropic", model: execution.model,
+    duty: "review", provider: "anthropic", model: execution.model, route: execution.route || null,
     costUsd: typeof parsed?.total_cost_usd === "number" ? parsed.total_cost_usd : null };
 }
 

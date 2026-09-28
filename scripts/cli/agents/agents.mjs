@@ -62,7 +62,35 @@ export function emptyAgentConfig() {
   return {
     version: AGENT_CONFIG_VERSION,
     duties: structuredClone(STARTER_DUTIES),
+    routes: {},
   };
+}
+
+export const RISKS = ["high"];
+
+function normalizeRoutes(raw) {
+  const out = {};
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  for (const [risk, riskRoutes] of Object.entries(raw)) {
+    const riskKey = String(risk || "").trim().toLowerCase();
+    if (!RISKS.includes(riskKey)) continue;
+    if (!riskRoutes || typeof riskRoutes !== "object" || Array.isArray(riskRoutes)) continue;
+    const entry = {};
+    for (const [duty, value] of Object.entries(riskRoutes)) {
+      const dutyKey = String(duty || "").trim().toLowerCase();
+      if (!DUTIES.includes(dutyKey)) continue;
+      if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+      const route = {
+        provider: String(value.provider || "").trim().toLowerCase(),
+        model: String(value.model || "").trim(),
+      };
+      const reasoningEffort = String(value.reasoning_effort || "").trim();
+      if (reasoningEffort) route.reasoning_effort = reasoningEffort;
+      entry[dutyKey] = route;
+    }
+    if (Object.keys(entry).length) out[riskKey] = entry;
+  }
+  return out;
 }
 
 function cleanProfile(value, duty) {
@@ -107,7 +135,7 @@ export function readAgentConfig(appData) {
     for (const duty of DUTIES) {
       duties[duty].mode = dutyMode.resolveMode(duty, source?.[duty], raw);
     }
-    return { version: AGENT_CONFIG_VERSION, duties };
+    return { version: AGENT_CONFIG_VERSION, duties, routes: normalizeRoutes(raw?.routes) };
   } catch {
     return emptyAgentConfig();
   }
@@ -126,7 +154,7 @@ export function saveAgentConfig(config, appData) {
 // missing worker mapping preserves the historical unpinned Claude executor.
 // `enabled` says the step happens at all, `runsAsAgent` that performing it
 // spends the configured model — the two differ exactly for a `session` critic.
-export function resolveDuty(duty, appData) {
+export function resolveDuty(duty, appData, { risk } = {}) {
   if (!DUTIES.includes(duty)) throw new Error(`unknown model duty "${duty}"`);
   const cfg = readAgentConfig(appData);
   const base = cfg.duties[duty] || {};
@@ -136,7 +164,7 @@ export function resolveDuty(duty, appData) {
     throw new Error(`unknown provider "${provider}" for duty "${duty}"`);
   }
   const mode = cleanMode(duty, base.mode) || starterMode(duty);
-  return {
+  const resolved = {
     name: duty,
     duty,
     ...base,
@@ -146,6 +174,33 @@ export function resolveDuty(duty, appData) {
     enabled: mode !== "off",
     runsAsAgent: mode === "agent" || mode === "always",
   };
+  const riskKey = String(risk || "").trim().toLowerCase();
+  if (!RISKS.includes(riskKey)) return resolved;
+  const route = cfg.routes?.[riskKey]?.[duty];
+  if (!route) {
+    return { ...resolved, route: { applied: false, risk: riskKey, note: `risk ${riskKey}, no route configured for ${duty}` } };
+  }
+  if (!PROVIDERS.includes(route.provider) || !PROVIDER_MODELS[route.provider]?.includes(route.model)) {
+    return {
+      ...resolved,
+      route: {
+        applied: false,
+        risk: riskKey,
+        note: `risk ${riskKey}: the configured route for ${duty} (${route.provider || "?"}/${route.model || "?"}) is invalid — falling back to the duty profile`,
+      },
+    };
+  }
+  const carried = Object.fromEntries(
+    Object.entries(resolved).filter(([k]) => k !== "reasoning_effort" && !k.endsWith("_cost_per_million")),
+  );
+  const routed = {
+    ...carried,
+    provider: route.provider,
+    model: route.model,
+    route: { applied: true, risk: riskKey, note: `risk ${riskKey} routed ${duty} to ${route.provider}/${route.model}` },
+  };
+  if (route.reasoning_effort) routed.reasoning_effort = route.reasoning_effort;
+  return routed;
 }
 
 // `off` | `session` | `agent`. Callers that inject context ask for the mode; the

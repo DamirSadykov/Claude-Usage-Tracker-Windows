@@ -38,6 +38,9 @@ steps:
     on-issue: <n>         # where control goes on `issue` — run layer, not an edge
     kind: auto|manual     # manual = only a human closes it; auto needs a verify
     budget: <usd>
+    red: <cmd>            # bug-fix gate: MUST fail on the base commit — proves red-tests catches it
+    red-tests: [<path>]   # the regression test file(s) red is proved against; needs red, and vice versa
+    risk: high            # routes worker/review to agents.json's routes.high, when configured — the only value accepted
 ```
 
 Rules that are not visible in the shape:
@@ -69,7 +72,9 @@ Refused: an `on-issue` with no `retry` (a missing limit forbids the transition,
 it does not permit an endless one); a cycle in `needs`; a `needs` or `on-issue`
 pointing at a step that does not exist; a step with neither a `title` nor a
 `task`; a `task` naming no task on the board, or one already bound to an earlier
-step; an invalid number or an unknown `kind`.
+step; an invalid number or an unknown `kind`; `red` declared without
+`red-tests`, or `red-tests` declared without `red` — the gate needs both halves
+or neither; a `risk` other than `high`.
 
 **Prose is refused too.** The language is required of every plan, not only of
 the texts that already look like one — a rule the guard declines to check is a
@@ -103,7 +108,9 @@ is a graph file, whatever it is called.
 Warned but accepted: `auto` with no `verify` (it runs as a gate — the authority
 to close a node comes from the check, not the flag); a change with no `budget`
 (`todos run --go` refuses to start a group without a ceiling); an `on-issue`
-target that is also in `needs` (legal — only the dependency blocks).
+target that is also in `needs` (legal — only the dependency blocks); a
+`red-tests` path not also named in `produces`; `red` declared on a `manual`
+step (a gate never runs it — nothing closes the node to trigger one).
 
 Which steps are `auto`: the ones a machine can judge, and they carry a `verify`.
 A step whose result only a human can accept — a design call, anything to look at
@@ -150,11 +157,16 @@ A step already `done` keeps its declarations: they are promises made before the
 work, and re-applying a partly finished plan leaves them alone rather than
 failing.
 
-A task that already carries a description keeps it too — the file's `why` is
-**not** written over it, and `apply` says so in its notes. That is the usual
-case for a step bound by `task: <N>` to older work: if the plan's reasoning is
-the one that should stand, re-apply with `--force`, otherwise the step runs on a
-description written for a different question.
+What happens to an existing description depends on the task's own status. On
+`backlog` or `queue` — nothing downstream has started yet — a `why` that
+disagrees with the description **replaces** it, and the old text is not lost:
+it is filed as a comment on the task (`Описание до плана «…»:` followed by the
+old text), so a step bound by `task: <N>` to a stale plan does not silently run
+on reasoning written for a different question, and nothing that was there
+before is thrown away either. Once a task is `in_progress` or in `review`, its
+description has become the record of what the work was actually understood to
+be while it ran, and `apply` leaves it alone, saying so in its notes; `--force`
+overwrites in either case, without filing a comment.
 
 ## 4. Worked example
 

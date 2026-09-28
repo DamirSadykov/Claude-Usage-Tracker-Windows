@@ -91,6 +91,14 @@ function normalizeKind(v) {
   return undefined;
 }
 
+function normalizeRisk(v) {
+  if (v == null) return undefined;
+  const s = String(v).trim().toLowerCase();
+  if (s === "high") return "high";
+  if (s === "none" || s === "clear" || s === "") return "";
+  return undefined;
+}
+
 // Normalize a --priority / set-priority value to a real bucket or "" (unset).
 // "none"/"clear"/"" explicitly clear it. Returns undefined for anything invalid,
 // so the caller can fail with a helpful message instead of writing garbage.
@@ -420,6 +428,16 @@ function setKind({ data, file, todo, value }) {
   process.stdout.write(`ok: #${todo.number} kind -> ${kind || "manual"}\n`);
 }
 
+function setRisk({ data, file, todo, value }) {
+  const risk = normalizeRisk(value);
+  if (risk === undefined) fail(`invalid risk "${value}". valid: high | none`);
+  if (risk) todo.risk = risk;
+  else delete todo.risk;
+  todo.updated_at = new Date().toISOString();
+  save(file, data);
+  process.stdout.write(risk ? `ok: #${todo.number} risk -> ${risk}\n` : `ok: #${todo.number} risk cleared\n`);
+}
+
 // Put a todo INTO a change, or take it out (c#9, formerly the root-task marker
 // of t#255). A change is a record now (`change.mjs`), so membership is the
 // `change_id` field, in lockstep with todos.rs::Todo.change_id — the value is
@@ -687,6 +705,32 @@ function setParallel({ data, file, todo, value }) {
   );
 }
 
+function setRed({ data, file, todo, value }) {
+  const cmd = String(value).trim();
+  if (cmd) todo.red = cmd;
+  else delete todo.red;
+  todo.updated_at = new Date().toISOString();
+  save(file, data);
+  process.stdout.write(
+    cmd ? `ok: #${todo.number} red -> ${cmd}\n` : `ok: #${todo.number} red cleared\n`,
+  );
+}
+
+function setRedTests({ data, file, todo, value }) {
+  const v = String(value).trim();
+  const list =
+    v === "" || /^(none|clear)$/i.test(v) ? [] : v.split(",").map((s) => s.trim()).filter(Boolean);
+  if (list.length) todo.red_tests = list;
+  else delete todo.red_tests;
+  todo.updated_at = new Date().toISOString();
+  save(file, data);
+  process.stdout.write(
+    list.length
+      ? `ok: #${todo.number} red-tests -> ${list.join(", ")}\n`
+      : `ok: #${todo.number} red-tests cleared\n`,
+  );
+}
+
 // How an `on_issue` target reads in a message: its board number when the target
 // still exists, the raw id otherwise (a deleted target must stay visible).
 function onIssueLabel(data, todo) {
@@ -917,6 +961,11 @@ const SET_FIELDS = {
     declaration: true,
     set: setKind,
   },
+  risk: {
+    values: "high | none   (routes worker/review to agents.json's routes.high, when configured)",
+    declaration: true,
+    set: setRisk,
+  },
   change: {
     values: "<c#N> | none   (a change is a record: cli change list --all)",
     set: setChange,
@@ -946,6 +995,16 @@ const SET_FIELDS = {
     values: "<task> | none   (same board, needs a retry limit; never a dep edge)",
     declaration: true,
     set: setOnIssue,
+  },
+  red: {
+    values: '"<cmd>"   MUST fail (non-zero) on the base commit; proves red-tests catches the bug; "" withdraws it',
+    declaration: true,
+    set: setRed,
+  },
+  "red-tests": {
+    values: "<path1,path2,...> | none   (regression test file(s) red is proved against; pairs with red)",
+    declaration: true,
+    set: setRedTests,
   },
   plan: { values: '--text "<steps + order>"   HOW only', text: true, set: setPlan },
   description: {
@@ -1256,6 +1315,15 @@ const COMMENT_USAGE =
   'usage: cli todos comment add <id> --text "<body>" [--by claude|user]\n' +
   "       cli todos comment list <id> [--json]";
 
+export function addComment(todo, { author = "claude", body } = {}) {
+  if (!Array.isArray(todo.comments)) todo.comments = [];
+  const now = new Date().toISOString();
+  const comment = { id: randomUUID(), author, body: String(body ?? ""), created_at: now };
+  todo.comments.push(comment);
+  todo.updated_at = now;
+  return comment;
+}
+
 // Append or list comments on a todo. Mirrors the Comment shape in todos.rs /
 // TodoWindow.vue: { id, author, body, created_at }. The thread is shared with
 // the tracker UI (the user posts there as "user"); this CLI is Claude's path, so
@@ -1272,11 +1340,7 @@ function cmdComment(args) {
     const data = loadBoardForWrite(file);
     const todo = resolveTask(data, id); // id | N | #N, as the help promises
     if (!todo) fail(`no todo with id ${id}`);
-    if (!Array.isArray(todo.comments)) todo.comments = [];
-    const now = new Date().toISOString();
-    const comment = { id: randomUUID(), author, body, created_at: now };
-    todo.comments.push(comment);
-    todo.updated_at = now;
+    const comment = addComment(todo, { author, body });
     save(file, data);
     process.stdout.write(
       `ok: comment ${comment.id} on ${todo.number != null ? `#${todo.number}` : todo.id} by ${author}\n`,
@@ -2007,6 +2071,10 @@ export function formatDeclarations(t, byId, { ready = false } = {}) {
     const target = byId?.get?.(t.on_issue);
     parts.push(`?issue -> ${target ? `#${target.number}` : t.on_issue}`);
   }
+  if (t.red && String(t.red).trim()) parts.push(`red: ${String(t.red).trim()}`);
+  const redTests = (Array.isArray(t.red_tests) ? t.red_tests : []).filter(Boolean);
+  if (redTests.length) parts.push(`red-tests: ${redTests.join(", ")}`);
+  if (t.risk && String(t.risk).trim()) parts.push(`risk: ${String(t.risk).trim()}`);
   let out = `  ${ready ? "▸" : " "} #${t.number} [${col(t.status)}] ${t.subject} — ${parts.join(" · ")}\n`;
   if (t.kind === "auto" && !hasVerify(t)) {
     out += `      ⚠ auto without verify — runs as a GATE: todos set verify ${t.number} "<cmd>"\n`;
@@ -2025,7 +2093,10 @@ function hasDeclarations(t) {
     typeof t.retry_limit === "number" ||
     typeof t.budget_usd === "number" ||
     typeof t.parallel_limit === "number" ||
-    t.on_issue
+    t.on_issue ||
+    (t.red && String(t.red).trim()) ||
+    (Array.isArray(t.red_tests) && t.red_tests.filter(Boolean).length) ||
+    (t.risk && String(t.risk).trim())
   );
 }
 

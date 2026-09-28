@@ -123,6 +123,87 @@ describe("lifecycle duty map", () => {
     expect(resolveMode("worker", undefined, undefined)).toBe("always");
   });
 
+  it("routes a duty to the configured pair when the task's risk is high", () => {
+    saveAgentConfig({
+      version: 4,
+      duties: { worker: { mode: "always", provider: "anthropic", model: "sonnet", role: "worker", instructions: "do the work" } },
+      routes: { high: { worker: { provider: "openai", model: "gpt-5.6-sol" } } },
+    });
+    const resolved = resolveDuty("worker", undefined, { risk: "high" });
+    expect(resolved).toMatchObject({
+      provider: "openai", model: "gpt-5.6-sol",
+      mode: "always", role: "worker", instructions: "do the work",
+      route: { applied: true, risk: "high" },
+    });
+    expect(resolved.route.note).toMatch(/openai\/gpt-5\.6-sol/);
+  });
+
+  it("does not carry the duty's model-bound effort and prices onto the routed model", () => {
+    saveAgentConfig({
+      version: 4,
+      duties: {
+        worker: {
+          mode: "always", provider: "openai", model: "gpt-5.6-terra", reasoning_effort: "high",
+          input_cost_per_million: 1, output_cost_per_million: 2,
+        },
+      },
+      routes: { high: { worker: { provider: "anthropic", model: "opus" } } },
+    });
+    const resolved = resolveDuty("worker", undefined, { risk: "high" });
+    expect(resolved.provider).toBe("anthropic");
+    expect(resolved.model).toBe("opus");
+    expect(resolved.reasoning_effort).toBeUndefined();
+    expect(resolved.input_cost_per_million).toBeUndefined();
+    expect(resolved.output_cost_per_million).toBeUndefined();
+  });
+
+  it("ignores the configured route when risk is absent, and carries no route field", () => {
+    saveAgentConfig({
+      version: 4,
+      duties: { worker: { mode: "always", provider: "anthropic", model: "sonnet" } },
+      routes: { high: { worker: { provider: "openai", model: "gpt-5.6-sol" } } },
+    });
+    const resolved = resolveDuty("worker");
+    expect(resolved).toMatchObject({ provider: "anthropic", model: "sonnet" });
+    expect(resolved.route).toBeUndefined();
+  });
+
+  it("falls back to the duty profile with a note when the routed pair is invalid", () => {
+    saveAgentConfig({
+      version: 4,
+      duties: { review: { mode: "agent", provider: "anthropic", model: "opus" } },
+      routes: { high: { review: { provider: "openai", model: "opus" } } },
+    });
+    const resolved = resolveDuty("review", undefined, { risk: "high" });
+    expect(resolved).toMatchObject({ provider: "anthropic", model: "opus", route: { applied: false, risk: "high" } });
+    expect(resolved.route.note).toMatch(/invalid/);
+  });
+
+  it("falls back to the duty profile with a note when no route is configured for that duty", () => {
+    saveAgentConfig({
+      version: 4,
+      duties: { review: { mode: "agent", provider: "anthropic", model: "opus" } },
+      routes: { high: { worker: { provider: "openai", model: "gpt-5.6-sol" } } },
+    });
+    const resolved = resolveDuty("review", undefined, { risk: "high" });
+    expect(resolved).toMatchObject({ provider: "anthropic", model: "opus", route: { applied: false, risk: "high" } });
+    expect(resolved.route.note).toMatch(/no route configured for review/);
+  });
+
+  it("resolves models from lifecycle duties, never from task fields, even with routes present", () => {
+    saveAgentConfig({
+      version: 4,
+      duties: {
+        architect: { mode: "agent", provider: "openai", model: "gpt-5.6-sol", role: "architect" },
+        worker: { mode: "always", provider: "anthropic", model: "sonnet", role: "worker" },
+        review: { mode: "agent", provider: "anthropic", model: "opus", role: "reviewer" },
+      },
+      routes: { high: { worker: { provider: "openai", model: "gpt-5.6-luna" } } },
+    });
+    expect(resolveDuty("architect")).toMatchObject({ duty: "architect", provider: "openai", model: "gpt-5.6-sol", enabled: true });
+    expect(resolveDuty("worker")).toMatchObject({ duty: "worker", provider: "anthropic", model: "sonnet" });
+  });
+
   it("defaults the critic to the main session and round-trips its mode", () => {
     expect(criticMode()).toBe("session");
     expect(criticRunsAsAgent()).toBe(false);

@@ -99,6 +99,78 @@ describe("apply refuses an invalid graph", () => {
     const { warnings } = check(["parallel: 2", "steps:", "  1: A"].join("\n"));
     expect(warnings.join(" ")).toMatch(/change/);
   });
+
+  it("refuses red declared without red-tests", () => {
+    const { errors } = check(
+      ["steps:", "  1:", "    title: A", "    kind: auto", "    red: npm run test:red"].join("\n"),
+    );
+    expect(errors.join(" ")).toMatch(/red declared without red-tests/);
+  });
+
+  it("refuses red-tests declared without red", () => {
+    const { errors } = check(
+      ["steps:", "  1:", "    title: A", "    kind: auto", "    red-tests: [test/a.spec.js]"].join("\n"),
+    );
+    expect(errors.join(" ")).toMatch(/red-tests declared without red/);
+  });
+
+  it("only WARNS when a red-tests path is not also in produces", () => {
+    const { errors, warnings } = check(
+      [
+        "steps:",
+        "  1:",
+        "    title: A",
+        "    kind: auto",
+        "    red: npm run test:red",
+        "    red-tests: [test/a.spec.js]",
+        "    produces: [src/a.js]",
+      ].join("\n"),
+    );
+    expect(errors).toEqual([]);
+    expect(warnings.join(" ")).toMatch(/red-tests path "test\/a\.spec\.js" is not declared in produces/);
+  });
+
+  it("takes the same red declaration once red-tests is in produces too", () => {
+    const { errors, warnings } = check(
+      [
+        "steps:",
+        "  1:",
+        "    title: A",
+        "    kind: auto",
+        "    red: npm run test:red",
+        "    red-tests: [test/a.spec.js]",
+        "    produces: [src/a.js, test/a.spec.js]",
+      ].join("\n"),
+    );
+    expect(errors).toEqual([]);
+    expect(warnings.join(" ")).not.toMatch(/not declared in produces/);
+  });
+
+  it("only WARNS when red is declared on a manual node — a gate never runs it", () => {
+    const { errors, warnings } = check(
+      [
+        "steps:",
+        "  1:",
+        "    title: A",
+        "    kind: manual",
+        "    red: npm run test:red",
+        "    red-tests: [test/a.spec.js]",
+      ].join("\n"),
+    );
+    expect(errors).toEqual([]);
+    expect(warnings.join(" ")).toMatch(/red declared on a manual node — a gate never runs it/);
+  });
+
+  it("refuses a risk other than high", () => {
+    const { errors } = check(["steps:", "  1:", "    title: A", "    risk: medium"].join("\n"));
+    expect(errors.join(" ")).toMatch(/invalid risk "medium" — the only accepted value is "high"/);
+  });
+
+  it("takes risk: high without complaint", () => {
+    const { errors, warnings } = check(["steps:", "  1:", "    title: A", "    risk: high"].join("\n"));
+    expect(errors).toEqual([]);
+    expect(warnings).toEqual([]);
+  });
 });
 
 describe("apply records the graph", () => {
@@ -121,10 +193,13 @@ describe("apply records the graph", () => {
     "steps:",
     "  1:",
     "    title: Собираю каркас",
-    "    produces: [scripts/cli/process/apply.mjs]",
+    "    produces: [scripts/cli/process/apply.mjs, tests/apply.red.spec.js]",
     "    verify: npm test",
     "    retry: 3",
     "    kind: auto",
+    "    red: npm run test:red",
+    "    red-tests: [tests/apply.red.spec.js]",
+    "    risk: high",
     "  2:",
     "    title: Пишу тесты",
     "    needs: [1]",
@@ -189,10 +264,13 @@ describe("apply records the graph", () => {
     expect(change.budget_usd).toBe(5);
     expect([one, two, three].map((t) => t.change_id)).toEqual([change.id, change.id, change.id]);
 
-    expect(one.produces).toEqual(["scripts/cli/process/apply.mjs"]);
+    expect(one.produces).toEqual(["scripts/cli/process/apply.mjs", "tests/apply.red.spec.js"]);
     expect(one.verify).toBe("npm test");
     expect(one.retry_limit).toBe(3);
     expect(one.kind).toBe("auto");
+    expect(one.red).toBe("npm run test:red");
+    expect(one.red_tests).toEqual(["tests/apply.red.spec.js"]);
+    expect(one.risk).toBe("high");
 
     expect(two.depends_on).toContain(one.id);
     expect(three.depends_on).toContain(two.id);
@@ -391,19 +469,23 @@ describe("a step may name the task it IS", () => {
     expect(board().todos).toHaveLength(1);
   });
 
-  // The skip itself is old and deliberate (a description is not overwritten);
-  // saying nothing about it is what let a plan's reasoning vanish into a task
-  // whose description framed the work weeks earlier.
-  it("says out loud that the file's `why` was not recorded over an existing description", () => {
+  // A still-open (backlog/queue) task no longer keeps a stale description —
+  // apply replaces it with the file's `why`, and the old text moves to a
+  // comment instead of being kept silently (t#739).
+  it("replaces a backlog task's description with the file's `why`, keeping the old one as a comment", () => {
     todos("add", "Уже есть", "--description", "Постановка трёхнедельной давности");
     const n = board().todos[0].number;
     const out = say(
       yaml("why.yaml", "steps:", "  1:", `    task: ${n}`, "    why: |", "      Новое обоснование шага", "    retry: 2"),
       "--go",
     );
-    expect(out).toMatch(/`why` for step "1" was NOT recorded/);
-    expect(board().todos[0].description).toBe("Постановка трёхнедельной давности");
-    expect(board().todos[0].retry_limit).toBe(2);
+    expect(out).toMatch(/description replaced for step "1"/);
+    const row = board().todos[0];
+    expect(row.description).toBe("Новое обоснование шага");
+    expect(row.retry_limit).toBe(2);
+    expect(row.comments).toHaveLength(1);
+    expect(row.comments[0].author).toBe("claude");
+    expect(row.comments[0].body).toContain("Постановка трёхнедельной давности");
   });
 
   it("records the why when the task carries no description of its own", () => {
@@ -420,6 +502,101 @@ describe("a step may name the task it IS", () => {
     expect(() =>
       say(yaml("twins.yaml", "steps:", "  1:", `    task: ${n}`, "  2:", `    task: #${n}`), "--go"),
     ).toThrow(/already bound to an earlier step/);
+  });
+});
+
+describe("apply and a stale description (t#739)", () => {
+  let dir;
+  const savedAppData = process.env.APPDATA;
+  const board = () => loadBoard(path.join(dir, "com.claude-usage-tracker.app", "todos.json"));
+  const todos = (...args) =>
+    execFileSync(process.execPath, [cli, "todos", ...args], {
+      encoding: "utf8",
+      env: { ...process.env, APPDATA: dir },
+      windowsHide: true,
+    });
+  const say = (...args) => todos("apply", ...args);
+  const yaml = (name, ...lines) => {
+    const p = path.join(dir, name);
+    writeFileSync(p, lines.join("\n"));
+    return p;
+  };
+
+  beforeEach(() => {
+    dir = mkdtempSync(path.join(os.tmpdir(), "cut-stale-desc-"));
+    mkdirSync(path.join(dir, "com.claude-usage-tracker.app"), { recursive: true });
+  });
+  afterEach(() => {
+    if (savedAppData === undefined) delete process.env.APPDATA;
+    else process.env.APPDATA = savedAppData;
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("keeps the description on an in_progress task and only notes it, unchanged from before", () => {
+    todos("add", "В работе", "--description", "Постановка трёхнедельной давности");
+    const n = board().todos[0].number;
+    todos("set", "status", String(n), "in_progress");
+    const out = say(
+      yaml("wip.yaml", "steps:", "  1:", `    task: ${n}`, "    why: |", "      Новое обоснование шага"),
+      "--go",
+    );
+    expect(out).toMatch(/`why` for step "1" was NOT recorded/);
+    const row = board().todos[0];
+    expect(row.description).toBe("Постановка трёхнедельной давности");
+    expect(row.comments || []).toHaveLength(0);
+  });
+
+  it("does nothing when the file's why already matches the description", () => {
+    todos("add", "Совпадает", "--description", "Одно и то же обоснование");
+    const n = board().todos[0].number;
+    const out = say(
+      yaml("same.yaml", "steps:", "  1:", `    task: ${n}`, "    why: |", "      Одно и то же обоснование"),
+      "--go",
+    );
+    expect(out).not.toMatch(/replace description/);
+    expect(out).not.toMatch(/NOT recorded/);
+    const row = board().todos[0];
+    expect(row.description).toBe("Одно и то же обоснование");
+    expect(row.comments || []).toHaveLength(0);
+  });
+
+  it("re-applying the same plan twice replaces the description once and adds one comment only", () => {
+    todos("add", "Повтор", "--description", "Постановка трёхнедельной давности");
+    const n = board().todos[0].number;
+    const file = yaml("rep.yaml", "steps:", "  1:", `    task: ${n}`, "    why: |", "      Новое обоснование шага");
+    const first = say(file, "--go");
+    const second = say(file, "--go");
+    expect(first).toMatch(/description replaced for step "1"/);
+    expect(second).not.toMatch(/description replaced for step "1"/);
+    const row = board().todos[0];
+    expect(row.description).toBe("Новое обоснование шага");
+    expect(row.comments).toHaveLength(1);
+  });
+
+  it("shows the planned replacement in a dry run without writing anything", () => {
+    todos("add", "Черновик", "--description", "Постановка трёхнедельной давности");
+    const n = board().todos[0].number;
+    const out = say(
+      yaml("dry.yaml", "steps:", "  1:", `    task: ${n}`, "    why: |", "      Новое обоснование шага"),
+    );
+    expect(out).toMatch(/replace description \(old kept as comment\)/);
+    const row = board().todos[0];
+    expect(row.description).toBe("Постановка трёхнедельной давности");
+    expect(row.comments || []).toHaveLength(0);
+  });
+
+  it("--force overwrites the description without recording a comment", () => {
+    todos("add", "Форс", "--description", "Постановка трёхнедельной давности");
+    const n = board().todos[0].number;
+    const out = say(
+      yaml("force.yaml", "steps:", "  1:", `    task: ${n}`, "    why: |", "      Новое обоснование шага"),
+      "--go",
+      "--force",
+    );
+    expect(out).not.toMatch(/replace description/);
+    const row = board().todos[0];
+    expect(row.description).toBe("Новое обоснование шага");
+    expect(row.comments || []).toHaveLength(0);
   });
 });
 

@@ -26,6 +26,9 @@
 //       on-issue: 2              # run-layer transition, NEVER a dep edge (§12)
 //       kind: auto | manual      # who closes it (§8)
 //       budget: 2
+//       red: <cmd>               # MUST fail on the base commit — proves red-tests catches the bug
+//       red-tests: [path, ...]   # the regression test file(s) red is proved against
+//       risk: high               # routes worker/review to agents.json's routes.high, when configured
 //
 // Nothing here writes to the board directly: every task, edge and declaration
 // goes through todos.mjs (newTodo / addDepEdge / addProduces / setField), so a
@@ -44,6 +47,7 @@ import {
   newTodo,
   addDepEdge,
   addProduces,
+  addComment,
   setField,
   resolveTask,
   normalizeLimit,
@@ -61,7 +65,8 @@ const USAGE =
   "       --dry-run is the DEFAULT (prints what would change); --go writes.\n" +
   "       --force overwrites a vision/plan that is already there.\n" +
   "keys:  change, vision, plan, parallel, budget, steps{<id>: {title, needs,\n" +
-  "       produces, verify, retry, on-issue, kind, budget, why, priority}}";
+  "       produces, verify, retry, on-issue, kind, budget, red, red-tests, risk,\n" +
+  "       why, priority}}";
 
 function fail(msg) {
   process.stderr.write(msg + "\n");
@@ -99,6 +104,9 @@ export const DSL_STEP_FIELDS = [
   "on-issue",
   "kind",
   "budget",
+  "red",
+  "red-tests",
+  "risk",
 ];
 
 // `why` is the step's reasoning — what it rests on, where its risk shows. It is
@@ -158,6 +166,9 @@ function readSteps(raw) {
       onIssue: body["on-issue"] == null ? "" : String(body["on-issue"]).trim(),
       kind: body.kind == null ? "" : String(body.kind).trim().toLowerCase(),
       budget: body.budget == null ? "" : String(body.budget).trim(),
+      red: body.red == null ? "" : String(body.red).trim(),
+      redTests: asList(body["red-tests"] ?? body.red_tests),
+      risk: body.risk == null ? "" : String(body.risk).trim().toLowerCase(),
       priority: body.priority == null ? "" : String(body.priority).trim(),
       unknown: Object.keys(body).filter(
         (k) =>
@@ -215,6 +226,9 @@ function documentGraph(doc, onBoard) {
       budget: s.budget,
       onIssue: s.onIssue,
       kind: s.kind,
+      red: s.red,
+      redTests: s.redTests,
+      risk: s.risk,
       closed: false,
       outcome: "",
     })),
@@ -308,6 +322,14 @@ function matchExisting(data, doc, project) {
   return { record, byStep, adopted, renamed };
 }
 
+function staleDescription(existing, why, force) {
+  if (!existing || force || isDone(existing)) return false;
+  const oldText = String(existing.description || "").trim();
+  const newText = String(why || "").trim();
+  if (!oldText || !newText || sameSubject(oldText, newText)) return false;
+  return existing.status === "backlog" || existing.status === "queue";
+}
+
 const clipLine = (text, max = 60) => {
   const one = String(text).replace(/\s+/g, " ").trim();
   return one.length > max ? one.slice(0, max - 1) + "…" : one;
@@ -384,6 +406,7 @@ export function applyDocument(doc, { go = false, force = false, project, board }
       adopted.has(hit.id) ? "adopted into the change" : "",
       renamed.has(hit.id) ? "title differs from the board — the task keeps its own" : "",
       isDone(hit) ? "closed — declarations left as they are" : "",
+      staleDescription(hit, s.why, force) ? "replace description (old kept as comment)" : "",
     ].filter(Boolean);
     say(`= step ${s.id}  ${fmtTask(hit)}${marks.length ? `  (${marks.join("; ")})` : ""}`);
   }
@@ -394,6 +417,9 @@ export function applyDocument(doc, { go = false, force = false, project, board }
     if (s.retry) say(`  retry  ${s.id}  <=${s.retry}`);
     if (s.kind) say(`  kind   ${s.id}  ${s.kind}`);
     if (s.budget) say(`  budget ${s.id}  $${s.budget}`);
+    if (s.red) say(`  red    ${s.id}  ${s.red}`);
+    if (s.redTests.length) say(`  red-tests ${s.id}  ${s.redTests.join(", ")}`);
+    if (s.risk) say(`  risk   ${s.id}  ${s.risk}`);
     if (s.why) say(`  why    ${s.id}  ${clipLine(s.why)}`);
     if (s.priority) say(`  prio   ${s.id}  ${s.priority}`);
     if (s.onIssue) say(`  ?issue ${s.id} -> ${s.onIssue}  (run layer, not a dep)`);
@@ -502,7 +528,7 @@ export function applyDocument(doc, { go = false, force = false, project, board }
         // the rest of the pass. The closed node keeps what it has; only its edges,
         // which are the graph and not a promise, are still written.
         if (isDone(t)) {
-          if (s.produces.length || s.verify || s.retry || s.kind || s.budget || s.why)
+          if (s.produces.length || s.verify || s.retry || s.kind || s.budget || s.why || s.red || s.redTests.length || s.risk)
             notes.push(`keep: #${t.number} is done — its declarations were left as they are`);
           continue;
         }
@@ -512,20 +538,33 @@ export function applyDocument(doc, { go = false, force = false, project, board }
             `ok: #${t.number} produces ${t.produces.join(", ")} (${t.produces.length} declared)`,
           );
         // The reasoning lands in `description`, the field that already holds WHAT &
-        // WHY — and only while it is empty, exactly as the vision of a change root.
-        // Kept quiet, the skip is invisible in the worst case there is: a step
-        // bound by `task: N` to an older task, whose description then frames the
-        // work as it was understood weeks ago and not as this plan reasoned it.
-        if (s.why && (force || !String(t.description || "").trim())) set(t, "description", s.why);
-        else if (s.why && !sameSubject(t.description || "", s.why))
+        // WHY — always while it is empty; on backlog/queue a differing `why` also
+        // replaces it (staleDescription above), old text moved to a comment. Once
+        // work is under way (in_progress, review) the old skip holds instead.
+        if (s.why && (force || !String(t.description || "").trim())) {
+          set(t, "description", s.why);
+        } else if (s.why && staleDescription(t, s.why, force)) {
+          addComment(t, {
+            author: "claude",
+            body: `Описание до плана «${doc.change || (change ? changeAddress(change) : `t#${t.number}`)}»:\n${t.description}`,
+          });
+          set(t, "description", s.why);
+          notes.push(
+            `ok: #${t.number} description replaced for step "${s.id}" — the old one is kept as a comment`,
+          );
+        } else if (s.why && !sameSubject(t.description || "", s.why)) {
           notes.push(
             `keep: #${t.number} already carries a description — the file's \`why\` for step "${s.id}" was NOT recorded (--force overwrites)`,
           );
+        }
         if (s.priority) set(t, "priority", s.priority);
         if (s.verify) set(t, "verify", s.verify);
         if (s.retry) set(t, "retry", s.retry);
         if (s.kind) set(t, "kind", s.kind);
         if (s.budget) set(t, "budget", s.budget);
+        if (s.red) set(t, "red", s.red);
+        if (s.redTests.length) set(t, "red-tests", s.redTests.join(","));
+        if (s.risk) set(t, "risk", s.risk);
       }
       if (change) {
         if (doc.parallel) change.parallel_limit = Number(doc.parallel);

@@ -713,3 +713,35 @@ describe("outcome weak file evidence (end to end, t#520)", () => {
     expect(json.missing).toEqual(["words.txt"]);
   });
 });
+
+describe("buildOutcomeReport — git evidence since step_base", () => {
+  const node = () => board([1, { produces: ["src/greet.mjs"] }]).todos[0];
+
+  it("counts a produces path the node changed since its step_base, even when this attempt wrote nothing", () => {
+    const report = buildOutcomeReport({
+      data: board([1]),
+      todo: node(),
+      blocks: [],
+      touches: touchesOf(),
+      root: "D:/p",
+      statFile: () => "2000-01-01T00:00:00.000Z",
+      gitChanged: new Set(["src/greet.mjs"]),
+    });
+    expect(report.produces[0]).toMatchObject({ produced: true, evidence: "git" });
+    expect(report.outcome).toBe("ok");
+  });
+
+  it("stays missing when git shows no change to the promised path", () => {
+    const report = buildOutcomeReport({
+      data: board([1]),
+      todo: node(),
+      blocks: [],
+      touches: touchesOf(),
+      root: "D:/p",
+      statFile: () => "2000-01-01T00:00:00.000Z",
+      gitChanged: new Set(["src/other.mjs"]),
+    });
+    expect(report.produces[0]).toMatchObject({ produced: false, evidence: null });
+    expect(report.outcome).toBe("issue");
+  });
+});

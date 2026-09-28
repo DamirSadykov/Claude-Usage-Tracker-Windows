@@ -65,6 +65,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFile } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { readFileSync, appendFileSync, mkdirSync } from "node:fs";
 
 import {
@@ -83,12 +84,22 @@ import {
 import { findChange } from "../board/change.mjs";
 import { resolveDuty } from "../agents/agents.mjs";
 import { withBoardLock } from "../kernel/board-lock.mjs";
+import {
+  gitHead,
+  gitBase,
+  snapshotTree,
+  diffNameStatus,
+  computeNeighbourDamage,
+  runRedGate,
+  recoverMarkers,
+} from "./red-gate.mjs";
 
 export const DEFAULT_PARALLEL_LIMIT = 1;
 
 const brief = (t) => (t ? { id: t.id, number: t.number, subject: t.subject } : null);
 const num = (t) => (t && t.number != null ? `#${t.number}` : t ? t.id : "?");
 const declaredVerify = (t) => (t && t.verify && String(t.verify).trim()) || "";
+const declaredRed = (t) => (t && t.red && String(t.red).trim()) || "";
 
 function fail(msg) {
   process.stderr.write(msg + "\n");
@@ -100,6 +111,14 @@ function appDataFile(name) {
     process.env.APPDATA ||
     path.join(process.env.USERPROFILE || "", "AppData", "Roaming");
   return path.join(appData, "com.claude-usage-tracker.app", name);
+}
+
+function redGateDir() {
+  return appDataFile("red-gate");
+}
+
+function recoverRedGate(cwd) {
+  recoverMarkers({ appDataDir: redGateDir(), cwd });
 }
 
 // ── the node ─────────────────────────────────────────────────────────────────
@@ -190,6 +209,11 @@ export function simulationEffects() {
     reconcile: async () => ({ outcome: "ok", outcome_reason: "dry-run" }),
     setStatus: async () => {},
     recordHandoff: async () => ({ written: false }),
+    recordIssue: async () => ({ written: false }),
+    stepBase: async () => ({ ok: true, sha: "dry" }),
+    priorChanges: async () => ({ ok: true, changes: null }),
+    ownChanges: async () => ({ ok: true, skip: true }),
+    redGate: async () => ({ ok: true, field: "failed-on-base", reason: null }),
     stepCost: async ({ task }) =>
       typeof task.budget_usd === "number" ? task.budget_usd : null,
   };
@@ -275,6 +299,74 @@ export function liveEffects({ cwd } = {}) {
         error: r.code === 0 ? "" : r.stderr.trim() || r.stdout.trim(),
       };
     },
+    recordIssue: async ({ task, comment }) => {
+      const file = appDataFile("todos.json");
+      return withBoardLock(file, () => {
+        const data = loadBoardForWrite(file);
+        const todo = data.todos.find((t) => t && t.id === task.id);
+        if (!todo) return { written: false, error: `task ${task.id} not found on the board` };
+        if (!Array.isArray(todo.comments)) todo.comments = [];
+        todo.comments.push(comment);
+        todo.updated_at = comment.created_at;
+        saveBoard(file, data);
+        return { written: true };
+      });
+    },
+    stepBase: async ({ task, cwd }) => {
+      const based = gitBase(cwd);
+      if (!based.ok) return { ok: false, error: based.error };
+      const file = appDataFile("todos.json");
+      const write = withBoardLock(file, () => {
+        const data = loadBoardForWrite(file);
+        const todo = data.todos.find((t) => t && t.id === task.id);
+        if (!todo) return { written: false, error: `task ${task.id} not found on the board` };
+        todo.step_base = based.sha;
+        todo.updated_at = new Date().toISOString();
+        saveBoard(file, data);
+        return { written: true };
+      });
+      if (!write.written) return { ok: false, error: write.error };
+      return { ok: true, sha: based.sha };
+    },
+    priorChanges: async ({ task, cwd }) => {
+      if (!task.step_base) return { ok: true, changes: null };
+      const head = gitHead(cwd);
+      if (!head.ok) return { ok: false, error: head.error };
+      const changes = diffNameStatus(cwd, head.sha, task.step_base);
+      if (!Array.isArray(changes)) return { ok: false, error: changes.error };
+      return { ok: true, changes };
+    },
+    ownChanges: async ({ task, cwd }) => {
+      if (!task.step_base) return { ok: true, skip: true };
+      const head = gitHead(cwd);
+      if (!head.ok) return { ok: false, error: head.error };
+      const end = snapshotTree(cwd);
+      if (!end.ok) return { ok: false, error: end.error };
+      const damage = computeNeighbourDamage({
+        cwd,
+        head: head.sha,
+        stepBase: task.step_base,
+        end: end.sha,
+        produces: task.produces,
+      });
+      if (!damage.ok) return { ok: false, error: damage.error };
+      return { ok: true, own: damage.own, damaged: damage.damaged };
+    },
+    redGate: async ({ task, cwd, timeoutMs }) => {
+      let mod;
+      try {
+        mod = await import("./run-step.mjs");
+      } catch (err) {
+        return {
+          ok: false,
+          field: null,
+          reason: `the step executor is missing: scripts/cli/process/run-step.mjs could not be loaded (${
+            (err && err.message) || err
+          })`,
+        };
+      }
+      return runRedGate({ task, cwd, timeoutMs, appDataDir: redGateDir(), runCmd: mod.runVerify });
+    },
     // What a step really cost lives in the tracker's blocks (SQLite, Rust side),
     // but the headless run already reports its own total — `executeStep` returns
     // it as `costUsd` (from `total_cost_usd` of the JSON result). Read that name,
@@ -346,12 +438,19 @@ export function runRecordOf(report, { inherit = false } = {}) {
       attempt: s.attempt ?? null,
       result: s.result,
       verify: s.verify ?? null,
+      red: s.red ?? null,
       cost_usd: typeof s.cost_usd === "number" ? s.cost_usd : null,
       session: s.session || null,
       requested_mode: s.requested_mode || null,
       start_mode: s.start_mode || "unknown",
       parent_session: s.parent_session || null,
+      provider: s.provider || null,
+      model: s.model || null,
+      route: s.route || null,
+      review: s.review || null,
       reason: s.reason || null,
+      own_changes: typeof s.own_changes === "number" ? s.own_changes : null,
+      neighbour_damage: typeof s.neighbour_damage === "number" ? s.neighbour_damage : null,
     })),
     spend: report.spend || null,
     refused: (report.refused || []).length,
@@ -376,12 +475,19 @@ export function reportRecordOf(report) {
         attempt: s.attempt ?? null,
         result: s.result,
         verify: s.verify ?? null,
+        red: s.red ?? null,
         cost_usd: typeof s.cost_usd === "number" ? s.cost_usd : null,
         session: s.session || null,
         requested_mode: s.requested_mode || null,
         start_mode: s.start_mode || "unknown",
         parent_session: s.parent_session || null,
+        provider: s.provider || null,
+        model: s.model || null,
+        route: s.route || null,
+        review: s.review || null,
         reason: s.reason || null,
+        own_changes: typeof s.own_changes === "number" ? s.own_changes : null,
+        neighbour_damage: typeof s.neighbour_damage === "number" ? s.neighbour_damage : null,
       },
     ],
     refused: (report.refused || []).length,
@@ -446,7 +552,7 @@ export function inheritFrom(ctx, task) {
   return own.length === 1 ? own[0] : "";
 }
 
-export function stepBrief(ctx, task, wave) {
+export function stepBrief(ctx, task, wave, { attempt, limit, priorChanges } = {}) {
   return {
     task,
     board: ctx.data,
@@ -454,6 +560,9 @@ export function stepBrief(ctx, task, wave) {
     timeoutMs: ctx.timeoutMs,
     alongside: wave.filter((t) => t !== task).map(brief),
     inherit: inheritFrom(ctx, task),
+    attempt,
+    limit,
+    priorChanges,
   };
 }
 
@@ -467,11 +576,57 @@ export async function beginStep(ctx, task, wave = []) {
   if (limit !== null && spent + 1 > limit) {
     return { task, kind: "retry-exhausted", attempt: spent, limit, cost: null, session: null };
   }
+  const based = await recordStepBase(ctx, task);
+  if (!based.ok) {
+    if (declaredRed(task)) {
+      return {
+        task,
+        kind: "red-base-failed",
+        attempt: spent,
+        limit,
+        cost: null,
+        session: null,
+        reason: `red declared but ${ctx.cwd} is not a git work tree${based.error ? `: ${based.error}` : ""}`,
+      };
+    }
+    if (!ctx.stepBaseWarned) {
+      ctx.stepBaseWarned = true;
+      process.stderr.write(
+        `run: step base unavailable for ${ctx.cwd}${based.error ? `: ${based.error}` : ""} — continuing without it, this run's produces/scope checks are best-effort\n`,
+      );
+    }
+  }
+  let priorChanges = null;
+  if (task.step_base) {
+    try {
+      const pr = (await ctx.effects.priorChanges({ task, cwd: ctx.cwd })) || {};
+      if (pr.ok) priorChanges = pr.changes ?? null;
+    } catch {}
+  }
   const attempt = spent + 1;
   ctx.attempts.set(task.id, attempt);
 
   await moveTo(ctx, task, "in_progress");
-  return { task, kind: "begin", attempt, limit, brief: stepBrief(ctx, task, wave) };
+  return {
+    task,
+    kind: "begin",
+    attempt,
+    limit,
+    brief: stepBrief(ctx, task, wave, { attempt, limit, priorChanges }),
+  };
+}
+
+async function recordStepBase(ctx, task) {
+  if (task.step_base) return { ok: true };
+  let result;
+  try {
+    result = (await ctx.effects.stepBase({ task, cwd: ctx.cwd })) || {};
+  } catch (err) {
+    result = { ok: false, error: String((err && err.message) || err) };
+  }
+  if (!result.ok) return { ok: false, error: result.error };
+  task.step_base = result.sha;
+  return { ok: true };
 }
 
 // The baton the step wrote, put on the board before anything else reads it. A
@@ -490,31 +645,83 @@ async function recordWork(ctx, task, result) {
   return { baton, cost };
 }
 
-// Everything AFTER the executor and the reviewer have run: the review verdict,
-// its cost added onto what the worker already cost, and the branch into gate /
-// issue / verify+reconcile / close. Anything that moves ANOTHER node (the
-// `?issue` transition) is only RETURNED as an intent here — it is applied in
-// board order afterwards, never from inside a single node's own step.
-export async function finishStep(ctx, task, { result, review, baton, cost }) {
+const clampChars = (s, max) => {
+  const t = String(s ?? "").trim();
+  return t.length <= max ? t : `${t.slice(0, max)}\n… [${t.length - max} chars elided] …`;
+};
+
+const tailLines = (s, n) => {
+  const t = String(s ?? "").trim();
+  const lines = t.split(/\r?\n/);
+  return lines.length <= n ? t : lines.slice(-n).join("\n");
+};
+
+async function recordIssueComment(ctx, task, { attempt, limit, source, text }) {
+  const marker = `ISSUE attempt ${attempt}/${limit === null ? "-" : limit}`;
+  const comment = {
+    id: randomUUID(),
+    author: "review",
+    body: `${marker}\n${source}\n${text}`.trim(),
+    created_at: new Date().toISOString(),
+  };
+  (task.comments ??= []).push(comment);
+  if (typeof ctx.effects.recordIssue === "function") {
+    let written;
+    try {
+      written = await ctx.effects.recordIssue({ task, comment });
+    } catch (e) {
+      written = { written: false, error: e && e.message ? e.message : String(e) };
+    }
+    if (written && written.written === false && written.error)
+      process.stderr.write(`run: ISSUE comment for #${task.number} not saved to the board — ${written.error}
+`);
+  }
+  return comment;
+}
+
+function resultBase(ctx, task, result, review, baton, cost, ownChanges) {
   const attempt = ctx.attempts.get(task.id);
   const limit = retryLimitOf(task);
   if (typeof review?.costUsd === "number" && Number.isFinite(review.costUsd))
     cost = (typeof cost === "number" ? cost : 0) + review.costUsd;
 
-  const base = {
+  return {
     task, attempt, limit, cost, baton, session: result.sessionId || null,
     requestedMode: result.requestedMode || null,
     startMode: result.startMode || "unknown",
     parentSession: result.parentSession || null,
+    provider: result.provider || null,
+    model: result.model || null,
+    route: result.route || null,
+    ownChanges: Array.isArray(ownChanges) ? ownChanges.length : null,
+    neighbourDamage: Array.isArray(ownChanges) ? 0 : null,
     review: review ? {
       skipped: !!review.skipped,
       approved: !!review.approved,
+      provider: review.provider || null,
       model: review.model || null,
       session: review.sessionId || null,
+      route: review.route || null,
     } : null,
   };
+}
+
+// Everything AFTER the executor and the reviewer have run: the review verdict,
+// its cost added onto what the worker already cost, and the branch into gate /
+// issue / verify+reconcile / close. Anything that moves ANOTHER node (the
+// `?issue` transition) is only RETURNED as an intent here — it is applied in
+// board order afterwards, never from inside a single node's own step.
+export async function finishStep(ctx, task, { result, review, baton, cost, ownChanges }) {
+  const base = resultBase(ctx, task, result, review, baton, cost, ownChanges);
+  const { attempt, limit } = base;
 
   if (review && review.skipped !== true && (review.ok === false || review.approved !== true)) {
+    await recordIssueComment(ctx, task, {
+      attempt,
+      limit,
+      source: review.model ? `review ${review.model}` : "review",
+      text: clampChars(review.result || review.error || "reviewer did not approve the obligations", 6000),
+    });
     return {
       ...base,
       kind: "issue",
@@ -529,7 +736,28 @@ export async function finishStep(ctx, task, { result, review, baton, cost }) {
     return { ...base, kind: "gate", reason: gateReason(task) };
   }
   if (result.ok === false) {
-    return { ...base, kind: "issue", reason: `step failed: ${result.error || "no error reported"}` };
+    const error = result.error || "no error reported";
+    await recordIssueComment(ctx, task, { attempt, limit, source: "executor", text: clampChars(error, 6000) });
+    return { ...base, kind: "issue", reason: `step failed: ${error}` };
+  }
+
+  if (declaredRed(task)) {
+    let gate;
+    try {
+      gate = (await ctx.effects.redGate({ task, cwd: ctx.cwd, timeoutMs: ctx.timeoutMs })) || {};
+    } catch (err) {
+      gate = { ok: false, field: null, reason: `red gate crashed: ${(err && err.message) || err}` };
+    }
+    if (!gate.ok) {
+      await recordIssueComment(ctx, task, {
+        attempt,
+        limit,
+        source: "red",
+        text: clampChars(gate.reason || "red gate issue", 6000),
+      });
+      return { ...base, kind: "issue", red: gate.field ?? null, reason: gate.reason || "red gate issue" };
+    }
+    base.red = gate.field ?? null;
   }
 
   const verdictRun = await ctx.effects.runVerify({
@@ -538,6 +766,10 @@ export async function finishStep(ctx, task, { result, review, baton, cost }) {
     timeoutMs: ctx.timeoutMs,
   });
   const verify = Number(verdictRun?.code) === 0 ? "ok" : "issue";
+  if (verify === "issue") {
+    const combined = [verdictRun?.stdout, verdictRun?.stderr].filter((s) => s && String(s).trim()).join("\n");
+    await recordIssueComment(ctx, task, { attempt, limit, source: "verify", text: tailLines(combined, 60) });
+  }
   const report = (await ctx.effects.reconcile({ task, verify })) || {};
   const outcome = report.outcome ?? null;
   const reason = report.outcome_reason || `verify:${verify}`;
@@ -553,8 +785,47 @@ export async function finishStep(ctx, task, { result, review, baton, cost }) {
       };
     return { ...base, kind: "done", verify, reason };
   }
-  if (outcome === "issue") return { ...base, kind: "issue", verify, reason };
+  if (outcome === "issue") {
+    if (verify === "ok") await recordIssueComment(ctx, task, { attempt, limit, source: "reconcile", text: clampChars(reason, 6000) });
+    return { ...base, kind: "issue", verify, reason };
+  }
   return { ...base, kind: "undecided", verify, reason };
+}
+
+function formatNeighbourDamage(damaged) {
+  const lines = damaged.map((d) => `${d.state} ${d.path}`).join("\n");
+  return (
+    `this step reverted or deleted work of earlier steps of the run, outside its own produces:\n${lines}`
+  );
+}
+
+async function checkNeighbourDamage(ctx, task, result, baton, cost) {
+  if (result.ok === false || !task.step_base) return null;
+  let damage;
+  try {
+    damage = (await ctx.effects.ownChanges({ task, cwd: ctx.cwd })) || {};
+  } catch (err) {
+    damage = { ok: false, error: String((err && err.message) || err) };
+  }
+  if (!damage.ok || damage.skip) return null;
+  const ownChanges = damage.own || [];
+  if (!Array.isArray(damage.damaged) || !damage.damaged.length) return { ownChanges, issue: null };
+  const base = resultBase(ctx, task, result, null, baton, cost, ownChanges);
+  base.neighbourDamage = damage.damaged.length;
+  await recordIssueComment(ctx, task, {
+    attempt: base.attempt,
+    limit: base.limit,
+    source: "scope",
+    text: formatNeighbourDamage(damage.damaged),
+  });
+  return {
+    ownChanges,
+    issue: {
+      ...base,
+      kind: "issue",
+      reason: `step reverted or deleted work of earlier steps outside its own produces: ${damage.damaged.map((d) => d.path).join(", ")}`,
+    },
+  };
 }
 
 // One attempt at one node, composed from the three phases above: beginStep does
@@ -563,7 +834,7 @@ export async function finishStep(ctx, task, { result, review, baton, cost }) {
 // its verdict and branches.
 async function runOne(ctx, task, wave = []) {
   const begun = await beginStep(ctx, task, wave);
-  if (begun.kind === "retry-exhausted") return begun;
+  if (begun.kind === "retry-exhausted" || begun.kind === "red-base-failed") return begun;
 
   let result;
   try {
@@ -573,6 +844,11 @@ async function runOne(ctx, task, wave = []) {
   }
   const { baton, cost } = await recordWork(ctx, task, result);
   if (result.sessionId) ctx.sessions.set(task.id, result.sessionId);
+
+  const damage = await checkNeighbourDamage(ctx, task, result, baton, cost);
+  if (damage && damage.issue) return damage.issue;
+  const ownChanges = damage ? damage.ownChanges : null;
+
   let review = null;
   if (result.ok !== false && typeof ctx.effects.reviewStep === "function") {
     try {
@@ -581,17 +857,18 @@ async function runOne(ctx, task, wave = []) {
         workerResult: result.result || "",
         cwd: ctx.cwd,
         timeoutMs: ctx.timeoutMs,
+        ownChanges,
       });
     } catch (err) {
       review = { approved: false, ok: false, error: String(err?.message || err) };
     }
   }
-  return finishStep(ctx, task, { result, review, baton, cost });
+  return finishStep(ctx, task, { result, review, baton, cost, ownChanges });
 }
 
 export async function runReported(ctx, task, wave, { result, review = null }) {
   const begun = await beginStep(ctx, task, wave);
-  if (begun.kind === "retry-exhausted") return begun;
+  if (begun.kind === "retry-exhausted" || begun.kind === "red-base-failed") return begun;
   const { baton, cost } = await recordWork(ctx, task, result);
   return finishStep(ctx, task, { result, review, baton, cost });
 }
@@ -616,17 +893,22 @@ async function applyIssue(ctx, r) {
     park(ctx, "retry", task, `retry limit exhausted — ${r.attempt}/<=${limit}, predicate issue (${r.reason})`);
     return;
   }
-  const target = task.on_issue ? ctx.byId.get(task.on_issue) : null;
+  if (!task.on_issue) {
+    await moveTo(ctx, task, "queue");
+    ctx.transitions.push({
+      from: brief(task),
+      to: brief(task),
+      attempt: r.attempt,
+      limit,
+      reason: r.reason,
+      self: true,
+    });
+    return;
+  }
+  const target = ctx.byId.get(task.on_issue);
   if (!target) {
     await moveTo(ctx, task, "review");
-    park(
-      ctx,
-      "retry",
-      task,
-      task.on_issue
-        ? `outcome issue and the declared ?issue target ${task.on_issue} is not on the board`
-        : `outcome issue (${r.reason}) and no ?issue transition declared — there is nowhere to hand control`,
-    );
+    park(ctx, "retry", task, `outcome issue and the declared ?issue target ${task.on_issue} is not on the board`);
     return;
   }
   // Point return: the transition TARGET is reopened, the `done` nodes between it
@@ -713,6 +995,7 @@ export function buildRunContext({ data, change, effects = {}, dry = true, cwd = 
     unknownCost: 0,
     stop: null,
     maxParallel: 0,
+    stepBaseWarned: false,
   };
 }
 
@@ -727,6 +1010,17 @@ const budgetExhaustedReason = (spent, budget, notStarted) =>
 
 const retryExhaustedReason = (attempt, limit) =>
   `attempt ${attempt + 1} would be past the declared limit — ${attempt}/<=${limit}; attempt M+1 never starts`;
+
+export function buildWave(ready, limit) {
+  if (!ready.length) return [];
+  if (declaredRed(ready[0])) return [ready[0]];
+  const wave = [];
+  for (const t of ready) {
+    if (wave.length >= limit || declaredRed(t)) break;
+    wave.push(t);
+  }
+  return wave;
+}
 
 export function resolveParallelLimit(root, override) {
   return (
@@ -753,15 +1047,21 @@ export async function applyResult(ctx, r, { dry, log }) {
     requested_mode: r.requestedMode || null,
     start_mode: r.startMode || "unknown",
     parent_session: r.parentSession || null,
+    provider: r.provider || null,
+    model: r.model || null,
+    route: r.route || null,
     cost_usd: r.cost,
     baton: r.baton ?? null,
     review: r.review ?? null,
     gate: r.kind === "gate",
     verify: r.verify ?? null,
+    red: r.red ?? null,
     outcome: r.kind === "done" ? "ok" : r.kind === "issue" ? "issue" : null,
     result: r.kind,
     reason: r.reason || null,
     status: r.task.status,
+    own_changes: typeof r.ownChanges === "number" ? r.ownChanges : null,
+    neighbour_damage: typeof r.neighbourDamage === "number" ? r.neighbourDamage : null,
   };
   ctx.steps.push(record);
   log(formatStepLine(record, dry));
@@ -769,6 +1069,11 @@ export async function applyResult(ctx, r, { dry, log }) {
   if (r.kind === "gate") {
     ctx.parked.add(r.task.id);
     park(ctx, "gate", r.task, r.reason);
+    return record;
+  }
+  if (r.kind === "red-base-failed") {
+    ctx.parked.add(r.task.id);
+    park(ctx, "red-base", r.task, r.reason);
     return record;
   }
   if (r.kind === "retry-exhausted") {
@@ -837,7 +1142,7 @@ export function nextFrontier(ctx, { limit, groupBudget, spentKnown }) {
     park(ctx, "retry", exhausted, retryExhaustedReason(attemptsSoFar(exhausted), retryLimitOf(exhausted)));
     return { stop: ctx.stop };
   }
-  return { wave: ready.slice(0, limit) };
+  return { wave: buildWave(ready, limit) };
 }
 
 // The run loop. `data` is cloned first, so nothing the engine does is visible on
@@ -898,7 +1203,7 @@ export async function runChange({
       break;
     }
 
-    const wave = ready.slice(0, limit);
+    const wave = buildWave(ready, limit);
     ctx.waves.push(wave.map((t) => t.number));
     if (ctx.steps.length + wave.length > bound) {
       park(ctx, "empty-frontier", null, `runaway guard: more than ${bound} steps in one run — the graph or the seam is looping`);
@@ -968,7 +1273,8 @@ function formatStepLine(s, dry) {
       : s.baton === "refused"
         ? " · baton REFUSED by the board"
         : " · NO baton — it wrote no ## HANDOFF";
-  return `  wave ${s.wave}  #${s.task.number} ${s.task.subject} — ${verb}${attempt}${cost}${baton}\n`;
+  const route = s.route ? ` · ${s.route.note}` : "";
+  return `  wave ${s.wave}  #${s.task.number} ${s.task.subject} — ${verb}${attempt}${cost}${baton}${route}\n`;
 }
 
 // All four stops print the SAME shape: the node, the reason, "pipeline parked",
@@ -995,6 +1301,8 @@ export function formatStop(stop) {
 }
 
 function formatTransitionLine(t) {
+  if (t.self)
+    return `  ?issue  #${t.from.number} retried in place — ${t.reason} (attempt ${t.attempt}/<=${t.limit}; no ?issue target declared, the node itself is requeued with the findings)\n`;
   return `  ?issue  #${t.from.number} → #${t.to.number} — ${t.reason} (attempt ${t.attempt}/<=${t.limit}; the target is reopened, closed nodes below it stay closed)\n`;
 }
 
@@ -1195,7 +1503,42 @@ export function stampHandout(file, data, wave) {
   return at;
 }
 
+function attachStepBase(data, wave, cwd) {
+  if (!wave.length) return { wave, stop: null };
+  let warned = false;
+  for (const t of wave) {
+    if (t.step_base) continue;
+    const head = gitBase(cwd);
+    if (!head.ok) {
+      if (declaredRed(t)) {
+        return {
+          wave: [],
+          stop: {
+            kind: "red-base",
+            task: brief(t),
+            status: t.status,
+            reason: `red declared but ${cwd} is not a git work tree${head.error ? `: ${head.error}` : ""}`,
+            parked: true,
+          },
+        };
+      }
+      if (!warned) {
+        warned = true;
+        process.stderr.write(
+          `run: step base unavailable for ${cwd}${head.error ? `: ${head.error}` : ""} — continuing without it, this run's produces/scope checks are best-effort\n`,
+        );
+      }
+      continue;
+    }
+    const todo = data.todos.find((x) => x && x.id === t.id);
+    if (todo) todo.step_base = head.sha;
+    t.step_base = head.sha;
+  }
+  return { wave, stop: null };
+}
+
 async function cmdNext(ref, f) {
+  recoverRedGate(process.cwd());
   let parallel;
   if (f.parallel !== undefined) {
     parallel = Number(f.parallel);
@@ -1220,7 +1563,11 @@ async function cmdNext(ref, f) {
     const c = buildRunContext({ data, change: ref, dry: true, cwd: process.cwd(), timeoutMs, spent });
     const l = resolveParallelLimit(c.root, parallel);
     const gb = typeof c.root.budget_usd === "number" ? c.root.budget_usd : null;
-    const o = nextFrontier(c, { limit: l, groupBudget: gb, spentKnown });
+    let o = nextFrontier(c, { limit: l, groupBudget: gb, spentKnown });
+    if (o.wave) {
+      const based = attachStepBase(data, o.wave, process.cwd());
+      o = based.stop ? { stop: based.stop } : { ...o, wave: based.wave };
+    }
     const at = stampHandout(file, data, o.wave || []);
     return { root: c.root, limit: l, groupBudget: gb, ctx: c, outcome: o, handoutAt: at };
   });
@@ -1250,6 +1597,7 @@ async function cmdNext(ref, f) {
 }
 
 async function cmdReport(ref, f) {
+  recoverRedGate(process.cwd());
   const taskRef = f.report;
   if (f.result !== "ok" && f.result !== "issue") fail('--report needs --result "ok" or "issue"');
   let cost;
@@ -1538,6 +1886,7 @@ export async function run(args) {
   if (f.go && f.dry) fail("--go and --dry-run ask for opposite things — pick one");
 
   const dry = !f.go;
+  if (!dry) recoverRedGate(process.cwd());
   const file = appDataFile("todos.json");
   const data = dry ? loadBoard(file) : loadBoardForWrite(file);
   const { root } = collectChange(data, ref);

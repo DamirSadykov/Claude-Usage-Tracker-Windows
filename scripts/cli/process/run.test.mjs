@@ -17,7 +17,7 @@ import {
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawnSync, execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import {
   runChange,
@@ -44,6 +44,7 @@ import {
   formatRunHistory,
 } from "./run.mjs";
 import { isReadyNode, loadBoard } from "../board/todos.mjs";
+import { buildStepPrompt } from "./run-step.mjs";
 
 // ── fixtures ─────────────────────────────────────────────────────────────────
 const task = (number, extra = {}) => ({
@@ -102,6 +103,12 @@ function harness(overrides = {}) {
       calls.statuses.push([t.number, status]);
     },
     stepCost: async () => 0,
+    // No real git in these tests unless a test opts in: without these stubs a
+    // `dry:false` run falls through to liveEffects (buildRunContext merges it
+    // under the harness), which would snapshot the ACTUAL repo working tree.
+    stepBase: async () => ({ ok: false, error: "harness: no step base in tests" }),
+    priorChanges: async () => ({ ok: true, changes: null }),
+    ownChanges: async () => ({ ok: true, skip: true }),
     ...overrides,
   };
   return { effects, calls, state };
@@ -471,6 +478,253 @@ describe("runChange — issue, transition and the retry limit", () => {
     expect(r.stop.reason).toMatch(/NO declared retry limit/);
     expect(statusOf(r, 2)).toBe("done");
     expect(statusOf(r, 3)).toBe("review");
+  });
+});
+
+describe("runChange — self-retry when a retry limit is declared but no on_issue is", () => {
+  it("requeues the node itself and runs it a second time, carrying the reviewer's findings forward", async () => {
+    const data = board(changeRoot(1, [2], { budget_usd: 10 }), auto(2, { retry_limit: 2 }));
+    const seen = [];
+    const h = harness({
+      executeStep: async (b) => {
+        seen.push(b);
+        return { sessionId: `s-2-${seen.length}`, ok: true, result: "implemented" };
+      },
+      reviewStep: async () => ({
+        approved: seen.length === 1 ? false : true,
+        ok: true,
+        model: "opus",
+        result: "scope regression: touched files outside the promise\nVERDICT: issue",
+      }),
+    });
+    const r = await go(data, "1", h.effects);
+
+    expect(seen).toHaveLength(2);
+    expect(seen[0].attempt).toBe(1);
+    expect(seen[0].limit).toBe(2);
+    expect(seen[1].attempt).toBe(2);
+    expect(seen[1].limit).toBe(2);
+    expect(r.complete).toBe(true);
+    expect(statusOf(r, 2)).toBe("done");
+    expect(r.transitions).toHaveLength(1);
+    expect(r.transitions[0].from.number).toBe(2);
+    expect(r.transitions[0].to.number).toBe(2);
+    expect(r.transitions[0].self).toBe(true);
+
+    const comment = (seen[1].task.comments || []).find(
+      (c) => c.author === "review" && c.body.startsWith("ISSUE attempt 1/2"),
+    );
+    expect(comment).toBeTruthy();
+    expect(comment.body).toContain("review opus");
+    expect(comment.body).toContain("scope regression: touched files outside the promise");
+
+    const prompt = buildStepPrompt({
+      task: seen[1].task,
+      board: seen[1].board,
+      alongside: seen[1].alongside,
+      attempt: seen[1].attempt,
+      limit: seen[1].limit,
+    });
+    expect(prompt).toContain("PREVIOUS ATTEMPT");
+    expect(prompt).toContain("scope regression: touched files outside the promise");
+  });
+
+  it("adds an ISSUE comment with the verify output tail when the declared check fails", async () => {
+    const data = board(changeRoot(1, [2], { budget_usd: 10 }), auto(2, { retry_limit: 1 }));
+    const h = harness({
+      runVerify: async () => ({
+        code: 1,
+        stdout: "running tests\n...\nFAIL something\n",
+        stderr: "assertion failed at line 12\n",
+      }),
+    });
+    const r = await go(data, "1", h.effects);
+
+    const t2 = r.board.todos.find((t) => t.number === 2);
+    const comment = (t2.comments || []).find(
+      (c) => c.author === "review" && c.body.startsWith("ISSUE attempt 1/1"),
+    );
+    expect(comment).toBeTruthy();
+    expect(comment.body).toContain("verify");
+    expect(comment.body).toContain("assertion failed at line 12");
+    expect(r.stop.kind).toBe("retry");
+    expect(statusOf(r, 2)).toBe("review");
+  });
+
+  it("adds an ISSUE comment with the executor error when the step itself fails", async () => {
+    const data = board(changeRoot(1, [2], { budget_usd: 10 }), auto(2, { retry_limit: 1 }));
+    const h = harness({
+      executeStep: async () => ({ sessionId: "s-2", ok: false, error: "codex exited 3: sandbox denied write" }),
+    });
+    const r = await go(data, "1", h.effects);
+
+    const t2 = r.board.todos.find((t) => t.number === 2);
+    const comment = (t2.comments || []).find((c) => c.author === "review" && c.body.startsWith("ISSUE attempt 1/1"));
+    expect(comment).toBeTruthy();
+    expect(comment.body).toContain("executor");
+    expect(comment.body).toContain("sandbox denied write");
+  });
+
+  it("adds an ISSUE comment with the reconcile reason when verify passes but the outcome is issue", async () => {
+    const data = board(changeRoot(1, [2], { budget_usd: 10 }), auto(2, { retry_limit: 1 }));
+    const h = harness({
+      reconcile: async () => ({ outcome: "issue", outcome_reason: "promised src/a.ts was never written" }),
+    });
+    const r = await go(data, "1", h.effects);
+
+    const t2 = r.board.todos.find((t) => t.number === 2);
+    const comment = (t2.comments || []).find((c) => c.author === "review" && c.body.startsWith("ISSUE attempt 1/1"));
+    expect(comment).toBeTruthy();
+    expect(comment.body).toContain("reconcile");
+    expect(comment.body).toContain("promised src/a.ts was never written");
+  });
+
+  it("never starts a third attempt when the retry limit is 2 and every attempt gets an issue", async () => {
+    const data = board(changeRoot(1, [2], { budget_usd: 10 }), auto(2, { retry_limit: 2 }));
+    const h = harness({
+      reviewStep: async () => ({ approved: false, ok: true, result: "still wrong\nVERDICT: issue" }),
+    });
+    const r = await go(data, "1", h.effects);
+
+    expect(h.calls.steps).toEqual([2, 2]);
+    expect(r.stop.kind).toBe("retry");
+    expect(r.stop.reason).toMatch(/retry limit exhausted/);
+    expect(statusOf(r, 2)).toBe("review");
+  });
+});
+
+const redAuto = (number, extra = {}) =>
+  auto(number, { red: "npm run test:red", red_tests: ["test/regression.spec.js"], ...extra });
+
+describe("runChange — the red gate never shares a wave", () => {
+  it("keeps a red-declared step solo even when the parallel limit allows more", async () => {
+    const data = board(
+      changeRoot(1, [2, 3, 4], { parallel_limit: 3, budget_usd: 10 }),
+      auto(2),
+      redAuto(3),
+      auto(4),
+    );
+    const h = harness({
+      stepBase: async () => ({ ok: true, sha: "base-sha" }),
+      redGate: async () => ({ ok: true, field: "failed-on-base", reason: null }),
+    });
+    const r = await go(data, "1", h.effects);
+
+    expect(r.waves).toEqual([[2], [3], [4]]);
+    expect(r.complete).toBe(true);
+  });
+
+  it("parks a red-declared step instead of starting it when the base cannot be recorded", async () => {
+    const data = board(changeRoot(1, [2], { budget_usd: 10 }), redAuto(2));
+    const h = harness({
+      stepBase: async () => ({ ok: false, error: "not a git repository" }),
+    });
+    const r = await go(data, "1", h.effects);
+
+    expect(h.calls.steps).toEqual([]);
+    expect(r.stop.kind).toBe("red-base");
+    expect(r.stop.reason).toMatch(/not a git work tree/);
+    expect(statusOf(r, 2)).toBe("queue");
+  });
+});
+
+describe("runChange — the red gate's verdict", () => {
+  it("a failing gate (red passes on base) produces an ISSUE comment with source `red` and is retried per retry_limit", async () => {
+    const data = board(changeRoot(1, [2], { budget_usd: 10 }), redAuto(2, { retry_limit: 2 }));
+    const h = harness({
+      stepBase: async () => ({ ok: true, sha: "base-sha" }),
+      redGate: async () => ({
+        ok: false,
+        field: "passed-on-base",
+        reason: "the regression test passes on the base code — it does not catch the bug",
+      }),
+    });
+    const r = await go(data, "1", h.effects);
+
+    expect(h.calls.steps).toEqual([2, 2]);
+    expect(h.calls.verifies).toEqual([]);
+    const t2 = r.board.todos.find((t) => t.number === 2);
+    const comment = (t2.comments || []).find(
+      (c) => c.author === "review" && c.body.startsWith("ISSUE attempt 1/2"),
+    );
+    expect(comment).toBeTruthy();
+    expect(comment.body).toContain("red");
+    expect(comment.body).toContain("does not catch the bug");
+    expect(r.stop.kind).toBe("retry");
+    expect(r.stop.reason).toMatch(/retry limit exhausted/);
+    expect(statusOf(r, 2)).toBe("review");
+  });
+
+  it("a passing gate (red fails on base) proceeds to the declared verify and records the field", async () => {
+    const data = board(changeRoot(1, [2], { budget_usd: 10 }), redAuto(2));
+    const h = harness({
+      stepBase: async () => ({ ok: true, sha: "base-sha" }),
+      redGate: async () => ({ ok: true, field: "failed-on-base", reason: null }),
+    });
+    const r = await go(data, "1", h.effects);
+
+    expect(h.calls.verifies).toEqual(["npm test"]);
+    expect(r.steps[0].result).toBe("done");
+    expect(r.steps[0].red).toBe("failed-on-base");
+    expect(statusOf(r, 2)).toBe("done");
+  });
+});
+
+describe("runChange — neighbour damage ends a step as issue before review", () => {
+  it("a step that reverts or deletes an earlier step's uncommitted work never reaches review", async () => {
+    const data = board(changeRoot(1, [2], { budget_usd: 10 }), auto(2, { produces: ["src/own.js"] }));
+    data.todos[1].step_base = "base-sha";
+    const h = harness({
+      ownChanges: async () => ({
+        ok: true,
+        own: [
+          { status: "M", path: "src/sum.mjs" },
+          { status: "D", path: "test/sum.regression.test.mjs" },
+        ],
+        damaged: [
+          { path: "src/sum.mjs", state: "reverted" },
+          { path: "test/sum.regression.test.mjs", state: "deleted" },
+        ],
+      }),
+    });
+    const r = await go(data, "1", h.effects);
+
+    expect(h.calls.reviews).toEqual([]);
+    expect(r.steps[0].result).toBe("issue");
+    expect(r.steps[0].reason).toMatch(/reverted or deleted/);
+    expect(r.steps[0].own_changes).toBe(2);
+    expect(r.steps[0].neighbour_damage).toBe(2);
+    const t2 = r.board.todos.find((t) => t.number === 2);
+    const comment = (t2.comments || []).find((c) => c.author === "review" && c.body.includes("\nscope\n"));
+    expect(comment).toBeTruthy();
+    expect(comment.body).toContain("src/sum.mjs");
+    expect(comment.body).toContain("test/sum.regression.test.mjs");
+  });
+
+  it("a step that only adds its own file causes no issue", async () => {
+    const data = board(changeRoot(1, [2], { budget_usd: 10 }), auto(2, { produces: ["src/own.js"] }));
+    data.todos[1].step_base = "base-sha";
+    const h = harness({
+      ownChanges: async () => ({ ok: true, own: [{ status: "A", path: "src/own.js" }], damaged: [] }),
+    });
+    const r = await go(data, "1", h.effects);
+
+    expect(h.calls.reviews).toEqual([2]);
+    expect(r.steps[0].result).toBe("done");
+    expect(r.steps[0].own_changes).toBe(1);
+    expect(r.steps[0].neighbour_damage).toBe(0);
+  });
+
+  it("a step that modifies a prior file that IS in its own produces causes no issue", async () => {
+    const data = board(changeRoot(1, [2], { budget_usd: 10 }), auto(2, { produces: ["src/sum.mjs"] }));
+    data.todos[1].step_base = "base-sha";
+    const h = harness({
+      ownChanges: async () => ({ ok: true, own: [{ status: "M", path: "src/sum.mjs" }], damaged: [] }),
+    });
+    const r = await go(data, "1", h.effects);
+
+    expect(h.calls.reviews).toEqual([2]);
+    expect(r.steps[0].result).toBe("done");
   });
 });
 
@@ -851,8 +1105,17 @@ describe("run(['--next']) — the field wired end to end onto the real board (t#
     mkdirSync(appDir, { recursive: true });
     const initial = board(changeRoot(1, [2, 3], { parallel_limit: 2 }), auto(2), auto(3));
     writeFileSync(path.join(appDir, "todos.json"), JSON.stringify(initial));
+    const gitDir = mkdtempSync(path.join(os.tmpdir(), "cut-run-cmdnext-git-"));
+    execFileSync("git", ["init", "-q"], { cwd: gitDir });
+    execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: gitDir });
+    execFileSync("git", ["config", "user.name", "Test"], { cwd: gitDir });
+    writeFileSync(path.join(gitDir, "a.txt"), "x\n");
+    execFileSync("git", ["add", "-A"], { cwd: gitDir });
+    execFileSync("git", ["commit", "-q", "-m", "base"], { cwd: gitDir });
     const prevAppData = process.env.APPDATA;
+    const prevCwd = process.cwd();
     process.env.APPDATA = dir;
+    process.chdir(gitDir);
     const origWrite = process.stdout.write;
     process.stdout.write = () => true;
     try {
@@ -873,9 +1136,11 @@ describe("run(['--next']) — the field wired end to end onto the real board (t#
       expect(t2b.status).toBe("queue");
     } finally {
       process.stdout.write = origWrite;
+      process.chdir(prevCwd);
       if (prevAppData === undefined) delete process.env.APPDATA;
       else process.env.APPDATA = prevAppData;
       rmSync(dir, { recursive: true, force: true });
+      rmSync(gitDir, { recursive: true, force: true });
     }
   }, 20000);
 });
@@ -1176,9 +1441,16 @@ function outsideEffects(reconcile) {
       task.handoff = text;
       return { written: true };
     },
+    recordIssue: async () => ({ written: true }),
     runVerify: async () => ({ code: 0 }),
     reconcile,
     stepCost: async ({ result }) => (typeof result?.costUsd === "number" ? result.costUsd : null),
+    // Same reason as harness()'s stubs: an omitted key here falls through to
+    // liveEffects (buildRunContext's dry:false merge), which would snapshot
+    // the ACTUAL repo working tree.
+    stepBase: async () => ({ ok: false, error: "outsideEffects: no step base in tests" }),
+    priorChanges: async () => ({ ok: true, changes: null }),
+    ownChanges: async () => ({ ok: true, skip: true }),
   };
 }
 
@@ -1406,6 +1678,63 @@ describe("equivalence — a --next/--report pair walks a graph to --go's own end
     const attemptsB = attemptsSoFar(boardB.todos.find((t) => t.number === 3));
     expect(attemptsB).toBe(attemptsA);
     expect(attemptsB).toBe(2);
+  });
+});
+
+// ── risk routing (t#741) ────────────────────────────────────────────────────
+
+describe("risk routing through the run record", () => {
+  it("carries the effective provider/model and the route note into the step record", async () => {
+    const data = board(
+      changeRoot(1, [2], { budget_usd: 10 }),
+      auto(2, { risk: "high" }),
+    );
+    const h = harness({
+      executeStep: async ({ task: t }) => ({
+        sessionId: `s-${t.number}`, ok: true,
+        provider: "openai", model: "gpt-5.6-terra",
+        route: { applied: true, risk: "high", note: "risk high routed worker to openai/gpt-5.6-terra" },
+      }),
+    });
+    const r = await go(data, "1", h.effects);
+
+    expect(r.steps[0]).toMatchObject({
+      provider: "openai", model: "gpt-5.6-terra",
+      route: { applied: true, risk: "high" },
+    });
+    const rec = runRecordOf(r);
+    expect(rec.steps[0]).toMatchObject({
+      provider: "openai", model: "gpt-5.6-terra",
+      route: { applied: true, risk: "high" },
+    });
+  });
+
+  it("mentions the route in the printed step line when risk is high, whether applied or not", async () => {
+    const data = board(
+      changeRoot(1, [2], { budget_usd: 10 }),
+      auto(2, { risk: "high" }),
+    );
+    const lines = [];
+    const h = harness({
+      executeStep: async ({ task: t }) => ({
+        sessionId: `s-${t.number}`, ok: true,
+        provider: "anthropic", model: "opus",
+        route: { applied: false, risk: "high", note: "risk high, no route configured for worker" },
+      }),
+    });
+    await go(data, "1", h.effects, { log: (l) => lines.push(l) });
+
+    expect(lines.join("")).toMatch(/no route configured for worker/);
+  });
+
+  it("leaves the step record without a route when the task carries no risk", async () => {
+    const data = board(changeRoot(1, [2], { budget_usd: 10 }), auto(2));
+    const h = harness({
+      executeStep: async ({ task: t }) => ({ sessionId: `s-${t.number}`, ok: true, provider: "anthropic", model: "sonnet" }),
+    });
+    const r = await go(data, "1", h.effects);
+
+    expect(r.steps[0].route).toBeNull();
   });
 });
 

@@ -326,6 +326,161 @@ describe("buildStepPrompt", () => {
   });
 });
 
+describe("buildStepPrompt · prior changes", () => {
+  it("adds the rule against touching earlier steps' changes and lists the prior paths", () => {
+    const data = chain();
+    writeFileSync(boardFile(), JSON.stringify(data));
+    const prompt = buildStepPrompt({
+      task: taskOf(data, "id-3"),
+      board: data,
+      priorChanges: [
+        { status: "M", path: "src/sum.mjs" },
+        { status: "A", path: "test/sum.regression.test.mjs" },
+      ],
+    });
+    expect(prompt).toContain("Do not revert, rewrite or delete changes");
+    expect(prompt).toContain("src/sum.mjs");
+    expect(prompt).toContain("test/sum.regression.test.mjs");
+  });
+
+  it("states the rule without a paths list when prior changes are not known", () => {
+    const data = chain();
+    writeFileSync(boardFile(), JSON.stringify(data));
+    const prompt = buildStepPrompt({ task: taskOf(data, "id-3"), board: data });
+    expect(prompt).toContain("Do not revert, rewrite or delete changes");
+    expect(prompt).not.toContain("Already in the working tree when this step started");
+  });
+});
+
+describe("buildStepPrompt · PREVIOUS ATTEMPT", () => {
+  it("says nothing about a previous attempt on the first attempt", () => {
+    const data = chain();
+    writeFileSync(boardFile(), JSON.stringify(data));
+    const prompt = buildStepPrompt({ task: taskOf(data, "id-3"), board: data, attempt: 1, limit: 2 });
+    expect(prompt).not.toContain("PREVIOUS ATTEMPT");
+  });
+
+  it("says nothing about a previous attempt when the caller does not report one", () => {
+    const data = chain();
+    writeFileSync(boardFile(), JSON.stringify(data));
+    const prompt = buildStepPrompt({ task: taskOf(data, "id-3"), board: data });
+    expect(prompt).not.toContain("PREVIOUS ATTEMPT");
+  });
+
+  it("carries the ISSUE findings and the fix-in-place instruction from attempt 2 on", () => {
+    const data = chain();
+    const t3 = taskOf(data, "id-3");
+    t3.comments = [
+      {
+        id: "c1",
+        author: "review",
+        body: "ISSUE attempt 1/2\nreview opus\nscope regression: touched files outside the promise",
+        created_at: "2026-09-01T00:00:00.000Z",
+      },
+    ];
+    writeFileSync(boardFile(), JSON.stringify(data));
+    const prompt = buildStepPrompt({ task: t3, board: data, attempt: 2, limit: 2 });
+    expect(prompt).toContain("PREVIOUS ATTEMPT");
+    expect(prompt).toContain("attempt 2 of <=2");
+    expect(prompt).toContain("scope regression: touched files outside the promise");
+    expect(prompt).toContain("do not start over");
+    expect(prompt).toContain("no weakening a test");
+  });
+
+  it("ignores non-review or non-ISSUE comments when assembling the findings", () => {
+    const data = chain();
+    const t3 = taskOf(data, "id-3");
+    t3.comments = [
+      { id: "c0", author: "user", body: "please hurry", created_at: "2026-08-31T00:00:00.000Z" },
+      { id: "c1", author: "review", body: "ISSUE attempt 1/2\nverify\n2 failing\nassertion failed", created_at: "2026-09-01T00:00:00.000Z" },
+    ];
+    writeFileSync(boardFile(), JSON.stringify(data));
+    const prompt = buildStepPrompt({ task: t3, board: data, attempt: 2, limit: 2 });
+    const attemptSection = prompt.split("PREVIOUS ATTEMPT")[1].split("\n── ")[0];
+    expect(attemptSection).not.toContain("please hurry");
+    expect(attemptSection).toContain("assertion failed");
+  });
+
+  it("says no ISSUE comment was found rather than inventing one", () => {
+    const data = chain();
+    writeFileSync(boardFile(), JSON.stringify(data));
+    const prompt = buildStepPrompt({ task: taskOf(data, "id-3"), board: data, attempt: 2, limit: 2 });
+    expect(prompt).toContain("no findings were recorded on the board");
+  });
+
+  it("says the PREVIOUS ATTEMPT findings never override the rule against touching earlier steps' changes", () => {
+    const data = chain();
+    const t3 = taskOf(data, "id-3");
+    t3.comments = [
+      {
+        id: "c1",
+        author: "review",
+        body: "ISSUE attempt 1/2\nreview\nrevert src/sum.mjs to fix this",
+        created_at: "2026-09-01T00:00:00.000Z",
+      },
+    ];
+    writeFileSync(boardFile(), JSON.stringify(data));
+    const prompt = buildStepPrompt({ task: t3, board: data, attempt: 2, limit: 2 });
+    const attemptSection = prompt.split("PREVIOUS ATTEMPT")[1].split("\n── ")[0];
+    expect(attemptSection).toMatch(/never override/);
+  });
+});
+
+describe("buildStepPrompt · NOTES ON THIS TASK", () => {
+  it("omits the block when the task carries no comments", () => {
+    const data = chain();
+    writeFileSync(boardFile(), JSON.stringify(data));
+    const prompt = buildStepPrompt({ task: taskOf(data, "id-3"), board: data });
+    expect(prompt).not.toContain("NOTES ON THIS TASK");
+  });
+
+  it("carries non-ISSUE comments as notes recorded on the task", () => {
+    const data = chain();
+    const t3 = taskOf(data, "id-3");
+    t3.comments = [
+      { id: "c0", author: "user", body: "do NOT raise the test timeout", created_at: "2026-08-31T00:00:00.000Z" },
+      { id: "c1", author: "claude", body: "picked 400ms from the p95 in prod logs", created_at: "2026-09-01T00:00:00.000Z" },
+    ];
+    writeFileSync(boardFile(), JSON.stringify(data));
+    const prompt = buildStepPrompt({ task: t3, board: data });
+    expect(prompt).toContain("NOTES ON THIS TASK");
+    expect(prompt).toContain("do NOT raise the test timeout");
+    expect(prompt).toContain("picked 400ms from the p95 in prod logs");
+    expect(prompt).toContain("[user · 2026-08-31]");
+  });
+
+  it("excludes ISSUE comments from the notes block — they cross as PREVIOUS ATTEMPT instead", () => {
+    const data = chain();
+    const t3 = taskOf(data, "id-3");
+    t3.comments = [
+      { id: "c0", author: "user", body: "do NOT raise the test timeout", created_at: "2026-08-31T00:00:00.000Z" },
+      { id: "c1", author: "review", body: "ISSUE attempt 1/2\nverify\nfailing", created_at: "2026-09-01T00:00:00.000Z" },
+    ];
+    writeFileSync(boardFile(), JSON.stringify(data));
+    const prompt = buildStepPrompt({ task: t3, board: data });
+    const notesSection = prompt.split("NOTES ON THIS TASK")[1].split("\n── ")[0];
+    expect(notesSection).not.toContain("ISSUE attempt");
+  });
+
+  it("caps the notes to the last 8 and elides a long body", () => {
+    const data = chain();
+    const t3 = taskOf(data, "id-3");
+    t3.comments = Array.from({ length: 10 }, (_, i) => ({
+      id: `c${i}`,
+      author: "user",
+      body: i === 9 ? "x".repeat(2000) : `note ${i}`,
+      created_at: `2026-09-${String(i + 1).padStart(2, "0")}T00:00:00.000Z`,
+    }));
+    writeFileSync(boardFile(), JSON.stringify(data));
+    const prompt = buildStepPrompt({ task: t3, board: data });
+    expect(prompt).not.toContain("note 0");
+    expect(prompt).not.toContain("note 1");
+    expect(prompt).toContain("note 2");
+    expect(prompt).toContain("note 8");
+    expect(prompt).toContain("chars elided");
+  });
+});
+
 describe("buildReviewPrompt", () => {
   const task = {
     number: 3,
@@ -347,6 +502,49 @@ describe("buildReviewPrompt", () => {
     writeFileSync(path.join(appDir, "settings.json"), JSON.stringify({ specsEnabled: true }));
     const prompt = buildReviewPrompt({ task, appData: tmp });
     expect(prompt).toMatch(/spec: tasks#model/);
+  });
+
+  it("carries the task's notes so the reviewer checks the work against them too", () => {
+    const noted = {
+      ...task,
+      comments: [
+        { id: "c0", author: "user", body: "do NOT raise the test timeout", created_at: "2026-08-31T00:00:00.000Z" },
+      ],
+    };
+    const prompt = buildReviewPrompt({ task: noted, appData: tmp });
+    expect(prompt).toContain("NOTES ON THIS TASK");
+    expect(prompt).toContain("do NOT raise the test timeout");
+  });
+});
+
+describe("buildReviewPrompt · CHANGES OF THIS STEP", () => {
+  const task = {
+    number: 3,
+    subject: "third step",
+    produces: ["src/parser.rs"],
+    verify: "npm test",
+  };
+
+  it("lists this step's own changes and states the rule against treating earlier work as a finding", () => {
+    const prompt = buildReviewPrompt({
+      task,
+      appData: tmp,
+      ownChanges: [
+        { status: "M", path: "src/parser.rs" },
+        { status: "A", path: "src/new.rs" },
+      ],
+    });
+    expect(prompt).toContain("CHANGES OF THIS STEP");
+    expect(prompt).toContain("M src/parser.rs");
+    expect(prompt).toContain("A src/new.rs");
+    expect(prompt).toContain("not findings of this step");
+  });
+
+  it("says the own diff is unknown when there is no step base, and states the rule in general terms", () => {
+    const prompt = buildReviewPrompt({ task, appData: tmp });
+    expect(prompt).toContain("CHANGES OF THIS STEP");
+    expect(prompt).toContain("unknown");
+    expect(prompt).toContain("not findings of this step");
   });
 });
 
@@ -631,6 +829,94 @@ describe("executeReview", () => {
     expect(seen.argv).not.toContain("Edit");
     expect(seen).toMatchObject({ brainRole: "reviewer", brainKind: "runner" });
     expect(seen.stdin).toContain("implemented");
+  });
+});
+
+describe("executeStep/executeReview · risk routing (t#741)", () => {
+  it("executeStep routes the worker to the configured pair when the task's risk is high", async () => {
+    const data = chain();
+    writeFileSync(boardFile(), JSON.stringify(data));
+    saveAgentConfig({
+      version: 4,
+      duties: { worker: { mode: "always", provider: "anthropic", model: "sonnet", role: "worker" } },
+      routes: { high: { worker: { provider: "openai", model: "gpt-5.6-terra" } } },
+    });
+    const t = taskOf(data, "id-3");
+    t.risk = "high";
+    const echo = path.join(tmp, "route-worker-echo.json");
+    process.env.FAKE_ECHO = echo;
+    const r = await executeStep({ task: t, board: data, cwd: tmp, codexBin: [process.execPath, fakeCodex] });
+    expect(r).toMatchObject({
+      ok: true, provider: "openai", model: "gpt-5.6-terra",
+      route: { applied: true, risk: "high" },
+    });
+    const seen = JSON.parse(readFileSync(echo, "utf8"));
+    expect(seen.argv[seen.argv.indexOf("--model") + 1]).toBe("gpt-5.6-terra");
+  });
+
+  it("executeStep falls back to the duty profile with a note when risk is high but no route is configured", async () => {
+    const data = chain();
+    writeFileSync(boardFile(), JSON.stringify(data));
+    saveAgentConfig({
+      version: 4,
+      duties: { worker: { mode: "always", provider: "anthropic", model: "sonnet" } },
+    });
+    const t = taskOf(data, "id-3");
+    t.risk = "high";
+    const r = await executeStep({ task: t, board: data, cwd: tmp, claudeBin: [process.execPath, fakeClaude] });
+    expect(r).toMatchObject({ ok: true, provider: "anthropic", model: "sonnet", route: { applied: false, risk: "high" } });
+    expect(r.route.note).toMatch(/no route configured for worker/);
+  });
+
+  it("executeStep ignores a configured route when the task carries no risk", async () => {
+    const data = chain();
+    writeFileSync(boardFile(), JSON.stringify(data));
+    saveAgentConfig({
+      version: 4,
+      duties: { worker: { mode: "always", provider: "anthropic", model: "sonnet" } },
+      routes: { high: { worker: { provider: "openai", model: "gpt-5.6-terra" } } },
+    });
+    const t = taskOf(data, "id-3");
+    const r = await executeStep({ task: t, board: data, cwd: tmp, claudeBin: [process.execPath, fakeClaude] });
+    expect(r.provider).toBe("anthropic");
+    expect(r.model).toBe("sonnet");
+    expect(r.route).toBeNull();
+  });
+
+  it("executeReview routes the reviewer to the configured pair when the task's risk is high", async () => {
+    const data = chain();
+    writeFileSync(boardFile(), JSON.stringify(data));
+    saveAgentConfig({
+      version: 4,
+      duties: { review: { mode: "agent", provider: "anthropic", model: "opus" } },
+      routes: { high: { review: { provider: "openai", model: "gpt-5.6-luna" } } },
+    });
+    const t = taskOf(data, "id-3");
+    t.risk = "high";
+    const r = await executeReview({ task: t, workerResult: "implemented", cwd: tmp, codexBin: [process.execPath, fakeCodex] });
+    expect(r).toMatchObject({
+      duty: "review", provider: "openai", model: "gpt-5.6-luna",
+      route: { applied: true, risk: "high" },
+    });
+  });
+
+  it("executeReview falls back to the duty profile with a note when the routed pair is invalid", async () => {
+    const data = chain();
+    writeFileSync(boardFile(), JSON.stringify(data));
+    saveAgentConfig({
+      version: 4,
+      duties: { review: { mode: "agent", provider: "anthropic", model: "opus" } },
+      routes: { high: { review: { provider: "openai", model: "not-a-real-model" } } },
+    });
+    const t = taskOf(data, "id-3");
+    t.risk = "high";
+    process.env.FAKE_MODE = "review-approve";
+    const r = await executeReview({ task: t, workerResult: "implemented", cwd: tmp, claudeBin: [process.execPath, fakeClaude] });
+    expect(r).toMatchObject({
+      duty: "review", provider: "anthropic", model: "opus",
+      route: { applied: false, risk: "high" },
+    });
+    expect(r.route.note).toMatch(/invalid/);
   });
 });
 

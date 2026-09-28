@@ -1098,7 +1098,16 @@ pub fn upsert(file: &mut TodoFile, mut todo: Todo, now: &str) {
             todo.number = existing.number;
         }
         let mut merged_ext = existing.ext.clone();
-        merged_ext.extend(todo.ext);
+        for (ns, incoming) in todo.ext {
+            match (merged_ext.get_mut(&ns), incoming) {
+                (Some(Value::Object(stored)), Value::Object(fresh)) if ns == "process" => {
+                    stored.extend(fresh);
+                }
+                (_, incoming) => {
+                    merged_ext.insert(ns, incoming);
+                }
+            }
+        }
         todo.ext = merged_ext;
         // Provenance is set once (by the CLI) and has no UI field, so a UI edit
         // that doesn't carry it must not erase it.
@@ -2634,6 +2643,55 @@ mod tests {
             serde_json::json!({ "enabled": true })
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn runner_process_fields_survive_a_rust_round_trip() {
+        let path = std::env::temp_dir().join("cut_todos_runner_fields_round_trip.json");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(
+            &path,
+            r#"{"version":3,"todos":[{"id":"a","subject":"step","status":"queue","ext":{"process":{"verify":"npm test","red":"npm run red","red_tests":["test/r.test.mjs"],"step_base":"abc123","risk":"high"}}}]}"#,
+        )
+        .unwrap();
+
+        let file = load(&path);
+        save(&path, &file).unwrap();
+
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let process = &saved["todos"][0]["ext"]["process"];
+        assert_eq!(process["verify"], "npm test");
+        assert_eq!(process["red"], "npm run red");
+        assert_eq!(process["red_tests"], serde_json::json!(["test/r.test.mjs"]));
+        assert_eq!(process["step_base"], "abc123");
+        assert_eq!(process["risk"], "high");
+        for key in ["red", "red_tests", "step_base", "risk"] {
+            assert!(saved["todos"][0].get(key).is_none(), "{key} leaked to the top level");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn upsert_keeps_process_keys_written_after_the_ui_snapshot() {
+        let mut file = TodoFile::default();
+        let mut stored = todo("a", "in_progress");
+        stored.ext.insert(
+            "process".to_string(),
+            serde_json::json!({ "red": "npm run red", "step_base": "abc123", "risk": "high" }),
+        );
+        file.todos.push(stored);
+
+        let mut edited = todo("a", "in_progress");
+        edited.ext.insert(
+            "process".to_string(),
+            serde_json::json!({ "red": "npm run red", "risk": "high" }),
+        );
+        upsert(&mut file, edited, "T2");
+
+        let process = &file.todos[0].ext["process"];
+        assert_eq!(process["step_base"], "abc123");
+        assert_eq!(process["red"], "npm run red");
+        assert_eq!(process["risk"], "high");
     }
 
     #[test]
