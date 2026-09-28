@@ -34,6 +34,7 @@ import { useSettings } from "../kernel/settingsStore";
 import type { TriageDigest, DigestItem } from "../contracts/types";
 import TodoFiltersBar from "../board/TodoFiltersBar.vue";
 import TodoBoard from "../board/TodoBoard.vue";
+import TodoDetailPane from "../board/TodoDetailPane.vue";
 import { defaultTodoFilters, projectTodos, type TodoCardRow, type TodoFilters } from "../board/todoFilter";
 
 const { t, locale } = useI18n();
@@ -79,6 +80,8 @@ const changes = computed(() => boardStore.changes.value as unknown as BoardChang
 const loading = ref(true);
 const errorMsg = ref("");
 const detailRecord = ref<Todo | null>(null);
+const detailLoading = ref(false);
+const detailLoadFailed = ref(false);
 
 // Board mutations return the updated compact row plus its cache revision.
 // The editor still needs the full task (comments, plan and handoff), so refresh
@@ -89,8 +92,11 @@ type TodoMutation = BoardMutation;
 async function applyTodoMutation(result: TodoMutation, refreshDetail = false) {
   boardStore.applyMutation(result);
   if (!result.row || (!refreshDetail && detailRecord.value?.id !== result.row.id)) return;
-  const updated = await invoke<Todo | null>("get_task_detail", { id: result.row.id });
-  if (updated) detailRecord.value = updated;
+  const id = result.row.id;
+  const updated = await invoke<Todo | null>("get_task_detail", { id });
+  // A comment mutation can finish after the user has opened another card.
+  // Never let that old detail request replace the newly selected full record.
+  if (updated && detailId.value === id) detailRecord.value = updated;
 }
 
 interface BoardStateInfo {
@@ -354,6 +360,25 @@ async function confirmDelete() {
 // (preserving id / comments / links / created_at) and persists via `upsert_todo`.
 const view = ref<"board" | "detail">("board");
 const detailId = ref<string | null>(null);
+interface BoardScrollPosition { left: number; top: number }
+let boardScrollPosition: BoardScrollPosition[] = [];
+
+function rememberBoardScroll() {
+  // Board and columns are unmounted for the editor. Remember both axes so a
+  // return lands at the same column and the same card, rather than at (0, 0).
+  boardScrollPosition = Array.from(document.querySelectorAll<HTMLElement>(".tw-board, .tw-col-body"))
+    .map((element) => ({ left: element.scrollLeft, top: element.scrollTop }));
+}
+
+function restoreBoardScroll() {
+  const current = document.querySelectorAll<HTMLElement>(".tw-board, .tw-col-body");
+  boardScrollPosition.forEach((position, index) => {
+    const element = current[index];
+    if (element) element.scrollTo({ left: position.left, top: position.top });
+  });
+  boardScrollPosition = [];
+}
+
 const detail = computed(() => {
   const row = todos.value.find((t) => t.id === detailId.value);
   if (!row) return null;
@@ -394,20 +419,8 @@ const draft = ref<Draft>({
 const draftSubjectRemaining = computed(() => SUBJECT_LIMIT - draft.value.subject.trim().length);
 const draftSubjectOverLimit = computed(() => draftSubjectRemaining.value < 0);
 
-function rankStatus(s: string): number {
-  const i = COLUMNS.findIndex((c) => c.id === s);
-  return i < 0 ? COLUMNS.length : i;
-}
-// Left-rail tasks: same project as the open task (project-less tasks group
-// together), ordered by board column so the rail reads like a mini board.
-const detailSiblings = computed(() => {
-  const p = detail.value?.project ?? null;
-  return todos.value
-    .filter((t) => (t.project ?? null) === p)
-    .slice()
-    .sort((a, b) => rankStatus(a.status) - rankStatus(b.status));
-});
-
+// The rail contains every open sibling, but completed work is explicitly paged.
+// This avoids mounting a project's entire history merely to edit one task.
 // Handoff the open task INHERITS from its direct prerequisites (#141): the same
 // view `cc-todos todos handoff <task>` gives an agent, surfaced read-only in the
 // card. Only direct `depends_on` — cumulative context rides authored handoff text.
@@ -440,9 +453,29 @@ function fillDraft(todo: Todo) {
   };
 }
 
+function clearDetailDraft() {
+  // Do not briefly expose the previous task's editable values while this task's
+  // full record is in flight. The editor itself stays disabled behind its
+  // loading state, but clearing this also keeps any reactive consumers honest.
+  draft.value = {
+    subject: "",
+    description: "",
+    plan: "",
+    handoff: "",
+    project: "",
+    scheduled_for: "",
+    status: "backlog",
+    priority: "",
+  };
+}
+
 async function openDetail(todo: { id: string }) {
+  if (view.value === "board") rememberBoardScroll();
   detailId.value = todo.id;
   detailRecord.value = null;
+  clearDetailDraft();
+  detailLoading.value = true;
+  detailLoadFailed.value = false;
   descMode.value = "edit";
   mention.value = null;
   saved.value = false;
@@ -454,8 +487,9 @@ async function openDetail(todo: { id: string }) {
       fillDraft(full);
     }
   } catch {
-    // A compact card is still enough to open the editor if the detail request
-    // is temporarily unavailable.
+    if (detailId.value === todo.id) detailLoadFailed.value = true;
+  } finally {
+    if (detailId.value === todo.id) detailLoading.value = false;
   }
 }
 
@@ -463,11 +497,15 @@ function closeDetail() {
   view.value = "board";
   detailId.value = null;
   detailRecord.value = null;
+  detailLoading.value = false;
+  detailLoadFailed.value = false;
+  void nextTick().then(restoreBoardScroll);
 }
 
 async function saveDetail() {
   const cur = detail.value;
-  if (!cur) return;
+  if (!cur || !detailRecord.value || detailLoading.value) return;
+  const id = cur.id;
   const d = draft.value;
   if (!d.subject.trim() || d.subject.trim().length > SUBJECT_LIMIT) return;
   const todo: Todo = {
@@ -483,9 +521,13 @@ async function saveDetail() {
   };
   try {
     await invoke<Todo[]>("upsert_todo", { todo });
-    detailRecord.value = todo;
     await boardStore.reload(true);
-    flashSaved();
+    // Saving A may complete after navigation to B. Persist and refresh the
+    // board either way, but only update the editor that initiated this save.
+    if (detailId.value === id) {
+      detailRecord.value = todo;
+      flashSaved();
+    }
   } catch (e) {
     errorMsg.value = String(e);
   }
@@ -498,7 +540,16 @@ async function saveDetail() {
 // todo, so we merge onto that — never onto the draft.
 const newComment = ref("");
 
-const detailComments = computed(() => detail.value?.comments ?? []);
+const detailComments = computed(() => detailRecord.value?.comments ?? []);
+// Tokenize only when the full record is loaded or replaced after a comment
+// mutation. Draft typing and compact-board refreshes must not parse the thread.
+const renderedDetailComments = ref<Array<{ id: string; author: string; created_at: string; body: string; segments: ReturnType<typeof tokenize> }>>([]);
+watch(detailRecord, (record) => {
+  renderedDetailComments.value = (record?.comments ?? []).map((comment) => ({
+    ...comment,
+    segments: tokenize(comment.body),
+  }));
+});
 
 async function addComment() {
   const body = newComment.value.trim();
@@ -1744,7 +1795,7 @@ onUnmounted(() => {
           {{ t("todoBack") }}
         </button>
         <div class="tw-title">
-          <h1><span v-if="detail?.number" class="tw-detail-num">#{{ detail.number }}</span>{{ draft.subject || t("todoNew") }}</h1>
+          <h1><span v-if="detail?.number" class="tw-detail-num">#{{ detail.number }}</span>{{ detail?.subject || t("todoNew") }}</h1>
           <span v-if="detail && detail.created_by === 'claude'" class="tw-ai" :title="t('todoAiHint')">{{ t("todoAi") }}</span>
         </div>
         <div class="tw-spacer"></div>
@@ -1754,28 +1805,23 @@ onUnmounted(() => {
             {{ t("todoSaved") }}
           </span>
         </transition>
-        <button class="tw-btn" :disabled="!draft.subject.trim() || draftSubjectOverLimit" @click="saveDetail">{{ t("save") }}</button>
+        <button class="tw-btn" :disabled="detailLoading || !detailRecord || !draft.subject.trim() || draftSubjectOverLimit" @click="saveDetail">{{ t("save") }}</button>
       </header>
 
       <div v-if="errorMsg" class="tw-error">{{ errorMsg }}</div>
 
-      <div class="tw-detail">
-        <aside class="tw-detail-list">
-          <div class="tw-detail-list-hd">{{ detail && detail.project ? detail.project : t("todoNoProject") }}</div>
-          <button
-            v-for="td in detailSiblings"
-            :key="td.id"
-            class="tw-detail-item"
-            :class="{ active: td.id === detailId }"
-            @click="openDetail(td)"
-          >
-            <span class="tw-detail-item-dot" :style="{ background: columnColor(td.status) }"></span>
-            <span class="tw-detail-item-subj" :class="{ done: td.status === 'done' }"><span v-if="td.number" class="tw-detail-item-num">#{{ td.number }}</span>{{ td.subject }}</span>
-            <span v-if="td.created_by === 'claude'" class="tw-ai sm" :title="t('todoAiHint')">{{ t("todoAi") }}</span>
-          </button>
-        </aside>
-
-        <section v-if="detail" class="tw-detail-main">
+      <TodoDetailPane
+        :rows="todos"
+        :detail="detail"
+        :active-id="detailId"
+        :project-label="detail?.project || t('todoNoProject')"
+        :more-label="t('todoMore')"
+        :ai-label="t('todoAi')"
+        :ai-hint="t('todoAiHint')"
+        :column-color="columnColor"
+        @open="openDetail"
+      >
+        <section v-if="detail && detailRecord && !detailLoading" class="tw-detail-main">
           <label class="tw-field">
             <span>{{ t("todoSubject") }}</span>
             <input v-model="draft.subject" class="tw-input" maxlength="200" />
@@ -1928,7 +1974,7 @@ onUnmounted(() => {
               </span>
             </transition>
             <button type="button" class="tw-btn ghost" @click="closeDetail">{{ t("todoBack") }}</button>
-            <button type="button" class="tw-btn" :disabled="!draft.subject.trim() || draftSubjectOverLimit" @click="saveDetail">{{ t("save") }}</button>
+            <button type="button" class="tw-btn" :disabled="detailLoading || !detailRecord || !draft.subject.trim() || draftSubjectOverLimit" @click="saveDetail">{{ t("save") }}</button>
           </div>
 
           <!-- Cost by block: the task's spend split by (session x interval) -->
@@ -1971,7 +2017,7 @@ onUnmounted(() => {
             <div v-if="!detailComments.length" class="tw-comments-empty">{{ t("todoCommentsEmpty") }}</div>
             <ul v-else class="tw-comment-list">
               <li
-                v-for="c in detailComments"
+                v-for="c in renderedDetailComments"
                 :key="c.id"
                 class="tw-comment"
                 :class="{ ai: c.author === 'claude' }"
@@ -1984,7 +2030,7 @@ onUnmounted(() => {
                   </button>
                 </div>
                 <p class="tw-comment-body"
-                  ><template v-for="(s, i) in tokenize(c.body)" :key="i"
+                  ><template v-for="(s, i) in c.segments" :key="i"
                     ><a v-if="s.kind === 'url'" class="tw-link" @click.prevent="openLink(s.href)">{{ s.text }}</a
                     ><a v-else-if="s.kind === 'task'" class="tw-ref" :title="s.subject" @click.prevent="openTask(s.number)">{{ s.text }}<span class="tw-ref-title">{{ s.subject }}</span></a
                     ><a v-else-if="s.kind === 'project'" class="tw-ref tw-ref-proj" @click.prevent="openProject(s.project)">{{ s.text }}</a
@@ -2024,8 +2070,8 @@ onUnmounted(() => {
             </div>
           </div>
         </section>
-        <section v-else class="tw-detail-main tw-detail-empty">{{ t("todoColEmpty") }}</section>
-      </div>
+        <section v-else class="tw-detail-main tw-detail-empty">{{ detailLoading ? t("loading") : (detailLoadFailed ? t("todoDetailLoadFailed") : t("todoColEmpty")) }}</section>
+      </TodoDetailPane>
     </template>
 
     <!-- EXTERNAL VIEW: readonly mirror of external tasks, grouped by source (ph6) -->

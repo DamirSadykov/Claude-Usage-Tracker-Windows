@@ -13,7 +13,7 @@ import ClusterBubble from "../../atoms/ClusterBubble.vue";
 import SidePanel from "../../atoms/SidePanel.vue";
 import FocusRowItem from "../../atoms/FocusRowItem.vue";
 import MiniMap from "../../atoms/MiniMap.vue";
-import { focusRows, hubIds, refEdges, ringsAround } from "../adapt";
+import { indexedRings, referenceIndex } from "../changeSelectors";
 import { board as mockBoard } from "../boardMock";
 import { useBoard } from "../useBoard";
 
@@ -45,31 +45,13 @@ const { board: liveBoard, live } = useBoard();
 const board = computed(() => (live.value ? liveBoard.value : mockBoard));
 
 const byId = computed(() => new Map(board.value.map((t) => [t.id, t])));
-const edges = computed(() => refEdges(board.value));
-const hubs = computed(() => hubIds(board.value));
+const reference = computed(() => referenceIndex(board.value));
+const edges = computed(() => reference.value.edges);
+const hubs = computed(() => reference.value.hubs);
 
-const incoming = computed(() => {
-    const map = new Map<string, number>();
-    for (const e of edges.value) map.set(e.to, (map.get(e.to) ?? 0) + 1);
-    return map;
-});
-
-const outgoing = computed(() => {
-    const map = new Map<string, number>();
-    for (const e of edges.value) map.set(e.from, (map.get(e.from) ?? 0) + 1);
-    return map;
-});
-
-const adjacency = computed(() => {
-    const map = new Map<string, Set<string>>();
-    for (const e of edges.value) {
-        if (!map.has(e.from)) map.set(e.from, new Set());
-        if (!map.has(e.to)) map.set(e.to, new Set());
-        map.get(e.from)!.add(e.to);
-        map.get(e.to)!.add(e.from);
-    }
-    return map;
-});
+const incoming = computed(() => reference.value.incoming);
+const outgoing = computed(() => reference.value.outgoing);
+const adjacency = computed(() => reference.value.adjacency);
 
 const idOfLabel = computed(
     () => new Map(board.value.map((t) => [t.number ? `#${t.number}` : t.id, t.id])),
@@ -221,9 +203,8 @@ function distancesFor(limit: number) {
     const map = new Map<string, number>();
     if (!focusId.value) return map;
     for (let d = 1; d <= limit; d += 1) {
-        for (const node of ringsAround(board.value, focusId.value, d).nodes) {
-            if (!map.has(node.id)) map.set(node.id, d);
-        }
+        for (const [id, distance] of indexedRings(reference.value, focusId.value, d).distances)
+            if (distance) map.set(id, distance);
     }
     return map;
 }
@@ -424,7 +405,7 @@ const scene = computed(() => {
     if (focusId.value) alive.add(focusId.value);
     const raw = free
         ? edges.value.map((e) => ({ from: e.from, to: e.to }))
-        : ringsAround(board.value, focusId.value ?? "", source.rings).links;
+        : indexedRings(reference.value, focusId.value ?? "", source.rings).links;
     const links = raw
         .filter((l) => alive.has(l.from) && alive.has(l.to))
         .map((l) => ({
@@ -450,11 +431,21 @@ const scene = computed(() => {
     };
 });
 
-const rows = computed(() =>
-    focusId.value
-        ? focusRows(board.value, focusId.value)
-        : { outgoing: [], incoming: [] },
-);
+const rows = computed(() => {
+    const focus = focusId.value;
+    if (!focus) return { outgoing: [], incoming: [] };
+    const makeRows = (ids: readonly string[]) =>
+        ids.flatMap((id) => {
+            const todo = byId.value.get(id);
+            return todo
+                ? [{ id: todo.number ? `#${todo.number}` : todo.id, title: todo.subject, count: 1 }]
+                : [];
+        });
+    return {
+        outgoing: makeRows(reference.value.outgoingNodes.get(focus) ?? []),
+        incoming: makeRows(reference.value.incomingNodes.get(focus) ?? []),
+    };
+});
 
 const deeper = computed(() => {
     if (!focusId.value || depthValue.value >= 4) return 0;

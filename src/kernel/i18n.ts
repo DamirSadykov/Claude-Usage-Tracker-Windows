@@ -46,6 +46,7 @@ const messages = {
     configure: "Configure",
     retry: "Retry",
     loading: "Loading…",
+    todoDetailLoadFailed: "Unable to load task details.",
     loadTimeout:
         "Something went wrong: the app got no reply from its own backend in 40 seconds. This is not a server or session key error — try again or report the problem.",
     updateSessionKey: "Update session key",
@@ -882,6 +883,7 @@ const messages = {
     configure: "Настроить",
     retry: "Повторить",
     loading: "Загрузка данных…",
+    todoDetailLoadFailed: "Не удалось загрузить задачу.",
     loadTimeout:
         "Что-то пошло не так: приложение не дождалось ответа от собственного бэкенда за 40 секунд. Это не ошибка сервера и не ключ сессии — повторите или сообщите о проблеме.",
     updateSessionKey: "Обновить ключ сессии",

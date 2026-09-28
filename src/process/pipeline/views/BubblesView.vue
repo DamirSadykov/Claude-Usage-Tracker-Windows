@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
 import ToolBar from "../../atoms/ToolBar.vue";
 import LegendBar from "../../atoms/LegendBar.vue";
 import SegControl from "../../atoms/SegControl.vue";
@@ -19,6 +19,7 @@ import {
 } from "../adapt";
 import { board as mockBoard } from "../boardMock";
 import { useBoard } from "../useBoard";
+import { stableBubbleRoots } from "../changeSelectors";
 
 const emit = defineEmits<{
     (e: "mode", value: "lanes" | "wires" | "rings" | "specs"): void;
@@ -28,11 +29,6 @@ const emit = defineEmits<{
 const R_MIN = 84;
 const R_MAX = 220;
 const R_SCALE = 42;
-const BUBBLE_GAP = 26;
-const RELAX_ITERS = 56;
-const RELAX_GUARD = 40;
-const RELAX_PULL = 0.018;
-const RELAX_CALM = 14;
 const THEME_RING = 170;
 const THEME_SLOT = 196;
 const THEME_WIDTH = 140;
@@ -91,6 +87,7 @@ interface Shape {
     dense: boolean;
     nodes: InnerNode[];
     r: number;
+    collapsedR: number;
 }
 
 interface Bubble extends Shape {
@@ -390,7 +387,10 @@ function themeLayout(root: TreeNode, dense: boolean): { nodes: InnerNode[]; r: n
     return { nodes, r: radius };
 }
 
-const shapes = computed<Shape[]>(() =>
+// This projection deliberately has no `opened` dependency.  It is the stable
+// input to the root collision layout, so expanding one bubble cannot schedule
+// placement work for every root.
+const rootSeeds = computed(() =>
     roots.value.map((root) => {
         const kids = tree.value.children.get(root.id) ?? [];
         const inside = subtreeOf(tree.value, root.id);
@@ -398,11 +398,10 @@ const shapes = computed<Shape[]>(() =>
         const themes = kids.filter((id) => tree.value.byId.get(id)?.kind === "theme");
         const split = { done: 0, wait: 0, blocked: 0 };
         for (const id of tasks) split[healthOf(id)] += 1;
-        const open = opened.value.includes(root.id);
         const dense = tasks.length + themes.length > DENSE_LIMIT;
-        const inner = open ? themeLayout(root, dense) : { nodes: [], r: 0 };
         const collapsed = clamp(R_SCALE * Math.sqrt(tasks.length), R_MIN, R_MAX);
         return {
+            root,
             id: root.id,
             kind: root.kind,
             address:
@@ -414,67 +413,57 @@ const shapes = computed<Shape[]>(() =>
             themes: themes.length,
             split,
             loop: innerCross.value.get(root.id) ?? 0,
-            open,
             dense,
-            nodes: inner.nodes,
-            r: open ? Math.max(collapsed, inner.r) : collapsed,
+            collapsedR: collapsed,
         };
     }),
 );
 
-function relax(list: Shape[], w: number, h: number): Bubble[] {
-    const cx = w / 2;
-    const cy = h / 2;
-    const n = list.length;
-    const total = list.reduce((sum, s) => sum + s.r, 0);
-    const ring = n > 1 ? Math.max(240, (total * 2.2) / Math.PI) : 0;
-    const placed: Bubble[] = list.map((s, i) => {
-        const angle = -Math.PI / 2 + (i * TAU) / n;
-        return { ...s, x: cx + ring * Math.cos(angle), y: cy + ring * Math.sin(angle) };
-    });
+// A bubble's inner layout is independent of which other bubbles are open.
+// Keep it by the actual tree root: an unchanged root can be opened, closed,
+// and reopened without recomputing its themes and task orbit.
+const innerLayouts = shallowRef(
+    new Map<string, { root: TreeNode; dense: boolean; layout: { nodes: InnerNode[]; r: number } }>(),
+);
 
-    const separate = (): boolean => {
-        let moved = false;
-        for (let i = 0; i < n; i += 1) {
-            for (let j = i + 1; j < n; j += 1) {
-                const a = placed[i];
-                const b = placed[j];
-                let dx = b.x - a.x;
-                let dy = b.y - a.y;
-                let d = Math.hypot(dx, dy);
-                const need = a.r + b.r + BUBBLE_GAP;
-                if (d >= need) continue;
-                if (d < 0.001) {
-                    const angle = (((i * 37 + j * 61) % 360) * Math.PI) / 180;
-                    dx = Math.cos(angle);
-                    dy = Math.sin(angle);
-                    d = 0.001;
-                }
-                const push = (need - d) / 2;
-                a.x -= (dx / d) * push;
-                a.y -= (dy / d) * push;
-                b.x += (dx / d) * push;
-                b.y += (dy / d) * push;
-                moved = true;
-            }
-        }
-        return moved;
-    };
-
-    for (let step = 0; step < RELAX_ITERS; step += 1) {
-        if (step < RELAX_ITERS - RELAX_CALM) {
-            for (const p of placed) {
-                p.x += (cx - p.x) * RELAX_PULL;
-                p.y += (cy - p.y) * RELAX_PULL;
-            }
-        }
-        separate();
-    }
-    for (let step = 0; step < RELAX_GUARD; step += 1) if (!separate()) break;
-    return placed;
+function innerLayout(seed: { id: string; root: TreeNode; dense: boolean }) {
+    const cached = innerLayouts.value.get(seed.id);
+    if (cached && cached.root === seed.root && cached.dense === seed.dense) return cached.layout;
+    const layout = themeLayout(seed.root, seed.dense);
+    innerLayouts.value.set(seed.id, { root: seed.root, dense: seed.dense, layout });
+    return layout;
 }
 
-const bubbles = computed(() => relax(shapes.value, size.value.w, size.value.h));
+const shapes = computed<Shape[]>(() =>
+    rootSeeds.value.map((seed) => {
+        const open = opened.value.includes(seed.id);
+        // `themeLayout` is the expensive part; it is invoked only for an open
+        // root, while collapsed peers reuse their stable root projection.
+        const inner = open ? innerLayout(seed) : { nodes: [], r: 0 };
+        return {
+            ...seed,
+            open,
+            nodes: inner.nodes,
+            r: open ? Math.max(seed.collapsedR, inner.r) : seed.collapsedR,
+        };
+    }),
+);
+
+// Opening a root changes only that root's contents. Root coordinates are based
+// on the collapsed board snapshot, so one click cannot re-relax every bubble.
+const rootPositions = computed(() =>
+    stableBubbleRoots(
+        rootSeeds.value.map((shape) => ({ id: shape.id, radius: shape.collapsedR })),
+        size.value.w,
+        size.value.h,
+    ),
+);
+const bubbles = computed<Bubble[]>(() =>
+    shapes.value.map((shape) => ({
+        ...shape,
+        ...(rootPositions.value.get(shape.id) ?? { x: size.value.w / 2, y: size.value.h / 2 }),
+    })),
+);
 
 const bubbleById = computed(() => new Map(bubbles.value.map((b) => [b.id, b])));
 
