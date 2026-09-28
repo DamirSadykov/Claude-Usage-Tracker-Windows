@@ -126,6 +126,7 @@ pub struct AppConfig {
     // EVERY transcript, so it runs only when the user turns it on. Gates the
     // background publisher loop and the analytics Outcome card.
     pub corrections_enabled: bool,
+    pub keep_awake_enabled: bool,
 }
 
 impl Default for AppConfig {
@@ -161,6 +162,7 @@ impl Default for AppConfig {
             goal_cost_per_hour_max: None,
             goal_error_rate_max: None,
             corrections_enabled: false,
+            keep_awake_enabled: false,
         }
     }
 }
@@ -334,6 +336,7 @@ impl AppConfig {
             goal_cost_per_hour_max: lenient_f64(g("goal_cost_per_hour_max")),
             goal_error_rate_max: lenient_f64(g("goal_error_rate_max")),
             corrections_enabled: lenient_bool(g("corrections_enabled"), d.corrections_enabled),
+            keep_awake_enabled: lenient_bool(g("keep_awake_enabled"), d.keep_awake_enabled),
         }
     }
 }
