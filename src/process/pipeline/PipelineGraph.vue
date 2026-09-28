@@ -16,7 +16,8 @@ const props = withDefaults(defineProps<{
     chrome?: boolean;
     query?: string;
     filters?: TodoFilters;
-}>(), { chrome: false, query: "" });
+    focusLane?: string;
+}>(), { chrome: false, query: "", focusLane: "" });
 
 const emit = defineEmits<{ (e: "open", id: string): void }>();
 
@@ -60,6 +61,7 @@ const isSpecDoc = computed(() => SPEC_MODES.includes(mode.value));
             v-else
             :query="props.query"
             :filters="props.filters"
+            :focus-lane="props.focusLane"
             :active-hit="activeHit"
             @update:active-hit="activeHit = $event"
             @mode="mode = $event"

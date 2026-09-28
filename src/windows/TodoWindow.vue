@@ -6,8 +6,6 @@
 // active ones for the current project. Claude only flips `status` (and edits
 // details on request) by rewriting the same file.
 //
-// The view is a kanban board: one column per status, cards drag between columns
-// (which persists the new status). Columns mirror `todos.rs::STATUSES`.
 import { ref, computed, watch, onMounted, onUnmounted, nextTick } from "vue";
 import { useI18n, type Composer } from "vue-i18n";
 import { invoke } from "@tauri-apps/api/core";
@@ -16,6 +14,7 @@ import GraphView from "../board/GraphView.vue";
 import SpecView from "../spec/SpecView.vue";
 import PipelineGraph from "../process/pipeline/PipelineGraph.vue";
 import type { PipelineMode } from "../process/pipeline/modes";
+import { selectChange } from "../process/pipeline/useChange";
 import type { BoardChange, Todo } from "../contracts/board";
 import { boardStore, type BoardMutation } from "../board/boardStore";
 import { useProjectLinks } from "../analytics/projectLinks";
@@ -33,9 +32,11 @@ import i18n from "../kernel/i18n";
 import { useSettings } from "../kernel/settingsStore";
 import type { TriageDigest, DigestItem } from "../contracts/types";
 import TodoFiltersBar from "../board/TodoFiltersBar.vue";
-import TodoBoard from "../board/TodoBoard.vue";
 import TodoDetailPane from "../board/TodoDetailPane.vue";
-import { defaultTodoFilters, projectTodos, type TodoCardRow, type TodoFilters } from "../board/todoFilter";
+import ChangeDetail from "../process/pipeline/ChangeDetail.vue";
+import TodoTree from "../board/TodoTree.vue";
+import { buildBoardTree, findBoardTreeNode, type BoardTreeNode, type BoardTreeRow } from "../board/boardTree";
+import { defaultTodoFilters, type TodoFilters } from "../board/todoFilter";
 
 const { t, locale } = useI18n();
 
@@ -55,8 +56,6 @@ function applyLocale(l: string | null | undefined) {
 const { settings, initSettings } = useSettings();
 watch(() => settings.value.locale, (l) => applyLocale(l));
 
-// Kanban columns, left to right — must match `todos.rs::STATUSES`. `dot` is the
-// column's accent colour, also used for each card's left stripe.
 interface Column {
   id: string;
   labelKey: string;
@@ -150,7 +149,6 @@ function readFilters(): TodoFilters {
 const filters = ref<TodoFilters>(readFilters());
 watch(filters, value => { try { localStorage.setItem(FILTER_STORAGE_KEY, JSON.stringify(value)); } catch {} }, { deep: true });
 const projectFilter = computed({ get: () => filters.value.project, set: value => filters.value = { ...filters.value, project: value } });
-const showDone = computed({ get: () => filters.value.showDone, set: value => filters.value = { ...filters.value, showDone: value } });
 const search = computed({ get: () => filters.value.query, set: value => filters.value = { ...filters.value, query: value } });
 
 // Form state (doubles as create + edit). editingId === null → creating.
@@ -181,7 +179,7 @@ const taskCosts = ref<Map<string, TaskCostRow>>(new Map());
 
 // Merge-link badges (issue #13). A task's `project` is stored raw, so it may be a
 // canonical (absorbed others) or an alias (folded into a canonical) — need both.
-const { aliasesOf, canonicalOf } = useProjectLinks();
+const { canonicalOf } = useProjectLinks();
 
 // Project list for the filter/picker — RESOLVED to canonical names so a renamed
 // project's tasks don't split across the old and new name. `knownProjects`
@@ -194,24 +192,30 @@ const projects = computed(() => {
 });
 
 
-const cardRows = computed<TodoCardRow[]>(() => todos.value.map((todo) => {
-  const cost = taskCosts.value.get(todo.id);
-  return {
-    ...todo,
-    filterProject: todo.project ? canonicalOf(todo.project) ?? todo.project : null,
-    aliases: todo.project ? aliasesOf(todo.project) : [],
-    mergedInto: todo.project ? canonicalOf(todo.project) : null,
-    refCount: (todo as Todo & { ref_count?: number }).ref_count ?? 0,
-    cost: cost?.cost,
-    costTitle: cost ? `${t("todoCostHint")}: ${cost.sessions} ${t("todoCostSessions")} · ${fmtTok(cost.total_tokens)} ${t("todoCostTokens")}` : "",
-    importedAt: (todo as Todo & { imported_at?: string | null }).imported_at,
-    hasPlan: !!(todo as Todo & { has_plan?: boolean }).has_plan,
-    spec: [...((todo as Todo & { spec?: string[] }).spec ?? [])],
-  };
-}));
-const projection = computed(() => projectTodos(cardRows.value, filters.value, boardStore.indexes.value));
-const doneLimit = ref(50);
-watch(() => projection.value.columns.done.length, () => { doneLimit.value = 50; });
+const treeRows = computed<BoardTreeRow[]>(() => boardStore.rows.value.map((row) => ({
+  ...row,
+  cost: taskCosts.value.get(row.id)?.cost,
+  filterProject: row.project ? canonicalOf(row.project) ?? row.project : null,
+})));
+const tree = computed(() => buildBoardTree(treeRows.value, changes.value, filters.value, boardStore.indexes.value));
+const selectedTreeNode = ref<BoardTreeNode | null>(null);
+const selectedChange = computed(() => {
+  const node = selectedTreeNode.value;
+  return node?.kind === "change" ? changes.value.find((change) => change.id === node.id) ?? null : null;
+});
+
+function selectTreeNode(node: BoardTreeNode) {
+  selectedTreeNode.value = node;
+  if (node.kind === "task" || node.kind === "legacy") void openDetail(node);
+  else closeDetail();
+}
+
+function selectChangeTask(address: string) {
+  const number = Number(address.replace(/^#/, ""));
+  const row = boardStore.rows.value.find((candidate) => candidate.number === number);
+  const node = row ? findBoardTreeNode(tree.value, row.id) : null;
+  if (node) selectTreeNode(node);
+}
 
 const openCount = computed(
   () => todos.value.filter((t) => t.status !== "done").length,
@@ -336,30 +340,8 @@ async function confirmDelete() {
   }
 }
 
-// --- Detail view (master-detail editor) ---
-// The board swaps to a full-screen detail editor: left rail lists the open
-// task's project siblings, right panel edits its fields. `draft` is an isolated
-// editable copy, so an external live-reload of `todos` never clobbers an in-
-// progress edit; `saveDetail` merges the draft back over the existing todo
-// (preserving id / comments / links / created_at) and persists via `upsert_todo`.
 const view = ref<"board" | "detail">("board");
 const detailId = ref<string | null>(null);
-interface BoardScrollPosition { left: number; top: number }
-let boardScrollPosition: BoardScrollPosition[] = [];
-
-function rememberBoardScroll() {
-  boardScrollPosition = Array.from(document.querySelectorAll<HTMLElement>(".tw-board, .tw-col-body"))
-    .map((element) => ({ left: element.scrollLeft, top: element.scrollTop }));
-}
-
-function restoreBoardScroll() {
-  const current = document.querySelectorAll<HTMLElement>(".tw-board, .tw-col-body");
-  boardScrollPosition.forEach((position, index) => {
-    const element = current[index];
-    if (element) element.scrollTo({ left: position.left, top: position.top });
-  });
-  boardScrollPosition = [];
-}
 
 const detail = computed(() => {
   const row = todos.value.find((t) => t.id === detailId.value);
@@ -445,7 +427,6 @@ function clearDetailDraft() {
 }
 
 async function openDetail(todo: { id: string }) {
-  if (view.value === "board") rememberBoardScroll();
   detailId.value = todo.id;
   detailRecord.value = null;
   clearDetailDraft();
@@ -454,7 +435,6 @@ async function openDetail(todo: { id: string }) {
   descMode.value = "edit";
   mention.value = null;
   saved.value = false;
-  view.value = "detail";
   try {
     const full = await invoke<Todo | null>("get_task_detail", { id: todo.id });
     if (full && detailId.value === todo.id) {
@@ -469,12 +449,15 @@ async function openDetail(todo: { id: string }) {
 }
 
 function closeDetail() {
-  view.value = "board";
   detailId.value = null;
   detailRecord.value = null;
   detailLoading.value = false;
   detailLoadFailed.value = false;
-  void nextTick().then(restoreBoardScroll);
+}
+
+function changeDetailStatus(event: Event) {
+  const todo = detail.value;
+  if (todo) void moveStatus(todo, (event.target as HTMLSelectElement).value);
 }
 
 async function saveDetail() {
@@ -700,6 +683,7 @@ async function openSettings() {
 // the level ABOVE it — the spec section a change points at, with that change's
 // graph under it.
 const viewMode = ref<"board" | "graph" | "specs">("board");
+const graphMode = ref<PipelineMode>("lanes");
 // The graph tab has two renderings while the redesign lands: the new lane/wire
 // screens (default) and the classic force layout. The choice is remembered per
 // machine so a session that prefers the old picture keeps it.
@@ -721,6 +705,15 @@ const specMode = ref<PipelineMode>("reader");
 watch(graphUiNew, (on) =>
   localStorage.setItem("graph-ui", on ? "next" : "classic"),
 );
+const graphFocusLane = ref("");
+function openChangeGraph(change: BoardChange) {
+  selectChange(`c#${change.number}`);
+  graphMode.value = "lanes";
+  graphUiNew.value = true;
+  viewMode.value = "graph";
+  graphFocusLane.value = "";
+  void nextTick(() => { graphFocusLane.value = change.id; });
+}
 const graphRef = ref<InstanceType<typeof GraphView> | null>(null);
 const pipelineGraphRef = ref<InstanceType<typeof PipelineGraph> | null>(null);
 const pipelineActiveHit = ref<string | null>(null);
@@ -733,6 +726,18 @@ function onSearchEnter(event?: KeyboardEvent) {
 // Keyboard shortcuts (registry in ../hotkeys): Ctrl+F → search, Ctrl+P → project.
 const searchInputRef = ref<HTMLInputElement | null>(null);
 const filtersBarRef = ref<InstanceType<typeof TodoFiltersBar> | null>(null);
+const treeWidth = ref(380);
+function resizeTree(event: PointerEvent) {
+  treeWidth.value = Math.max(260, Math.min(640, event.clientX));
+}
+function stopTreeResize() {
+  document.removeEventListener("pointermove", resizeTree);
+  document.removeEventListener("pointerup", stopTreeResize);
+}
+function startTreeResize() {
+  document.addEventListener("pointermove", resizeTree);
+  document.addEventListener("pointerup", stopTreeResize, { once: true });
+}
 useHotkeys({
   search: () => (viewMode.value === "board" ? filtersBarRef.value?.focusSearch() : searchInputRef.value?.focus()),
   project: () => filtersBarRef.value?.focusProject(),
@@ -1387,9 +1392,6 @@ function costOf(todo: Todo | null | undefined): TaskCostRow | null {
 }
 
 const fmtCost = (c: number) => "$" + (c >= 100 ? String(Math.round(c)) : c.toFixed(2));
-function fmtTok(n: number) {
-  return n >= 1_000_000 ? (n / 1_000_000).toFixed(1) + "M" : n >= 1_000 ? Math.round(n / 1_000) + "k" : String(n);
-}
 
 // ── cost by block (t#298) ─────────────────────────────────────────────────────
 // A block = this task worked by ONE session over ONE stretch of time, from the
@@ -1520,6 +1522,7 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
+  stopTreeResize();
   if (unlistenLocale) unlistenLocale();
   if (unlistenFocus) unlistenFocus();
   if (unlistenTriage) unlistenTriage();
@@ -1724,6 +1727,8 @@ onUnmounted(() => {
       v-else-if="viewMode === 'graph' && graphUiNew"
       :query="search"
       :filters="filters"
+      :focus-lane="graphFocusLane"
+      v-model:mode="graphMode"
       v-model:active-hit="pipelineActiveHit"
       @open="onPipelineOpen"
     />
@@ -1756,7 +1761,72 @@ onUnmounted(() => {
       @open="onPipelineOpen"
     />
 
-    <TodoBoard v-else :projection="projection" :show-done="showDone" :done-limit="doneLimit" @add="startNew" @move="moveStatus" @open="openDetail" @remove="removeTodo" @open-spec="openSpecSection" @more-done="doneLimit += 50" />
+    <div v-else class="tw-tree-layout" :style="{ '--tree-width': `${treeWidth}px` }">
+      <TodoTree
+        :tree="tree"
+        :selected-id="selectedTreeNode?.id"
+        @select="selectTreeNode"
+        @open="selectTreeNode($event)"
+      />
+      <div class="tw-tree-resize" @pointerdown.prevent="startTreeResize"></div>
+      <TodoDetailPane
+        v-if="detailId"
+        :rows="todos"
+        :detail="detail"
+        :active-id="detailId"
+        :project-label="detail?.project || t('todoNoProject')"
+        :more-label="t('todoMore')"
+        :ai-label="t('todoAi')"
+        :ai-hint="t('todoAiHint')"
+        :column-color="columnColor"
+        @open="openDetail"
+      >
+        <section v-if="detail && detailRecord && !detailLoading" class="tw-detail-main">
+          <div class="tw-detail-pane-head">
+            <h2><span v-if="detail.number" class="tw-detail-num">#{{ detail.number }}</span>{{ detail.subject }}</h2>
+            <button class="tw-btn ghost" @click="removeTodo(detail)">{{ t('todoDelete') }}</button>
+          </div>
+          <label class="tw-field">
+            <span>{{ t('todoStatus') }}</span>
+            <select :value="detail.status" class="tw-select" @change="changeDetailStatus">
+              <option v-for="column in COLUMNS" :key="column.id" :value="column.id">{{ t(column.labelKey) }}</option>
+            </select>
+          </label>
+          <label class="tw-field">
+            <span>{{ t('todoDescription') }}</span>
+            <div class="tw-richtext">{{ detail.description || t('todoNoDescription') }}</div>
+          </label>
+          <label class="tw-field">
+            <span>{{ t('todoHandoff') }}</span>
+            <div class="tw-richtext">{{ detail.handoff || t('todoNoDescription') }}</div>
+          </label>
+          <div class="tw-comments">
+            <div class="tw-comments-hd">{{ t('todoComments') }}</div>
+            <div v-if="!detailComments.length" class="tw-comments-empty">{{ t('todoCommentsEmpty') }}</div>
+            <ul v-else class="tw-comment-list">
+              <li v-for="comment in renderedDetailComments" :key="comment.id" class="tw-comment">
+                <div class="tw-comment-head"><span class="tw-comment-author">{{ commentAuthorLabel(comment.author) }}</span><span class="tw-comment-time">{{ fmtTime(comment.created_at) }}</span></div>
+                <p class="tw-comment-body">{{ comment.body }}</p>
+              </li>
+            </ul>
+            <div class="tw-comment-compose">
+              <textarea v-model="newComment" class="tw-input tw-area" :placeholder="t('todoCommentPlaceholder')" rows="2" @keydown.ctrl.enter="addComment" @keydown.meta.enter="addComment"></textarea>
+              <button class="tw-btn" :disabled="!newComment.trim()" @click="addComment">{{ t('todoCommentAdd') }}</button>
+            </div>
+          </div>
+        </section>
+        <section v-else class="tw-detail-main tw-detail-empty">{{ detailLoading ? t('loading') : t('todoDetailLoadFailed') }}</section>
+      </TodoDetailPane>
+      <ChangeDetail
+        v-if="selectedChange && selectedTreeNode"
+        :address="`c#${selectedChange.number}`"
+        show-graph
+        show-heading
+        @open="selectChangeTask"
+        @graph="openChangeGraph(selectedChange)"
+      />
+      <div v-if="!detailId && !selectedChange" class="tw-empty">{{ t("tasks") }}</div>
+    </div>
     </template>
 
     <!-- DETAIL VIEW: master-detail editor (left = project siblings, right = fields) -->
@@ -2351,7 +2421,17 @@ onUnmounted(() => {
   gap: 6px;
   min-width: 0;
 }
-.tw-filter-date { max-width: 126px; }
+.tw-filter-date {
+  max-width: 126px;
+  background: var(--card-bg);
+  color: var(--text-2);
+  border: 1px solid var(--stroke-strong);
+  border-radius: 6px;
+  padding: 3px 6px;
+  font-size: 11px;
+  font-family: var(--segoe);
+  color-scheme: dark;
+}
 .tw-more {
   width: 100%;
   margin-top: 8px;
@@ -2762,6 +2842,21 @@ onUnmounted(() => {
 }
 
 /* Board */
+.tw-tree-layout {
+  display: grid;
+  flex: 1;
+  grid-template-columns: var(--tree-width, 380px) 6px minmax(0, 1fr);
+  min-height: 0;
+}
+.tw-tree-layout > :first-child { border-right: 1px solid var(--stroke-strong); }
+.tw-tree-layout > :last-child { min-height: 0; overflow: auto; }
+.tw-tree-resize { cursor: col-resize; margin-left: -3px; position: relative; width: 6px; z-index: 1; }
+.tw-tree-resize::after { background: var(--stroke-strong); content: ""; inset: 0 2px; position: absolute; }
+@media (max-width: 720px) {
+  .tw-tree-layout { grid-template-columns: 1fr; grid-template-rows: minmax(180px, 40%) minmax(0, 1fr); }
+  .tw-tree-layout > :first-child { border-bottom: 1px solid var(--stroke-strong); border-right: 0; }
+  .tw-tree-resize { display: none; }
+}
 .tw-board {
   flex: 1;
   min-height: 0;

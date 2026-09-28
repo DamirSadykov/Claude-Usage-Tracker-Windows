@@ -11,6 +11,13 @@
 
 /* This is deliberately a sibling of the scrolling canvas.  A selected card may
    be anywhere in the graph, but its details must remain in the viewport. */
+.pipe-stage {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    position: relative;
+}
 .pipe-inspector-layer {
     position: absolute;
     inset: 0;
