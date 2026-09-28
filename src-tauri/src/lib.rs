@@ -2647,6 +2647,33 @@ fn delete_todo(app: AppHandle, id: String) -> Result<Vec<todos::Todo>, String> {
 }
 
 #[tauri::command]
+fn add_todo_comment(app: AppHandle, id: String, body: String) -> Result<Vec<todos::Todo>, String> {
+    if body.trim().is_empty() {
+        return Err("comment body must not be empty".to_string());
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut outcome = Ok(());
+    let todos = write_todos_locked(&app, |file| {
+        outcome = todos::add_comment(file, &id, "user", &body, &now);
+    })?;
+    outcome.map(|()| todos)
+}
+
+#[tauri::command]
+fn remove_todo_comment(
+    app: AppHandle,
+    id: String,
+    comment_id: String,
+) -> Result<Vec<todos::Todo>, String> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut outcome = Ok(());
+    let todos = write_todos_locked(&app, |file| {
+        outcome = todos::remove_comment(file, &id, &comment_id, &now);
+    })?;
+    outcome.map(|()| todos)
+}
+
+#[tauri::command]
 fn set_todo_status(
     app: AppHandle,
     id: String,
@@ -3264,6 +3291,8 @@ pub fn run() {
             codex_hook_status,
             upsert_todo,
             delete_todo,
+            add_todo_comment,
+            remove_todo_comment,
             set_todo_status,
             add_todo_dep,
             remove_todo_dep,
