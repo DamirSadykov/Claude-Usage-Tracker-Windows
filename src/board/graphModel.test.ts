@@ -1,13 +1,14 @@
 import { describe, it, expect, vi } from "vitest";
 import { normalizeGraph, normalizeNode, loadRunLayer, loadRunGroups } from "./graphModel";
 
-const invoked: { change: string }[] = [];
+const invoked: { changeRefs: string[] }[] = [];
 vi.mock("@tauri-apps/api/core", () => ({
-  invoke: (_cmd: string, args: { change: string }) => {
+  invoke: (_cmd: string, args: { changeRefs: string[] }) => {
     invoked.push(args);
-    if (args.change === "boom") return Promise.reject(new Error("no such change"));
-    if (args.change === "294") {
-      return Promise.resolve({
+    if (args.changeRefs.includes("boom")) return Promise.reject(new Error("no such change"));
+    return Promise.resolve({
+      graphs: args.changeRefs.map((change) => change === "294"
+        ? {
         nodes: [
           { id: "u-294", number: 294, change: true, measurability: "no_in_progress" },
           { id: "u-297", number: 297, measurability: "measured", cost: 1.95, messages: 20 },
@@ -23,15 +24,15 @@ vi.mock("@tauri-apps/api/core", () => ({
             record: false,
           },
         ],
-      });
-    }
-    return Promise.resolve({
+      }
+        : ({
       nodes: [
         { id: "u-299", number: 299, change: true, measurability: "measured", cost: 8.36, messages: 4 },
         // The same node the other change measured, seen here as an unmeasured member.
         { id: "u-294", number: 294, change: true, measurability: "no_in_progress" },
       ],
       edges: [],
+    })),
     });
   },
 }));
@@ -167,11 +168,10 @@ describe("contract from t#306", () => {
     expect(normalizeNode({ number: 1, measurability: "wat" }).measurability).toBe("no_blocks");
   });
 
-  it("merges several changes into one layer and survives a failing one", async () => {
-    const layer = await loadRunLayer(["294", "299", "294", "boom", ""]);
-    // Duplicates are asked once, the empty ref not at all, and the failing change
-    // costs only its own rows.
-    expect(invoked.map((a) => a.change)).toEqual(["294", "299", "boom"]);
+  it("merges several changes in one batch and survives a failure", async () => {
+    const layer = await loadRunLayer(["294", "299", "294", ""]);
+    // Duplicates are sent once, and empty refs are not sent at all.
+    expect(invoked[invoked.length - 1]?.changeRefs).toEqual(["294", "299"]);
     expect([...layer.keys()].sort()).toEqual(["u-294", "u-297", "u-299"]);
     expect(layer.get("u-297")!.cost).toBeCloseTo(1.95, 5);
     expect(layer.get("u-299")!.cost).toBeCloseTo(8.36, 5);

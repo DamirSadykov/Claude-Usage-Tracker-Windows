@@ -397,6 +397,12 @@ pub struct TodoFile {
 }
 
 impl TodoFile {
+    /// Find a task by its stable opaque id. Board IPC uses this after a mutation
+    /// to return only the affected compact row instead of another full board.
+    pub fn find_todo(&self, id: &str) -> Option<&Todo> {
+        self.todos.iter().find(|todo| todo.id == id)
+    }
+
     /// Resolve `c#N`, `cN`, a bare number or an id to a change record.
     pub fn find_change(&self, change_ref: &str) -> Option<&Change> {
         let r = change_ref.trim();

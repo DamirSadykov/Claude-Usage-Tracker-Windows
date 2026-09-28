@@ -223,6 +223,19 @@ impl StatsDb {
     }
 }
 
+impl StatsDb {
+    /// A cheap revision token for caches derived from usage rows. `data_version`
+    /// catches commits by other SQLite connections; `total_changes` catches
+    /// writes made through this long-lived connection.
+    pub fn graph_revision(&self) -> Result<(i64, u64), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let data_version = conn.query_row("PRAGMA data_version", [], |row| row.get(0))?;
+        let total_changes =
+            conn.query_row("SELECT total_changes()", [], |row| row.get::<_, i64>(0))?;
+        Ok((data_version, total_changes as u64))
+    }
+}
+
 #[cfg(test)]
 impl StatsDb {
     /// Insert a snapshot with an explicit timestamp. Test-only — production code

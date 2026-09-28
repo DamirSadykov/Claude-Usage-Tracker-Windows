@@ -18,6 +18,7 @@ import SpecView from "../spec/SpecView.vue";
 import PipelineGraph from "../process/pipeline/PipelineGraph.vue";
 import type { PipelineMode } from "../process/pipeline/modes";
 import type { BoardChange, Todo } from "../contracts/board";
+import { boardStore, type BoardMutation } from "../board/boardStore";
 import { useProjectLinks } from "../analytics/projectLinks";
 import { useHotkeys } from "../kernel/hotkeys";
 import { BOARD_CURRENT_VERSION } from "../board/boardVersion";
@@ -69,10 +70,26 @@ const COL_BY_ID: Record<string, Column> = Object.fromEntries(
   COLUMNS.map((c) => [c.id, c]),
 );
 
-const todos = ref<Todo[]>([]);
-const changes = ref<BoardChange[]>([]);
+// The kanban deliberately reads the same compact snapshot as the pipeline
+// graph. Full records only enter `detailRecord` for the one open editor.
+const todos = computed(() => boardStore.rows.value as unknown as Todo[]);
+const changes = computed(() => boardStore.changes.value as unknown as BoardChange[]);
 const loading = ref(true);
 const errorMsg = ref("");
+const detailRecord = ref<Todo | null>(null);
+
+// Board mutations return the updated compact row plus its cache revision.
+// The editor still needs the full task (comments, plan and handoff), so refresh
+// only that task instead of accidentally assigning the response object to the
+// entire todo array.
+type TodoMutation = BoardMutation;
+
+async function applyTodoMutation(result: TodoMutation, refreshDetail = false) {
+  boardStore.applyMutation(result);
+  if (!result.row || (!refreshDetail && detailRecord.value?.id !== result.row.id)) return;
+  const updated = await invoke<Todo | null>("get_task_detail", { id: result.row.id });
+  if (updated) detailRecord.value = updated;
+}
 
 interface BoardStateInfo {
   state: "ok" | "unreadable" | "future-version";
@@ -133,11 +150,6 @@ const search = ref("");
 // Drag-and-drop state: id of the card being dragged + id of the column hovered.
 const dragId = ref<string | null>(null);
 const overCol = ref<string | null>(null);
-
-// Live reload: a watcher in the backend emits `todos-file-changed` when
-// todos.json changes on disk (CLI / Claude / hand-edit). We defer the reload
-// while a drag or the form is open so it never yanks state from under the user.
-const pendingReload = ref(false);
 
 // Form state (doubles as create + edit). editingId === null → creating.
 const editingId = ref<string | null>(null);
@@ -230,34 +242,21 @@ const openCount = computed(
 async function loadTodos(silent = false) {
   if (!silent) loading.value = true;
   try {
-    todos.value = await invoke<Todo[]>("get_todos");
+    await boardStore.start();
+    if (boardStore.stale.value) await boardStore.reload();
     errorMsg.value = "";
   } catch (e) {
     errorMsg.value = String(e);
   } finally {
     if (!silent) loading.value = false;
   }
-  try {
-    changes.value = await invoke<BoardChange[]>("get_changes");
-  } catch {
-    changes.value = [];
-  }
   void loadBoardState();
 }
 
-// Reload now if it's safe; otherwise mark it pending until the drag/form ends.
-function requestReload() {
-  if (dragId.value || formOpen.value) {
-    pendingReload.value = true;
-    return;
-  }
-  void loadTodos(true);
-}
-// Run a deferred reload once the user is no longer mid-interaction.
+// A hidden window's stale marker can be cleared once editing/dragging ends.
 function flushPendingReload() {
-  if (pendingReload.value && !dragId.value && !formOpen.value) {
-    pendingReload.value = false;
-    void loadTodos(true);
+  if (boardStore.stale.value && !dragId.value && !formOpen.value) {
+    void boardStore.reload();
   }
 }
 
@@ -312,7 +311,8 @@ async function submitForm() {
     ext: existing?.ext,
   };
   try {
-    todos.value = await invoke<Todo[]>("upsert_todo", { todo });
+    await invoke<Todo[]>("upsert_todo", { todo });
+    await boardStore.reload(true);
     resetForm();
   } catch (e) {
     errorMsg.value = String(e);
@@ -323,17 +323,15 @@ async function submitForm() {
 // instantly, then persist; on failure reload from disk to undo the optimism.
 async function moveStatus(todo: Todo, status: string) {
   if (todo.status === status) return;
-  todos.value = todos.value.map((t) =>
-    t.id === todo.id ? { ...t, status } : t,
-  );
   try {
-    todos.value = await invoke<Todo[]>("set_todo_status", {
+    const result = await invoke<TodoMutation>("set_todo_status", {
       id: todo.id,
       status,
     });
+    await applyTodoMutation(result);
   } catch (e) {
     errorMsg.value = String(e);
-    await loadTodos();
+    await boardStore.reload(true);
   }
 }
 
@@ -352,7 +350,8 @@ async function confirmDelete() {
   if (!todo) return;
   pendingDelete.value = null;
   try {
-    todos.value = await invoke<Todo[]>("delete_todo", { id: todo.id });
+    await invoke<Todo[]>("delete_todo", { id: todo.id });
+    await boardStore.reload(true);
     if (editingId.value === todo.id) resetForm();
     if (detailId.value === todo.id) closeDetail();
   } catch (e) {
@@ -368,7 +367,13 @@ async function confirmDelete() {
 // (preserving id / comments / links / created_at) and persists via `upsert_todo`.
 const view = ref<"board" | "detail">("board");
 const detailId = ref<string | null>(null);
-const detail = computed(() => todos.value.find((t) => t.id === detailId.value) ?? null);
+const detail = computed(() => {
+  const row = todos.value.find((t) => t.id === detailId.value);
+  if (!row) return null;
+  // Compact board data remains authoritative for fields shared by cards. The
+  // selected record contributes only the deliberately on-demand heavy fields.
+  return detailRecord.value?.id === row.id ? { ...row, ...detailRecord.value } : row;
+});
 
 // Transient "Saved ✓" confirmation shown after a successful detail save.
 const saved = ref(false);
@@ -435,8 +440,7 @@ const inheritedHandoff = computed(() => {
     }));
 });
 
-function openDetail(todo: Todo) {
-  detailId.value = todo.id;
+function fillDraft(todo: Todo) {
   draft.value = {
     subject: todo.subject,
     description: todo.description ?? "",
@@ -447,15 +451,32 @@ function openDetail(todo: Todo) {
     status: todo.status,
     priority: todo.priority ?? "",
   };
+}
+
+async function openDetail(todo: Todo) {
+  detailId.value = todo.id;
+  detailRecord.value = todo;
+  fillDraft(todo);
   descMode.value = "edit";
   mention.value = null;
   saved.value = false;
   view.value = "detail";
+  try {
+    const full = await invoke<Todo | null>("get_task_detail", { id: todo.id });
+    if (full && detailId.value === todo.id) {
+      detailRecord.value = full;
+      fillDraft(full);
+    }
+  } catch {
+    // A compact card is still enough to open the editor if the detail request
+    // is temporarily unavailable.
+  }
 }
 
 function closeDetail() {
   view.value = "board";
   detailId.value = null;
+  detailRecord.value = null;
 }
 
 async function saveDetail() {
@@ -475,7 +496,9 @@ async function saveDetail() {
     priority: d.priority || "",
   };
   try {
-    todos.value = await invoke<Todo[]>("upsert_todo", { todo });
+    await invoke<Todo[]>("upsert_todo", { todo });
+    detailRecord.value = todo;
+    await boardStore.reload(true);
     flashSaved();
   } catch (e) {
     errorMsg.value = String(e);
@@ -495,10 +518,11 @@ async function addComment() {
   const body = newComment.value.trim();
   if (!body || !detail.value) return;
   try {
-    todos.value = await invoke<Todo[]>("add_todo_comment", {
+    const result = await invoke<TodoMutation>("add_todo_comment", {
       id: detail.value.id,
       body,
     });
+    await applyTodoMutation(result, true);
     newComment.value = "";
   } catch (e) {
     errorMsg.value = String(e);
@@ -508,10 +532,11 @@ async function addComment() {
 async function removeComment(id: string) {
   if (!detail.value) return;
   try {
-    todos.value = await invoke<Todo[]>("remove_todo_comment", {
+    const result = await invoke<TodoMutation>("remove_todo_comment", {
       id: detail.value.id,
       commentId: id,
     });
+    await applyTodoMutation(result, true);
   } catch (e) {
     errorMsg.value = String(e);
   }
@@ -706,7 +731,10 @@ useHotkeys({
 // GraphView mutates dependencies through the backend and hands back the fresh
 // list; adopt it so both views stay in lockstep without a reload round-trip.
 function onGraphUpdate(list: Todo[]) {
-  todos.value = list;
+  // GraphView's legacy event carries a full list. Do not retain it: the shared
+  // store owns the only board snapshot in this WebView.
+  void list;
+  void boardStore.reload(true);
 }
 
 // --- the spec a task is about (t#339/t#346) ----------------------------------
@@ -1356,7 +1384,6 @@ function relTime(iso: string | undefined | null): string {
 }
 
 let unlistenLocale: (() => void) | null = null;
-let unlistenTodos: (() => void) | null = null;
 let unlistenFocus: (() => void) | null = null;
 let unlistenTriage: (() => void) | null = null;
 let unlistenExternal: (() => void) | null = null;
@@ -1510,12 +1537,8 @@ onMounted(async () => {
   unlistenLocale = await listen<string>("todos-locale", (e) => {
     applyLocale(e.payload);
   });
-  // Live reload: the backend watcher fires this whenever todos.json changes on
-  // disk (CLI / Claude / hand-edit), so the board stays in sync without a manual
-  // refresh.
-  unlistenTodos = await listen("todos-file-changed", () => {
-    requestReload();
-  });
+  // boardStore owns the sole todos-file-changed subscription. In a hidden
+  // persisted window it marks the snapshot stale and waits for focus/show.
   // A fresh nightly-triage digest landed (the backend broadcasts to all
   // windows); refresh the chip so it reflects the latest run.
   unlistenTriage = await listen("triage-alert", () => {
@@ -1548,13 +1571,14 @@ onMounted(async () => {
       // Pick up a status remap done in the Settings → Integrations window.
       void loadStatusMap();
       void loadExternalTasks();
+      // Covers focus events that arrive before visibilitychange in WebView2.
+      if (boardStore.stale.value) void boardStore.reload();
     }
   });
 });
 
 onUnmounted(() => {
   if (unlistenLocale) unlistenLocale();
-  if (unlistenTodos) unlistenTodos();
   if (unlistenFocus) unlistenFocus();
   if (unlistenTriage) unlistenTriage();
   if (unlistenExternal) unlistenExternal();

@@ -155,6 +155,14 @@ onMounted(async () => {
             savedTick.value++;
         }),
     );
+    // A newly created renderer cannot receive the opening event before these
+    // listeners exist. Read the backend's retained request after subscribing:
+    // an open during this call is then covered by either the event or this read.
+    try {
+        activeTab.value = await invoke<SettingsTab>("get_settings_open_tab");
+    } catch {
+        // Browser/component previews have no Tauri command; keep account.
+    }
 });
 
 onUnmounted(() => {

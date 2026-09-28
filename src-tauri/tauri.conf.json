@@ -36,46 +36,6 @@
         "visible": false,
         "skipTaskbar": true,
         "transparent": false
-      },
-      {
-        "label": "analytics",
-        "url": "index.html#analytics",
-        "title": "Claude Usage — Analytics",
-        "width": 960,
-        "height": 720,
-        "minWidth": 720,
-        "minHeight": 520,
-        "resizable": true,
-        "decorations": true,
-        "center": true,
-        "visible": false
-      },
-      {
-        "label": "todos",
-        "url": "index.html#todos",
-        "title": "Claude Usage — Tasks",
-        "width": 1040,
-        "height": 760,
-        "minWidth": 640,
-        "minHeight": 480,
-        "resizable": true,
-        "decorations": true,
-        "center": true,
-        "visible": false,
-        "dragDropEnabled": false
-      },
-      {
-        "label": "settings",
-        "url": "index.html#settings",
-        "title": "Claude Usage — Settings",
-        "width": 680,
-        "height": 780,
-        "minWidth": 560,
-        "minHeight": 540,
-        "resizable": true,
-        "decorations": true,
-        "center": true,
-        "visible": false
       }
     ],
     "trayIcon": {

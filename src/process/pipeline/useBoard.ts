@@ -1,7 +1,7 @@
 import { ref, computed, onMounted } from "vue";
-import { invoke } from "@tauri-apps/api/core";
 import { loadRunLayer } from "../../board/graphModel";
 import type { RunGraphNode } from "../../board/graphModel";
+import { boardStore } from "../../board/boardStore";
 import {
     laneIndex,
     normalizeShares,
@@ -21,44 +21,24 @@ import {
     tasks as mockTasks,
 } from "./mock";
 
-export function useBoard(withPorts = false) {
-    const board = ref<BoardTodo[]>([]);
-    const changes = ref<BoardChange[]>([]);
+export function useBoard(withPorts = false, metricChanges: string[] = []) {
+    // These are the shared compact board rows. A pipeline view must not parse its
+    // own full board (or eagerly measure every change) just because it mounted.
+    const board = computed(() => boardStore.rows.value as unknown as BoardTodo[]);
+    const changes = computed(() => boardStore.changes.value as BoardChange[]);
     const costs = ref<TaskCostRow[]>([]);
     const run = ref<Map<string, RunGraphNode>>(new Map());
     const live = ref(false);
     const error = ref("");
 
     async function load() {
+        await boardStore.start();
+        live.value = boardStore.error.value === "";
+        error.value = boardStore.error.value;
+        // Graph metrics are deliberately opt-in: callers pass only changes that
+        // are actually visible or expanded in their viewport.
         try {
-            board.value = await invoke<BoardTodo[]>("get_todos");
-            live.value = true;
-        } catch (e) {
-            error.value = String(e);
-            live.value = false;
-            return;
-        }
-        try {
-            changes.value = await invoke<BoardChange[]>("get_changes");
-        } catch {
-            changes.value = [];
-        }
-        try {
-            const payload = await invoke<{ tasks: TaskCostRow[] } | null>(
-                "get_task_costs",
-            );
-            costs.value = payload?.tasks ?? [];
-        } catch {
-            costs.value = [];
-        }
-        try {
-            const refs = [
-                ...changes.value.map((c) => `c#${c.number}`),
-                ...board.value
-                    .filter((t) => t.change === true && t.number)
-                    .map((t) => `#${t.number}`),
-            ];
-            run.value = await loadRunLayer(refs);
+            run.value = await loadRunLayer(metricChanges);
         } catch {
             run.value = new Map();
         }
@@ -118,7 +98,7 @@ export function useBoard(withPorts = false) {
         return out;
     });
 
-    onMounted(load);
+    onMounted(() => void load());
 
     return {
         live,

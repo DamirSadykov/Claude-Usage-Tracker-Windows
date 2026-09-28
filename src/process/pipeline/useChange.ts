@@ -1,6 +1,7 @@
 import { ref, computed, watch, onMounted } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { loadRunGraph, type RunGraph } from "../../board/graphModel";
+import { boardStore } from "../../board/boardStore";
 import {
     blockersFor,
     changeAddress,
@@ -28,8 +29,8 @@ export function selectChange(address: string) {
 }
 
 export function useChange() {
-    const board = ref<ChangeTask[]>([]);
-    const changesRaw = ref<ChangeRecord[]>([]);
+    const board = computed(() => boardStore.rows.value as unknown as ChangeTask[]);
+    const changesRaw = computed(() => boardStore.changes.value as ChangeRecord[]);
     const live = ref(false);
     const error = ref("");
     const graph = ref<RunGraph>(EMPTY_GRAPH);
@@ -50,21 +51,9 @@ export function useChange() {
     }
 
     async function load() {
-        try {
-            board.value = await invoke<ChangeTask[]>("get_todos");
-            live.value = true;
-        } catch (e) {
-            error.value = String(e);
-            live.value = false;
-            board.value = [];
-        }
-        if (live.value) {
-            try {
-                changesRaw.value = await invoke<ChangeRecord[]>("get_changes");
-            } catch {
-                changesRaw.value = [];
-            }
-        }
+        await boardStore.start();
+        live.value = boardStore.error.value === "";
+        error.value = boardStore.error.value;
         pickDefault();
     }
 
@@ -83,10 +72,7 @@ export function useChange() {
     }
 
     watch(selected, loadGraph);
-    onMounted(async () => {
-        await load();
-        await loadGraph();
-    });
+    onMounted(async () => { await load(); await loadGraph(); });
 
     const current = computed(
         () => changes.value.find((c) => changeAddress(c) === selected.value) ?? null,
@@ -128,7 +114,10 @@ export function useChange() {
         closeError.value = "";
         try {
             await invoke<string>("close_change", { change: changeAddress(current.value) });
-            await reload();
+            // close_change is CLI-backed rather than a compact mutation response.
+            // Refresh once; its watcher echo is revision-gated by the store.
+            await boardStore.reload(true);
+            await loadGraph();
         } catch (e) {
             closeError.value = String(e);
         } finally {

@@ -10,7 +10,7 @@ pub mod triage;
 mod layers;
 
 pub use analytics::{alerts, cc, codex, corrections, domain, memory, project_groups, stats, status, usage};
-pub use board::{graph, task_sessions, todos};
+pub use board::{cache, graph, graph_cache, payload, task_sessions, todos};
 pub use external::{enroll, identity};
 pub use kernel::{board_lock, report, sysmon};
 pub use triage::triage_schedule;
@@ -1257,19 +1257,11 @@ fn report_issue(store: tauri::State<'_, Arc<DiagStore>>) -> Result<(), String> {
     open::that(url).map_err(|e| e.to_string())
 }
 
-/// Show (and focus) the standalone analytics window. It's declared hidden in
-/// tauri.conf and revealed on demand from the popup's "Подробнее" button.
-/// The system [X] is intercepted in `setup` to hide rather than destroy the
-/// window, so a lookup here is the single source of truth for its lifecycle.
+/// Show (and focus) the standalone analytics window, creating its WebView only
+/// when the dashboard is requested.
 #[tauri::command]
 fn open_analytics_window(app: AppHandle) {
-    if let Some(win) = app.get_webview_window("analytics") {
-        let _ = win.unminimize();
-        let _ = win.show();
-        let _ = win.set_focus();
-    } else {
-        warn!("analytics window not found");
-    }
+    kernel::windows::open_analytics(&app);
 }
 
 /// Opens the folder containing the log file in the OS file manager.
@@ -1302,11 +1294,7 @@ fn todos_path(app: &AppHandle) -> Result<PathBuf, String> {
 #[tauri::command]
 fn get_todos(app: AppHandle) -> Result<Vec<todos::Todo>, String> {
     let path = todos_path(&app)?;
-    Ok(match todos::load_checked(&path) {
-        todos::LoadOutcome::Ok(file) => file.todos,
-        todos::LoadOutcome::Missing => Vec::new(),
-        todos::LoadOutcome::Unreadable { .. } | todos::LoadOutcome::FutureVersion { .. } => Vec::new(),
-    })
+    Ok(app.state::<cache::BoardCache>().load(&path).map(|snapshot| snapshot.file.todos.clone()).unwrap_or_default())
 }
 
 /// The change records of the board (t#360). Separate from [`get_todos`] because
@@ -1315,11 +1303,28 @@ fn get_todos(app: AppHandle) -> Result<Vec<todos::Todo>, String> {
 #[tauri::command]
 fn get_changes(app: AppHandle) -> Result<Vec<todos::Change>, String> {
     let path = todos_path(&app)?;
-    Ok(match todos::load_checked(&path) {
-        todos::LoadOutcome::Ok(file) => file.changes,
-        todos::LoadOutcome::Missing => Vec::new(),
-        todos::LoadOutcome::Unreadable { .. } | todos::LoadOutcome::FutureVersion { .. } => Vec::new(),
-    })
+    Ok(app.state::<cache::BoardCache>().load(&path).map(|snapshot| snapshot.file.changes.clone()).unwrap_or_default())
+}
+
+#[tauri::command]
+fn get_board(app: AppHandle) -> Result<payload::BoardPayload, String> {
+    let path = todos_path(&app)?;
+    match app.state::<cache::BoardCache>().load(&path) {
+        Ok(snapshot) => Ok(payload::board(snapshot.revision, &snapshot.file)),
+        Err(todos::LoadOutcome::FutureVersion { .. }) => Ok(payload::BoardPayload { revision: 0, todos: Vec::new(), changes: Vec::new(), state: "future-version" }),
+        Err(_) => Ok(payload::BoardPayload { revision: 0, todos: Vec::new(), changes: Vec::new(), state: "unreadable" }),
+    }
+}
+
+#[tauri::command]
+fn get_task_detail(app: AppHandle, id: String) -> Result<Option<todos::Todo>, String> {
+    let path = todos_path(&app)?;
+    let snapshot = app.state::<cache::BoardCache>().load(&path).map_err(|outcome| match outcome {
+        todos::LoadOutcome::Unreadable { reason, .. } => reason,
+        todos::LoadOutcome::FutureVersion { version } => format!("board version {version} is newer than this reader"),
+        _ => "board unavailable".to_string(),
+    })?;
+    Ok(snapshot.file.todos.iter().find(|todo| todo.id == id).cloned())
 }
 
 #[derive(Serialize)]
@@ -1338,20 +1343,21 @@ struct BoardState {
 fn board_state(app: AppHandle) -> Result<BoardState, String> {
     let path = todos_path(&app)?;
     let file = path.display().to_string();
-    Ok(match todos::load_checked(&path) {
-        todos::LoadOutcome::Ok(_) | todos::LoadOutcome::Missing => {
+    Ok(match app.state::<cache::BoardCache>().load(&path) {
+        Ok(_) => {
             BoardState { state: "ok", file, backup: None, reason: None, version: None }
         }
-        todos::LoadOutcome::Unreadable { reason, backup } => BoardState {
+        Err(todos::LoadOutcome::Unreadable { reason, backup }) => BoardState {
             state: "unreadable",
             file,
             backup: backup.map(|p| p.display().to_string()),
             reason: Some(reason),
             version: None,
         },
-        todos::LoadOutcome::FutureVersion { version } => {
+        Err(todos::LoadOutcome::FutureVersion { version }) => {
             BoardState { state: "future-version", file, backup: None, reason: None, version: Some(version) }
         }
+        Err(todos::LoadOutcome::Missing) | Err(todos::LoadOutcome::Ok(_)) => unreachable!("cache normalizes missing boards"),
     })
 }
 
@@ -1905,6 +1911,131 @@ async fn get_task_graph(
     let mut out = graph::build(&board, &change, &blocks, &totals, &agents, &costs);
     graph::render(&mut out, format.as_deref().unwrap_or("mermaid"));
     Ok(out)
+}
+
+/// Lightweight graph data for all currently visible changes. Unlike
+/// `get_task_graph`, this never renders Mermaid/D2 and shares the journal,
+/// session and attribution work across every requested change.
+#[derive(Serialize)]
+struct GraphBatch {
+    revision: u64,
+    graphs: Vec<graph::GraphBatchGraph>,
+    totals: GraphBatchTotals,
+}
+
+#[derive(Default, Serialize)]
+struct GraphBatchTotals {
+    changes: u32,
+    nodes: u32,
+    blocks: u32,
+    cost: f64,
+    total_tokens: i64,
+    messages: i64,
+}
+
+fn load_graph_metrics(
+    stats: &StatsDb,
+    board: &todos::TodoFile,
+    journal_path: &Path,
+    attribution_path: &Path,
+) -> Result<graph_cache::GraphMetrics, String> {
+    let events = task_sessions::load(journal_path);
+    let usage = stats.sessions_all().map_err(|e| e.to_string())?;
+    let blocks = task_sessions::blocks(&events, &session_ends(&usage));
+    let spans: Vec<(String, String, String)> = blocks.iter().map(|block| {
+        (block.session.clone(), block.from.clone(), block.to.clone())
+    }).collect();
+    let totals = stats.block_totals_many(&spans).map_err(|e| e.to_string())?;
+    let attr = task_cost::load(attribution_path).unwrap_or_default();
+    let task_costs = task_cost::compute(&attr, board, &usage, &blocks).tasks.into_iter()
+        .map(|task| (task.id, task.cost)).collect();
+    Ok(graph_cache::GraphMetrics { blocks, totals, task_costs })
+}
+
+/// The graph's selected changes in one response. Block rows and per-agent data
+/// stay out of this hot path and are loaded after a user selects a node.
+#[tauri::command]
+async fn get_graph_batch(
+    app: AppHandle,
+    stats: tauri::State<'_, Arc<StatsDb>>,
+    change_refs: Vec<String>,
+) -> Result<GraphBatch, String> {
+    let board_path = todos_path(&app)?;
+    let snapshot = app.state::<cache::BoardCache>().load(&board_path)
+        .map_err(|_| "board unavailable".to_string())?;
+    let journal_path = task_sessions_path(&app)?;
+    let attribution_path = task_attribution_path(&app)?;
+    let key = graph_cache::GraphCacheKey {
+        board_revision: snapshot.revision,
+        journal_stamp: cache::FileStamp::read(&journal_path),
+        attribution_stamp: cache::FileStamp::read(&attribution_path),
+        sqlite_revision: stats.graph_revision().map_err(|e| e.to_string())?,
+    };
+    let metrics = app.state::<graph_cache::GraphCache>().get_or_compute(key, || {
+        load_graph_metrics(&stats, &snapshot.file, &journal_path, &attribution_path)
+    })?;
+    let mut seen = HashSet::new();
+    let refs: Vec<String> = change_refs.into_iter().map(|reference| reference.trim().to_string())
+        .filter(|reference| !reference.is_empty() && seen.insert(reference.clone())).collect();
+    let graphs: Vec<graph::GraphBatchGraph> = refs.iter().map(|reference| {
+        graph::build(&snapshot.file, reference, &metrics.blocks, &metrics.totals, &[], &metrics.task_costs).into()
+    }).collect();
+    let mut totals = GraphBatchTotals { changes: graphs.len() as u32, ..Default::default() };
+    let mut node_ids = HashSet::new();
+    for node in graphs.iter().flat_map(|graph| graph.nodes.iter()) {
+        if node_ids.insert(node.id.as_str()) {
+            totals.nodes += 1;
+            totals.blocks += node.blocks;
+            totals.cost += node.cost.unwrap_or_default();
+            totals.total_tokens += node.total_tokens.unwrap_or_default();
+            totals.messages += node.messages.unwrap_or_default();
+        }
+    }
+    Ok(GraphBatch { revision: snapshot.revision, graphs, totals })
+}
+
+#[derive(Serialize)]
+struct GraphNodeDetail {
+    blocks: task_sessions::TaskBlocks,
+    /// Parallel to `blocks.blocks`: executor rows for that exact block.
+    agents: Vec<Vec<graph::GraphAgent>>,
+}
+
+#[tauri::command]
+async fn get_graph_node_detail(
+    app: AppHandle,
+    stats: tauri::State<'_, Arc<StatsDb>>,
+    task: String,
+) -> Result<GraphNodeDetail, String> {
+    let board_path = todos_path(&app)?;
+    let snapshot = app.state::<cache::BoardCache>().load(&board_path)
+        .map_err(|_| "board unavailable".to_string())?;
+    let journal_path = task_sessions_path(&app)?;
+    let attribution_path = task_attribution_path(&app)?;
+    let key = graph_cache::GraphCacheKey {
+        board_revision: snapshot.revision,
+        journal_stamp: cache::FileStamp::read(&journal_path),
+        attribution_stamp: cache::FileStamp::read(&attribution_path),
+        sqlite_revision: stats.graph_revision().map_err(|e| e.to_string())?,
+    };
+    let metrics = app.state::<graph_cache::GraphCache>().get_or_compute(key, || {
+        load_graph_metrics(&stats, &snapshot.file, &journal_path, &attribution_path)
+    })?;
+    let Some(task_id) = task_sessions::resolve_task_ref(&snapshot.file, &task) else {
+        return Ok(GraphNodeDetail { blocks: task_sessions::TaskBlocks { blocks: Vec::new(), explicit_blocks: 0, auto_blocks: 0 }, agents: Vec::new() });
+    };
+    let selected: Vec<(task_sessions::TaskBlock, contracts::analytics_read::BlockTotals)> = metrics.blocks.iter()
+        .zip(metrics.totals.iter()).filter(|(block, _)| block.task == task_id)
+        .map(|(block, total)| (block.clone(), total.clone())).collect();
+    let blocks: Vec<task_sessions::TaskBlock> = selected.iter().map(|(block, _)| block.clone()).collect();
+    let totals: Vec<contracts::analytics_read::BlockTotals> = selected.into_iter().map(|(_, total)| total).collect();
+    let agents = blocks.iter().map(|block| {
+        stats.block_agents(&block.session, &block.from, &block.to).map_err(|e| e.to_string())
+    }).collect::<Result<Vec<_>, _>>()?.into_iter().map(|rows| rows.into_iter().map(|row| graph::GraphAgent {
+        agent_id: row.agent_id, agent_type: row.agent_type, description: row.description,
+        cost: row.cost, total_tokens: row.total_tokens, messages: row.messages,
+    }).collect()).collect();
+    Ok(GraphNodeDetail { blocks: task_sessions::compose(&blocks, &snapshot.file, &totals), agents })
 }
 
 /// Shows a block's transcript in the OS file manager and returns its path
@@ -2700,6 +2831,7 @@ fn write_todos_locked(
         Ok(())
     })?;
     *guard = Some(todo_status_map(&file));
+    app.state::<cache::BoardCache>().install(&path, file.clone());
     Ok(file.todos)
 }
 
@@ -2712,7 +2844,17 @@ fn write_todos_locked_replace(
     let mut guard = snap.0.lock().unwrap();
     let file = todos::replace_locked(&path, file)?;
     *guard = Some(todo_status_map(&file));
+    app.state::<cache::BoardCache>().install(&path, file.clone());
     Ok(file.todos)
+}
+
+fn mutation_payload(app: &AppHandle, id: &str) -> Result<payload::MutationPayload, String> {
+    let path = todos_path(app)?;
+    let snapshot = app.state::<cache::BoardCache>().load(&path).map_err(|_| "board unavailable".to_string())?;
+    Ok(payload::MutationPayload {
+        revision: snapshot.revision,
+        row: snapshot.file.find_todo(id).map(payload::row),
+    })
 }
 
 #[tauri::command]
@@ -2733,16 +2875,16 @@ fn delete_todo(app: AppHandle, id: String) -> Result<Vec<todos::Todo>, String> {
 }
 
 #[tauri::command]
-fn add_todo_comment(app: AppHandle, id: String, body: String) -> Result<Vec<todos::Todo>, String> {
+fn add_todo_comment(app: AppHandle, id: String, body: String) -> Result<payload::MutationPayload, String> {
     if body.trim().is_empty() {
         return Err("comment body must not be empty".to_string());
     }
     let now = chrono::Utc::now().to_rfc3339();
     let mut outcome = Ok(());
-    let todos = write_todos_locked(&app, |file| {
+    let _todos = write_todos_locked(&app, |file| {
         outcome = todos::add_comment(file, &id, "user", &body, &now);
     })?;
-    outcome.map(|()| todos)
+    outcome.map(|()| mutation_payload(&app, &id)).and_then(|result| result)
 }
 
 #[tauri::command]
@@ -2750,13 +2892,13 @@ fn remove_todo_comment(
     app: AppHandle,
     id: String,
     comment_id: String,
-) -> Result<Vec<todos::Todo>, String> {
+) -> Result<payload::MutationPayload, String> {
     let now = chrono::Utc::now().to_rfc3339();
     let mut outcome = Ok(());
-    let todos = write_todos_locked(&app, |file| {
+    let _todos = write_todos_locked(&app, |file| {
         outcome = todos::remove_comment(file, &id, &comment_id, &now);
     })?;
-    outcome.map(|()| todos)
+    outcome.map(|()| mutation_payload(&app, &id)).and_then(|result| result)
 }
 
 #[tauri::command]
@@ -2764,14 +2906,16 @@ fn set_todo_status(
     app: AppHandle,
     id: String,
     status: String,
-) -> Result<Vec<todos::Todo>, String> {
+) -> Result<payload::MutationPayload, String> {
     if !todos::is_valid_status(&status) {
         return Err(format!("invalid status: {status}"));
     }
     let now = chrono::Utc::now().to_rfc3339();
+    let changed_id = id.clone();
     write_todos_locked(&app, move |file| {
-        todos::set_status(file, &id, &status, &now);
-    })
+        todos::set_status(file, &changed_id, &status, &now);
+    })?;
+    mutation_payload(&app, &id)
 }
 
 /// Add a dependency edge for the task graph (#88): `from_id` depends on `on_id`.
@@ -2926,38 +3070,28 @@ fn apply_todo_import(app: AppHandle, path: String) -> Result<todos::ImportReport
     Ok(report)
 }
 
-/// Show the standalone Todo window (declared hidden in tauri.conf.json).
+/// Show the standalone Todo window, creating it on demand.
 #[tauri::command]
 fn open_todo_window(app: AppHandle) {
-    if let Some(win) = app.get_webview_window("todos") {
-        let _ = win.unminimize();
-        let _ = win.show();
-        let _ = win.set_focus();
-    } else {
-        warn!("todos window not found");
-    }
+    kernel::windows::open_todos(&app);
 }
 
-/// Show the shared Settings window (declared hidden in tauri.conf.json) and tell
-/// it which tab to open. Every screen's gear routes here, so settings live in one
-/// canonical window instead of inline in each. `tab` falls back to "account".
+/// Show the shared Settings window, remembering the requested tab for its
+/// mount-time handshake when this call creates a new renderer.
 fn show_settings_window(app: &AppHandle, tab: Option<String>) {
-    if let Some(win) = app.get_webview_window("settings") {
-        let _ = win.unminimize();
-        let _ = win.show();
-        let _ = win.set_focus();
-        // The window is created hidden at startup, so its `settings-open` listener
-        // is already registered by the time any gear is clicked (same pattern as
-        // the todos-locale push). Emit after show so it switches tab immediately.
-        let _ = win.emit("settings-open", tab.unwrap_or_else(|| "account".into()));
-    } else {
-        warn!("settings window not found");
-    }
+    kernel::windows::open_settings(app, tab);
 }
 
 #[tauri::command]
 fn open_settings_window(app: AppHandle, tab: Option<String>) {
     show_settings_window(&app, tab);
+}
+
+/// Handshake for a just-created Settings window. Unlike an event, this cannot
+/// be lost before Vue registers its listeners.
+#[tauri::command]
+fn get_settings_open_tab(state: tauri::State<'_, kernel::windows::WindowOpenState>) -> String {
+    state.settings_tab()
 }
 
 /// Background watcher: poll `todos.json`'s mtime and, on change, (1) emit
@@ -2978,7 +3112,6 @@ fn spawn_todos_watch(app: AppHandle) {
             Ok(p) => p,
             Err(_) => return,
         };
-        let modified = |p: &PathBuf| std::fs::metadata(p).and_then(|m| m.modified()).ok();
         // One-time migration: give every existing task a stable number so inline
         // `#N` references work even before the first edit this session. Done under
         // the snapshot lock so the resulting write isn't seen as an external change.
@@ -2988,6 +3121,7 @@ fn spawn_todos_watch(app: AppHandle) {
             match todos::transact_if(&path, |file| Ok((todos::ensure_numbers(file), ()))) {
                 Ok((file, ())) => {
                     *guard = Some(todo_status_map(&file));
+                    app.state::<cache::BoardCache>().install(&path, file);
                 }
                 Err(todos::TransactError::Lock(e)) => {
                     warn!("todos watcher startup: board lock unavailable, skipping number backfill: {e}");
@@ -3003,10 +3137,13 @@ fn spawn_todos_watch(app: AppHandle) {
                 }
             }
         }
-        let mut last: Option<SystemTime> = modified(&path);
+        // A timestamp alone is not a safe invalidation key: an external writer
+        // can replace the board within the filesystem's timestamp granularity.
+        // Keep the length alongside it, matching BoardCache's stamp.
+        let mut last = cache::FileStamp::read(&path);
         loop {
             std::thread::sleep(Duration::from_millis(1500));
-            let current = modified(&path);
+            let current = cache::FileStamp::read(&path);
             if current.is_none() {
                 // File briefly absent (mid-rename) or never created — remember
                 // so its (re)appearance counts as a change, but don't report it.
@@ -3017,6 +3154,12 @@ fn spawn_todos_watch(app: AppHandle) {
                 continue;
             }
             last = current;
+            // `write_todos_locked` already installed this exact post-write
+            // stamp. The watcher sees the rename too, but it is not an external
+            // board change and must not trigger a reload echo.
+            if app.state::<cache::BoardCache>().matches(&path) {
+                continue;
+            }
             let _ = app.emit("todos-file-changed", ());
 
             // Diff statuses under the snapshot lock, spanning the file read, so a
@@ -3025,8 +3168,9 @@ fn spawn_todos_watch(app: AppHandle) {
             let alerts: Vec<TodoStatusAlert> = {
                 let snap = app.state::<TodoSnapshot>();
                 let mut guard = snap.0.lock().unwrap();
-                match todos::load_known(&path) {
-                    Ok(file) => {
+                match app.state::<cache::BoardCache>().load(&path) {
+                    Ok(snapshot) => {
+                        let file = &snapshot.file;
                         let (map, alerts) = diff_snapshot(guard.as_ref(), &file);
                         *guard = Some(map);
                         alerts
@@ -3172,6 +3316,9 @@ pub fn run() {
             app.manage(Mutex::new(AlertEngine::new()));
             app.manage(Arc::new(Mutex::new(StatusState::default())));
             app.manage(TodoSnapshot::default());
+            app.manage(cache::BoardCache::default());
+            app.manage(graph_cache::GraphCache::default());
+            app.manage(kernel::windows::WindowOpenState::default());
             let notify = Arc::new(Notify::new());
             app.manage(notify.clone());
 
@@ -3257,43 +3404,6 @@ pub fn run() {
                 });
             }
 
-            // Analytics window: hide on [X] instead of destroying. Keeps the
-            // webview alive so `open_analytics_window` can simply show+focus it
-            // every time — one canonical path, no re-create/white-screen race.
-            if let Some(window) = app.get_webview_window("analytics") {
-                let w = window.clone();
-                window.on_window_event(move |event| {
-                    if let WindowEvent::CloseRequested { api, .. } = event {
-                        api.prevent_close();
-                        let _ = w.hide();
-                    }
-                });
-            }
-
-            // Todos window: same hide-on-[X] as analytics, so `open_todo_window`
-            // can always show+focus the live webview instead of finding it gone.
-            if let Some(window) = app.get_webview_window("todos") {
-                let w = window.clone();
-                window.on_window_event(move |event| {
-                    if let WindowEvent::CloseRequested { api, .. } = event {
-                        api.prevent_close();
-                        let _ = w.hide();
-                    }
-                });
-            }
-
-            // Settings window: same hide-on-[X] so `open_settings_window` always
-            // re-shows the one live webview (preserves its loaded state + listener).
-            if let Some(window) = app.get_webview_window("settings") {
-                let w = window.clone();
-                window.on_window_event(move |event| {
-                    if let WindowEvent::CloseRequested { api, .. } = event {
-                        api.prevent_close();
-                        let _ = w.hide();
-                    }
-                });
-            }
-
             // Before anything reads the board: bring stored `#N` task references
             // to the `t#N` form the rest of the app assumes.
             match migrate_todo_refs(app.handle()) {
@@ -3349,6 +3459,8 @@ pub fn run() {
             export_analytics_json,
             get_todos,
             get_changes,
+            get_board,
+            get_task_detail,
             board_state,
             close_change,
             get_corrections_metrics,
@@ -3356,6 +3468,8 @@ pub fn run() {
             get_task_costs,
             get_task_blocks,
             get_task_graph,
+            get_graph_batch,
+            get_graph_node_detail,
             reveal_transcript,
             refresh_task_costs,
             get_triage_digest,
@@ -3390,6 +3504,7 @@ pub fn run() {
             apply_todo_import,
             open_todo_window,
             open_settings_window,
+            get_settings_open_tab,
             enrollment_status,
             enroll_bind,
             enroll_reset,
