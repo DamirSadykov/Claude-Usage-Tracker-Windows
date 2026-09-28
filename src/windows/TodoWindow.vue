@@ -750,11 +750,15 @@ const specMode = ref<PipelineMode>("reader");
 watch(graphUiNew, (on) =>
   localStorage.setItem("graph-ui", on ? "next" : "classic"),
 );
-// In graph view the ONE shared search box (below) highlights matching nodes instead
-// of filtering; Enter cycles to the next hit via GraphView's exposed `cycleNext`.
+// In graph view the ONE shared search box highlights matching nodes. Both graph
+// implementations expose the same keyboard navigation contract.
 const graphRef = ref<InstanceType<typeof GraphView> | null>(null);
-function onSearchEnter() {
-  if (viewMode.value === "graph") graphRef.value?.cycleNext();
+const pipelineGraphRef = ref<InstanceType<typeof PipelineGraph> | null>(null);
+const pipelineActiveHit = ref<string | null>(null);
+function onSearchEnter(event?: KeyboardEvent) {
+  if (viewMode.value !== "graph") return;
+  if (graphUiNew.value) pipelineGraphRef.value?.cycleHit(event?.shiftKey ? -1 : 1);
+  else graphRef.value?.cycleNext();
 }
 
 // Keyboard shortcuts (registry in ../hotkeys): Ctrl+F → search, Ctrl+P → project.
@@ -1752,7 +1756,11 @@ onUnmounted(() => {
 
     <!-- Task graph, new rendering: lanes by theme, artifacts on wires, ref rings -->
     <PipelineGraph
+      ref="pipelineGraphRef"
       v-else-if="viewMode === 'graph' && graphUiNew"
+      :query="search"
+      :filters="filters"
+      v-model:active-hit="pipelineActiveHit"
       @open="onPipelineOpen"
     />
 

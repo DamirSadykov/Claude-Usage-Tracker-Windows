@@ -58,6 +58,6 @@ const headline = computed(() => {
             </template>
         </AppBar>
 
-        <PipelineGraph v-model:mode="mode" :chrome="true" />
+        <PipelineGraph v-model:mode="mode" :query="query" :chrome="true" />
     </div>
 </template>

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, watch, nextTick } from "vue";
+import { projectTodos, type TodoFilters } from "../../../board/todoFilter";
 import ToolBar from "../../atoms/ToolBar.vue";
 import LegendBar from "../../atoms/LegendBar.vue";
 import ToolButton from "../../atoms/ToolButton.vue";
@@ -19,13 +20,21 @@ import { graphStats } from "../mock";
 import { useBoard } from "../useBoard";
 import { isFreeLane } from "../adapt";
 import type { ProjectBand as ProjectRow, TaskNode } from "../types";
+import { graphHits, stepGraphHit } from "../graphNavigation";
+
+const props = withDefaults(defineProps<{
+    query?: string;
+    filters?: TodoFilters;
+    activeHit?: string | null;
+}>(), { query: "", activeHit: null });
 
 const emit = defineEmits<{
     (e: "mode", value: "lanes" | "wires" | "bubbles" | "rings" | "specs"): void;
     (e: "open", id: string): void;
+    (e: "update:activeHit", id: string | null): void;
 }>();
 
-const { lanes, tasks, links, projects, nodeByLabel, projection, live } = useBoard();
+const { lanes, tasks, links, projects, nodeByLabel, projection, live, board } = useBoard();
 
 const linkMode = ref("deps");
 const layoutMode = ref("lanes");
@@ -129,10 +138,58 @@ function projectOfLane(laneId: string) {
     return projects.value.find((p) => p.lanes.includes(laneId))?.name ?? "";
 }
 
+const filteredIds = computed(() => {
+    // A failed compact-board load renders demo cards, whose IDs are unrelated
+    // to a stale board snapshot and therefore must not be filtered by it.
+    if (!props.filters || !live.value) return null;
+    const filters = { ...props.filters, query: "", showDone: true };
+    return new Set(projectTodos(board.value as any[], filters).visible.map((todo) =>
+        todo.number ? `#${todo.number}` : todo.id,
+    ));
+});
 function visible(task: TaskNode) {
+    if (filteredIds.value && !filteredIds.value.has(task.id)) return false;
     if (hideDone.value && task.done) return false;
     return shownWaves.value.includes(task.wave);
 }
+// Navigation is over cards that survive the header filters, so Enter never
+// chooses a hidden node that cannot be brought into view.
+const hits = computed(() => graphHits(tasks.value.filter(visible), props.query));
+function isMatch(id: string) { return hits.value.includes(id); }
+
+async function scrollToHit(id: string) {
+    await nextTick();
+    selectedCard(id)?.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
+}
+function updateMatchClasses() {
+    for (const card of pipeCanvas.value?.querySelectorAll<HTMLElement>("[data-node]") ?? []) {
+        const id = card.dataset.node ?? "";
+        card.classList.toggle("match", isMatch(id));
+        card.classList.toggle("current", props.activeHit === id);
+    }
+}
+// A new query begins at its first result.  Do not include activeHit here:
+// Enter updates it to the next result and that update must not send the
+// viewport back to the first card.
+watch([() => props.query, hits], async ([query], [previousQuery]) => {
+    const first = hits.value[0] ?? null;
+    const reset = query !== previousQuery || !hits.value.includes(props.activeHit ?? "");
+    if (reset && props.activeHit !== first)
+        emit("update:activeHit", first);
+    await nextTick();
+    updateMatchClasses();
+    if (reset && first) void scrollToHit(first);
+}, { immediate: true });
+watch(() => props.activeHit, async () => {
+    await nextTick();
+    updateMatchClasses();
+});
+function cycleHit(direction: 1 | -1 = 1) {
+    const hit = stepGraphHit(hits.value, props.activeHit, direction);
+    emit("update:activeHit", hit);
+    if (hit) void scrollToHit(hit);
+}
+defineExpose({ cycleHit });
 
 function tasksOf(laneId: string) {
     return (renderIndex.value.tasksByLane.get(laneId) ?? []).filter(visible);
@@ -463,6 +520,7 @@ function resetView() {
                                 :auto="task.auto"
                                 :done="task.done"
                                 :active="task.active"
+                                :class="{ match: isMatch(task.id), current: props.activeHit === task.id }"
                                 :cost="costLayer ? task.cost : undefined"
                                 :cost-note="costLayer ? task.costNote : undefined"
                                 :cost-share="costLayer ? task.costShare : undefined"
@@ -530,6 +588,7 @@ function resetView() {
                                     :auto="task.auto"
                                     :done="task.done"
                                     :active="task.active"
+                                    :class="{ match: isMatch(task.id), current: props.activeHit === task.id }"
                                     :cost="costLayer ? task.cost : undefined"
                                     :cost-note="costLayer ? task.costNote : undefined"
                                     :cost-share="costLayer ? task.costShare : undefined"
@@ -672,18 +731,6 @@ function resetView() {
             </div>
         </template>
 
-        <NodeInspector
-            v-if="selected"
-            class="lanes-inspector"
-            :id="selected"
-            :node="nodeByLabel.get(selected) ?? null"
-            :cards="tasks"
-            :edges="links"
-            @close="selected = ''"
-            @pick="selected = $event"
-            @open="emit('open', $event)"
-        />
-
         <div v-if="groupOpen" class="lanes-group">
             <div class="lanes-group-head">Сгруппировать свободные задачи</div>
             <p class="lanes-group-text">
@@ -702,6 +749,17 @@ function resetView() {
         </div>
 
         <div class="pipe-spacer" />
+    </div>
+    <div v-if="selected" class="pipe-inspector-layer">
+        <NodeInspector
+            :id="selected"
+            :node="nodeByLabel.get(selected) ?? null"
+            :cards="tasks"
+            :edges="links"
+            @close="selected = ''"
+            @pick="selected = $event"
+            @open="emit('open', $event)"
+        />
     </div>
 </template>
 
@@ -840,12 +898,8 @@ function resetView() {
 .lanes-dim {
     opacity: 0.4;
 }
-.lanes-inspector {
-    position: absolute;
-    right: 20px;
-    top: 14px;
-    z-index: 7;
-}
+.node-card.match { box-shadow: 0 0 0 2px rgba(255, 193, 7, 0.72); }
+.node-card.current { box-shadow: 0 0 0 3px var(--accent); }
 .lanes-picker {
     position: relative;
 }

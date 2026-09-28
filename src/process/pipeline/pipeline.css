@@ -6,6 +6,25 @@
     color: var(--text);
     font-family: var(--segoe);
     overflow: hidden;
+    position: relative;
+}
+
+/* This is deliberately a sibling of the scrolling canvas.  A selected card may
+   be anywhere in the graph, but its details must remain in the viewport. */
+.pipe-inspector-layer {
+    position: absolute;
+    inset: 0;
+    z-index: 10;
+    display: flex;
+    justify-content: flex-end;
+    align-items: flex-start;
+    padding: 14px 20px;
+    box-sizing: border-box;
+    pointer-events: none;
+}
+.pipe-inspector-layer .node-inspector {
+    max-height: 100%;
+    pointer-events: auto;
 }
 
 .pipe-canvas {

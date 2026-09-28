@@ -1260,7 +1260,7 @@ fn report_issue(store: tauri::State<'_, Arc<DiagStore>>) -> Result<(), String> {
 /// Show (and focus) the standalone analytics window, creating its WebView only
 /// when the dashboard is requested.
 #[tauri::command]
-fn open_analytics_window(app: AppHandle) {
+async fn open_analytics_window(app: AppHandle) {
     kernel::windows::open_analytics(&app);
 }
 
@@ -3072,7 +3072,7 @@ fn apply_todo_import(app: AppHandle, path: String) -> Result<todos::ImportReport
 
 /// Show the standalone Todo window, creating it on demand.
 #[tauri::command]
-fn open_todo_window(app: AppHandle) {
+async fn open_todo_window(app: AppHandle) {
     kernel::windows::open_todos(&app);
 }
 
@@ -3083,7 +3083,7 @@ fn show_settings_window(app: &AppHandle, tab: Option<String>) {
 }
 
 #[tauri::command]
-fn open_settings_window(app: AppHandle, tab: Option<String>) {
+async fn open_settings_window(app: AppHandle, tab: Option<String>) {
     show_settings_window(&app, tab);
 }
 

@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed } from "vue";
+import { computed, ref } from "vue";
+import type { TodoFilters } from "../../board/todoFilter";
 import LanesView from "./views/LanesView.vue";
 import WiresView from "./views/WiresView.vue";
 import RingsView from "./views/RingsView.vue";
@@ -11,11 +12,22 @@ import ChangeView from "./views/ChangeView.vue";
 import { SPEC_MODES, type PipelineMode } from "./modes";
 import "./pipeline.css";
 
-withDefaults(defineProps<{ chrome?: boolean }>(), { chrome: false });
+const props = withDefaults(defineProps<{
+    chrome?: boolean;
+    query?: string;
+    filters?: TodoFilters;
+}>(), { chrome: false, query: "" });
 
 const emit = defineEmits<{ (e: "open", id: string): void }>();
 
 const mode = defineModel<PipelineMode>("mode", { default: "lanes" });
+const activeHit = defineModel<string | null>("activeHit", { default: null });
+const viewRef = ref<{ cycleHit?: (direction: 1 | -1) => void } | null>(null);
+
+function cycleHit(direction: 1 | -1 = 1) {
+    viewRef.value?.cycleHit?.(direction);
+}
+defineExpose({ cycleHit });
 
 const views = {
     lanes: LanesView,
@@ -36,6 +48,7 @@ const isSpecDoc = computed(() => SPEC_MODES.includes(mode.value));
     <div class="pipe-root pipe-embed">
         <component
             :is="current"
+            ref="viewRef"
             v-if="isSpecDoc"
             :chrome="chrome"
             @mode="mode = $event"
@@ -43,7 +56,12 @@ const isSpecDoc = computed(() => SPEC_MODES.includes(mode.value));
         />
         <component
             :is="current"
+            ref="viewRef"
             v-else
+            :query="props.query"
+            :filters="props.filters"
+            :active-hit="activeHit"
+            @update:active-hit="activeHit = $event"
             @mode="mode = $event"
             @open="emit('open', $event)"
         />

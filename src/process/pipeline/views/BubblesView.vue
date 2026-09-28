@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from "vue";
 import ToolBar from "../../atoms/ToolBar.vue";
 import LegendBar from "../../atoms/LegendBar.vue";
 import SegControl from "../../atoms/SegControl.vue";
@@ -20,10 +20,19 @@ import {
 import { board as mockBoard } from "../boardMock";
 import { useBoard } from "../useBoard";
 import { stableBubbleRoots } from "../changeSelectors";
+import { projectTodos, type FilterableTodoRow, type TodoFilters } from "../../../board/todoFilter";
+import { graphHits, stepGraphHit } from "../graphNavigation";
+
+const props = withDefaults(defineProps<{
+    query?: string;
+    filters?: TodoFilters;
+    activeHit?: string | null;
+}>(), { query: "", activeHit: null });
 
 const emit = defineEmits<{
     (e: "mode", value: "lanes" | "wires" | "rings" | "specs"): void;
     (e: "open", id: string): void;
+    (e: "update:activeHit", id: string | null): void;
 }>();
 
 const R_MIN = 84;
@@ -130,6 +139,15 @@ const board = computed(() => (live.value ? liveBoard.value : mockBoard));
 const changes = computed(() => (live.value ? liveChanges.value : []));
 const byId = computed(() => new Map(board.value.map((t) => [t.id, t])));
 const tree = computed(() => specTree(board.value, changes.value));
+
+const filteredIds = computed(() => {
+    if (!props.filters || !live.value) return null;
+    const filters = { ...props.filters, query: "", showDone: true };
+    return new Set(projectTodos(board.value as unknown as FilterableTodoRow[], filters).visible.map((todo) => todo.id));
+});
+const visibleTasks = computed(() => board.value.filter((todo) => !filteredIds.value || filteredIds.value.has(todo.id)));
+const hits = computed(() => graphHits(visibleTasks.value.map((todo) => ({ id: todo.id, title: todo.subject })), props.query));
+function isMatch(id: string) { return hits.value.includes(id); }
 
 const opened = ref<string[]>([]);
 const picked = ref<string | null>(null);
@@ -281,7 +299,7 @@ function themeLayout(root: TreeNode, dense: boolean): { nodes: InnerNode[]; r: n
     const t = tree.value;
     const kids = t.children.get(root.id) ?? [];
     const themes = kids.filter((id) => t.byId.get(id)?.kind === "theme");
-    const direct = kids.filter((id) => t.byId.get(id)?.kind === "task");
+    const direct = kids.filter((id) => t.byId.get(id)?.kind === "task" && (!filteredIds.value || filteredIds.value.has(id)));
     const nodes: InnerNode[] = [];
 
     const seatOf = (id: string) => {
@@ -334,7 +352,7 @@ function themeLayout(root: TreeNode, dense: boolean): { nodes: InnerNode[]; r: n
         nodes.push(
             decorate(id, "theme", ring * Math.cos(angle), ring * Math.sin(angle)),
         );
-        const own = t.children.get(id) ?? [];
+        const own = (t.children.get(id) ?? []).filter((kid) => !filteredIds.value || t.byId.get(kid)?.kind !== "task" || filteredIds.value.has(kid));
         const span = (TAU * orbit) / themes.length - CHIP_PITCH;
         const shown: string[] = [];
         let used = 0;
@@ -394,7 +412,7 @@ const rootSeeds = computed(() =>
     roots.value.map((root) => {
         const kids = tree.value.children.get(root.id) ?? [];
         const inside = subtreeOf(tree.value, root.id);
-        const tasks = inside.filter((id) => tree.value.byId.get(id)?.kind === "task");
+        const tasks = inside.filter((id) => tree.value.byId.get(id)?.kind === "task" && (!filteredIds.value || filteredIds.value.has(id)));
         const themes = kids.filter((id) => tree.value.byId.get(id)?.kind === "theme");
         const split = { done: 0, wait: 0, blocked: 0 };
         for (const id of tasks) split[healthOf(id)] += 1;
@@ -752,6 +770,28 @@ function selectNode(id: string) {
     pickedEdge.value = null;
 }
 
+async function scrollToHit(id: string) {
+    const home = rootOf.value.get(id);
+    if (home) opened.value = [...new Set([...opened.value, home])];
+    picked.value = id;
+    await nextTick();
+    frame.value?.querySelector<HTMLElement>(`[data-node="${CSS.escape(id)}"]`)
+        ?.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
+}
+function cycleHit(direction: 1 | -1 = 1) {
+    const hit = stepGraphHit(hits.value, props.activeHit, direction);
+    emit("update:activeHit", hit);
+    if (hit) void scrollToHit(hit);
+}
+defineExpose({ cycleHit });
+watch([() => props.query, hits], ([query], [previousQuery]) => {
+    const first = hits.value[0] ?? null;
+    const reset = query !== previousQuery || !hits.value.includes(props.activeHit ?? "");
+    if (reset && props.activeHit !== first) emit("update:activeHit", first);
+    if (reset && first) void scrollToHit(first);
+}, { immediate: true });
+watch(() => props.activeHit, (id) => { if (id) void scrollToHit(id); });
+
 function focusRow(id: string) {
     const home = rootOf.value.get(id);
     if (home) expand(home);
@@ -1058,7 +1098,8 @@ watch([bounds, () => size.value.w, () => size.value.h], fit, { immediate: true }
                             v-for="node in b.nodes"
                             :key="node.id"
                             class="bub-node"
-                            :class="{ marked: picked === node.id }"
+                            :class="{ marked: picked === node.id, match: isMatch(node.id), current: props.activeHit === node.id }"
+                            :data-node="node.kind === 'more' ? undefined : node.id"
                             :style="{
                                 left: `${b.r + node.x}px`,
                                 top: `${b.r + node.y}px`,
@@ -1382,6 +1423,15 @@ watch([bounds, () => size.value.w, () => size.value.h], fit, { immediate: true }
 .bub-node.marked .bub-chip {
     border-color: var(--accent);
     color: var(--accent);
+}
+.bub-node.match .bub-chip {
+    border-color: var(--warn);
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--warn) 45%, transparent);
+}
+.bub-node.current .bub-chip,
+.bub-node.current {
+    border-radius: var(--r-pill);
+    box-shadow: 0 0 0 2px var(--accent);
 }
 .bub-chip {
     display: inline-flex;

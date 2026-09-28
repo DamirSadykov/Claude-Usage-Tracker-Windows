@@ -207,7 +207,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
 .node-inspector {
     box-sizing: border-box;
     width: 300px;
-    max-height: calc(100% - 28px);
+    max-height: 100%;
     padding: 13px 14px 14px;
     border: 1px solid var(--stroke-strong);
     border-radius: var(--r-card);
