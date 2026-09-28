@@ -1232,6 +1232,16 @@ function handleSave() {
           <div class="toggle-knob"></div>
         </div>
       </div>
+
+      <div class="card toggle-card" @click="toggleKeepAwake">
+        <div style="flex: 1; min-width: 0">
+          <div class="card-title" style="font-size: 13px">{{ t('keepAwakeTitle') }}</div>
+          <div class="card-sub">{{ t('keepAwakeDesc') }}</div>
+        </div>
+        <div class="toggle" :class="{ on: localKeepAwakeEnabled }">
+          <div class="toggle-knob"></div>
+        </div>
+      </div>
       </template>
 
       <!-- ===== Limits / thresholds ===== -->
@@ -1566,16 +1576,6 @@ function handleSave() {
           <div class="card-sub">{{ t('runtimeInsightsDesc') }}</div>
         </div>
         <div class="toggle" :class="{ on: localRuntimeEnabled }">
-          <div class="toggle-knob"></div>
-        </div>
-      </div>
-
-      <div class="card toggle-card" @click="toggleKeepAwake">
-        <div style="flex: 1; min-width: 0">
-          <div class="card-title" style="font-size: 13px">{{ t('keepAwakeTitle') }}</div>
-          <div class="card-sub">{{ t('keepAwakeDesc') }}</div>
-        </div>
-        <div class="toggle" :class="{ on: localKeepAwakeEnabled }">
           <div class="toggle-knob"></div>
         </div>
       </div>
