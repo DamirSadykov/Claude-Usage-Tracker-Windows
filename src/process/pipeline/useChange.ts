@@ -128,8 +128,6 @@ export function useChange() {
         closeError.value = "";
         try {
             await invoke<string>("close_change", { change: changeAddress(current.value) });
-            // close_change is CLI-backed rather than a compact mutation response.
-            // Refresh once; its watcher echo is revision-gated by the store.
             await boardStore.reload(true);
         } catch (e) {
             closeError.value = String(e);

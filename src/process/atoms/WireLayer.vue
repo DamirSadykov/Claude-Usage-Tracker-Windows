@@ -40,8 +40,6 @@ const elements = new Map<string, HTMLElement>();
 const visible = new Set<string>();
 
 function scrollViewport(host: HTMLElement) {
-    // The row is the oversized wire canvas; its LaneFrame ancestor owns the
-    // horizontal scrolling and clipping.
     return host.closest<HTMLElement>(".lane-body") ?? host;
 }
 
@@ -94,8 +92,6 @@ function measure() {
     };
     const out: Segment[] = [];
     for (const link of props.links) {
-        // Wires are meaningful only while both cards are in the scroll viewport.
-        // The element map is refreshed on DOM changes, never once per edge.
         if (!visible.has(link.from) || !visible.has(link.to)) continue;
         const a = elements.get(link.from);
         const b = elements.get(link.to);

@@ -54,10 +54,6 @@ const showDoneLanes = ref(false);
 const laneLinks = new Map<string, readonly { from: string; to: string; tone: string }[]>();
 const projectLinks = new Map<string, readonly { from: string; to: string; tone: string }[]>();
 
-// The board can deliberately fall back to the demo data while its compact
-// store is unavailable.  Keep that data on the same indexed rendering path as
-// a live projection; otherwise a failed load leaves every lane empty because
-// the store-backed projection has no rows.
 const renderIndex = computed(() => {
     if (live.value) return projection.value;
     const byId = new Map<string, TaskNode>();
@@ -139,8 +135,6 @@ function projectOfLane(laneId: string) {
 }
 
 const filteredIds = computed(() => {
-    // A failed compact-board load renders demo cards, whose IDs are unrelated
-    // to a stale board snapshot and therefore must not be filtered by it.
     if (!props.filters || !live.value) return null;
     const filters = { ...props.filters, query: "", showDone: true };
     return new Set(projectTodos(board.value as any[], filters).visible.map((todo) =>
@@ -152,8 +146,6 @@ function visible(task: TaskNode) {
     if (hideDone.value && task.done) return false;
     return shownWaves.value.includes(task.wave);
 }
-// Navigation is over cards that survive the header filters, so Enter never
-// chooses a hidden node that cannot be brought into view.
 const hits = computed(() => graphHits(tasks.value.filter(visible), props.query));
 function isMatch(id: string) { return hits.value.includes(id); }
 
@@ -168,9 +160,6 @@ function updateMatchClasses() {
         card.classList.toggle("current", props.activeHit === id);
     }
 }
-// A new query begins at its first result.  Do not include activeHit here:
-// Enter updates it to the next result and that update must not send the
-// viewport back to the first card.
 watch([() => props.query, hits], async ([query], [previousQuery]) => {
     const first = hits.value[0] ?? null;
     const reset = query !== previousQuery || !hits.value.includes(props.activeHit ?? "");
@@ -253,8 +242,6 @@ function freeLinks(project: ProjectRow) {
     return result;
 }
 
-// Link lists are props of each mounted WireLayer.  Keep their identity stable
-// while selection changes, so choosing a card never remeasures every lane.
 watch([links, hideDone, shownWaves], () => {
     laneLinks.clear();
     projectLinks.clear();
@@ -266,8 +253,6 @@ function selectedCard(id: string) {
         : null;
 }
 
-// Do not pass a selection prop to every NodeCard.  Only the old and new cards
-// receive a class change, leaving unrelated cards and WireLayers untouched.
 watch(selected, (next, previous) => {
     selectedCard(previous)?.classList.remove("selected");
     selectedCard(next)?.classList.add("selected");

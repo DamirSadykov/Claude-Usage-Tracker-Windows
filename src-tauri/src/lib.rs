@@ -1257,8 +1257,6 @@ fn report_issue(store: tauri::State<'_, Arc<DiagStore>>) -> Result<(), String> {
     open::that(url).map_err(|e| e.to_string())
 }
 
-/// Show (and focus) the standalone analytics window, creating its WebView only
-/// when the dashboard is requested.
 #[tauri::command]
 async fn open_analytics_window(app: AppHandle) {
     kernel::windows::open_analytics(&app);
@@ -1913,9 +1911,6 @@ async fn get_task_graph(
     Ok(out)
 }
 
-/// Lightweight graph data for all currently visible changes. Unlike
-/// `get_task_graph`, this never renders Mermaid/D2 and shares the journal,
-/// session and attribution work across every requested change.
 #[derive(Serialize)]
 struct GraphBatch {
     revision: u64,
@@ -1952,8 +1947,6 @@ fn load_graph_metrics(
     Ok(graph_cache::GraphMetrics { blocks, totals, task_costs })
 }
 
-/// The graph's selected changes in one response. Block rows and per-agent data
-/// stay out of this hot path and are loaded after a user selects a node.
 #[tauri::command]
 async fn get_graph_batch(
     app: AppHandle,
@@ -1997,7 +1990,6 @@ async fn get_graph_batch(
 #[derive(Serialize)]
 struct GraphNodeDetail {
     blocks: task_sessions::TaskBlocks,
-    /// Parallel to `blocks.blocks`: executor rows for that exact block.
     agents: Vec<Vec<graph::GraphAgent>>,
 }
 
@@ -3070,14 +3062,11 @@ fn apply_todo_import(app: AppHandle, path: String) -> Result<todos::ImportReport
     Ok(report)
 }
 
-/// Show the standalone Todo window, creating it on demand.
 #[tauri::command]
 async fn open_todo_window(app: AppHandle) {
     kernel::windows::open_todos(&app);
 }
 
-/// Show the shared Settings window, remembering the requested tab for its
-/// mount-time handshake when this call creates a new renderer.
 fn show_settings_window(app: &AppHandle, tab: Option<String>) {
     kernel::windows::open_settings(app, tab);
 }
@@ -3087,8 +3076,6 @@ async fn open_settings_window(app: AppHandle, tab: Option<String>) {
     show_settings_window(&app, tab);
 }
 
-/// Handshake for a just-created Settings window. Unlike an event, this cannot
-/// be lost before Vue registers its listeners.
 #[tauri::command]
 fn get_settings_open_tab(state: tauri::State<'_, kernel::windows::WindowOpenState>) -> String {
     state.settings_tab()
@@ -3137,9 +3124,6 @@ fn spawn_todos_watch(app: AppHandle) {
                 }
             }
         }
-        // A timestamp alone is not a safe invalidation key: an external writer
-        // can replace the board within the filesystem's timestamp granularity.
-        // Keep the length alongside it, matching BoardCache's stamp.
         let mut last = cache::FileStamp::read(&path);
         loop {
             std::thread::sleep(Duration::from_millis(1500));
@@ -3154,9 +3138,6 @@ fn spawn_todos_watch(app: AppHandle) {
                 continue;
             }
             last = current;
-            // `write_todos_locked` already installed this exact post-write
-            // stamp. The watcher sees the rename too, but it is not an external
-            // board change and must not trigger a reload echo.
             if app.state::<cache::BoardCache>().matches(&path) {
                 continue;
             }

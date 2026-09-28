@@ -1,4 +1,3 @@
-//! A single, revisioned parsed view of `todos.json` shared by board readers.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -44,9 +43,6 @@ impl BoardCache {
         matches!((&stamp, &inner.snapshot), (Some(stamp), Some(snapshot)) if snapshot.stamp.as_ref() == Some(stamp))
     }
 
-    /// Return the cached parse only when both mtime and length agree.  A missing
-    /// stamp is deliberately never trusted: external writers can otherwise hide
-    /// a same-second replacement from us.
     pub fn load(&self, path: &Path) -> Result<Arc<BoardSnapshot>, LoadOutcome> {
         let stamp = FileStamp::read(path);
         let mut inner = self.inner.lock().unwrap();
@@ -59,7 +55,6 @@ impl BoardCache {
             LoadOutcome::Ok(file) => Ok(Self::install_locked(&mut inner, stamp, file)),
             LoadOutcome::Missing => Ok(Self::install_locked(&mut inner, None, TodoFile::default())),
             other => {
-                // Don't serve an old valid board after an unreadable external edit.
                 inner.snapshot = None;
                 Err(other)
             }

@@ -25,7 +25,6 @@ export interface FilterableTodoRow {
   priority?: string; project?: string | null; change?: boolean; created_at: string;
   updated_at: string; scheduled_for?: string | null; created_by?: string;
   closed_at?: string | null;
-  /** Canonical project used by the filter; `project` remains the stored label. */
   filterProject?: string | null;
 }
 export interface TodoProjection<T extends FilterableTodoRow = FilterableTodoRow> {
@@ -33,7 +32,6 @@ export interface TodoProjection<T extends FilterableTodoRow = FilterableTodoRow>
   visible: T[];
 }
 
-/** Render-ready board data. Card templates receive display primitives only. */
 export interface TodoCardRow extends FilterableTodoRow {
   from?: string | null;
   aliases: string[];
@@ -52,7 +50,6 @@ const emptyColumns = <T>(): Record<TodoStatus, T[]> => ({
 
 function datePart(value: string | null | undefined): string { return (value ?? "").slice(0, 10); }
 
-/** Pure, single-pass board projection. Search text comes from the store index. */
 export function projectTodos<T extends FilterableTodoRow>(
   rows: readonly T[], filters: TodoFilters, indexes?: Pick<BoardIndexes, "search">,
 ): TodoProjection<T> {
@@ -63,8 +60,6 @@ export function projectTodos<T extends FilterableTodoRow>(
   for (const row of rows) {
     if (!filters.showDone && row.status === "done" && filters.status !== "done") continue;
     if (filters.status && row.status !== filters.status) continue;
-    // The selector contains canonical project names, while old rows can retain
-    // an alias after a project merge. Keep the stored project for display.
     if (filters.project && (row.filterProject ?? row.project) !== filters.project) continue;
     if (filters.priority && row.priority !== filters.priority) continue;
     if (filters.createdBy && row.created_by !== filters.createdBy) continue;
@@ -84,8 +79,6 @@ export function projectTodos<T extends FilterableTodoRow>(
   for (const status of TODO_STATUSES) {
     columns[status].sort((a, b) => {
       if (status === "done") {
-        // Completion time is independent of later edits (for example, a comment
-        // added after closing). Keep the newest completed task at the top.
         return (b.closed_at || "").localeCompare(a.closed_at || "")
           || (b.updated_at || "").localeCompare(a.updated_at || "");
       }

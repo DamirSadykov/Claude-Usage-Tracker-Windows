@@ -188,9 +188,6 @@ pub struct TaskGraph {
     pub text: String,
 }
 
-/// The graph-model portion suitable for the board's hot path.  Rendering text
-/// and per-block agent rows are intentionally absent: those are requested only
-/// by the legacy export command and selected-node detail view respectively.
 #[derive(Debug, Clone, Serialize)]
 pub struct GraphBatchGraph {
     pub nodes: Vec<GraphBatchNode>,
@@ -198,8 +195,6 @@ pub struct GraphBatchGraph {
     pub groups: Vec<GraphGroup>,
 }
 
-/// A graph node without the executor rows.  `blocks` is just the aggregate
-/// count; the block records themselves live behind `get_graph_node_detail`.
 #[derive(Debug, Clone, Serialize)]
 pub struct GraphBatchNode {
     pub id: String,

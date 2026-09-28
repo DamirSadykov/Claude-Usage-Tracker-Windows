@@ -73,8 +73,6 @@ const COL_BY_ID: Record<string, Column> = Object.fromEntries(
   COLUMNS.map((c) => [c.id, c]),
 );
 
-// The kanban deliberately reads the same compact snapshot as the pipeline
-// graph. Full records only enter `detailRecord` for the one open editor.
 const todos = computed(() => boardStore.rows.value as unknown as Todo[]);
 const changes = computed(() => boardStore.changes.value as unknown as BoardChange[]);
 const loading = ref(true);
@@ -83,10 +81,6 @@ const detailRecord = ref<Todo | null>(null);
 const detailLoading = ref(false);
 const detailLoadFailed = ref(false);
 
-// Board mutations return the updated compact row plus its cache revision.
-// The editor still needs the full task (comments, plan and handoff), so refresh
-// only that task instead of accidentally assigning the response object to the
-// entire todo array.
 type TodoMutation = BoardMutation;
 
 async function applyTodoMutation(result: TodoMutation, refreshDetail = false) {
@@ -94,8 +88,6 @@ async function applyTodoMutation(result: TodoMutation, refreshDetail = false) {
   if (!result.row || (!refreshDetail && detailRecord.value?.id !== result.row.id)) return;
   const id = result.row.id;
   const updated = await invoke<Todo | null>("get_task_detail", { id });
-  // A comment mutation can finish after the user has opened another card.
-  // Never let that old detail request replace the newly selected full record.
   if (updated && detailId.value === id) detailRecord.value = updated;
 }
 
@@ -150,8 +142,6 @@ async function restoreBoardFromBackup() {
   }
 }
 
-// Filter settings are local to this renderer. Invalid/private-mode storage must
-// never prevent the board from opening.
 const FILTER_STORAGE_KEY = "todo-board-filters-v1";
 function readFilters(): TodoFilters {
   try { return { ...defaultTodoFilters(), ...JSON.parse(localStorage.getItem(FILTER_STORAGE_KEY) ?? "{}") }; }
@@ -187,7 +177,6 @@ const fSubjectOverLimit = computed(() => fSubjectRemaining.value < 0);
 // Projects the tracker has seen (from cc_usage), so the picker offers real
 // projects even before any todo uses them.
 const knownProjects = ref<string[]>([]);
-// Cost updates change the precomputed card primitives, never card templates.
 const taskCosts = ref<Map<string, TaskCostRow>>(new Map());
 
 // Merge-link badges (issue #13). A task's `project` is stored raw, so it may be a
@@ -205,8 +194,6 @@ const projects = computed(() => {
 });
 
 
-// Rust computes ref_count from the full task (including comments); board rows
-// are intentionally compact, so pass that primitive straight through.
 const cardRows = computed<TodoCardRow[]>(() => todos.value.map((todo) => {
   const cost = taskCosts.value.get(todo.id);
   return {
@@ -218,8 +205,6 @@ const cardRows = computed<TodoCardRow[]>(() => todos.value.map((todo) => {
     cost: cost?.cost,
     costTitle: cost ? `${t("todoCostHint")}: ${cost.sessions} ${t("todoCostSessions")} · ${fmtTok(cost.total_tokens)} ${t("todoCostTokens")}` : "",
     importedAt: (todo as Todo & { imported_at?: string | null }).imported_at,
-    // The board snapshot deliberately omits full plans; the card needs only
-    // this boolean affordance. Spec addresses remain direct links on the card.
     hasPlan: !!(todo as Todo & { has_plan?: boolean }).has_plan,
     spec: [...((todo as Todo & { spec?: string[] }).spec ?? [])],
   };
@@ -246,7 +231,6 @@ async function loadTodos(silent = false) {
   void loadBoardState();
 }
 
-// A hidden window's stale marker can be cleared once editing ends.
 function flushPendingReload() {
   if (boardStore.stale.value && !formOpen.value) {
     void boardStore.reload();
@@ -364,8 +348,6 @@ interface BoardScrollPosition { left: number; top: number }
 let boardScrollPosition: BoardScrollPosition[] = [];
 
 function rememberBoardScroll() {
-  // Board and columns are unmounted for the editor. Remember both axes so a
-  // return lands at the same column and the same card, rather than at (0, 0).
   boardScrollPosition = Array.from(document.querySelectorAll<HTMLElement>(".tw-board, .tw-col-body"))
     .map((element) => ({ left: element.scrollLeft, top: element.scrollTop }));
 }
@@ -382,8 +364,6 @@ function restoreBoardScroll() {
 const detail = computed(() => {
   const row = todos.value.find((t) => t.id === detailId.value);
   if (!row) return null;
-  // Compact board data remains authoritative for fields shared by cards. The
-  // selected record contributes only the deliberately on-demand heavy fields.
   return detailRecord.value?.id === row.id ? { ...row, ...detailRecord.value } : row;
 });
 
@@ -419,8 +399,6 @@ const draft = ref<Draft>({
 const draftSubjectRemaining = computed(() => SUBJECT_LIMIT - draft.value.subject.trim().length);
 const draftSubjectOverLimit = computed(() => draftSubjectRemaining.value < 0);
 
-// The rail contains every open sibling, but completed work is explicitly paged.
-// This avoids mounting a project's entire history merely to edit one task.
 // Handoff the open task INHERITS from its direct prerequisites (#141): the same
 // view `cc-todos todos handoff <task>` gives an agent, surfaced read-only in the
 // card. Only direct `depends_on` — cumulative context rides authored handoff text.
@@ -454,9 +432,6 @@ function fillDraft(todo: Todo) {
 }
 
 function clearDetailDraft() {
-  // Do not briefly expose the previous task's editable values while this task's
-  // full record is in flight. The editor itself stays disabled behind its
-  // loading state, but clearing this also keeps any reactive consumers honest.
   draft.value = {
     subject: "",
     description: "",
@@ -522,8 +497,6 @@ async function saveDetail() {
   try {
     await invoke<Todo[]>("upsert_todo", { todo });
     await boardStore.reload(true);
-    // Saving A may complete after navigation to B. Persist and refresh the
-    // board either way, but only update the editor that initiated this save.
     if (detailId.value === id) {
       detailRecord.value = todo;
       flashSaved();
@@ -541,8 +514,6 @@ async function saveDetail() {
 const newComment = ref("");
 
 const detailComments = computed(() => detailRecord.value?.comments ?? []);
-// Tokenize only when the full record is loaded or replaced after a comment
-// mutation. Draft typing and compact-board refreshes must not parse the thread.
 const renderedDetailComments = ref<Array<{ id: string; author: string; created_at: string; body: string; segments: ReturnType<typeof tokenize> }>>([]);
 watch(detailRecord, (record) => {
   renderedDetailComments.value = (record?.comments ?? []).map((comment) => ({
@@ -750,8 +721,6 @@ const specMode = ref<PipelineMode>("reader");
 watch(graphUiNew, (on) =>
   localStorage.setItem("graph-ui", on ? "next" : "classic"),
 );
-// In graph view the ONE shared search box highlights matching nodes. Both graph
-// implementations expose the same keyboard navigation contract.
 const graphRef = ref<InstanceType<typeof GraphView> | null>(null);
 const pipelineGraphRef = ref<InstanceType<typeof PipelineGraph> | null>(null);
 const pipelineActiveHit = ref<string | null>(null);
@@ -772,8 +741,6 @@ useHotkeys({
 // GraphView mutates dependencies through the backend and hands back the fresh
 // list; adopt it so both views stay in lockstep without a reload round-trip.
 function onGraphUpdate(list: Todo[]) {
-  // GraphView's legacy event carries a full list. Do not retain it: the shared
-  // store owns the only board snapshot in this WebView.
   void list;
   void boardStore.reload(true);
 }
@@ -1515,8 +1482,6 @@ onMounted(async () => {
   unlistenLocale = await listen<string>("todos-locale", (e) => {
     applyLocale(e.payload);
   });
-  // boardStore owns the sole todos-file-changed subscription. In a hidden
-  // persisted window it marks the snapshot stale and waits for focus/show.
   // A fresh nightly-triage digest landed (the backend broadcasts to all
   // windows); refresh the chip so it reflects the latest run.
   unlistenTriage = await listen("triage-alert", () => {
@@ -1549,7 +1514,6 @@ onMounted(async () => {
       // Pick up a status remap done in the Settings → Integrations window.
       void loadStatusMap();
       void loadExternalTasks();
-      // Covers focus events that arrive before visibilitychange in WebView2.
       if (boardStore.stale.value) void boardStore.reload();
     }
   });

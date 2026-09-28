@@ -12,8 +12,6 @@ export interface ReferenceIndex {
     hubs: Set<string>;
 }
 
-// Board snapshots are immutable and replaced on revision. Keeping this cache by
-// identity means a render never scans every description again.
 const referenceIndexes = new WeakMap<readonly BoardTodo[], ReferenceIndex>();
 const INLINE_REF = /\bt#(\d+)\b/g;
 
@@ -81,8 +79,6 @@ export function indexedRings(index: ReferenceIndex, focusId: string, depth: numb
 export interface BubbleRoot { id: string; radius: number; }
 export interface BubblePoint { x: number; y: number; }
 
-// Root placement deliberately depends only on collapsed radii. Opening a root
-// may grow its contents, but cannot re-run the O(n²) collision layout for peers.
 export function stableBubbleRoots(roots: readonly BubbleRoot[], width: number, height: number): Map<string, BubblePoint> {
     const out = new Map<string, BubblePoint>();
     const total = roots.reduce((sum, root) => sum + root.radius, 0);
@@ -97,7 +93,6 @@ export function stableBubbleRoots(roots: readonly BubbleRoot[], width: number, h
 
 export interface ChangeHeaderSummary { total: number; done: number; open: boolean; }
 
-/** Header data is board-only: selecting a change must not fetch its run graph. */
 export function changeHeaderSummary(change: ChangeRecord | null, board: ChangeTask[]): ChangeHeaderSummary {
     const progress = change ? changeProgress(changeMembers(board, change)) : { total: 0, done: 0 };
     return { ...progress, open: progress.total === 0 || progress.done !== progress.total };

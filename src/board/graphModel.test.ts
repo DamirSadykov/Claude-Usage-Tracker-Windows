@@ -170,7 +170,6 @@ describe("contract from t#306", () => {
 
   it("merges several changes in one batch and survives a failure", async () => {
     const layer = await loadRunLayer(["294", "299", "294", ""]);
-    // Duplicates are sent once, and empty refs are not sent at all.
     expect(invoked[invoked.length - 1]?.changeRefs).toEqual(["294", "299"]);
     expect([...layer.keys()].sort()).toEqual(["u-294", "u-297", "u-299"]);
     expect(layer.get("u-297")!.cost).toBeCloseTo(1.95, 5);

@@ -189,7 +189,6 @@ export async function loadRunGraph(change: string): Promise<RunGraph> {
   }
 }
 
-/** Fetch all requested changes from one shared backend snapshot. */
 async function loadRunGraphs(changes: string[]): Promise<RunGraph[]> {
   const change_refs = [...new Set(changes.map((change) => change.trim()).filter(Boolean))];
   if (!change_refs.length) return [];
@@ -230,7 +229,6 @@ export async function loadRunGroups(changes: string[]): Promise<RunLayer> {
   try {
     graphs = await loadRunGraphs(changes);
   } catch {
-    // The graph is decorative; retain the existing empty-layer failure mode.
   }
   for (const g of graphs) {
     for (const n of g.nodes) {
@@ -258,7 +256,6 @@ export async function loadTaskBlocks(task: string): Promise<RunBlock[]> {
   }
 }
 
-/** Heavy rows for one selected node, deliberately excluded from graph batches. */
 export async function loadGraphNodeDetail(task: string): Promise<RunNodeDetail> {
   if (!task) return { blocks: [], agents: [] };
   try {

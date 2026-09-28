@@ -9,7 +9,6 @@ export interface DetailSiblingPages<T extends Pick<Todo, "id" | "project" | "sta
   hasMoreDone: boolean;
 }
 
-/** Keeps the expensive partition and ordering stable for cosmetic row updates. */
 export interface DetailSiblingPager<T extends Pick<Todo, "id" | "project" | "status">> {
   pages(rows: readonly T[], project: string | null | undefined, activeId: string | null, doneLimit?: number): DetailSiblingPages<T>;
 }
@@ -18,9 +17,6 @@ function statusRank(status: string): number {
   return ["backlog", "queue", "in_progress", "review", "done"].indexOf(status);
 }
 
-// Keep the rail cheap: board rows are already compact, and only completed work
-// is paged. The active task is always included, even if it lies beyond the
-// current completed page, so selecting it never makes the rail look broken.
 export function detailSiblingPages<T extends Pick<Todo, "id" | "project" | "status">>(
   rows: readonly T[],
   project: string | null | undefined,
@@ -55,9 +51,6 @@ export function createDetailSiblingPager<T extends Pick<Todo, "id" | "project" |
     pages(rows, project, activeId, doneLimit = DETAIL_SIBLING_PAGE_SIZE) {
       const normalizedProject = project ?? null;
       const projectRows = rows.filter((row) => (row.project ?? null) === normalizedProject);
-      // Only rail-structural fields invalidate the ordering. Subject, priority,
-      // timestamp, and changes in another project still use the current row
-      // objects below without sorting this project's rail again.
       const hasSameShape = cachedProject === normalizedProject
         && cachedShape.size === projectRows.length
         && projectRows.every((row) => cachedShape.get(row.id) === row.status);

@@ -35,8 +35,6 @@ const labelFilter = ref("all");
 const portsOn = ref(true);
 const costOn = ref(false);
 const selected = ref("");
-// Keep the graph and its filters on one ID domain. The mock is only the
-// fallback returned by useBoard while its compact snapshot is unavailable.
 const { board, lanes, tasks, links, live } = useBoard();
 const canvas = ref<HTMLElement | null>(null);
 async function scrollToHit(id: string) {
@@ -65,8 +63,6 @@ const laneTasks = computed(() =>
     tasks.value.filter((task) => task.lane === lane.value.id && visibleWaves.value.includes(task.wave) && visible(task)),
 );
 
-// Match display IDs (#number) against the same compact-board projection used
-// by the lanes and board views.
 const filteredIds = computed(() => {
     if (!props.filters || !live.value || !board.value.length) return null;
     const filters = { ...props.filters, query: "", showDone: true };
@@ -79,8 +75,6 @@ function visible(task: TaskNode) {
     return !filteredIds.value || filteredIds.value.has(task.id);
 }
 
-// As in LanesView, keyboard navigation only considers cards still visible
-// after the shared header filters have been applied.
 const hits = computed(() => graphHits(tasks.value.filter(visible), props.query));
 function isMatch(id: string) { return hits.value.includes(id); }
 watch([() => props.query, hits], ([query], [previousQuery]) => {

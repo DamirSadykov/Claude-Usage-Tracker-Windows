@@ -1,4 +1,3 @@
-/** Shared, deterministic find navigation for the scroll-based pipeline views. */
 export interface GraphSearchNode {
     id: string;
     title: string;
@@ -9,7 +8,6 @@ function numberOf(id: string) {
     return Number.isFinite(value) ? value : Number.MAX_SAFE_INTEGER;
 }
 
-/** IDs matching a task number or its visible title, in stable graph order. */
 export function graphHits(nodes: readonly GraphSearchNode[], query: string): string[] {
     const needle = query.trim().toLocaleLowerCase();
     if (!needle) return [];
@@ -25,7 +23,6 @@ export function graphHits(nodes: readonly GraphSearchNode[], query: string): str
         .sort((left, right) => numberOf(left) - numberOf(right) || left.localeCompare(right));
 }
 
-/** Return the next (or previous) hit, wrapping at either end. */
 export function stepGraphHit(
     hits: readonly string[],
     activeHit: string | null | undefined,

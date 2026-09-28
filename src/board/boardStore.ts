@@ -1,6 +1,3 @@
-// One compact board snapshot per WebView.  Do not put full Todo records here:
-// detail panes fetch those on demand, while board and graph can share this cheap
-// immutable projection.
 import { shallowRef, type ShallowRef } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
@@ -41,9 +38,7 @@ export interface BoardPayload {
 
 export interface BoardIndexes {
   byId: Map<string, BoardRow>;
-  /** prerequisite -> tasks waiting on it */
   dependencyChildren: Map<string, string[]>;
-  /** task -> non-blocking links, including inline t# references when supplied */
   links: Map<string, string[]>;
   search: Map<string, string>;
 }
@@ -54,8 +49,6 @@ export interface BoardMutation {
 }
 
 function freezeRow(row: BoardRow): BoardRow {
-  // Publicly the compact row retains mutable-looking array types for existing
-  // consumers; the actual snapshot is frozen at the boundary.
   return Object.freeze({
     ...row,
     links: Object.freeze([...(row.links ?? [])]),
@@ -122,7 +115,6 @@ async function reload(force = false): Promise<void> {
   loading.value = true;
   try {
     const payload = await invoke<BoardPayload>("get_board");
-    // A delayed reply must never roll a newer mutation backwards.
     if (payload.revision >= revision.value) install(payload);
   } catch (cause) {
     error.value = String(cause);
@@ -131,7 +123,6 @@ async function reload(force = false): Promise<void> {
   }
 }
 
-/** Start the sole file watcher for this renderer. Safe to call from many views. */
 async function start(): Promise<void> {
   if (starting) return starting;
   if (started) return;
@@ -157,7 +148,6 @@ async function start(): Promise<void> {
 }
 
 function applyMutation(result: BoardMutation): void {
-  // The watcher echoes local writes. This revision gate makes that echo free.
   if (result.revision <= revision.value) return;
   if (!result.row) {
     revision.value = result.revision;
@@ -186,7 +176,6 @@ export interface BoardStore {
   dispose(): void;
 }
 
-/** Module scope is intentionally per renderer/WebView, not application-global. */
 export const boardStore: BoardStore = {
   rows, changes, indexes, revision, stale, loading, error, start, reload, applyMutation,
   dispose() {

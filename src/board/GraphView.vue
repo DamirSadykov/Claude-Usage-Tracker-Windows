@@ -287,8 +287,6 @@ const shownTasks = computed(() =>
 // share/clobber coordinates).
 // --- Run layer (t#307) -----------------------------------------------------
 // What each task actually cost, drawn ON the existing graph rather than in a
-// second picture. The visible changes arrive in one `get_graph_batch` call; it
-// stays off by default because only tasks inside a change carry run metrics.
 const runOn = ref(false);
 const runLoading = ref(false);
 const runLayer = ref<Map<string, RunGraphNode>>(new Map());
@@ -1153,9 +1151,6 @@ async function reloadRun() {
 }
 watch([runOn, () => runChanges.value.join(",")], () => void reloadRun());
 
-// Blocks and agents of the selected node are loaded on demand. The batch stays
-// small even when dozens of changes are visible; a block identifies the session
-// whose transcript a user wants to open.
 const runBlocks = ref<RunBlock[]>([]);
 const runPathMsg = ref("");
 const runNode = computed<RunGraphNode | null>(() =>

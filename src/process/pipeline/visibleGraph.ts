@@ -13,7 +13,6 @@ import {
 } from "./adapt";
 import type { Lane, ProjectBand, TaskLink, TaskNode } from "./types";
 
-/** Immutable, revision-scoped data used by the lanes renderer. */
 export interface LaneProjection {
     revision: number;
     lanes: readonly Lane[];
@@ -26,7 +25,6 @@ export interface LaneProjection {
     wavesByLane: ReadonlyMap<string, readonly number[]>;
 }
 
-/** A Map-shaped read-only facade; a real Map remains mutable at runtime. */
 class ImmutableMap<K, V> implements ReadonlyMap<K, V> {
     readonly [Symbol.toStringTag] = "ImmutableMap";
     readonly #values: Map<K, V>;
@@ -46,7 +44,6 @@ class ImmutableMap<K, V> implements ReadonlyMap<K, V> {
     [Symbol.iterator]() { return this.entries(); }
 }
 
-/** Copy and recursively freeze the small, JSON-shaped renderer records. */
 function immutable<T>(value: T): T {
     if (!value || typeof value !== "object") return value;
     if (Array.isArray(value)) return Object.freeze(value.map(immutable)) as T;

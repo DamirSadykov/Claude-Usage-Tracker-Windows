@@ -224,9 +224,6 @@ impl StatsDb {
 }
 
 impl StatsDb {
-    /// A cheap revision token for caches derived from usage rows. `data_version`
-    /// catches commits by other SQLite connections; `total_changes` catches
-    /// writes made through this long-lived connection.
     pub fn graph_revision(&self) -> Result<(i64, u64), rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
         let data_version = conn.query_row("PRAGMA data_version", [], |row| row.get(0))?;

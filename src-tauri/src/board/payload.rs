@@ -1,4 +1,3 @@
-//! Compact IPC payloads for the task board.
 
 use std::collections::HashSet;
 
@@ -24,9 +23,7 @@ pub struct TodoRow {
     pub from: Option<String>,
     pub created_by: String,
     pub imported_at: Option<String>,
-    /// Board cards only need to know whether a plan exists, never its contents.
     pub has_plan: bool,
-    /// Own spec addresses are small card affordances, not the full task detail.
     pub spec: Vec<String>,
     pub links: Vec<String>,
     pub depends_on: Vec<String>,
@@ -67,8 +64,6 @@ pub fn row(todo: &Todo) -> TodoRow {
     }
 }
 
-/// A task has no denormalized `closed_at`: its transition log is the source of
-/// truth. Later edits must not move a completed card ahead of newer completions.
 fn completion_at(todo: &Todo) -> Option<String> {
     if todo.status != "done" { return None; }
     todo.status_history.iter().rev()
@@ -86,8 +81,6 @@ pub fn board(revision: u64, file: &TodoFile) -> BoardPayload {
 }
 
 fn truncate(value: &str) -> String {
-    // The ellipsis is part of the advertised 300-character payload limit.
-    // Reserve room for it before collecting the visible prefix.
     if value.chars().count() <= DESCRIPTION_LIMIT {
         return value.to_owned();
     }

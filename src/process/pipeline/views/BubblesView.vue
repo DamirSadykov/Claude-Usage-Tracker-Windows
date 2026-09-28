@@ -405,9 +405,6 @@ function themeLayout(root: TreeNode, dense: boolean): { nodes: InnerNode[]; r: n
     return { nodes, r: radius };
 }
 
-// This projection deliberately has no `opened` dependency.  It is the stable
-// input to the root collision layout, so expanding one bubble cannot schedule
-// placement work for every root.
 const rootSeeds = computed(() =>
     roots.value.map((root) => {
         const kids = tree.value.children.get(root.id) ?? [];
@@ -437,9 +434,6 @@ const rootSeeds = computed(() =>
     }),
 );
 
-// A bubble's inner layout is independent of which other bubbles are open.
-// Keep it by the actual tree root: an unchanged root can be opened, closed,
-// and reopened without recomputing its themes and task orbit.
 const innerLayouts = shallowRef(
     new Map<string, { root: TreeNode; dense: boolean; layout: { nodes: InnerNode[]; r: number } }>(),
 );
@@ -455,8 +449,6 @@ function innerLayout(seed: { id: string; root: TreeNode; dense: boolean }) {
 const shapes = computed<Shape[]>(() =>
     rootSeeds.value.map((seed) => {
         const open = opened.value.includes(seed.id);
-        // `themeLayout` is the expensive part; it is invoked only for an open
-        // root, while collapsed peers reuse their stable root projection.
         const inner = open ? innerLayout(seed) : { nodes: [], r: 0 };
         return {
             ...seed,
@@ -467,8 +459,6 @@ const shapes = computed<Shape[]>(() =>
     }),
 );
 
-// Opening a root changes only that root's contents. Root coordinates are based
-// on the collapsed board snapshot, so one click cannot re-relax every bubble.
 const rootPositions = computed(() =>
     stableBubbleRoots(
         rootSeeds.value.map((shape) => ({ id: shape.id, radius: shape.collapsedR })),
