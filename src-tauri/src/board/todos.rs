@@ -1182,6 +1182,7 @@ pub fn upsert(file: &mut TodoFile, mut todo: Todo, now: &str) {
         if todo.handout_at.is_none() {
             todo.handout_at = existing.handout_at.clone();
         }
+        todo.comments = existing.comments.clone();
         *existing = todo;
     } else {
         if todo.created_at.is_empty() {
@@ -1219,6 +1220,47 @@ pub fn set_status(file: &mut TodoFile, id: &str, status: &str, now: &str) -> boo
     } else {
         false
     }
+}
+
+pub fn add_comment(
+    file: &mut TodoFile,
+    task_id: &str,
+    author: &str,
+    body: &str,
+    now: &str,
+) -> Result<(), String> {
+    let task = file
+        .todos
+        .iter_mut()
+        .find(|t| t.id == task_id)
+        .ok_or_else(|| format!("no task with id {task_id}"))?;
+    task.comments.push(Comment {
+        id: new_id(),
+        author: author.to_string(),
+        body: body.to_string(),
+        created_at: now.to_string(),
+    });
+    task.updated_at = now.to_string();
+    Ok(())
+}
+
+pub fn remove_comment(
+    file: &mut TodoFile,
+    task_id: &str,
+    comment_id: &str,
+    now: &str,
+) -> Result<(), String> {
+    let task = file
+        .todos
+        .iter_mut()
+        .find(|t| t.id == task_id)
+        .ok_or_else(|| format!("no task with id {task_id}"))?;
+    let before = task.comments.len();
+    task.comments.retain(|c| c.id != comment_id);
+    if task.comments.len() != before {
+        task.updated_at = now.to_string();
+    }
+    Ok(())
 }
 
 /// The project board a todo belongs to, normalized: a project-less (global) task
@@ -2227,6 +2269,92 @@ mod tests {
         c.number = 0;
         upsert(&mut f, c, "T4");
         assert_eq!(f.todos.iter().find(|t| t.id == "c").unwrap().number, 3);
+    }
+
+    #[test]
+    fn upsert_of_existing_task_ignores_incoming_comments() {
+        let mut f = TodoFile::default();
+        f.todos.push(todo("a", "backlog"));
+        add_comment(&mut f, "a", "user", "one", "T1").unwrap();
+        add_comment(&mut f, "a", "user", "two", "T2").unwrap();
+        assert_eq!(f.todos[0].comments.len(), 2);
+
+        let mut stale = f.todos[0].clone();
+        stale.comments.truncate(1);
+        upsert(&mut f, stale, "T3");
+        assert_eq!(f.todos[0].comments.len(), 2);
+        assert_eq!(f.todos[0].comments[0].body, "one");
+        assert_eq!(f.todos[0].comments[1].body, "two");
+    }
+
+    #[test]
+    fn upsert_of_existing_task_does_not_add_an_unknown_incoming_comment() {
+        let mut f = TodoFile::default();
+        f.todos.push(todo("a", "backlog"));
+        add_comment(&mut f, "a", "user", "kept", "T1").unwrap();
+
+        let mut edited = f.todos[0].clone();
+        edited.comments.push(Comment {
+            id: "forged".into(),
+            author: "user".into(),
+            body: "forged".into(),
+            created_at: "T2".into(),
+        });
+        upsert(&mut f, edited, "T2");
+
+        assert_eq!(f.todos[0].comments.len(), 1);
+        assert_eq!(f.todos[0].comments[0].body, "kept");
+    }
+
+    #[test]
+    fn upsert_of_a_new_task_keeps_its_incoming_comments() {
+        let mut f = TodoFile::default();
+        let mut fresh = todo("a", "backlog");
+        fresh.comments = vec![Comment {
+            id: "c1".into(),
+            author: "user".into(),
+            body: "seed".into(),
+            created_at: "T0".into(),
+        }];
+        upsert(&mut f, fresh, "T1");
+        assert_eq!(f.todos[0].comments.len(), 1);
+        assert_eq!(f.todos[0].comments[0].body, "seed");
+    }
+
+    #[test]
+    fn add_comment_appends_to_the_fresh_row() {
+        let mut f = TodoFile::default();
+        upsert(&mut f, todo("a", "backlog"), "T1");
+        add_comment(&mut f, "a", "user", "hello", "T2").unwrap();
+        assert_eq!(f.todos[0].comments.len(), 1);
+        assert_eq!(f.todos[0].comments[0].author, "user");
+        assert_eq!(f.todos[0].comments[0].body, "hello");
+        assert_eq!(f.todos[0].comments[0].created_at, "T2");
+        assert_eq!(f.todos[0].updated_at, "T2");
+        assert!(add_comment(&mut f, "missing", "user", "x", "T3").is_err());
+    }
+
+    #[test]
+    fn remove_comment_removes_only_that_id_and_a_stale_upsert_does_not_bring_it_back() {
+        let mut f = TodoFile::default();
+        upsert(&mut f, todo("a", "backlog"), "T1");
+        add_comment(&mut f, "a", "user", "keep", "T2").unwrap();
+        add_comment(&mut f, "a", "user", "drop", "T3").unwrap();
+        let drop_id = f.todos[0].comments[1].id.clone();
+
+        assert!(remove_comment(&mut f, "missing", &drop_id, "T4").is_err());
+        assert!(remove_comment(&mut f, "a", "no-such-id", "T4").is_ok());
+        assert_eq!(f.todos[0].comments.len(), 2);
+
+        remove_comment(&mut f, "a", &drop_id, "T5").unwrap();
+        assert_eq!(f.todos[0].comments.len(), 1);
+        assert_eq!(f.todos[0].comments[0].body, "keep");
+        assert_eq!(f.todos[0].updated_at, "T5");
+
+        let stale_snapshot = todo("a", "backlog");
+        upsert(&mut f, stale_snapshot, "T6");
+        assert_eq!(f.todos[0].comments.len(), 1);
+        assert_eq!(f.todos[0].comments[0].body, "keep");
     }
 
     #[test]

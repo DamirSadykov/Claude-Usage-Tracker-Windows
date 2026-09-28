@@ -17,7 +17,7 @@ import GraphView from "../board/GraphView.vue";
 import SpecView from "../spec/SpecView.vue";
 import PipelineGraph from "../process/pipeline/PipelineGraph.vue";
 import type { PipelineMode } from "../process/pipeline/modes";
-import type { BoardChange, Comment, Todo } from "../contracts/board";
+import type { BoardChange, Todo } from "../contracts/board";
 import { useProjectLinks } from "../analytics/projectLinks";
 import { useHotkeys } from "../kernel/hotkeys";
 import { BOARD_CURRENT_VERSION } from "../board/boardVersion";
@@ -491,36 +491,30 @@ const newComment = ref("");
 
 const detailComments = computed(() => detail.value?.comments ?? []);
 
-async function persistComments(comments: Comment[]) {
-  const cur = detail.value;
-  if (!cur) return;
+async function addComment() {
+  const body = newComment.value.trim();
+  if (!body || !detail.value) return;
   try {
-    todos.value = await invoke<Todo[]>("upsert_todo", {
-      todo: { ...cur, comments },
+    todos.value = await invoke<Todo[]>("add_todo_comment", {
+      id: detail.value.id,
+      body,
     });
+    newComment.value = "";
   } catch (e) {
     errorMsg.value = String(e);
   }
 }
 
-async function addComment() {
-  const body = newComment.value.trim();
-  if (!body || !detail.value) return;
-  const comment: Comment = {
-    id: crypto.randomUUID(),
-    author: "user",
-    body,
-    created_at: new Date().toISOString(),
-  };
-  await persistComments([...(detail.value.comments ?? []), comment]);
-  newComment.value = "";
-}
-
 async function removeComment(id: string) {
   if (!detail.value) return;
-  await persistComments(
-    (detail.value.comments ?? []).filter((c) => c.id !== id),
-  );
+  try {
+    todos.value = await invoke<Todo[]>("remove_todo_comment", {
+      id: detail.value.id,
+      commentId: id,
+    });
+  } catch (e) {
+    errorMsg.value = String(e);
+  }
 }
 
 function commentAuthorLabel(author: string) {
