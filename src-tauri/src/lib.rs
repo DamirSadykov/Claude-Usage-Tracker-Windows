@@ -1773,6 +1773,11 @@ fn run_events_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir.join("run-events.jsonl"))
 }
 
+fn runs_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    Ok(dir.join("runs.jsonl"))
+}
+
 fn journal_time(ts: &str) -> Option<SystemTime> {
     let seconds = chrono::DateTime::parse_from_rfc3339(ts)
         .ok()?
@@ -1951,6 +1956,12 @@ async fn get_task_work_tree(
     let usage = stats.sessions_all().map_err(|e| e.to_string())?;
     let blocks = task_sessions::blocks(&events, &session_ends(&usage));
     let run_events = task_cost::load_run_events(&run_events_path(&app)?);
+    let run_steps = task_cost::load_run_steps(&runs_path(&app)?);
+    let task_numbers = board
+        .todos
+        .iter()
+        .map(|todo| (todo.id.clone(), todo.number))
+        .collect();
     let claude = claude_dir();
     let codex = codex::codex_dir();
     Ok(task_cost::build_task_work_tree(
@@ -1958,6 +1969,8 @@ async fn get_task_work_tree(
         number,
         &blocks,
         &run_events,
+        &run_steps,
+        &task_numbers,
         claude.as_deref(),
         codex.as_deref(),
     ))

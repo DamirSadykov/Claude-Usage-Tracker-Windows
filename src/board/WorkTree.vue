@@ -5,6 +5,7 @@ import { useI18n } from "vue-i18n";
 import WorkTraceCharts from "./WorkTraceCharts.vue";
 import {
   aggregateTree,
+  contextLabels,
   modelCallNode,
   modelCalls,
   nodeType,
@@ -12,6 +13,8 @@ import {
   singleCall,
   treeView,
   type ToolCallType,
+  type ContextLabel,
+  type WorkContextInput,
   type WorkNode,
 } from "./workTree";
 type RawCall = {
@@ -38,11 +41,14 @@ type RawTree = {
   startedAt?: string;
   endedAt?: string;
   cost: number;
+  agentType?: string | null;
+  fork?: boolean;
+  compacted?: boolean;
   turns: RawTurn[];
 };
-type RawSession = { session: string; source: string; tree: RawTree };
-type RawEvent = { ts: string; kind: string };
-type RawAttempt = { number: number; startedAt: string; endedAt: string; events?: RawEvent[]; sessions: RawSession[] };
+type RawContext = WorkContextInput & { role?: "worker" | "review" | null };
+type RawSession = { session: string; source: string; tree: RawTree; context: RawContext };
+type RawAttempt = { number: number; startedAt: string; endedAt: string; sessions: RawSession[] };
 type Payload = { sessions: RawSession[]; attempts: RawAttempt[] };
 type NodeType = ToolCallType | "text";
 const props = defineProps<{ task: string; heading?: string }>();
@@ -67,7 +73,15 @@ function text(v: unknown) {
 function line(v: string | null) {
   return v?.split(/\r?\n/, 1)[0] || null;
 }
-function makeTree(raw: RawTree, session: string, prefix: string, role = t("workSession")): WorkNode {
+function makeTree(raw: RawTree, session: string, prefix: string, context?: RawContext): WorkNode {
+  const labels = contextLabels(context),
+    role =
+      context?.role === "worker"
+        ? t("workRoleWorker")
+        : context?.role === "review"
+          ? t("workRoleReviewer")
+          : t("workSession"),
+    parentTask = context?.parentTask ?? Number.parseInt(props.task.replace(/^#/, ""), 10);
   const models = raw.turns.map((turn) =>
     modelCallNode({
       id: `${prefix}:${turn.id}`,
@@ -85,15 +99,29 @@ function makeTree(raw: RawTree, session: string, prefix: string, role = t("workS
         cacheRead: turn.cacheReadTokens,
       },
       transcriptPath: raw.transcriptPath,
-      calls: turn.calls.map((call) => ({
-        id: `${prefix}:${call.id}`,
-        name: call.name,
-        input: text(call.input),
-        result: call.result ? text(call.result.content) : null,
-        startedAt: stamp(turn.timestamp),
-        endedAt: stamp(call.result?.timestamp) ?? stamp(turn.timestamp),
-        subagent: call.subagent ? makeTree(call.subagent, session, `${prefix}:${call.id}:agent`) : null,
-      })),
+      calls: turn.calls.map((call) => {
+        const subagentContext: RawContext | undefined = call.subagent
+          ? {
+              mode: call.subagent.fork || call.subagent.agentType === "fork" ? "fork" : "fresh",
+              agentType: call.subagent.agentType,
+              fork: call.subagent.fork,
+              parentTask: Number.isFinite(parentTask) ? parentTask : null,
+              parentSession: raw.sessionId || session,
+              compacted: call.subagent.compacted,
+            }
+          : undefined;
+        return {
+          id: `${prefix}:${call.id}`,
+          name: call.name,
+          input: text(call.input),
+          result: call.result ? text(call.result.content) : null,
+          startedAt: stamp(turn.timestamp),
+          endedAt: stamp(call.result?.timestamp) ?? stamp(turn.timestamp),
+          subagent: call.subagent
+            ? makeTree(call.subagent, session, `${prefix}:${call.id}:agent`, subagentContext)
+            : null,
+        };
+      }),
     }),
   );
   const node = aggregateTree({
@@ -109,6 +137,7 @@ function makeTree(raw: RawTree, session: string, prefix: string, role = t("workS
     result: null,
     transcriptPath: raw.transcriptPath,
     children: models,
+    contextLabels: labels,
   });
   const visit = (n: WorkNode) => {
     transcripts.set(n.id, n.transcriptPath ?? raw.transcriptPath);
@@ -117,16 +146,11 @@ function makeTree(raw: RawTree, session: string, prefix: string, role = t("workS
   visit(node);
   return node;
 }
-function roleOf(attempt: RawAttempt, raw: RawTree) {
-  const done = stamp(attempt.events?.find((event) => event.kind === "worker_done")?.ts),
-    start = stamp(raw.startedAt);
-  return done !== null && start !== null && start >= done ? t("workRoleReviewer") : t("workRoleWorker");
-}
 const roots = computed(() => {
   transcripts.clear();
   if (!tree.value) return [];
   const sessions = tree.value.sessions.map((entry) =>
-    makeTree(entry.tree, entry.session, `session:${entry.session}:${entry.source}`),
+    makeTree(entry.tree, entry.session, `session:${entry.session}:${entry.source}`, entry.context),
   );
   const attempts = tree.value.attempts.map((attempt) =>
     aggregateTree({
@@ -142,7 +166,7 @@ const roots = computed(() => {
       result: null,
       transcriptPath: null,
       children: attempt.sessions.map((entry) =>
-        makeTree(entry.tree, entry.session, `attempt:${attempt.number}:${entry.session}`, roleOf(attempt, entry.tree)),
+        makeTree(entry.tree, entry.session, `attempt:${attempt.number}:${entry.session}`, entry.context),
       ),
     }),
   );
@@ -205,6 +229,20 @@ function label(row: { node: WorkNode; modelNumber: number }) {
   if (n.kind === "tool") return `${n.sequence}. ${line(n.input) ?? n.name}`;
   if (n.kind === "model") return `${number}. ${n.name || t("workTraceReply")}`;
   return n.name;
+}
+function contextText(label: ContextLabel) {
+  if (label.kind === "inherits")
+    return [
+      t("workContextInheritsFrom"),
+      label.parentTask ? `t#${label.parentTask}` : null,
+      label.parentSession ?? null,
+    ]
+      .filter(Boolean)
+      .join(" · ");
+  return t(`workContext${label.kind[0].toUpperCase()}${label.kind.slice(1)}`);
+}
+function contextTitle(label: ContextLabel) {
+  return t(`workContext${label.kind[0].toUpperCase()}${label.kind.slice(1)}Hint`);
 }
 function usageOf(n: WorkNode) {
   return modelCalls(n).reduce(
@@ -366,6 +404,12 @@ watch(
             @click.stop="toggle(row.node)"
           /><span>{{ icon(row.node) }}</span
           ><span class="name">{{ label(row) }}</span
+          ><span
+            v-for="context in row.node.contextLabels"
+            :key="context.kind"
+            class="type-label"
+            :title="contextTitle(context)"
+            >{{ contextText(context) }}</span
           ><span v-if="row.node.kind === 'model'" class="type-label">{{
             t(`workTraceType_${nodeType(row.node)}`)
           }}</span

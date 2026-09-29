@@ -24,6 +24,21 @@ export interface WorkNode {
   ownCost?: number;
   sequence?: number;
   count?: number;
+  contextLabels?: readonly ContextLabel[];
+}
+export type ContextLabelKind = "fresh" | "inherits" | "continued" | "compacted";
+export interface ContextLabel {
+  kind: ContextLabelKind;
+  parentTask?: number;
+  parentSession?: string;
+}
+export interface WorkContextInput {
+  mode?: "fresh" | "fork" | "continued" | "unknown";
+  parentTask?: number | null;
+  parentSession?: string | null;
+  compacted?: boolean;
+  agentType?: string | null;
+  fork?: boolean;
 }
 export interface ToolCallInput {
   id: string;
@@ -33,6 +48,7 @@ export interface ToolCallInput {
   startedAt?: number | null;
   endedAt?: number | null;
   subagent?: WorkNode | null;
+  contextLabels?: readonly ContextLabel[];
 }
 export interface ModelCallInput {
   id: string;
@@ -138,6 +154,7 @@ export function modelCallNode(value: ModelCallInput): WorkNode {
       children: agent ? [agent] : [],
       callType,
       sequence: index + 1,
+      contextLabels: call.contextLabels,
     };
   });
   const usage = tokenBreakdown(value.tokenBreakdown),
@@ -160,6 +177,22 @@ export function modelCallNode(value: ModelCallInput): WorkNode {
     children: calls,
     tokenBreakdown: usage,
   };
+}
+export function contextLabels(context?: WorkContextInput): readonly ContextLabel[] {
+  if (!context) return [];
+  const mode = context.fork || context.agentType === "fork" ? "fork" : context.mode;
+  const labels: ContextLabel[] = [];
+  if (mode === "fresh") labels.push({ kind: "fresh" });
+  const rawParentTask = context.parentTask,
+    parentTask =
+      typeof rawParentTask === "number" && Number.isInteger(rawParentTask) && rawParentTask > 0
+        ? rawParentTask
+        : undefined,
+    parentSession = context.parentSession?.slice(0, 8);
+  if (mode === "fork") labels.push({ kind: "inherits", parentTask, parentSession });
+  if (mode === "continued") labels.push({ kind: "continued" });
+  if (context.compacted) labels.push({ kind: "compacted" });
+  return labels;
 }
 export function aggregateTree(node: WorkNode): WorkNode {
   const children = node.children.map(aggregateTree),

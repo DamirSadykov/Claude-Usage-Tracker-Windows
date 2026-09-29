@@ -27,6 +27,59 @@ pub struct TaskWorkSession {
     pub to: String,
     pub source: String,
     pub tree: WorkTree,
+    pub context: TaskWorkContext,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskWorkContext {
+    pub mode: ContextMode,
+    pub role: Option<WorkRole>,
+    pub parent_session: Option<String>,
+    pub parent_task: Option<u32>,
+    pub compacted: bool,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ContextMode {
+    Fresh,
+    Fork,
+    Continued,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkRole {
+    Worker,
+    Review,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct RunRecord {
+    #[serde(default)]
+    steps: Vec<RunStep>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct RunStep {
+    #[serde(default, deserialize_with = "deserialize_task")]
+    task: String,
+    #[serde(default)]
+    session: Option<String>,
+    #[serde(default)]
+    start_mode: String,
+    #[serde(default)]
+    parent_session: Option<String>,
+    #[serde(default)]
+    review: Option<RunReview>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct RunReview {
+    #[serde(default)]
+    session: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -97,11 +150,24 @@ pub fn load_run_events(path: &Path) -> Vec<RunEvent> {
         .unwrap_or_default()
 }
 
+pub fn load_run_steps(path: &Path) -> Vec<RunStep> {
+    std::fs::read_to_string(path)
+        .map(|raw| {
+            raw.lines()
+                .filter_map(|line| serde_json::from_str::<RunRecord>(line).ok())
+                .flat_map(|record| record.steps)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub fn build_task_work_tree(
     task: &str,
     task_number: u32,
     blocks: &[TaskBlock],
     run_events: &[RunEvent],
+    run_steps: &[RunStep],
+    task_numbers: &HashMap<String, u32>,
     claude_base: Option<&Path>,
     codex_base: Option<&Path>,
 ) -> TaskWorkTree {
@@ -113,17 +179,26 @@ pub fn build_task_work_tree(
         .collect();
     let mut sessions = Vec::new();
     let mut attempts: HashMap<u32, TaskWorkAttempt> = HashMap::new();
+    let mut session_tasks = HashMap::new();
+    for block in blocks {
+        session_tasks
+            .entry(block.session.clone())
+            .or_insert_with(|| block.task.clone());
+    }
 
     for block in task_blocks {
         let Some(tree) = tree_for_block(block, claude_base, codex_base) else {
             continue;
         };
+        let context =
+            context_for_block(block, run_steps, task_numbers, &session_tasks, claude_base);
         let session = TaskWorkSession {
             session: block.session.clone(),
             from: block.from.clone(),
             to: block.to.clone(),
             source: block.source.clone(),
             tree,
+            context,
         };
         if block.source == "run-step" {
             if let Some(number) = attempt_at(&events, &block.from) {
@@ -160,6 +235,94 @@ pub fn build_task_work_tree(
         task: task.to_string(),
         sessions,
         attempts,
+    }
+}
+
+fn context_for_block(
+    block: &TaskBlock,
+    run_steps: &[RunStep],
+    task_numbers: &HashMap<String, u32>,
+    session_tasks: &HashMap<String, String>,
+    claude_base: Option<&Path>,
+) -> TaskWorkContext {
+    for step in run_steps
+        .iter()
+        .filter(|step| run_step_matches(step, task_numbers.get(&block.task).copied().unwrap_or(0)))
+    {
+        if step.session.as_deref() == Some(&block.session) {
+            return runner_context(step, Some(WorkRole::Worker), task_numbers, session_tasks);
+        }
+        if step
+            .review
+            .as_ref()
+            .and_then(|review| review.session.as_deref())
+            == Some(&block.session)
+        {
+            return TaskWorkContext {
+                mode: ContextMode::Fresh,
+                role: Some(WorkRole::Review),
+                parent_session: None,
+                parent_task: None,
+                compacted: false,
+            };
+        }
+    }
+    let Some(path) = claude_base.and_then(|base| cc::transcript_path(base, &block.session, None))
+    else {
+        return TaskWorkContext {
+            mode: ContextMode::Unknown,
+            role: None,
+            parent_session: None,
+            parent_task: None,
+            compacted: false,
+        };
+    };
+    let (continued, compacted) = work_tree::session_context_markers(&path, &block.from, &block.to);
+    TaskWorkContext {
+        mode: if continued {
+            ContextMode::Continued
+        } else {
+            ContextMode::Fresh
+        },
+        role: None,
+        parent_session: None,
+        parent_task: None,
+        compacted,
+    }
+}
+
+fn run_step_matches(step: &RunStep, number: u32) -> bool {
+    [
+        format!("t#{number}"),
+        number.to_string(),
+        format!("#{number}"),
+    ]
+    .contains(&step.task)
+}
+
+fn runner_context(
+    step: &RunStep,
+    role: Option<WorkRole>,
+    task_numbers: &HashMap<String, u32>,
+    session_tasks: &HashMap<String, String>,
+) -> TaskWorkContext {
+    let mode = match step.start_mode.as_str() {
+        "fresh" => ContextMode::Fresh,
+        "fork" => ContextMode::Fork,
+        _ => ContextMode::Unknown,
+    };
+    let parent_session = step.parent_session.clone();
+    let parent_task = parent_session
+        .as_deref()
+        .and_then(|parent| session_tasks.get(parent))
+        .and_then(|task| task_numbers.get(task))
+        .copied();
+    TaskWorkContext {
+        mode,
+        role,
+        parent_session,
+        parent_task,
+        compacted: false,
     }
 }
 
@@ -399,6 +562,81 @@ mod tests {
         let events = load_run_events(&path);
         assert_eq!(events.len(), 1);
         assert!(task_matches(&events[0], 805));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn runner_context_uses_run_journal_for_worker_and_reviewer() {
+        let worker = RunStep {
+            task: "42".into(),
+            session: Some("worker-session".into()),
+            start_mode: "fork".into(),
+            parent_session: Some("parent-session".into()),
+            review: Some(RunReview {
+                session: Some("review-session".into()),
+            }),
+        };
+        let task_numbers =
+            HashMap::from([("task".to_string(), 42), ("parent-task".to_string(), 17)]);
+        let session_tasks =
+            HashMap::from([("parent-session".to_string(), "parent-task".to_string())]);
+        let block = TaskBlock {
+            task: "task".into(),
+            session: "worker-session".into(),
+            from: "2026-01-01T00:00:00Z".into(),
+            to: "2026-01-01T00:01:00Z".into(),
+            explicit: true,
+            source: "run-step".into(),
+            project: None,
+        };
+        assert_eq!(
+            context_for_block(
+                &block,
+                &[worker.clone()],
+                &task_numbers,
+                &session_tasks,
+                None,
+            ),
+            TaskWorkContext {
+                mode: ContextMode::Fork,
+                role: Some(WorkRole::Worker),
+                parent_session: Some("parent-session".into()),
+                parent_task: Some(17),
+                compacted: false,
+            }
+        );
+        let review = TaskBlock {
+            session: "review-session".into(),
+            ..block
+        };
+        assert_eq!(
+            context_for_block(&review, &[worker], &task_numbers, &session_tasks, None,),
+            TaskWorkContext {
+                mode: ContextMode::Fresh,
+                role: Some(WorkRole::Review),
+                parent_session: None,
+                parent_task: None,
+                compacted: false,
+            }
+        );
+    }
+
+    #[test]
+    fn loads_run_steps_tolerantly() {
+        let path = std::env::temp_dir().join("task-work-tree-runs.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "not json\n",
+                r#"{"steps":[{"task":42,"session":"worker","start_mode":"fresh"}]}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        let steps = load_run_steps(&path);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].task, "42");
+        assert_eq!(steps[0].start_mode, "fresh");
         std::fs::remove_file(path).unwrap();
     }
 

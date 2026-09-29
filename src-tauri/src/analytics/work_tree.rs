@@ -21,6 +21,9 @@ pub struct WorkTree {
     pub cache_creation_tokens: i64,
     pub cache_read_tokens: i64,
     pub cost: f64,
+    pub agent_type: Option<String>,
+    pub fork: bool,
+    pub compacted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -96,6 +99,7 @@ fn parse_work_tree(
     let mut turns: Vec<WorkTurn> = Vec::new();
     let mut turn_by_message = HashMap::<String, usize>::new();
     let mut results = HashMap::<String, WorkToolResult>::new();
+    let mut compacted = false;
 
     for line in BufReader::new(file).lines() {
         let line = line.map_err(|e| format!("{}: {e}", path.display()))?;
@@ -107,6 +111,17 @@ fn parse_work_tree(
                 .get("sessionId")
                 .and_then(Value::as_str)
                 .map(str::to_string);
+        }
+        if is_compaction(&record)
+            && in_interval(
+                record
+                    .get("timestamp")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                interval,
+            )
+        {
+            compacted = true;
         }
         match record.get("type").and_then(Value::as_str) {
             Some("assistant") => {
@@ -121,10 +136,12 @@ fn parse_work_tree(
     for turn in &mut turns {
         for call in &mut turn.calls {
             call.result = results.remove(&call.id);
-            if let Some(agent_path) = agents.get(&call.id) {
-                call.subagent = Some(Box::new(build_work_tree_inner(
-                    agent_path, interval, visiting,
-                )?));
+            if agents.contains_key(&call.id) {
+                let agent = agents.get(&call.id).expect("looked up above");
+                let mut child = build_work_tree_inner(&agent.transcript, interval, visiting)?;
+                child.agent_type = agent.agent_type.clone();
+                child.fork = agent.agent_type.as_deref() == Some("fork");
+                call.subagent = Some(Box::new(child));
             }
         }
     }
@@ -140,6 +157,9 @@ fn parse_work_tree(
         cache_creation_tokens: 0,
         cache_read_tokens: 0,
         cost: 0.0,
+        agent_type: None,
+        fork: false,
+        compacted,
     };
     for turn in &tree.turns {
         tree.input_tokens += turn.input_tokens;
@@ -332,7 +352,13 @@ fn collect_results(record: &Value, results: &mut HashMap<String, WorkToolResult>
     }
 }
 
-fn agent_manifests(path: &Path) -> HashMap<String, PathBuf> {
+#[derive(Clone)]
+struct AgentManifest {
+    transcript: PathBuf,
+    agent_type: Option<String>,
+}
+
+fn agent_manifests(path: &Path) -> HashMap<String, AgentManifest> {
     let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
         return HashMap::new();
     };
@@ -367,10 +393,55 @@ fn agent_manifests(path: &Path) -> HashMap<String, PathBuf> {
         if transcript.is_file() {
             manifests
                 .entry(tool_use_id.to_string())
-                .or_insert(transcript);
+                .or_insert(AgentManifest {
+                    transcript,
+                    agent_type: meta
+                        .get("agentType")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                });
         }
     }
     manifests
+}
+
+fn is_compaction(record: &Value) -> bool {
+    record.get("type").and_then(Value::as_str) == Some("compact_boundary")
+        || record.get("subtype").and_then(Value::as_str) == Some("compact_boundary")
+        || record.get("isCompactSummary").and_then(Value::as_bool) == Some(true)
+        || record
+            .pointer("/message/isCompactSummary")
+            .and_then(Value::as_bool)
+            == Some(true)
+}
+
+pub fn session_context_markers(path: &Path, start: &str, end: &str) -> (bool, bool) {
+    let Ok(file) = File::open(path) else {
+        return (false, false);
+    };
+    let mut before = false;
+    let mut compacted = false;
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        let Ok(record) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let timestamp = record
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if timestamp < start
+            && matches!(
+                record.get("type").and_then(Value::as_str),
+                Some("assistant" | "user")
+            )
+        {
+            before = true;
+        }
+        if timestamp >= start && timestamp <= end && is_compaction(&record) {
+            compacted = true;
+        }
+    }
+    (before, compacted)
 }
 
 fn in_interval(timestamp: &str, interval: &WorkTreeInterval) -> bool {
@@ -413,6 +484,38 @@ mod tests {
 second"}])),
             serde_json::json!("first")
         );
+    }
+
+    #[test]
+    fn a_compaction_record_marks_the_tree_compacted() {
+        let path = std::env::temp_dir().join("work-tree-compacted.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"type":"system","subtype":"compact_boundary","timestamp":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        assert!(build_session_work_tree(&path).unwrap().compacted);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn session_context_markers_detect_prior_messages_and_compaction_in_block() {
+        let path = std::env::temp_dir().join("work-tree-context-markers.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","timestamp":"2026-01-01T00:00:00Z"}"#,
+                "\n",
+                r#"{"type":"compact_boundary","timestamp":"2026-01-01T00:01:30Z"}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            session_context_markers(&path, "2026-01-01T00:01:00Z", "2026-01-01T00:02:00Z",),
+            (true, true)
+        );
+        std::fs::remove_file(path).unwrap();
     }
 
     use super::*;

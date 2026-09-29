@@ -97,6 +97,9 @@ pub fn build_codex_work_tree_in_interval(
         cache_creation_tokens: 0,
         cache_read_tokens: 0,
         cost: 0.0,
+        agent_type: None,
+        fork: false,
+        compacted: false,
     };
     for turn in &tree.turns {
         tree.input_tokens += turn.input_tokens;

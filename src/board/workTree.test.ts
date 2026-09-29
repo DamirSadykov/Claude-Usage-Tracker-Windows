@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   aggregateTree,
   classifyToolCall,
+  contextLabels,
   contextTokens,
   filterTree,
   headersOnlyTree,
@@ -40,6 +41,39 @@ describe("tool classification", () => {
     expect(classifyToolCall("apply_patch")).toBe("edit");
     expect(classifyToolCall("Agent")).toBe("agent");
     expect(classifyToolCall("WebSearch")).toBe("web");
+  });
+});
+
+describe("context labels", () => {
+  it("labels fresh, inherited, continued and compacted contexts without labeling unknown ones", () => {
+    expect(contextLabels({ mode: "fresh" })).toEqual([{ kind: "fresh" }]);
+    expect(contextLabels({ mode: "fork", parentTask: 813, parentSession: "abcdef012345" })).toEqual([
+      { kind: "inherits", parentTask: 813, parentSession: "abcdef01" },
+    ]);
+    expect(contextLabels({ mode: "continued", compacted: true })).toEqual([
+      { kind: "continued" },
+      { kind: "compacted" },
+    ]);
+    expect(contextLabels({ mode: "unknown" })).toEqual([]);
+  });
+
+  it("treats a fork subagent as inherited and an ordinary subagent as fresh", () => {
+    expect(contextLabels({ agentType: "fork", parentTask: 813, parentSession: "parent-session" })).toEqual([
+      { kind: "inherits", parentTask: 813, parentSession: "parent-s" },
+    ]);
+    expect(contextLabels({ agentType: "general-purpose", fork: false, mode: "fresh" })).toEqual([{ kind: "fresh" }]);
+  });
+
+  it("keeps an inheritance label when only part of the parent is known", () => {
+    expect(contextLabels({ mode: "fork", parentSession: "parent-session" })).toEqual([
+      { kind: "inherits", parentTask: undefined, parentSession: "parent-s" },
+    ]);
+    expect(contextLabels({ mode: "fork", parentTask: 813 })).toEqual([
+      { kind: "inherits", parentTask: 813, parentSession: undefined },
+    ]);
+    expect(contextLabels({ mode: "fork", parentTask: 0 })).toEqual([
+      { kind: "inherits", parentTask: undefined, parentSession: undefined },
+    ]);
   });
 });
 
