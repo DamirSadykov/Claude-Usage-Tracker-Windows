@@ -10,8 +10,6 @@ import {
   nodeType,
   pathTo,
   singleCall,
-  timelineBar,
-  timelineScale,
   treeView,
   type ToolCallType,
   type WorkNode,
@@ -55,7 +53,6 @@ const tree = ref<Payload | null>(null),
   selected = ref<WorkNode | null>(null),
   root = ref<HTMLElement | null>(null),
   collapsed = ref<Set<string>>(new Set()),
-  showTimeline = ref(false),
   headersOnly = ref(false);
 const enabledTypes = ref<Set<NodeType>>(new Set(["read", "edit", "shell", "agent", "web", "other", "text"]));
 const transcripts = new Map<string, string>();
@@ -178,12 +175,12 @@ const modelNumbers = computed(
   () => new Map(traceRoot.value ? modelCalls(traceRoot.value).map((node, index) => [node.id, index + 1]) : []),
 );
 const rows = computed(() => {
-  const out: { node: WorkNode; depth: number; scale: ReturnType<typeof timelineScale>; modelNumber: number }[] = [];
-  const visit = (n: WorkNode, depth: number, scale: ReturnType<typeof timelineScale>) => {
-    out.push({ node: n, depth, scale, modelNumber: modelNumbers.value.get(n.id) ?? 0 });
-    if (!collapsed.value.has(n.id) && !singleCall(n)) n.children.forEach((c) => visit(c, depth + 1, scale));
+  const out: { node: WorkNode; depth: number; modelNumber: number }[] = [];
+  const visit = (n: WorkNode, depth: number) => {
+    out.push({ node: n, depth, modelNumber: modelNumbers.value.get(n.id) ?? 0 });
+    if (!collapsed.value.has(n.id) && !singleCall(n)) n.children.forEach((c) => visit(c, depth + 1));
   };
-  visibleRoots.value.forEach((n) => visit(n, 0, timelineScale(n)));
+  visibleRoots.value.forEach((n) => visit(n, 0));
   return out;
 });
 const maxContext = computed(() => {
@@ -346,10 +343,9 @@ watch(
             }}</label
           >
         </fieldset>
-        <label><input v-model="headersOnly" type="checkbox" />{{ t("workTraceHeadersOnly") }}</label
-        ><label><input v-model="showTimeline" type="checkbox" />{{ t("workTraceTimeline") }}</label>
+        <label><input v-model="headersOnly" type="checkbox" />{{ t("workTraceHeadersOnly") }}</label>
       </div>
-      <nav ref="root" class="work-tree" :class="{ timeline: showTimeline }">
+      <nav ref="root" class="work-tree">
         <button
           v-for="row in rows"
           :key="row.node.id"
@@ -392,12 +388,6 @@ watch(
           ><span v-if="own(row.node)" class="cost" :title="costTitle(row.node)">{{ cost(own(row.node)) }}</span
           ><span v-if="expandable(row.node)" class="meta">{{ row.node.children.length }}</span
           ><span v-if="duration(row.node)" class="meta" :title="t('workTraceDuration')">{{ duration(row.node) }}</span
-          ><span v-if="showTimeline && timelineBar(row.node, row.scale)" class="bar"
-            ><i
-              :style="{
-                left: `${timelineBar(row.node, row.scale)?.start}%`,
-                width: `${timelineBar(row.node, row.scale)?.width}%`,
-              }" /></span
           ><span v-if="responseOf(row.node)" class="response">{{ responseOf(row.node) }}</span>
         </button>
       </nav>
@@ -487,9 +477,6 @@ watch(
   text-align: left;
   width: 100%;
 }
-.work-tree.timeline .work-row {
-  grid-template-columns: 10px 13px minmax(90px, 1fr) auto auto auto auto auto auto minmax(70px, 22%);
-}
 .work-row:hover {
   background: var(--card-bg-hover);
 }
@@ -562,23 +549,6 @@ watch(
 .expensive .cost {
   color: var(--high);
   font-weight: 700;
-}
-.bar {
-  background: color-mix(in srgb, var(--stroke-strong) 60%, transparent);
-  display: block;
-  height: 7px;
-  overflow: hidden;
-  position: relative;
-}
-.bar i {
-  background: var(--accent);
-  border-radius: 4px;
-  display: block;
-  height: 100%;
-  position: absolute;
-}
-.expensive .bar i {
-  background: var(--high);
 }
 .details {
   border: 1px solid var(--stroke-strong);

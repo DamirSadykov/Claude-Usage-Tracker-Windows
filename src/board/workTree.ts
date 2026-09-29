@@ -47,16 +47,6 @@ export interface ModelCallInput {
   result?: string | null;
   transcriptPath?: string | null;
 }
-export interface TimelineScale {
-  start: number;
-  end: number;
-  duration: number;
-  minimumWidth: number;
-}
-export interface TimelineBar {
-  start: number;
-  width: number;
-}
 export interface TracePoint {
   index: number;
   nodeId: string;
@@ -78,8 +68,6 @@ export interface TreeViewOptions {
   types?: ReadonlySet<ToolCallType | "text">;
   headersOnly?: boolean;
 }
-export const MIN_TIMELINE_WIDTH = 1;
-export const EXPENSIVE_NODE_COST = 1;
 const READ_TOOLS = new Set(["read", "grep", "glob", "ls"]);
 const READ_BASH =
   /^(?:cat|type|rg|grep|findstr|ls|dir|pwd|git\s+(?:status|diff|log|show)|Get-Content|Get-ChildItem|Select-String)\b/i;
@@ -87,17 +75,6 @@ const WRITE_BASH =
   /(?:^|\s)(?:>|>>|rm\b|del\b|remove-item\b|move-item\b|copy-item\b|cp\b|mv\b|mkdir\b|new-item\b|set-content\b|add-content\b|tee\b|npm\s+(?:install|run|test|build)|npx\b|node\b|python\b|cargo\b|git\s+(?:add|commit|push|checkout|reset|clean))/i;
 function number(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
-}
-function finite(value: number | null): number | null {
-  return value !== null && Number.isFinite(value) ? value : null;
-}
-function bounds(node: WorkNode): [number, number] | null {
-  const start = finite(node.startedAt),
-    end = finite(node.endedAt);
-  if (start === null && end === null) return null;
-  if (start === null) return [end!, end!];
-  if (end === null) return [start, start];
-  return [Math.min(start, end), Math.max(start, end)];
 }
 export function tokenBreakdown(value?: Partial<TokenBreakdown>): TokenBreakdown {
   return {
@@ -321,21 +298,4 @@ export function treeView(node: WorkNode, options: TreeViewOptions = {}): WorkNod
   const filtered = filterTree(node, options.types);
   const view = filtered && options.headersOnly ? headersOnlyTree(filtered) : filtered;
   return view && groupModelCalls(view);
-}
-export function timelineScale(root: WorkNode, minimumWidth = MIN_TIMELINE_WIDTH): TimelineScale {
-  const span = bounds(root),
-    start = span?.[0] ?? 0,
-    end = span?.[1] ?? start;
-  return { start, end, duration: Math.max(0, end - start), minimumWidth: Math.max(0, minimumWidth) };
-}
-export function timelineBar(node: WorkNode, scale: TimelineScale): TimelineBar | null {
-  const span = bounds(node);
-  if (!span) return null;
-  if (scale.duration === 0) return { start: 0, width: 100 };
-  const start = Math.max(0, Math.min(100 - scale.minimumWidth, ((span[0] - scale.start) / scale.duration) * 100)),
-    naturalWidth = Math.max(0, ((span[1] - span[0]) / scale.duration) * 100);
-  return { start, width: Math.min(100 - start, Math.max(scale.minimumWidth, naturalWidth)) };
-}
-export function isExpensiveNode(node: Pick<WorkNode, "cost">, threshold = EXPENSIVE_NODE_COST): boolean {
-  return Number.isFinite(node.cost) && node.cost >= threshold;
 }
