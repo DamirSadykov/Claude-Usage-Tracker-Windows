@@ -6,8 +6,8 @@ use std::path::Path;
 use serde_json::{json, Value};
 
 use crate::analytics::codex::cost_for;
-use crate::analytics::work_tree::{brief_input, brief_result, 
-    WorkToolCall, WorkToolResult, WorkTree, WorkTreeInterval, WorkTurn,
+use crate::analytics::work_tree::{
+    brief_input, brief_result, WorkToolCall, WorkToolResult, WorkTree, WorkTreeInterval, WorkTurn,
 };
 
 pub fn build_codex_work_tree(path: &Path) -> Result<WorkTree, String> {
@@ -128,6 +128,17 @@ fn call_from_payload(payload: &Value) -> Option<WorkToolCall> {
     let id = payload.get("call_id")?.as_str()?.to_string();
     let name = payload.get("name")?.as_str()?.to_string();
     let input = payload.get("input").cloned().unwrap_or(Value::Null);
+    if name == "exec" {
+        if let Some(files) = input.as_str().and_then(patch_files) {
+            return Some(WorkToolCall {
+                id,
+                name: "apply_patch".into(),
+                input: brief_input(&Value::String(files)),
+                result: None,
+                subagent: None,
+            });
+        }
+    }
     Some(WorkToolCall {
         id,
         name: name.clone(),
@@ -218,6 +229,37 @@ fn token_key(value: &Value) -> String {
     )
 }
 
+fn patch_files(script: &str) -> Option<String> {
+    if !script.contains("*** Begin Patch") {
+        return None;
+    }
+    let mut files = Vec::new();
+    for marker in ["*** Add File: ", "*** Update File: ", "*** Delete File: "] {
+        for (at, _) in script.match_indices(marker) {
+            let mut path = String::new();
+            let mut chars = script[at + marker.len()..].chars();
+            while let Some(c) = chars.next() {
+                match c {
+                    '\\' => match chars.next() {
+                        Some('n' | 'r') | None => break,
+                        Some(next) => path.push(next),
+                    },
+                    '"' | '\n' | '\r' => break,
+                    _ => path.push(c),
+                }
+            }
+            let path = path.trim();
+            let name = path.rsplit(['\\', '/']).next().unwrap_or(path);
+            if !name.is_empty() {
+                files.push((at, name.to_string()));
+            }
+        }
+    }
+    files.sort();
+    let names: Vec<String> = files.into_iter().map(|(_, name)| name).collect();
+    (!names.is_empty()).then(|| names.join(", "))
+}
+
 fn exec_input(input: &Value) -> Value {
     let Some(script) = input.as_str() else {
         return input.clone();
@@ -293,15 +335,20 @@ mod tests {
         assert_eq!(tree.session_id.as_deref(), Some("thread-1"));
         assert_eq!(tree.turns.len(), 1);
         assert_eq!(tree.input_tokens, 6);
-        assert_eq!(
-            tree.turns[0].calls[0].input,
-            json!("rg -n \"hi\" src")
-        );
+        assert_eq!(tree.turns[0].calls[0].input, json!("rg -n \"hi\" src"));
         assert_eq!(
             tree.turns[0].calls[0].result.as_ref().unwrap().content,
             "ok"
         );
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_patch_script_becomes_an_apply_patch_call_with_file_names() {
+        let script = r#"const patch = "*** Begin Patch\n*** Update File: D:\\new\\src\\a.ts\n@@\n*** Add File: src/b.ts\n+x\n*** End Patch";"#;
+        let call = call_from_payload(&json!({"call_id":"c","name":"exec","input":script})).unwrap();
+        assert_eq!(call.name, "apply_patch");
+        assert_eq!(call.input, json!("a.ts, b.ts"));
     }
 
     #[test]

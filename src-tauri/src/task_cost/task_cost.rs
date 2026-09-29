@@ -47,9 +47,9 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::contracts::analytics_read::SessionUsage;
 use crate::board::task_sessions::{self, TaskBlock};
 use crate::board::todos::{Todo, TodoFile};
+use crate::contracts::analytics_read::SessionUsage;
 
 fn default_version() -> u32 {
     1

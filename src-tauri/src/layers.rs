@@ -35,8 +35,10 @@ mod tests {
             .lines()
             .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
             .collect::<Vec<_>>()
-            .join("
-");
+            .join(
+                "
+",
+            );
         let mut out = Vec::new();
         let mut rest = code.as_str();
         while let Some(i) = rest.find("crate::") {
@@ -181,13 +183,15 @@ mod tests {
 
     #[test]
     fn multiline_grouped_crate_imports_are_checked_as_layer_references() {
-        let refs = crate_refs("use crate::{
+        let refs = crate_refs(
+            "use crate::{
     board::model::Board,
     // kernel::x,
     analytics::{
         Event,
     },
-};");
+};",
+        );
         assert_eq!(refs, vec!["board", "analytics"]);
     }
 

@@ -1,4 +1,3 @@
-
 use std::collections::HashSet;
 
 use serde::Serialize;
@@ -50,23 +49,39 @@ pub struct MutationPayload {
 
 pub fn row(todo: &Todo) -> TodoRow {
     TodoRow {
-        id: todo.id.clone(), number: todo.number, subject: todo.subject.clone(),
-        description: truncate(&todo.description), status: todo.status.clone(),
-        priority: todo.priority.clone(), kind: todo.kind.clone(), change: todo.change,
-        change_id: todo.change_id.clone(), scheduled_for: todo.scheduled_for.clone(),
-        project: todo.project.clone(), from: todo.from.clone(), links: todo.links.clone(),
+        id: todo.id.clone(),
+        number: todo.number,
+        subject: todo.subject.clone(),
+        description: truncate(&todo.description),
+        status: todo.status.clone(),
+        priority: todo.priority.clone(),
+        kind: todo.kind.clone(),
+        change: todo.change,
+        change_id: todo.change_id.clone(),
+        scheduled_for: todo.scheduled_for.clone(),
+        project: todo.project.clone(),
+        from: todo.from.clone(),
+        links: todo.links.clone(),
         created_by: todo.created_by.clone(),
-        imported_at: todo.imported_at.clone(), has_plan: !todo.plan.trim().is_empty(),
+        imported_at: todo.imported_at.clone(),
+        has_plan: !todo.plan.trim().is_empty(),
         spec: todo.spec.clone(),
-        depends_on: todo.depends_on.clone(), created_at: todo.created_at.clone(),
-        updated_at: todo.updated_at.clone(), closed_at: completion_at(todo), ref_count: reference_count(todo),
+        depends_on: todo.depends_on.clone(),
+        created_at: todo.created_at.clone(),
+        updated_at: todo.updated_at.clone(),
+        closed_at: completion_at(todo),
+        ref_count: reference_count(todo),
         comment_count: todo.comments.len(),
     }
 }
 
 fn completion_at(todo: &Todo) -> Option<String> {
-    if todo.status != "done" { return None; }
-    todo.status_history.iter().rev()
+    if todo.status != "done" {
+        return None;
+    }
+    todo.status_history
+        .iter()
+        .rev()
         .find(|entry| entry.status == "done")
         .map(|entry| entry.at.clone())
 }
@@ -90,11 +105,17 @@ fn truncate(value: &str) -> String {
 
 fn reference_count(todo: &Todo) -> usize {
     let mut refs = HashSet::new();
-    for text in std::iter::once(todo.description.as_str()).chain(todo.comments.iter().map(|c| c.body.as_str())) {
+    for text in std::iter::once(todo.description.as_str())
+        .chain(todo.comments.iter().map(|c| c.body.as_str()))
+    {
         for token in text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '#')) {
-            let digits = token.strip_prefix("t#").or_else(|| token.strip_prefix("T#"));
+            let digits = token
+                .strip_prefix("t#")
+                .or_else(|| token.strip_prefix("T#"));
             if let Some(n) = digits.and_then(|n| n.parse::<u32>().ok()) {
-                if n != todo.number { refs.insert(n); }
+                if n != todo.number {
+                    refs.insert(n);
+                }
             }
         }
     }
@@ -106,7 +127,17 @@ mod tests {
     use super::*;
     #[test]
     fn row_omits_heavy_fields_and_counts_references() {
-        let todo = Todo { number: 3, description: "see t#2".into(), comments: vec![crate::board::todos::Comment { id: "x".into(), author: "u".into(), body: "t#4 t#2".into(), created_at: String::new() }], ..Default::default() };
+        let todo = Todo {
+            number: 3,
+            description: "see t#2".into(),
+            comments: vec![crate::board::todos::Comment {
+                id: "x".into(),
+                author: "u".into(),
+                body: "t#4 t#2".into(),
+                created_at: String::new(),
+            }],
+            ..Default::default()
+        };
         let row = row(&todo);
         assert_eq!(row.ref_count, 2);
         assert_eq!(row.comment_count, 1);
@@ -114,7 +145,10 @@ mod tests {
 
     #[test]
     fn row_description_never_exceeds_limit() {
-        let todo = Todo { description: "a".repeat(DESCRIPTION_LIMIT + 1), ..Default::default() };
+        let todo = Todo {
+            description: "a".repeat(DESCRIPTION_LIMIT + 1),
+            ..Default::default()
+        };
         let row = row(&todo);
         assert_eq!(row.description.chars().count(), DESCRIPTION_LIMIT);
         assert!(row.description.ends_with('…'));

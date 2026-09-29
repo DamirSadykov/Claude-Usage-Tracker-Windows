@@ -2798,7 +2798,10 @@ mod tests {
         assert_eq!(process["step_base"], "abc123");
         assert_eq!(process["risk"], "high");
         for key in ["red", "red_tests", "step_base", "risk"] {
-            assert!(saved["todos"][0].get(key).is_none(), "{key} leaked to the top level");
+            assert!(
+                saved["todos"][0].get(key).is_none(),
+                "{key} leaked to the top level"
+            );
         }
         let _ = std::fs::remove_file(&path);
     }

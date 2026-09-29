@@ -241,8 +241,13 @@ pub fn brief_input(input: &Value) -> Value {
             .find_map(|key| map.get(*key).and_then(Value::as_str)),
         _ => None,
     };
-    text.map(|value| Value::String(clip(&value.split_whitespace().collect::<Vec<_>>().join(" "), 120)))
-        .unwrap_or(Value::Null)
+    text.map(|value| {
+        Value::String(clip(
+            &value.split_whitespace().collect::<Vec<_>>().join(" "),
+            120,
+        ))
+    })
+    .unwrap_or(Value::Null)
 }
 
 pub fn brief_result(content: &Value) -> Value {
@@ -398,7 +403,10 @@ mod tests {
                 .count(),
             120
         );
-        assert_eq!(brief_input(&serde_json::json!({"content": "secret"})), Value::Null);
+        assert_eq!(
+            brief_input(&serde_json::json!({"content": "secret"})),
+            Value::Null
+        );
         assert_eq!(
             brief_result(&serde_json::json!([{"type": "text", "text": "
   first

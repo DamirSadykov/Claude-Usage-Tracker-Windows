@@ -9,6 +9,7 @@ import {
   modelCalls,
   nodeType,
   pathTo,
+  singleCall,
   timelineBar,
   timelineScale,
   treeView,
@@ -180,7 +181,7 @@ const rows = computed(() => {
   const out: { node: WorkNode; depth: number; scale: ReturnType<typeof timelineScale>; modelNumber: number }[] = [];
   const visit = (n: WorkNode, depth: number, scale: ReturnType<typeof timelineScale>) => {
     out.push({ node: n, depth, scale, modelNumber: modelNumbers.value.get(n.id) ?? 0 });
-    if (!collapsed.value.has(n.id)) n.children.forEach((c) => visit(c, depth + 1, scale));
+    if (!collapsed.value.has(n.id) && !singleCall(n)) n.children.forEach((c) => visit(c, depth + 1, scale));
   };
   visibleRoots.value.forEach((n) => visit(n, 0, timelineScale(n)));
   return out;
@@ -188,14 +189,31 @@ const rows = computed(() => {
 const maxContext = computed(() => {
   const values: number[] = [];
   const visit = (node: WorkNode) => {
-    if (node.kind === "model" && node.tokenBreakdown) values.push(node.tokenBreakdown.input + node.tokenBreakdown.cacheRead + node.tokenBreakdown.cacheWrite);
+    if (node.kind === "model" && node.tokenBreakdown)
+      values.push(node.tokenBreakdown.input + node.tokenBreakdown.cacheRead + node.tokenBreakdown.cacheWrite);
     node.children.forEach(visit);
   };
   traceRoot.value?.children.forEach(visit);
   return Math.max(1, ...values);
 });
+function expandable(n: WorkNode) {
+  return n.children.length > 0 && !singleCall(n);
+}
+function label(row: { node: WorkNode; modelNumber: number }) {
+  const n = row.node,
+    call = singleCall(n),
+    number = n.sequence ?? row.modelNumber;
+  if (call)
+    return `${number}. ${n.sequence ? "" : `${call.name} `}${line(call.input) ?? (n.sequence ? call.name : "")}`;
+  if (n.kind === "tool") return `${n.sequence}. ${line(n.input) ?? n.name}`;
+  if (n.kind === "model") return `${number}. ${n.name || t("workTraceReply")}`;
+  return n.name;
+}
+function responseOf(n: WorkNode) {
+  return n.kind === "tool" ? line(n.result) : singleCall(n) ? line(singleCall(n)!.result) : null;
+}
 function toggle(n: WorkNode) {
-  if (!n.children.length) return;
+  if (!expandable(n)) return;
   const next = new Set(collapsed.value);
   next.has(n.id) ? next.delete(n.id) : next.add(n.id);
   collapsed.value = next;
@@ -223,7 +241,7 @@ function own(n: WorkNode) {
   return n.ownCost ?? n.cost;
 }
 function icon(n: WorkNode) {
-  return n.kind === "model" ? "●" : n.kind === "agent" ? "↳" : n.kind === "tool" ? "›" : "◆";
+  return n.kind === "model" ? "●" : n.kind === "agent" ? "↳" : n.kind === "tool" ? "›" : n.kind === "group" ? "≡" : "◆";
 }
 function duration(n: WorkNode) {
   if (n.startedAt === null || n.endedAt === null) return "";
@@ -312,34 +330,42 @@ watch(
           :key="row.node.id"
           type="button"
           class="work-row"
-          :class="{ selected: selected?.id === row.node.id, expensive: own(row.node) >= 1, 'model-row': row.node.kind === 'model' }"
+          :class="{
+            selected: selected?.id === row.node.id,
+            expensive: own(row.node) >= 1,
+            'model-row': row.node.kind === 'model',
+          }"
           :style="{ '--depth': row.depth }"
           :data-work-id="row.node.id"
           @click="activate(row.node)"
         >
           <span
             class="toggle"
-            :class="{ empty: !row.node.children.length, closed: collapsed.has(row.node.id) }"
+            :class="{ empty: !expandable(row.node), closed: collapsed.has(row.node.id) }"
             @click.stop="toggle(row.node)"
           /><span>{{ icon(row.node) }}</span
-          ><span class="name"
-            ><template v-if="row.node.sequence">{{ row.node.sequence }}. </template
-            ><template v-else-if="row.node.kind === 'model'">{{ row.modelNumber }}. </template
-            >{{
-              row.node.kind === "tool" && line(row.node.input)
-                ? line(row.node.input)
-                : row.node.name || t("workTraceReply")
-            }}</span
-          ><span v-if="row.node.kind === 'model'" class="type-label">{{ t(`workTraceType_${nodeType(row.node)}`) }}</span
-          ><span v-if="row.node.kind === 'tool' && line(row.node.input)" class="meta">{{ row.node.name }}</span
-          ><span v-if="row.node.model" class="meta">{{ row.node.model }}</span
-          ><span v-if="row.node.tokenBreakdown" class="context" :title="`${t('workTraceContext')}: ${tokenCount(row.node.tokenBreakdown.input + row.node.tokenBreakdown.cacheRead + row.node.tokenBreakdown.cacheWrite)}`"><i :style="{ width: `${Math.max(4, (row.node.tokenBreakdown.input + row.node.tokenBreakdown.cacheRead + row.node.tokenBreakdown.cacheWrite) / maxContext * 100)}%` }" />{{
-            tokenCount(
-              row.node.tokenBreakdown.input + row.node.tokenBreakdown.cacheRead + row.node.tokenBreakdown.cacheWrite,
-            )
+          ><span class="name">{{ label(row) }}</span
+          ><span v-if="row.node.kind === 'model'" class="type-label">{{
+            t(`workTraceType_${nodeType(row.node)}`)
           }}</span
+          ><span v-if="row.node.kind === 'tool' && line(row.node.input)" class="meta">{{ row.node.name }}</span
+          ><span v-if="row.node.sequence && row.modelNumber" class="meta">#{{ row.modelNumber }}</span
+          ><span v-if="row.node.model && !row.node.sequence" class="meta">{{ row.node.model }}</span
+          ><span
+            v-if="row.node.tokenBreakdown"
+            class="context"
+            :title="`${t('workTraceContext')}: ${tokenCount(row.node.tokenBreakdown.input + row.node.tokenBreakdown.cacheRead + row.node.tokenBreakdown.cacheWrite)}`"
+            ><i
+              :style="{
+                width: `${Math.max(4, ((row.node.tokenBreakdown.input + row.node.tokenBreakdown.cacheRead + row.node.tokenBreakdown.cacheWrite) / maxContext) * 100)}%`,
+              }"
+            />{{
+              tokenCount(
+                row.node.tokenBreakdown.input + row.node.tokenBreakdown.cacheRead + row.node.tokenBreakdown.cacheWrite,
+              )
+            }}</span
           ><span v-if="own(row.node)" class="cost">{{ cost(own(row.node)) }}</span
-          ><span v-if="row.node.children.length" class="meta">{{ row.node.children.length }}</span
+          ><span v-if="expandable(row.node)" class="meta">{{ row.node.children.length }}</span
           ><span v-if="duration(row.node)" class="meta" :title="t('workTraceDuration')">{{ duration(row.node) }}</span
           ><span v-if="showTimeline && timelineBar(row.node, row.scale)" class="bar"
             ><i
@@ -347,13 +373,18 @@ watch(
                 left: `${timelineBar(row.node, row.scale)?.start}%`,
                 width: `${timelineBar(row.node, row.scale)?.width}%`,
               }" /></span
-          ><span v-if="row.node.kind === 'tool' && line(row.node.result)" class="response">{{
-            line(row.node.result)
-          }}</span>
+          ><span v-if="responseOf(row.node)" class="response">{{ responseOf(row.node) }}</span>
         </button>
       </nav>
       <aside v-if="selected" class="details">
         <strong>{{ selected.name || t("workTraceReply") }}</strong
+        ><template v-if="singleCall(selected)"
+          ><b>{{ t("workTraceInput") }}</b>
+          <pre>{{ singleCall(selected)!.input }}</pre>
+          <template v-if="singleCall(selected)!.result"
+            ><b>{{ t("workTraceResponse") }}</b>
+            <pre>{{ line(singleCall(selected)!.result) }}</pre>
+          </template></template
         ><span v-if="selected.model">{{ selected.model }}</span
         ><template v-if="selected.input"
           ><b>{{ t("workTraceInput") }}</b>

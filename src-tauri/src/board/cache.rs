@@ -1,4 +1,3 @@
-
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -14,7 +13,10 @@ pub struct FileStamp {
 impl FileStamp {
     pub fn read(path: &Path) -> Option<Self> {
         let metadata = std::fs::metadata(path).ok()?;
-        Some(Self { modified: metadata.modified().ok()?, len: metadata.len() })
+        Some(Self {
+            modified: metadata.modified().ok()?,
+            len: metadata.len(),
+        })
     }
 }
 
@@ -66,7 +68,11 @@ impl BoardCache {
         Self::install_locked(&mut inner, FileStamp::read(path), file)
     }
 
-    fn install_locked(inner: &mut CacheInner, stamp: Option<FileStamp>, file: TodoFile) -> Arc<BoardSnapshot> {
+    fn install_locked(
+        inner: &mut CacheInner,
+        stamp: Option<FileStamp>,
+        file: TodoFile,
+    ) -> Arc<BoardSnapshot> {
         inner.next_revision = inner.next_revision.saturating_add(1);
         let snapshot = Arc::new(BoardSnapshot {
             revision: inner.next_revision,

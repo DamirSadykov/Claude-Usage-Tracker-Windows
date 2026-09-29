@@ -6,6 +6,8 @@ import {
   filterTree,
   headersOnlyTree,
   modelCallNode,
+  groupModelCalls,
+  singleCall,
   pathTo,
   nodeType,
   traceSeries,
@@ -76,6 +78,31 @@ describe("model call nodes", () => {
     expect(modelCallNode({ id: "text", model: "main" }).name).toBe("");
     expect(pathTo(node, "sub-model")?.map((n) => n.id)).toEqual(["model", "c", "sub-model"]);
     expect(pathTo(node, "missing")).toBeNull();
+  });
+
+  it("groups consecutive single-call model nodes of one tool and renumbers them", () => {
+    const call = (id: string, name: string) =>
+      modelCallNode({ id, model: "m", cost: 1, calls: [{ id: `${id}:c`, name }] });
+    const session = aggregateTree({
+      id: "s",
+      kind: "session",
+      name: "s",
+      model: null,
+      startedAt: null,
+      endedAt: null,
+      tokens: 0,
+      cost: 0,
+      input: null,
+      result: null,
+      transcriptPath: null,
+      children: [call("a", "exec"), call("b", "exec"), call("c", "exec"), call("d", "apply_patch"), call("e", "exec")],
+    });
+    const grouped = groupModelCalls(session);
+    expect(grouped.children.map((n) => n.kind)).toEqual(["group", "model", "model"]);
+    expect(grouped.children[0].name).toBe("exec");
+    expect(grouped.children[0].cost).toBe(3);
+    expect(grouped.children[0].children.map((n) => n.sequence)).toEqual([1, 2, 3]);
+    expect(singleCall(grouped.children[1])?.name).toBe("apply_patch");
   });
 
   it("sums model tokens and cost upwards without counting tool wrappers twice", () => {

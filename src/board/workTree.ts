@@ -1,5 +1,5 @@
 export type ToolCallType = "read" | "edit" | "shell" | "agent" | "web" | "other";
-export type WorkNodeKind = "task" | "session" | "run" | "model" | "tool" | "agent";
+export type WorkNodeKind = "task" | "session" | "run" | "group" | "model" | "tool" | "agent";
 export interface TokenBreakdown {
   input: number;
   cacheRead: number;
@@ -206,6 +206,47 @@ export function callSummary(calls: readonly Pick<WorkNode, "name">[]): string {
   calls.forEach((call) => counts.set(call.name, (counts.get(call.name) ?? 0) + 1));
   return [...counts.entries()].map(([name, count]) => (count > 1 ? `${name} ×${count}` : name)).join(" · ");
 }
+export function singleCall(node: WorkNode): WorkNode | null {
+  const [call, ...rest] = node.kind === "model" ? node.children : [];
+  return call && !rest.length && call.kind === "tool" && !call.children.length ? call : null;
+}
+export function groupModelCalls(node: WorkNode): WorkNode {
+  const children: WorkNode[] = [];
+  let run: WorkNode[] = [];
+  const flush = () => {
+    if (run.length > 1) {
+      const first = run[0],
+        last = run[run.length - 1],
+        members = run.map((member, index) => ({ ...member, sequence: index + 1 }));
+      children.push({
+        id: `group:${first.id}`,
+        kind: "group",
+        name: singleCall(first)!.name,
+        model: members.every((member) => member.model === first.model) ? first.model : null,
+        startedAt: first.startedAt,
+        endedAt: last.endedAt,
+        tokens: members.reduce((sum, member) => sum + member.tokens, 0),
+        cost: members.reduce((sum, member) => sum + member.cost, 0),
+        input: null,
+        result: null,
+        transcriptPath: first.transcriptPath,
+        children: members,
+      });
+    } else children.push(...run);
+    run = [];
+  };
+  for (const child of node.children.map(groupModelCalls)) {
+    const call = singleCall(child);
+    if (call && run.length && singleCall(run[0])!.name === call.name) run.push(child);
+    else {
+      flush();
+      if (call) run.push(child);
+      else children.push(child);
+    }
+  }
+  flush();
+  return { ...node, children };
+}
 export function pathTo(root: WorkNode, id: string): WorkNode[] | null {
   if (root.id === id) return [root];
   for (const child of root.children) {
@@ -278,7 +319,8 @@ export function headersOnlyTree(node: WorkNode): WorkNode {
 }
 export function treeView(node: WorkNode, options: TreeViewOptions = {}): WorkNode | null {
   const filtered = filterTree(node, options.types);
-  return filtered && options.headersOnly ? headersOnlyTree(filtered) : filtered;
+  const view = filtered && options.headersOnly ? headersOnlyTree(filtered) : filtered;
+  return view && groupModelCalls(view);
 }
 export function timelineScale(root: WorkNode, minimumWidth = MIN_TIMELINE_WIDTH): TimelineScale {
   const span = bounds(root),

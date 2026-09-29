@@ -20,8 +20,8 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::contracts::analytics_read::BlockTotals;
 use crate::board::todos::TodoFile;
+use crate::contracts::analytics_read::BlockTotals;
 
 /// Sources that mean "the binding was STATED" — everything else (the
 /// SessionStart hook's `auto`, an unknown/blank source from a future writer) is

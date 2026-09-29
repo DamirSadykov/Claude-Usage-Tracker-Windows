@@ -13,8 +13,8 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 
-pub use crate::kernel::paths::claude_dir;
 use crate::analytics::stats::{CcAgentRow, CcUsageRow, StatsDb, ToolResultRow, TurnRow};
+pub use crate::kernel::paths::claude_dir;
 
 /// A whole transcript file parsed into its concerns: per-message usage rows
 /// (assistant lines), tool-result outcomes (user lines), turn-duration rows
