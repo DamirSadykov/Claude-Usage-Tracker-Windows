@@ -3,13 +3,15 @@ pub mod board;
 pub mod contracts;
 pub mod external;
 pub mod kernel;
+#[cfg(test)]
+mod layers;
 pub mod spec;
 pub mod task_cost;
 pub mod triage;
-#[cfg(test)]
-mod layers;
 
-pub use analytics::{alerts, cc, codex, corrections, domain, memory, project_groups, stats, status, usage};
+pub use analytics::{
+    alerts, cc, codex, corrections, domain, memory, project_groups, stats, status, usage,
+};
 pub use board::{cache, graph, graph_cache, payload, task_sessions, todos};
 pub use external::{enroll, identity};
 pub use kernel::{board_lock, report, sysmon};
@@ -33,10 +35,13 @@ use tokio::sync::Notify;
 
 use alerts::{tier_level, ActiveSession, AlertEngine, AppConfig};
 use domain::{compute_levels, is_muted, today_spent_for, UsageLevels};
+use kernel::{
+    keep_awake,
+    paths::{cc_hook_script_path, claude_dir},
+};
 use report::{DiagReport, DiagStore};
 use stats::StatsDb;
 use usage::UsageData;
-use kernel::{keep_awake, paths::{cc_hook_script_path, claude_dir}};
 
 static TRAY_OK: &[u8] = include_bytes!("../icons/tray-ok.png");
 static TRAY_WARN: &[u8] = include_bytes!("../icons/tray-warn.png");
@@ -252,7 +257,10 @@ const AUTO_START_MAX_ATTEMPTS: u32 = 3;
 enum AutoStartPhase {
     #[default]
     Idle,
-    Pending { fires_at: Instant, attempt: u32 },
+    Pending {
+        fires_at: Instant,
+        attempt: u32,
+    },
 }
 
 #[derive(Default)]
@@ -273,11 +281,7 @@ struct AutoStartCancelledEvent {
     reason: &'static str,
 }
 
-async fn run_cycle(
-    app: &AppHandle,
-    cfg: &AppConfig,
-    ctx: &mut AutoStartCtx,
-) -> Option<Instant> {
+async fn run_cycle(app: &AppHandle, cfg: &AppConfig, ctx: &mut AutoStartCtx) -> Option<Instant> {
     let usage = match usage::fetch_usage(&cfg.session_key, &cfg.org_id).await {
         Ok(u) => u,
         Err(e) => {
@@ -287,7 +291,12 @@ async fn run_cycle(
                 app,
                 "usage-fetch",
                 "Не удалось получить данные об использовании",
-                format!("fetch_usage failed: verdict={} blame={} {}", e.verdict.code(), e.verdict.blame(), e),
+                format!(
+                    "fetch_usage failed: verdict={} blame={} {}",
+                    e.verdict.code(),
+                    e.verdict.blame(),
+                    e
+                ),
             );
             let _ = app.emit(
                 "usage-error",
@@ -422,8 +431,8 @@ async fn run_cycle(
     let (fires_at, attempt) = match &ctx.phase {
         AutoStartPhase::Idle => {
             let fires_at = now + Duration::from_secs(AUTO_START_COUNTDOWN_SECS);
-            let fires_at_ms = chrono::Utc::now().timestamp_millis()
-                + (AUTO_START_COUNTDOWN_SECS as i64) * 1000;
+            let fires_at_ms =
+                chrono::Utc::now().timestamp_millis() + (AUTO_START_COUNTDOWN_SECS as i64) * 1000;
             ctx.phase = AutoStartPhase::Pending {
                 fires_at,
                 attempt: 1,
@@ -465,8 +474,7 @@ async fn run_cycle(
     }
 
     let next_at = Instant::now() + Duration::from_secs(AUTO_START_RETRY_SECS);
-    let next_at_ms =
-        chrono::Utc::now().timestamp_millis() + (AUTO_START_RETRY_SECS as i64) * 1000;
+    let next_at_ms = chrono::Utc::now().timestamp_millis() + (AUTO_START_RETRY_SECS as i64) * 1000;
     let next_attempt = attempt + 1;
     ctx.phase = AutoStartPhase::Pending {
         fires_at: next_at,
@@ -641,7 +649,10 @@ fn spawn_status_loop(app: AppHandle) {
 
             if cfg.service_status_enabled {
                 match status::fetch_status(etag.as_deref()).await {
-                    Ok(status::StatusFetch::Modified { status: s, etag: new_etag }) => {
+                    Ok(status::StatusFetch::Modified {
+                        status: s,
+                        etag: new_etag,
+                    }) => {
                         fail = 0;
                         if let Some(tag) = new_etag {
                             etag = Some(tag);
@@ -656,7 +667,11 @@ fn spawn_status_loop(app: AppHandle) {
                         // Notify on a real change only — never on the first fetch.
                         if cfg.service_status_notify && !first {
                             if last_indicator.as_deref() != Some(s.indicator.as_str()) {
-                                let kind = if s.indicator == "none" { "resolved" } else { "degraded" };
+                                let kind = if s.indicator == "none" {
+                                    "resolved"
+                                } else {
+                                    "degraded"
+                                };
                                 let _ = app.emit(
                                     "service-alert",
                                     ServiceAlert {
@@ -741,13 +756,15 @@ fn spawn_memory_loop(app: AppHandle) {
         let mut watches: HashMap<String, memory::Watch> = HashMap::new();
 
         loop {
-            let enabled =
-                { app.state::<Mutex<AppConfig>>().lock().unwrap().memory_bloat_enabled };
+            let enabled = {
+                app.state::<Mutex<AppConfig>>()
+                    .lock()
+                    .unwrap()
+                    .memory_bloat_enabled
+            };
             if enabled {
                 if let Some(s) = memory::scan() {
-                    if let Some(delta) =
-                        watches.entry(s.project.clone()).or_default().observe(&s)
-                    {
+                    if let Some(delta) = watches.entry(s.project.clone()).or_default().observe(&s) {
                         let _ = app.emit(
                             "memory-alert",
                             MemoryAlert {
@@ -798,7 +815,8 @@ fn spawn_triage_loop(app: AppHandle) {
 
         loop {
             if let Some(d) = triage::load(&path) {
-                if !d.generated_at.is_empty() && last_seen.as_deref() != Some(d.generated_at.as_str())
+                if !d.generated_at.is_empty()
+                    && last_seen.as_deref() != Some(d.generated_at.as_str())
                 {
                     // Gate the toast, but advance `last_seen` regardless — so
                     // toggling notifications off then on never replays a stale
@@ -1090,10 +1108,7 @@ async fn open_url(url: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn ensure_project(
-    session_key: String,
-    org_id: String,
-) -> Result<usage::ProjectInfo, String> {
+async fn ensure_project(session_key: String, org_id: String) -> Result<usage::ProjectInfo, String> {
     usage::ensure_project(&session_key, &org_id)
         .await
         .map_err(|e| e.to_string())
@@ -1151,12 +1166,16 @@ async fn ingest_cc_usage(
     // Disk-heavy walk/parse — keep it off the async runtime threads.
     tauri::async_runtime::spawn_blocking(move || {
         let mut inserted = 0;
-        if let Some(base) = claude { inserted += cc::ingest(&base, &db)?; }
-        if let Some(base) = codex { inserted += codex::ingest(&base, &db)?; }
+        if let Some(base) = claude {
+            inserted += cc::ingest(&base, &db)?;
+        }
+        if let Some(base) = codex {
+            inserted += codex::ingest(&base, &db)?;
+        }
         Ok(inserted)
     })
-        .await
-        .map_err(|e| e.to_string())?
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -1292,7 +1311,11 @@ fn todos_path(app: &AppHandle) -> Result<PathBuf, String> {
 #[tauri::command]
 fn get_todos(app: AppHandle) -> Result<Vec<todos::Todo>, String> {
     let path = todos_path(&app)?;
-    Ok(app.state::<cache::BoardCache>().load(&path).map(|snapshot| snapshot.file.todos.clone()).unwrap_or_default())
+    Ok(app
+        .state::<cache::BoardCache>()
+        .load(&path)
+        .map(|snapshot| snapshot.file.todos.clone())
+        .unwrap_or_default())
 }
 
 /// The change records of the board (t#360). Separate from [`get_todos`] because
@@ -1301,7 +1324,11 @@ fn get_todos(app: AppHandle) -> Result<Vec<todos::Todo>, String> {
 #[tauri::command]
 fn get_changes(app: AppHandle) -> Result<Vec<todos::Change>, String> {
     let path = todos_path(&app)?;
-    Ok(app.state::<cache::BoardCache>().load(&path).map(|snapshot| snapshot.file.changes.clone()).unwrap_or_default())
+    Ok(app
+        .state::<cache::BoardCache>()
+        .load(&path)
+        .map(|snapshot| snapshot.file.changes.clone())
+        .unwrap_or_default())
 }
 
 #[tauri::command]
@@ -1309,20 +1336,40 @@ fn get_board(app: AppHandle) -> Result<payload::BoardPayload, String> {
     let path = todos_path(&app)?;
     match app.state::<cache::BoardCache>().load(&path) {
         Ok(snapshot) => Ok(payload::board(snapshot.revision, &snapshot.file)),
-        Err(todos::LoadOutcome::FutureVersion { .. }) => Ok(payload::BoardPayload { revision: 0, todos: Vec::new(), changes: Vec::new(), state: "future-version" }),
-        Err(_) => Ok(payload::BoardPayload { revision: 0, todos: Vec::new(), changes: Vec::new(), state: "unreadable" }),
+        Err(todos::LoadOutcome::FutureVersion { .. }) => Ok(payload::BoardPayload {
+            revision: 0,
+            todos: Vec::new(),
+            changes: Vec::new(),
+            state: "future-version",
+        }),
+        Err(_) => Ok(payload::BoardPayload {
+            revision: 0,
+            todos: Vec::new(),
+            changes: Vec::new(),
+            state: "unreadable",
+        }),
     }
 }
 
 #[tauri::command]
 fn get_task_detail(app: AppHandle, id: String) -> Result<Option<todos::Todo>, String> {
     let path = todos_path(&app)?;
-    let snapshot = app.state::<cache::BoardCache>().load(&path).map_err(|outcome| match outcome {
-        todos::LoadOutcome::Unreadable { reason, .. } => reason,
-        todos::LoadOutcome::FutureVersion { version } => format!("board version {version} is newer than this reader"),
-        _ => "board unavailable".to_string(),
-    })?;
-    Ok(snapshot.file.todos.iter().find(|todo| todo.id == id).cloned())
+    let snapshot =
+        app.state::<cache::BoardCache>()
+            .load(&path)
+            .map_err(|outcome| match outcome {
+                todos::LoadOutcome::Unreadable { reason, .. } => reason,
+                todos::LoadOutcome::FutureVersion { version } => {
+                    format!("board version {version} is newer than this reader")
+                }
+                _ => "board unavailable".to_string(),
+            })?;
+    Ok(snapshot
+        .file
+        .todos
+        .iter()
+        .find(|todo| todo.id == id)
+        .cloned())
 }
 
 #[derive(Serialize)]
@@ -1342,9 +1389,13 @@ fn board_state(app: AppHandle) -> Result<BoardState, String> {
     let path = todos_path(&app)?;
     let file = path.display().to_string();
     Ok(match app.state::<cache::BoardCache>().load(&path) {
-        Ok(_) => {
-            BoardState { state: "ok", file, backup: None, reason: None, version: None }
-        }
+        Ok(_) => BoardState {
+            state: "ok",
+            file,
+            backup: None,
+            reason: None,
+            version: None,
+        },
         Err(todos::LoadOutcome::Unreadable { reason, backup }) => BoardState {
             state: "unreadable",
             file,
@@ -1352,10 +1403,16 @@ fn board_state(app: AppHandle) -> Result<BoardState, String> {
             reason: Some(reason),
             version: None,
         },
-        Err(todos::LoadOutcome::FutureVersion { version }) => {
-            BoardState { state: "future-version", file, backup: None, reason: None, version: Some(version) }
+        Err(todos::LoadOutcome::FutureVersion { version }) => BoardState {
+            state: "future-version",
+            file,
+            backup: None,
+            reason: None,
+            version: Some(version),
+        },
+        Err(todos::LoadOutcome::Missing) | Err(todos::LoadOutcome::Ok(_)) => {
+            unreachable!("cache normalizes missing boards")
         }
-        Err(todos::LoadOutcome::Missing) | Err(todos::LoadOutcome::Ok(_)) => unreachable!("cache normalizes missing boards"),
     })
 }
 
@@ -1711,6 +1768,11 @@ fn task_sessions_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir.join("task-sessions.jsonl"))
 }
 
+fn run_events_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    Ok(dir.join("run-events.jsonl"))
+}
+
 fn journal_time(ts: &str) -> Option<SystemTime> {
     let seconds = chrono::DateTime::parse_from_rfc3339(ts)
         .ok()?
@@ -1736,8 +1798,7 @@ fn open_run_step_starts(events: &[task_sessions::TaskSessionEvent]) -> Vec<Syste
             open.remove(event.session.as_str());
         }
     }
-    open
-        .into_values()
+    open.into_values()
         .filter(|event| event.source == "run-step")
         .filter_map(|event| journal_time(&event.ts))
         .collect()
@@ -1745,10 +1806,14 @@ fn open_run_step_starts(events: &[task_sessions::TaskSessionEvent]) -> Vec<Syste
 
 fn newest_transcript_mtime(root: &Path) -> Option<SystemTime> {
     fn visit(dir: &Path, newest: &mut Option<SystemTime>) {
-        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
-            let Ok(kind) = entry.file_type() else { continue };
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
             if kind.is_dir() {
                 visit(&path, newest);
             } else if kind.is_file()
@@ -1785,12 +1850,19 @@ fn spawn_keep_awake_worker(app: AppHandle) -> keep_awake::WakeHandle {
         let codex = codex::codex_dir()
             .as_deref()
             .map(|dir| newest_transcript_mtime(&dir.join("sessions")));
-        let newest_transcript = [claude.flatten(), codex.flatten()].into_iter().flatten().max();
+        let newest_transcript = [claude.flatten(), codex.flatten()]
+            .into_iter()
+            .flatten()
+            .max();
         let open_run_steps = task_sessions_path(&app)
             .map(|path| task_sessions::load(&path))
             .map(|events| open_run_step_starts(&events))
             .unwrap_or_default();
-        keep_awake::Activity { enabled, newest_transcript, open_run_steps }
+        keep_awake::Activity {
+            enabled,
+            newest_transcript,
+            open_run_steps,
+        }
     })
 }
 
@@ -1853,6 +1925,42 @@ async fn get_task_blocks(
         .collect();
     let totals = stats.block_totals_many(&spans).map_err(|e| e.to_string())?;
     Ok(task_sessions::compose(&blocks, &board, &totals))
+}
+
+#[tauri::command]
+async fn get_task_work_tree(
+    app: AppHandle,
+    stats: tauri::State<'_, Arc<StatsDb>>,
+    task: String,
+) -> Result<task_cost::TaskWorkTree, String> {
+    let board = todos::load_known(&todos_path(&app)?)?;
+    let Some(task_id) = task_sessions::resolve_task_ref(&board, task.trim()) else {
+        return Ok(task_cost::TaskWorkTree {
+            task,
+            sessions: Vec::new(),
+            attempts: Vec::new(),
+        });
+    };
+    let number = board
+        .todos
+        .iter()
+        .find(|todo| todo.id == task_id)
+        .map(|todo| todo.number)
+        .unwrap_or(0);
+    let events = task_sessions::load(&task_sessions_path(&app)?);
+    let usage = stats.sessions_all().map_err(|e| e.to_string())?;
+    let blocks = task_sessions::blocks(&events, &session_ends(&usage));
+    let run_events = task_cost::load_run_events(&run_events_path(&app)?);
+    let claude = claude_dir();
+    let codex = codex::codex_dir();
+    Ok(task_cost::build_task_work_tree(
+        &task_id,
+        number,
+        &blocks,
+        &run_events,
+        claude.as_deref(),
+        codex.as_deref(),
+    ))
 }
 
 /// The run graph of a change (t#306): the change's dependency subtree joined with
@@ -1937,14 +2045,22 @@ fn load_graph_metrics(
     let events = task_sessions::load(journal_path);
     let usage = stats.sessions_all().map_err(|e| e.to_string())?;
     let blocks = task_sessions::blocks(&events, &session_ends(&usage));
-    let spans: Vec<(String, String, String)> = blocks.iter().map(|block| {
-        (block.session.clone(), block.from.clone(), block.to.clone())
-    }).collect();
+    let spans: Vec<(String, String, String)> = blocks
+        .iter()
+        .map(|block| (block.session.clone(), block.from.clone(), block.to.clone()))
+        .collect();
     let totals = stats.block_totals_many(&spans).map_err(|e| e.to_string())?;
     let attr = task_cost::load(attribution_path).unwrap_or_default();
-    let task_costs = task_cost::compute(&attr, board, &usage, &blocks).tasks.into_iter()
-        .map(|task| (task.id, task.cost)).collect();
-    Ok(graph_cache::GraphMetrics { blocks, totals, task_costs })
+    let task_costs = task_cost::compute(&attr, board, &usage, &blocks)
+        .tasks
+        .into_iter()
+        .map(|task| (task.id, task.cost))
+        .collect();
+    Ok(graph_cache::GraphMetrics {
+        blocks,
+        totals,
+        task_costs,
+    })
 }
 
 #[tauri::command]
@@ -1954,7 +2070,9 @@ async fn get_graph_batch(
     change_refs: Vec<String>,
 ) -> Result<GraphBatch, String> {
     let board_path = todos_path(&app)?;
-    let snapshot = app.state::<cache::BoardCache>().load(&board_path)
+    let snapshot = app
+        .state::<cache::BoardCache>()
+        .load(&board_path)
         .map_err(|_| "board unavailable".to_string())?;
     let journal_path = task_sessions_path(&app)?;
     let attribution_path = task_attribution_path(&app)?;
@@ -1964,16 +2082,35 @@ async fn get_graph_batch(
         attribution_stamp: cache::FileStamp::read(&attribution_path),
         sqlite_revision: stats.graph_revision().map_err(|e| e.to_string())?,
     };
-    let metrics = app.state::<graph_cache::GraphCache>().get_or_compute(key, || {
-        load_graph_metrics(&stats, &snapshot.file, &journal_path, &attribution_path)
-    })?;
+    let metrics = app
+        .state::<graph_cache::GraphCache>()
+        .get_or_compute(key, || {
+            load_graph_metrics(&stats, &snapshot.file, &journal_path, &attribution_path)
+        })?;
     let mut seen = HashSet::new();
-    let refs: Vec<String> = change_refs.into_iter().map(|reference| reference.trim().to_string())
-        .filter(|reference| !reference.is_empty() && seen.insert(reference.clone())).collect();
-    let graphs: Vec<graph::GraphBatchGraph> = refs.iter().map(|reference| {
-        graph::build(&snapshot.file, reference, &metrics.blocks, &metrics.totals, &[], &metrics.task_costs).into()
-    }).collect();
-    let mut totals = GraphBatchTotals { changes: graphs.len() as u32, ..Default::default() };
+    let refs: Vec<String> = change_refs
+        .into_iter()
+        .map(|reference| reference.trim().to_string())
+        .filter(|reference| !reference.is_empty() && seen.insert(reference.clone()))
+        .collect();
+    let graphs: Vec<graph::GraphBatchGraph> = refs
+        .iter()
+        .map(|reference| {
+            graph::build(
+                &snapshot.file,
+                reference,
+                &metrics.blocks,
+                &metrics.totals,
+                &[],
+                &metrics.task_costs,
+            )
+            .into()
+        })
+        .collect();
+    let mut totals = GraphBatchTotals {
+        changes: graphs.len() as u32,
+        ..Default::default()
+    };
     let mut node_ids = HashSet::new();
     for node in graphs.iter().flat_map(|graph| graph.nodes.iter()) {
         if node_ids.insert(node.id.as_str()) {
@@ -1984,7 +2121,11 @@ async fn get_graph_batch(
             totals.messages += node.messages.unwrap_or_default();
         }
     }
-    Ok(GraphBatch { revision: snapshot.revision, graphs, totals })
+    Ok(GraphBatch {
+        revision: snapshot.revision,
+        graphs,
+        totals,
+    })
 }
 
 #[derive(Serialize)]
@@ -2000,7 +2141,9 @@ async fn get_graph_node_detail(
     task: String,
 ) -> Result<GraphNodeDetail, String> {
     let board_path = todos_path(&app)?;
-    let snapshot = app.state::<cache::BoardCache>().load(&board_path)
+    let snapshot = app
+        .state::<cache::BoardCache>()
+        .load(&board_path)
         .map_err(|_| "board unavailable".to_string())?;
     let journal_path = task_sessions_path(&app)?;
     let attribution_path = task_attribution_path(&app)?;
@@ -2010,24 +2153,61 @@ async fn get_graph_node_detail(
         attribution_stamp: cache::FileStamp::read(&attribution_path),
         sqlite_revision: stats.graph_revision().map_err(|e| e.to_string())?,
     };
-    let metrics = app.state::<graph_cache::GraphCache>().get_or_compute(key, || {
-        load_graph_metrics(&stats, &snapshot.file, &journal_path, &attribution_path)
-    })?;
+    let metrics = app
+        .state::<graph_cache::GraphCache>()
+        .get_or_compute(key, || {
+            load_graph_metrics(&stats, &snapshot.file, &journal_path, &attribution_path)
+        })?;
     let Some(task_id) = task_sessions::resolve_task_ref(&snapshot.file, &task) else {
-        return Ok(GraphNodeDetail { blocks: task_sessions::TaskBlocks { blocks: Vec::new(), explicit_blocks: 0, auto_blocks: 0 }, agents: Vec::new() });
+        return Ok(GraphNodeDetail {
+            blocks: task_sessions::TaskBlocks {
+                blocks: Vec::new(),
+                explicit_blocks: 0,
+                auto_blocks: 0,
+            },
+            agents: Vec::new(),
+        });
     };
-    let selected: Vec<(task_sessions::TaskBlock, contracts::analytics_read::BlockTotals)> = metrics.blocks.iter()
-        .zip(metrics.totals.iter()).filter(|(block, _)| block.task == task_id)
-        .map(|(block, total)| (block.clone(), total.clone())).collect();
-    let blocks: Vec<task_sessions::TaskBlock> = selected.iter().map(|(block, _)| block.clone()).collect();
-    let totals: Vec<contracts::analytics_read::BlockTotals> = selected.into_iter().map(|(_, total)| total).collect();
-    let agents = blocks.iter().map(|block| {
-        stats.block_agents(&block.session, &block.from, &block.to).map_err(|e| e.to_string())
-    }).collect::<Result<Vec<_>, _>>()?.into_iter().map(|rows| rows.into_iter().map(|row| graph::GraphAgent {
-        agent_id: row.agent_id, agent_type: row.agent_type, description: row.description,
-        cost: row.cost, total_tokens: row.total_tokens, messages: row.messages,
-    }).collect()).collect();
-    Ok(GraphNodeDetail { blocks: task_sessions::compose(&blocks, &snapshot.file, &totals), agents })
+    let selected: Vec<(
+        task_sessions::TaskBlock,
+        contracts::analytics_read::BlockTotals,
+    )> = metrics
+        .blocks
+        .iter()
+        .zip(metrics.totals.iter())
+        .filter(|(block, _)| block.task == task_id)
+        .map(|(block, total)| (block.clone(), total.clone()))
+        .collect();
+    let blocks: Vec<task_sessions::TaskBlock> =
+        selected.iter().map(|(block, _)| block.clone()).collect();
+    let totals: Vec<contracts::analytics_read::BlockTotals> =
+        selected.into_iter().map(|(_, total)| total).collect();
+    let agents = blocks
+        .iter()
+        .map(|block| {
+            stats
+                .block_agents(&block.session, &block.from, &block.to)
+                .map_err(|e| e.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| graph::GraphAgent {
+                    agent_id: row.agent_id,
+                    agent_type: row.agent_type,
+                    description: row.description,
+                    cost: row.cost,
+                    total_tokens: row.total_tokens,
+                    messages: row.messages,
+                })
+                .collect()
+        })
+        .collect();
+    Ok(GraphNodeDetail {
+        blocks: task_sessions::compose(&blocks, &snapshot.file, &totals),
+        agents,
+    })
 }
 
 /// Shows a block's transcript in the OS file manager and returns its path
@@ -2040,6 +2220,31 @@ async fn reveal_transcript(session: String, agent: Option<String>) -> Result<Str
     let agent = agent.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let path = cc::transcript_path(&base, session.trim(), agent)
         .ok_or("Транскрипт не найден — файл мог быть очищен по сроку хранения")?;
+    #[cfg(windows)]
+    let shown = std::process::Command::new("explorer")
+        .arg(format!("/select,{}", path.display()))
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| e.to_string());
+    #[cfg(not(windows))]
+    let shown = open::that(path.parent().unwrap_or(&path)).map_err(|e| e.to_string());
+    shown?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+async fn reveal_work_transcript(transcript_path: String) -> Result<String, String> {
+    let path = PathBuf::from(transcript_path)
+        .canonicalize()
+        .map_err(|_| "Транскрипт не найден — файл мог быть очищен по сроку хранения")?;
+    let allowed = [claude_dir(), codex::codex_dir()]
+        .into_iter()
+        .flatten()
+        .filter_map(|base| base.canonicalize().ok())
+        .any(|base| path.starts_with(base));
+    if !allowed {
+        return Err("Путь транскрипта находится вне каталогов Claude и Codex".into());
+    }
     #[cfg(windows)]
     let shown = std::process::Command::new("explorer")
         .arg(format!("/select,{}", path.display()))
@@ -2149,7 +2354,9 @@ fn get_raw_projects(stats: tauri::State<'_, Arc<StatsDb>>) -> Result<Vec<String>
 
 /// All project merge links (alias→canonical, issue #13) for the management tab.
 #[tauri::command]
-fn get_project_links(stats: tauri::State<'_, Arc<StatsDb>>) -> Result<Vec<stats::ProjectLink>, String> {
+fn get_project_links(
+    stats: tauri::State<'_, Arc<StatsDb>>,
+) -> Result<Vec<stats::ProjectLink>, String> {
     stats.project_links_all().map_err(|e| e.to_string())
 }
 
@@ -2177,7 +2384,9 @@ fn remove_project_link(
     app: tauri::AppHandle,
     stats: tauri::State<'_, Arc<StatsDb>>,
 ) -> Result<(), String> {
-    stats.remove_project_link(&alias).map_err(|e| e.to_string())?;
+    stats
+        .remove_project_link(&alias)
+        .map_err(|e| e.to_string())?;
     let _ = app.emit("project-links-changed", ());
     Ok(())
 }
@@ -2463,7 +2672,11 @@ fn heal_cc_hook(app: &AppHandle) -> Option<String> {
     }
 
     let script = cc_hook_script_path(app).ok()?;
-    wire_hook_event(&mut root, "SessionStart", &format!("node \"{script}\" hook"));
+    wire_hook_event(
+        &mut root,
+        "SessionStart",
+        &format!("node \"{script}\" hook"),
+    );
     wire_hook_event(&mut root, "Stop", &format!("node \"{script}\" stop-hook"));
     wire_hook_event_matched(
         &mut root,
@@ -2823,7 +3036,8 @@ fn write_todos_locked(
         Ok(())
     })?;
     *guard = Some(todo_status_map(&file));
-    app.state::<cache::BoardCache>().install(&path, file.clone());
+    app.state::<cache::BoardCache>()
+        .install(&path, file.clone());
     Ok(file.todos)
 }
 
@@ -2836,13 +3050,17 @@ fn write_todos_locked_replace(
     let mut guard = snap.0.lock().unwrap();
     let file = todos::replace_locked(&path, file)?;
     *guard = Some(todo_status_map(&file));
-    app.state::<cache::BoardCache>().install(&path, file.clone());
+    app.state::<cache::BoardCache>()
+        .install(&path, file.clone());
     Ok(file.todos)
 }
 
 fn mutation_payload(app: &AppHandle, id: &str) -> Result<payload::MutationPayload, String> {
     let path = todos_path(app)?;
-    let snapshot = app.state::<cache::BoardCache>().load(&path).map_err(|_| "board unavailable".to_string())?;
+    let snapshot = app
+        .state::<cache::BoardCache>()
+        .load(&path)
+        .map_err(|_| "board unavailable".to_string())?;
     Ok(payload::MutationPayload {
         revision: snapshot.revision,
         row: snapshot.file.find_todo(id).map(payload::row),
@@ -2867,7 +3085,11 @@ fn delete_todo(app: AppHandle, id: String) -> Result<Vec<todos::Todo>, String> {
 }
 
 #[tauri::command]
-fn add_todo_comment(app: AppHandle, id: String, body: String) -> Result<payload::MutationPayload, String> {
+fn add_todo_comment(
+    app: AppHandle,
+    id: String,
+    body: String,
+) -> Result<payload::MutationPayload, String> {
     if body.trim().is_empty() {
         return Err("comment body must not be empty".to_string());
     }
@@ -2876,7 +3098,9 @@ fn add_todo_comment(app: AppHandle, id: String, body: String) -> Result<payload:
     let _todos = write_todos_locked(&app, |file| {
         outcome = todos::add_comment(file, &id, "user", &body, &now);
     })?;
-    outcome.map(|()| mutation_payload(&app, &id)).and_then(|result| result)
+    outcome
+        .map(|()| mutation_payload(&app, &id))
+        .and_then(|result| result)
 }
 
 #[tauri::command]
@@ -2890,7 +3114,9 @@ fn remove_todo_comment(
     let _todos = write_todos_locked(&app, |file| {
         outcome = todos::remove_comment(file, &id, &comment_id, &now);
     })?;
-    outcome.map(|()| mutation_payload(&app, &id)).and_then(|result| result)
+    outcome
+        .map(|()| mutation_payload(&app, &id))
+        .and_then(|result| result)
 }
 
 #[tauri::command]
@@ -2971,14 +3197,22 @@ fn migrate_todo_refs(app: &AppHandle) -> Result<MigrationReport, String> {
     let mut probe = todos::load_for_write(&path)?;
     let dry = todos::migrate_refs(&mut probe);
     if dry.refs == 0 {
-        return Ok(MigrationReport { refs: 0, tasks: 0, backup: String::new() });
+        return Ok(MigrationReport {
+            refs: 0,
+            tasks: 0,
+            backup: String::new(),
+        });
     }
     let backup = todos::backup_after_verified_load(&path)?;
     let mut stats = todos::MigrationStats::default();
     write_todos_locked(&app, |file| {
         stats = todos::migrate_refs(file);
     })?;
-    Ok(MigrationReport { refs: stats.refs, tasks: stats.tasks, backup })
+    Ok(MigrationReport {
+        refs: stats.refs,
+        tasks: stats.tasks,
+        backup,
+    })
 }
 
 /// The most recent `todos.json` backup, or None if none exist — drives whether the
@@ -2993,14 +3227,15 @@ fn latest_todo_backup(app: AppHandle) -> Result<Option<todos::BackupInfo>, Strin
 /// installed under the write lock; the file watcher then pushes the reload to the
 /// todo window. Returns the restored list.
 #[tauri::command]
-fn restore_todo_backup(
-    app: AppHandle,
-    name: Option<String>,
-) -> Result<Vec<todos::Todo>, String> {
+fn restore_todo_backup(app: AppHandle, name: Option<String>) -> Result<Vec<todos::Todo>, String> {
     let path = todos_path(&app)?;
     let name = match name {
         Some(n) if !n.trim().is_empty() => n,
-        _ => todos::latest_backup(&path).ok_or("Нет доступного бэкапа для отката")?.name,
+        _ => {
+            todos::latest_backup(&path)
+                .ok_or("Нет доступного бэкапа для отката")?
+                .name
+        }
     };
     let restored = todos::read_backup(&path, &name)?;
     write_todos_locked_replace(&app, restored)
@@ -3115,7 +3350,9 @@ fn spawn_todos_watch(app: AppHandle) {
                     *guard = todos::load_known(&path).ok().map(|f| todo_status_map(&f));
                 }
                 Err(todos::TransactError::Unwritable(e)) => {
-                    warn!("todos watcher startup: board not writable, skipping number backfill: {e}");
+                    warn!(
+                        "todos watcher startup: board not writable, skipping number backfill: {e}"
+                    );
                     *guard = todos::load_known(&path).ok().map(|f| todo_status_map(&f));
                 }
                 Err(todos::TransactError::Failed(e)) => {
@@ -3257,7 +3494,10 @@ pub fn run() {
                 std::fs::create_dir_all(&log_dir).ok();
                 let pruned = report::prune_rotated_logs(&log_dir, report::LOG_RETENTION);
                 if pruned > 0 {
-                    info!("Removed {pruned} rotated log file(s) older than {} days", report::LOG_RETENTION.as_secs() / 86_400);
+                    info!(
+                        "Removed {pruned} rotated log file(s) older than {} days",
+                        report::LOG_RETENTION.as_secs() / 86_400
+                    );
                 }
                 report::set_panic_file(&log_dir);
                 if let Some(rep) = report::take_panic_report(&log_dir, &version) {
@@ -3354,8 +3594,8 @@ pub fn run() {
                             } else {
                                 // Skip the re-open if the window was just auto-hidden
                                 // by this same click stealing focus.
-                                let since = now_ms()
-                                    .saturating_sub(tray_last_hide.load(Ordering::Relaxed));
+                                let since =
+                                    now_ms().saturating_sub(tray_last_hide.load(Ordering::Relaxed));
                                 if since > REOPEN_DEBOUNCE_MS {
                                     show_flyout(&window, Some(position));
                                 }
@@ -3448,10 +3688,12 @@ pub fn run() {
             refresh_corrections_metrics,
             get_task_costs,
             get_task_blocks,
+            get_task_work_tree,
             get_task_graph,
             get_graph_batch,
             get_graph_node_detail,
             reveal_transcript,
+            reveal_work_transcript,
             refresh_task_costs,
             get_triage_digest,
             get_triage_schedule,
@@ -3502,7 +3744,9 @@ mod hook_install_tests {
 
     #[test]
     fn recognizes_legacy_and_unified_hook_commands() {
-        assert!(is_our_hook_command(r#"node "C:/app/scripts/cc-todos-hook.mjs""#));
+        assert!(is_our_hook_command(
+            r#"node "C:/app/scripts/cc-todos-hook.mjs""#
+        ));
         assert!(is_our_hook_command(r#"node "C:/app/scripts/cli.mjs" hook"#));
         assert!(!is_our_hook_command("node some-other-tool.mjs"));
     }
@@ -3520,7 +3764,12 @@ mod hook_install_tests {
         let dir = std::env::temp_dir().join("cut_hook_cleanup_test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        for name in ["cc-todos-hook.mjs", "cc-todos.mjs", "cc-phases.mjs", "keep.mjs"] {
+        for name in [
+            "cc-todos-hook.mjs",
+            "cc-todos.mjs",
+            "cc-phases.mjs",
+            "keep.mjs",
+        ] {
             std::fs::write(dir.join(name), "x").unwrap();
         }
         remove_legacy_scripts(&dir);
@@ -3528,7 +3777,7 @@ mod hook_install_tests {
         assert!(!dir.join("cc-todos.mjs").exists());
         assert!(!dir.join("cc-phases.mjs").exists());
         assert!(dir.join("keep.mjs").exists()); // untouched
-        // A second run over the now-clean dir must not error.
+                                                // A second run over the now-clean dir must not error.
         remove_legacy_scripts(&dir);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3559,17 +3808,32 @@ mod hook_install_tests {
                 { "type": "command", "command": "node \"C:/kb/hooks.mjs\" lifecycle codex SessionStart", "timeout": 30 }
             ] } ] }
         });
-        wire_codex_session_start(&mut root, "node \"C:/app/scripts/cli.mjs\" hook --host codex");
+        wire_codex_session_start(
+            &mut root,
+            "node \"C:/app/scripts/cli.mjs\" hook --host codex",
+        );
         let groups = root["hooks"]["SessionStart"].as_array().unwrap();
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[1]["matcher"], CODEX_SESSION_START_MATCHER);
-        assert_eq!(groups[1]["hooks"][0]["additionalContextLimit"], CODEX_HOOK_CONTEXT_LIMIT);
+        assert_eq!(
+            groups[1]["hooks"][0]["additionalContextLimit"],
+            CODEX_HOOK_CONTEXT_LIMIT
+        );
         assert_eq!(groups[1]["hooks"][0]["timeout"], CODEX_HOOK_TIMEOUT_SECS);
-        wire_codex_session_start(&mut root, "node \"D:/moved/scripts/cli.mjs\" hook --host codex");
+        wire_codex_session_start(
+            &mut root,
+            "node \"D:/moved/scripts/cli.mjs\" hook --host codex",
+        );
         let groups = root["hooks"]["SessionStart"].as_array().unwrap();
         assert_eq!(groups.len(), 2);
-        assert_eq!(groups[1]["hooks"][0]["command"], "node \"D:/moved/scripts/cli.mjs\" hook --host codex");
-        assert_eq!(groups[0]["hooks"][0]["command"], "node \"C:/kb/hooks.mjs\" lifecycle codex SessionStart");
+        assert_eq!(
+            groups[1]["hooks"][0]["command"],
+            "node \"D:/moved/scripts/cli.mjs\" hook --host codex"
+        );
+        assert_eq!(
+            groups[0]["hooks"][0]["command"],
+            "node \"C:/kb/hooks.mjs\" lifecycle codex SessionStart"
+        );
     }
 
     #[test]
@@ -3690,9 +3954,20 @@ mod hook_install_tests {
         let mut root = serde_json::json!({});
         wire_plan_pair(&mut root);
         wire_plan_pair(&mut root); // idempotency: a re-install must not duplicate
-        assert_eq!(commands_for(&root, "PostToolUse"), vec![ENTER_CMD, EXIT_CMD]);
-        assert!(settings_has_cc_hook_matched(&root, "PostToolUse", "EnterPlanMode"));
-        assert!(settings_has_cc_hook_matched(&root, "PostToolUse", "ExitPlanMode"));
+        assert_eq!(
+            commands_for(&root, "PostToolUse"),
+            vec![ENTER_CMD, EXIT_CMD]
+        );
+        assert!(settings_has_cc_hook_matched(
+            &root,
+            "PostToolUse",
+            "EnterPlanMode"
+        ));
+        assert!(settings_has_cc_hook_matched(
+            &root,
+            "PostToolUse",
+            "ExitPlanMode"
+        ));
     }
 
     #[test]
@@ -3730,8 +4005,15 @@ mod hook_install_tests {
         wire_hook_event_matched(&mut root, "PreToolUse", "ExitPlanMode", GUARD_CMD);
         wire_hook_event_matched(&mut root, "PreToolUse", "ExitPlanMode", GUARD_CMD); // re-install
         assert_eq!(commands_for(&root, "PreToolUse"), vec![GUARD_CMD]);
-        assert_eq!(commands_for(&root, "PostToolUse"), vec![ENTER_CMD, EXIT_CMD]);
-        assert!(settings_has_cc_hook_matched(&root, "PreToolUse", "ExitPlanMode"));
+        assert_eq!(
+            commands_for(&root, "PostToolUse"),
+            vec![ENTER_CMD, EXIT_CMD]
+        );
+        assert!(settings_has_cc_hook_matched(
+            &root,
+            "PreToolUse",
+            "ExitPlanMode"
+        ));
     }
 
     #[test]
@@ -3782,7 +4064,10 @@ mod todo_snapshot_tests {
     }
 
     fn board(todos: Vec<todos::Todo>) -> todos::TodoFile {
-        todos::TodoFile { todos, ..Default::default() }
+        todos::TodoFile {
+            todos,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -3798,7 +4083,14 @@ mod todo_snapshot_tests {
         let prev: HashMap<String, String> = [("a".to_string(), "queue".to_string())].into();
         let file = board(vec![todo("a", "done")]);
         let (_, alerts) = diff_snapshot(Some(&prev), &file);
-        assert_eq!(alerts, vec![TodoStatusAlert { subject: "task a".to_string(), status: "done".to_string(), project: None }]);
+        assert_eq!(
+            alerts,
+            vec![TodoStatusAlert {
+                subject: "task a".to_string(),
+                status: "done".to_string(),
+                project: None
+            }]
+        );
     }
 
     #[test]

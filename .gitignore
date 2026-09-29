@@ -21,3 +21,4 @@ settings.local.json
 .claude/phases/
 src-tauri/target-test/
 target-test/
+/.codex-cargo-target/
