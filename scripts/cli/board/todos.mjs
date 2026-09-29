@@ -49,12 +49,18 @@ import { matchPlanCli, specsEnabled } from "../kernel/settings.mjs";
 import { appDataFile } from "../kernel/appdata.mjs";
 import { findChange, changeAddress, CURRENT, BoardUnreadableError, STATUSES, col, isDone, isChangeRoot, normalizeLimit, todosPath, load, save, boardPath, loadBoard, assertBoardWritable, loadBoardForWrite, saveBoard, withDeferredSave, resolveTask, changeRootsFor, changeAsRoot, specAddressesForManual } from "../kernel/board-io.mjs";
 import { withBoardLock } from "../kernel/board-lock.mjs";
-import { findSessionTranscripts, parseTouchedFiles, reconcileTodo, applyOutcome } from "../process/outcome.mjs";
-import { runVerify } from "../process/run-step.mjs";
 
 let specPort = null;
+let closePort = null;
 export function setSpecPort(port) {
   specPort = port;
+}
+
+// Process owns transcripts, reconciliation and execution.  Board receives just
+// the closing capability at the composition root (cli.mjs), keeping this layer
+// dependent on kernel only.
+export function setClosePort(port) {
+  closePort = port;
 }
 
 export { findChange, changeAddress, CURRENT, BoardUnreadableError, STATUSES, col, isDone, isChangeRoot, normalizeLimit, boardPath, loadBoard, assertBoardWritable, loadBoardForWrite, saveBoard, withDeferredSave, resolveTask, changeRootsFor, changeAsRoot, specAddressesForManual } from "../kernel/board-io.mjs";
@@ -254,39 +260,6 @@ function changeSessionRefusal(reason) {
   return `refusing: ${reason}\n\n${CHANGE_SESSION_TEMPLATE}`;
 }
 
-// `parseTouchedFiles` is the canonical parser for editing tool_use entries.
-// Agent has no file_path, so it is intentionally the one small extra predicate
-// here; a successful Agent call is work even when its subagent made no edit.
-function transcriptHasAgentCallSince(raw, since) {
-  for (const line of String(raw || "").split("\n")) {
-    if (!line.includes('"tool_use"') || !line.includes('"Agent"')) continue;
-    let rec;
-    try {
-      rec = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    if (typeof rec.timestamp !== "string" || rec.timestamp < since) continue;
-    const content = rec?.message?.content;
-    if (Array.isArray(content) && content.some((item) => item?.type === "tool_use" && item.name === "Agent")) return true;
-  }
-  return false;
-}
-
-function hasChangeSessionWork(session, startAt) {
-  for (const transcript of findSessionTranscripts(session)) {
-    let raw;
-    try {
-      raw = readFileSync(transcript, "utf8");
-    } catch {
-      continue;
-    }
-    if (transcriptHasAgentCallSince(raw, startAt)) return true;
-    if (parseTouchedFiles(raw).touches.some((touch) => touch.mutates && touch.ts && touch.ts >= startAt)) return true;
-  }
-  return false;
-}
-
 function guardChangeSession({ data, todo, status, flags }) {
   const session = currentSessionId(flags);
   const roots = changeRootIds(data, todo);
@@ -306,7 +279,9 @@ function guardChangeSession({ data, todo, status, flags }) {
   }
   if (status === "done") {
     const start = startsHere[startsHere.length - 1];
-    if (!hasChangeSessionWork(session, start.ts)) {
+    // Without the process port this capability is unavailable: preserve the
+    // ordinary board mutation rather than failing because a host omitted it.
+    if (closePort?.hasSessionWork && !closePort.hasSessionWork(session, start.ts)) {
       fail(changeSessionRefusal(`no work in the window of #${todo.number} — no Agent call and no edit since its start`));
     }
   }
@@ -375,8 +350,9 @@ function cmdTake(args) {
 // puts on a field lives HERE, in the refusal or the warning the handler prints —
 // not in an instruction the caller is expected to have read first.
 
-async function setStatus({ data, file, todo, value, flags }) {
+function setStatus({ data, file, todo, value, flags, changeSession, close }) {
   const status = String(value);
+  changeSession ??= guardChangeSession({ data, todo, status, flags });
   if (!STATUSES.includes(status))
     fail(`invalid status "${value}". valid: ${STATUSES.join(" | ")}`);
   // Done-gate (#88): `done` is the ONLY status that releases downstream tasks
@@ -396,7 +372,6 @@ async function setStatus({ data, file, todo, value, flags }) {
       );
     }
   }
-  const changeSession = guardChangeSession({ data, todo, status, flags });
   // The interactive change path has a strong session window.  Close it only
   // after giving its declared check to the same reconciliation used by
   // `todos outcome --write`; the headless runner has no session id here and
@@ -405,14 +380,7 @@ async function setStatus({ data, file, todo, value, flags }) {
   // A repeated `set status … done` is deliberately an idempotent board edit.
   // It has no new work window to verify, and must not replace an earlier ok
   // outcome just because the declared check happens to fail now.
-  if (status === "done" && todo.status !== "done" && changeSession.session && !flags.force && changeRootIds(data, todo).size) {
-    const declared = typeof todo.verify === "string" ? todo.verify.trim() : "";
-    let verdict;
-    if (declared) {
-      const check = await runVerify({ cmd: declared, cwd: process.cwd() });
-      verdict = check.code === 0 ? "ok" : "issue";
-      process.stdout.write(`verify: ${declared} -> ${verdict}\n`);
-    }
+  if (close && todo.status !== "done") {
     appendTaskSessionEvent({
       session: changeSession.session,
       task: todo.id,
@@ -421,13 +389,16 @@ async function setStatus({ data, file, todo, value, flags }) {
       project: todo.project || null,
     });
     closeEventWritten = true;
-    const reconciliation = reconcileTodo({ file, data, todo, verify: verdict });
+    const reconciliation = closePort.reconcileTodo({ file, data, todo, verify: close.verdict });
     const { report } = reconciliation;
-    if (report.finalized) applyOutcome(file, data, todo, report);
+    if (report.finalized) closePort.applyOutcomeToTodo(todo, report);
     if (!report.finalized) {
       fail(`outcome not finalized (${report.outcome_reason}) — nothing written`);
     }
     if (report.outcome === "issue") {
+      // The rejected close still records its reconciliation; status deliberately
+      // remains in_progress, so persist the outcome before reporting failure.
+      save(file, data);
       fail(`refusing: outcome issue (${report.outcome_reason}); #${todo.number} remains in_progress`);
     }
     process.stdout.write(`outcome: ${report.outcome} (${report.outcome_reason})\n`);
@@ -1207,10 +1178,40 @@ async function cmdSet(args) {
   if (typeof value !== "string")
     fail(`usage: cli todos set ${field} <task> ${spec.values}`);
   const file = todosPath();
-  const data = loadBoardForWrite(file);
-  const todo = resolveTask(data, task);
-  if (!todo) fail(`no todo with id ${task}`);
-  await setField({ data, file, todo, field, value, flags });
+  // The guard reads transcripts and verify may run for minutes.  Both happen
+  // before acquiring the board lock; only the fresh reconciliation and write
+  // below are one short board transaction.
+  if (field === "status") {
+    const before = loadBoardForWrite(file);
+    const beforeTodo = resolveTask(before, task);
+    if (!beforeTodo) fail(`no todo with id ${task}`);
+    const status = String(value);
+    if (!STATUSES.includes(status)) fail(`invalid status "${value}". valid: ${STATUSES.join(" | ")}`);
+    const changeSession = guardChangeSession({ data: before, todo: beforeTodo, status, flags });
+    let close = null;
+    if (status === "done" && beforeTodo.status !== "done" && changeSession.session && !flags.force && changeRootIds(before, beforeTodo).size && closePort) {
+      const declared = typeof beforeTodo.verify === "string" ? beforeTodo.verify.trim() : "";
+      let verdict;
+      if (declared) {
+        const check = await closePort.runVerify({ cmd: declared, cwd: process.cwd() });
+        verdict = check.code === 0 ? "ok" : "issue";
+        process.stdout.write(`verify: ${declared} -> ${verdict}\n`);
+      }
+      close = { session: changeSession.session, verdict };
+    }
+    return withBoardLock(file, () => {
+      const data = loadBoardForWrite(file);
+      const todo = resolveTask(data, task);
+      if (!todo) fail(`no todo with id ${task}`);
+      return setStatus({ data, file, todo, value, flags, changeSession, close });
+    });
+  }
+  return withBoardLock(file, () => {
+    const data = loadBoardForWrite(file);
+    const todo = resolveTask(data, task);
+    if (!todo) fail(`no todo with id ${task}`);
+    return setField({ data, file, todo, field, value, flags });
+  });
 }
 
 // Minimal `--flag value` parser: collects positional args and flag pairs.
@@ -2418,17 +2419,18 @@ export const MUTATING = new Set([
 
 export function run(args) {
   const [cmd, ...rest] = args;
+  if (cmd === "set") return cmdSet(rest);
   if (MUTATING.has(cmd)) return withBoardLock(todosPath(), () => dispatch(cmd, rest));
   return dispatch(cmd, rest);
 }
 
-async function dispatch(cmd, rest) {
+function dispatch(cmd, rest) {
   switch (cmd) {
     case "add":
       cmdAdd(rest);
       break;
     case "set":
-      await cmdSet(rest);
+      cmdSet(rest);
       break;
     case "take":
       cmdTake(rest);

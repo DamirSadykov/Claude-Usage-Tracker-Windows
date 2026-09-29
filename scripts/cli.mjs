@@ -130,11 +130,19 @@ try {
   } else if (area === "todos") {
     const ritual = await import(new URL("./cli/spec/board-ritual.mjs", import.meta.url));
     const spec = await import(new URL("./cli/spec/spec.mjs", import.meta.url));
+    const outcome = await import(new URL("./cli/process/outcome.mjs", import.meta.url));
+    const runStep = await import(new URL("./cli/process/run-step.mjs", import.meta.url));
     const todos = await import(new URL(mod, import.meta.url));
     todos.setSpecPort({
       resolveAddress: spec.resolveAddress,
       formatSections: ritual.formatSpecSections,
       recordBaseline: ritual.recordSpecBaseline,
+    });
+    todos.setClosePort({
+      hasSessionWork: outcome.hasSessionWork,
+      reconcileTodo: outcome.reconcileTodo,
+      applyOutcomeToTodo: outcome.applyOutcomeToTodo,
+      runVerify: runStep.runVerify,
     });
     await todos.run(rest);
   } else {

@@ -50,7 +50,7 @@ describe("todos list scope and pagination", () => {
   const currentProject = path.basename(process.cwd());
 
   const run = (...args) => execFileSync(process.execPath, [cli, "todos", "list", ...args], {
-    env: { ...process.env, APPDATA: dir },
+    env: { ...envWithoutSession(), APPDATA: dir },
     encoding: "utf8",
   });
 
@@ -555,7 +555,7 @@ describe("todos take without a session id", () => {
         todos: [{ id: "task-uuid", number: 1, subject: "s", status: "in_progress", project: "p" }],
       }),
     );
-    const env = { ...process.env, APPDATA: dir, CLAUDE_CODE_SESSION_ID: "sess-cont" };
+    const env = { ...envWithoutSession(), APPDATA: dir, CLAUDE_CODE_SESSION_ID: "sess-cont" };
     const out = execFileSync(process.execPath, [cli, "todos", "set", "status", "1", "in_progress"], {
       env,
       encoding: "utf8",
@@ -570,7 +570,7 @@ describe("todos take without a session id", () => {
   it("fails with a message naming the variable and the --session escape", () => {
     const dir = mkdtempSync(path.join(os.tmpdir(), "cut-take-no-session-"));
     mkdirSync(path.join(dir, "com.claude-usage-tracker.app"), { recursive: true });
-    const env = { ...process.env, APPDATA: dir };
+    const env = { ...envWithoutSession(), APPDATA: dir };
     delete env.CLAUDE_CODE_SESSION_ID;
     let stderr = "";
     let failed = false;
@@ -711,7 +711,7 @@ describe("declaration commands", () => {
 
   const run = (...args) =>
     execFileSync(process.execPath, [cli, "todos", ...args], {
-      env: { ...process.env, APPDATA: dir },
+      env: { ...envWithoutSession(), APPDATA: dir },
       encoding: "utf8",
     });
 
@@ -719,7 +719,7 @@ describe("declaration commands", () => {
   const refuse = (...args) => {
     try {
       execFileSync(process.execPath, [cli, "todos", ...args], {
-        env: { ...process.env, APPDATA: dir },
+        env: { ...envWithoutSession(), APPDATA: dir },
         encoding: "utf8",
         stdio: "pipe",
       });
@@ -973,7 +973,7 @@ describe("todos pipeline declarations", () => {
 
   const pipeline = (...args) =>
     execFileSync(process.execPath, [cli, "todos", "pipeline", ...args], {
-      env: { ...process.env, APPDATA: dir },
+      env: { ...envWithoutSession(), APPDATA: dir },
       encoding: "utf8",
     });
 
@@ -1111,14 +1111,14 @@ describe("todos set", () => {
 
   const run = (...args) =>
     execFileSync(process.execPath, [cli, "todos", ...args], {
-      env: { ...process.env, APPDATA: dir },
+      env: { ...envWithoutSession(), APPDATA: dir },
       encoding: "utf8",
     });
 
   const refuse = (...args) => {
     try {
       execFileSync(process.execPath, [cli, "todos", ...args], {
-        env: { ...process.env, APPDATA: dir },
+        env: { ...envWithoutSession(), APPDATA: dir },
         encoding: "utf8",
         stdio: "pipe",
       });
@@ -1174,7 +1174,7 @@ describe("todos set", () => {
     let error;
     try {
       execFileSync(process.execPath, ["--input-type=module", "--eval", script], {
-        env: { ...process.env, APPDATA: dir },
+        env: { ...envWithoutSession(), APPDATA: dir },
         encoding: "utf8",
         stdio: "pipe",
       });
@@ -1316,14 +1316,14 @@ describe("todos add: subject cap", () => {
 
   const run = (...args) =>
     execFileSync(process.execPath, [cli, "todos", ...args], {
-      env: { ...process.env, APPDATA: dir },
+      env: { ...envWithoutSession(), APPDATA: dir },
       encoding: "utf8",
     });
 
   const refuse = (...args) => {
     try {
       execFileSync(process.execPath, [cli, "todos", ...args], {
-        env: { ...process.env, APPDATA: dir },
+        env: { ...envWithoutSession(), APPDATA: dir },
         encoding: "utf8",
         stdio: "pipe",
       });
@@ -1382,14 +1382,14 @@ describe("rules the CLI enforces instead of explaining", () => {
 
   const run = (...args) =>
     execFileSync(process.execPath, [cli, "todos", ...args], {
-      env: { ...process.env, APPDATA: dir },
+      env: { ...envWithoutSession(), APPDATA: dir },
       encoding: "utf8",
     });
 
   const refuse = (...args) => {
     try {
       execFileSync(process.execPath, [cli, "todos", ...args], {
-        env: { ...process.env, APPDATA: dir },
+        env: { ...envWithoutSession(), APPDATA: dir },
         encoding: "utf8",
         stdio: "pipe",
       });
@@ -1553,7 +1553,7 @@ describe("rules the CLI enforces instead of explaining", () => {
       todo(1, { verify: 'node -e "process.exit(0)"' }),
       todo(2, { change: true, depends_on: ["id-1"] }),
     ]);
-    const env = { ...process.env, APPDATA: dir, USERPROFILE: home, CLAUDE_CODE_SESSION_ID: session };
+    const env = { ...envWithoutSession(), APPDATA: dir, USERPROFILE: home, CLAUDE_CODE_SESSION_ID: session };
     execFileSync(process.execPath, [cli, "todos", "set", "status", "1", "in_progress"], { env, encoding: "utf8" });
     const out = execFileSync(process.execPath, [cli, "todos", "set", "status", "1", "done"], { env, encoding: "utf8" });
     expect(out).toContain("verify:");
@@ -1579,7 +1579,7 @@ describe("rules the CLI enforces instead of explaining", () => {
       todo(1, { verify: 'node -e "process.exit(process.env.VERIFY_FAIL ? 7 : 0)"' }),
       todo(2, { change: true, depends_on: ["id-1"] }),
     ]);
-    const env = { ...process.env, APPDATA: dir, USERPROFILE: home, CLAUDE_CODE_SESSION_ID: session };
+    const env = { ...envWithoutSession(), APPDATA: dir, USERPROFILE: home, CLAUDE_CODE_SESSION_ID: session };
     execFileSync(process.execPath, [cli, "todos", "set", "status", "1", "in_progress"], { env, encoding: "utf8" });
     execFileSync(process.execPath, [cli, "todos", "set", "status", "1", "done"], { env, encoding: "utf8" });
     const out = execFileSync(process.execPath, [cli, "todos", "set", "status", "1", "done"], {
@@ -1601,7 +1601,7 @@ describe("rules the CLI enforces instead of explaining", () => {
       JSON.stringify({ timestamp: "2099-01-01T00:00:00.000Z", message: { content: [{ type: "tool_use", name: "Agent", input: {} }] } }) + "\n",
     );
     seed([todo(1, { verify: 'node -e "process.exit(7)"' }), todo(2, { change: true, depends_on: ["id-1"] })]);
-    const env = { ...process.env, APPDATA: dir, USERPROFILE: home, CLAUDE_CODE_SESSION_ID: session };
+    const env = { ...envWithoutSession(), APPDATA: dir, USERPROFILE: home, CLAUDE_CODE_SESSION_ID: session };
     execFileSync(process.execPath, [cli, "todos", "set", "status", "1", "in_progress"], { env, encoding: "utf8" });
     let err = "";
     try {
@@ -1616,7 +1616,7 @@ describe("rules the CLI enforces instead of explaining", () => {
 
   it("does not rerun verify or reconcile for the runner-style close without a session", () => {
     seed([todo(1, { verify: 'node -e "process.exit(7)"' }), todo(2, { change: true, depends_on: ["id-1"] })]);
-    const env = { ...process.env, APPDATA: dir };
+    const env = { ...envWithoutSession(), APPDATA: dir };
     delete env.CLAUDE_CODE_SESSION_ID;
     execFileSync(process.execPath, [cli, "todos", "set", "status", "1", "in_progress"], { env, encoding: "utf8" });
     const out = execFileSync(process.execPath, [cli, "todos", "set", "status", "1", "done"], { env, encoding: "utf8" });
@@ -1722,7 +1722,7 @@ describe("todos — board recovery & versions (t#575)", () => {
   const run = (...args) => {
     const r = spawnSync(process.execPath, [cli, "todos", ...args], {
       encoding: "utf8",
-      env: { ...process.env, APPDATA: dir },
+      env: { ...envWithoutSession(), APPDATA: dir },
       windowsHide: true,
     });
     return { code: r.status, out: r.stdout || "", err: r.stderr || "" };

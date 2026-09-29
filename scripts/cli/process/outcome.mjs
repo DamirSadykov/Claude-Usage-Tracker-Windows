@@ -373,6 +373,29 @@ export function findSessionTranscripts(session, root = claudeProjectsDir()) {
   return [];
 }
 
+// The interactive-close guard's strong-work predicate.  It belongs here with
+// transcript discovery/parsing, rather than making board depend on process.
+function transcriptHasAgentCallSince(raw, since) {
+  for (const line of String(raw || "").split("\n")) {
+    if (!line.includes('"tool_use"') || !line.includes('"Agent"')) continue;
+    let rec;
+    try { rec = JSON.parse(line); } catch { continue; }
+    if (typeof rec.timestamp !== "string" || rec.timestamp < since) continue;
+    if (Array.isArray(rec?.message?.content) && rec.message.content.some((item) => item?.type === "tool_use" && item.name === "Agent")) return true;
+  }
+  return false;
+}
+
+export function hasSessionWork(session, startAt) {
+  for (const transcript of findSessionTranscripts(session)) {
+    let raw;
+    try { raw = readFileSync(transcript, "utf8"); } catch { continue; }
+    if (transcriptHasAgentCallSince(raw, startAt)) return true;
+    if (parseTouchedFiles(raw).touches.some((touch) => touch.mutates && touch.ts && touch.ts >= startAt)) return true;
+  }
+  return false;
+}
+
 // ── command ──────────────────────────────────────────────────────────────────
 function parseFlags(args) {
   const f = { positional: [] };
@@ -457,11 +480,16 @@ export function stepChanges(todo, cwd) {
 export function applyOutcome(file, data, todo, report) {
   const t = data.todos.find((x) => x && x.id === todo.id);
   if (!t) return false;
-  t.outcome = report.outcome;
-  t.outcome_reason = report.outcome_reason;
-  t.outcome_at = new Date().toISOString();
+  applyOutcomeToTodo(t, report);
   saveBoard(file, data);
   return true;
+}
+
+export function applyOutcomeToTodo(todo, report) {
+  todo.outcome = report.outcome;
+  todo.outcome_reason = report.outcome_reason;
+  todo.outcome_at = new Date().toISOString();
+  return todo;
 }
 
 function printReport(r) {
