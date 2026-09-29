@@ -49,10 +49,24 @@ export function formatRunEvent(event) {
   return `${prefix}${attempt}: ${kind}`.trim();
 }
 
+function lastRunStart(file, expected) {
+  let raw;
+  try { raw = readFileSync(file); } catch { return 0; }
+  let offset = 0, found = 0;
+  for (const line of raw.toString("utf8").split("\n")) {
+    try {
+      const event = JSON.parse(line);
+      if (event.kind === "run_start" && changeId(event.change) === expected) found = offset;
+    } catch {}
+    offset += Buffer.byteLength(line) + 1;
+  }
+  return found;
+}
+
 export function watchRunEvents({ change, file, from, onLine = (line) => process.stdout.write(line + "\n"), signal } = {}) {
   const expected = changeId(change);
   mkdirSync(path.dirname(file), { recursive: true });
-  let offset = from === "start" ? 0 : (() => { try { return statSync(file).size; } catch { return 0; } })();
+  let offset = from === "start" ? lastRunStart(file, expected) : (() => { try { return statSync(file).size; } catch { return 0; } })();
   return new Promise((resolve) => {
     let closed = false;
     let watcher;

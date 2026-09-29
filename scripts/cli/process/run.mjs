@@ -1726,6 +1726,13 @@ export function formatRunReport(r) {
         r.spend.group_budget !== null ? ` of $${r.spend.group_budget}` : ""
       }${r.spend.unmeasured_steps ? `; ${r.spend.unmeasured_steps} step(s) unmeasured` : ""}\n`;
   out.push(spend);
+  if (r.dry && r.steps.length)
+    out.push(
+      `\nto run it: todos run c#${th.number} --go — it takes minutes per step.\n` +
+        `  run it in the background and watch it live: todos run watch c#${th.number} --from start\n` +
+        "  (one line per step start, worker done, review, verify and park; exits when the run parks or ends;\n" +
+        "  Claude Code: put that command under the Monitor tool instead of waiting blind)\n",
+    );
   if (r.stop) out.push(formatStop(r.stop));
   else if (r.complete)
     out.push(
@@ -2241,7 +2248,8 @@ function usage(code) {
       "                 what each cost, where it parked, and the share of runs that\n" +
       "                 needed exactly ONE pass over the graph — the number that says\n" +
       "                 whether plans hold up, and which stop eats them when they do not.\n\n" +
-      "  watch <change>       print live events for one change and stop when its run parks or ends\n" +
+      "  watch <change>       print live events for one change and stop when its run parks or ends;\n" +
+      "                       --from start replays the latest run of the change first\n" +
       "    --from start       include existing events; otherwise starts at the current end of the journal\n\n" +
       "  --next         hand the frontier to a caller driving the loop itself — the\n" +
       "                 worker/review provider+model to bill (agents.mjs), each ready\n" +
@@ -2310,6 +2318,14 @@ export async function run(args) {
         (root.record
           ? `  cli change set budget ${root.address} <usd>`
           : `  todos set budget ${root.number} <usd>`),
+    );
+  }
+  if (!dry) {
+    const address = root.address ?? `#${root.number}`;
+    process.stderr.write(
+      `live events: cli todos run watch ${address} --from start\n` +
+        "  one line per step start, worker done, review, verify and park; it exits when the run parks or ends.\n" +
+        "  an agent running this in the background should watch that command (Claude Code: the Monitor tool) instead of waiting blind.\n",
     );
   }
 
