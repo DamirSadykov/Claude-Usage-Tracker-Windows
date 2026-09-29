@@ -35,7 +35,6 @@ export function useChange() {
     const error = ref("");
     const graph = ref<RunGraph>(EMPTY_GRAPH);
     const graphLoading = ref(false);
-    const activeTab = ref("delta");
     const closing = ref(false);
     const closeError = ref("");
 
@@ -114,10 +113,6 @@ export function useChange() {
         selected.value = address;
     }
 
-    function setActiveTab(tab: string) {
-        activeTab.value = tab;
-    }
-
     async function reload() {
         await load();
     }
@@ -146,7 +141,6 @@ export function useChange() {
         open,
         selected,
         select,
-        setActiveTab,
         blockers,
         waiting,
         passed,

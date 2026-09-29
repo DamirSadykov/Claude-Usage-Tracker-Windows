@@ -54,6 +54,12 @@ function select(node: BoardTreeNode): void {
   emit("select", node);
 }
 
+function activate(node: BoardTreeNode): void {
+  const wasSelected = node.id === selectedId.value;
+  select(node);
+  if (node.children.length && (wasSelected || collapsed.value.has(node.id))) toggle(node);
+}
+
 function toggle(node: BoardTreeNode): void {
   if (!node.children.length) return;
   const next = new Set(collapsed.value);
@@ -170,7 +176,7 @@ watch(rows, () => scrollSelected(selectedId.value), { flush: "post" });
       :class="{ selected: row.node.id === selectedId, closed: row.node.closed, group: row.node.kind === 'group', change: row.node.kind === 'change', legacy: row.node.kind === 'legacy' }"
       :data-tree-id="row.node.id"
       :style="{ '--tree-depth': row.depth }"
-      @click="select(row.node)"
+      @click="activate(row.node)"
       @dblclick="open(row.node)"
     >
       <span class="todo-tree-toggle" :class="{ empty: !row.node.children.length, collapsed: collapsed.has(row.node.id) }" @click.stop="toggle(row.node)"></span>

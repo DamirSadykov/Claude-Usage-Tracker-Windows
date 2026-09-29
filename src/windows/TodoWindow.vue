@@ -210,6 +210,20 @@ function selectTreeNode(node: BoardTreeNode) {
   else closeDetail();
 }
 
+const detailChangeNode = computed<BoardTreeNode | null>(() => {
+  const id = selectedTreeNode.value?.kind === "task" ? selectedTreeNode.value.id : null;
+  if (!id) return null;
+  const visit = (nodes: readonly BoardTreeNode[], change: BoardTreeNode | null): BoardTreeNode | null => {
+    for (const node of nodes) {
+      if (node.id === id) return change;
+      const hit = visit(node.children, node.kind === "change" ? node : change);
+      if (hit) return hit;
+    }
+    return null;
+  };
+  return visit(tree.value, null);
+});
+
 function selectChangeTask(address: string) {
   const number = Number(address.replace(/^#/, ""));
   const row = boardStore.rows.value.find((candidate) => candidate.number === number);
@@ -1769,18 +1783,11 @@ onUnmounted(() => {
         @open="selectTreeNode($event)"
       />
       <div class="tw-tree-resize" @pointerdown.prevent="startTreeResize"></div>
-      <TodoDetailPane
-        v-if="detailId"
-        :rows="todos"
-        :detail="detail"
-        :active-id="detailId"
-        :project-label="detail?.project || t('todoNoProject')"
-        :more-label="t('todoMore')"
-        :ai-label="t('todoAi')"
-        :ai-hint="t('todoAiHint')"
-        :column-color="columnColor"
-        @open="openDetail"
-      >
+      <div v-if="detailId" class="tw-tree-detail">
+        <button v-if="detailChangeNode" class="tw-back" @click="selectTreeNode(detailChangeNode)">
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 3.5 5 8l4.5 4.5" /></svg>
+          c#{{ detailChangeNode.number }} {{ detailChangeNode.title }}
+        </button>
         <section v-if="detail && detailRecord && !detailLoading" class="tw-detail-main">
           <div class="tw-detail-pane-head">
             <h2><span v-if="detail.number" class="tw-detail-num">#{{ detail.number }}</span>{{ detail.subject }}</h2>
@@ -1816,7 +1823,7 @@ onUnmounted(() => {
           </div>
         </section>
         <section v-else class="tw-detail-main tw-detail-empty">{{ detailLoading ? t('loading') : t('todoDetailLoadFailed') }}</section>
-      </TodoDetailPane>
+      </div>
       <ChangeDetail
         v-if="selectedChange && selectedTreeNode"
         :address="`c#${selectedChange.number}`"
@@ -2850,6 +2857,8 @@ onUnmounted(() => {
 }
 .tw-tree-layout > :first-child { border-right: 1px solid var(--stroke-strong); }
 .tw-tree-layout > :last-child { min-height: 0; overflow: auto; }
+.tw-tree-detail { display: flex; flex-direction: column; gap: 10px; padding: 14px 16px; }
+.tw-tree-detail > .tw-back { align-self: flex-start; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tw-tree-resize { cursor: col-resize; margin-left: -3px; position: relative; width: 6px; z-index: 1; }
 .tw-tree-resize::after { background: var(--stroke-strong); content: ""; inset: 0 2px; position: absolute; }
 @media (max-width: 720px) {
