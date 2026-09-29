@@ -209,6 +209,31 @@ function label(row: { node: WorkNode; modelNumber: number }) {
   if (n.kind === "model") return `${number}. ${n.name || t("workTraceReply")}`;
   return n.name;
 }
+function usageOf(n: WorkNode) {
+  return modelCalls(n).reduce(
+    (sum, m) => ({
+      input: sum.input + (m.tokenBreakdown?.input ?? 0),
+      cacheRead: sum.cacheRead + (m.tokenBreakdown?.cacheRead ?? 0),
+      cacheWrite: sum.cacheWrite + (m.tokenBreakdown?.cacheWrite ?? 0),
+      output: sum.output + (m.tokenBreakdown?.output ?? 0),
+    }),
+    { input: 0, cacheRead: 0, cacheWrite: 0, output: 0 },
+  );
+}
+function costLines(n: WorkNode) {
+  const usage = n.kind === "model" && n.tokenBreakdown ? n.tokenBreakdown : usageOf(n),
+    out = [
+      `${t("workCostInput")}: ${tokenCount(usage.input) || 0}`,
+      `${t("workCostCacheRead")}: ${tokenCount(usage.cacheRead) || 0}`,
+      `${t("workCostCacheWrite")}: ${tokenCount(usage.cacheWrite) || 0}`,
+      `${t("workCostOutput")}: ${tokenCount(usage.output) || 0}`,
+    ];
+  if (n.kind === "model" && n.cost > own(n)) out.push(`${t("workCostWithNested")}: ${cost(n.cost)}`);
+  return out;
+}
+function costTitle(n: WorkNode) {
+  return [`${t("workCost")} ${cost(own(n))}`, ...costLines(n), t("workCostHint")].join("\n");
+}
 function responseOf(n: WorkNode) {
   return n.kind === "tool" ? line(n.result) : singleCall(n) ? line(singleCall(n)!.result) : null;
 }
@@ -364,7 +389,7 @@ watch(
                 row.node.tokenBreakdown.input + row.node.tokenBreakdown.cacheRead + row.node.tokenBreakdown.cacheWrite,
               )
             }}</span
-          ><span v-if="own(row.node)" class="cost">{{ cost(own(row.node)) }}</span
+          ><span v-if="own(row.node)" class="cost" :title="costTitle(row.node)">{{ cost(own(row.node)) }}</span
           ><span v-if="expandable(row.node)" class="meta">{{ row.node.children.length }}</span
           ><span v-if="duration(row.node)" class="meta" :title="t('workTraceDuration')">{{ duration(row.node) }}</span
           ><span v-if="showTimeline && timelineBar(row.node, row.scale)" class="bar"
@@ -392,6 +417,12 @@ watch(
         ><template v-if="selected.result"
           ><b>{{ t("workTraceResponse") }}</b>
           <pre>{{ line(selected.result) }}</pre></template
+        ><template v-if="own(selected)"
+          ><b>{{ t("workCost") }} {{ cost(own(selected)) }}</b>
+          <ul class="cost-lines">
+            <li v-for="item in costLines(selected)" :key="item">{{ item }}</li>
+          </ul>
+          <small>{{ t("workCostHint") }}</small></template
         ><button v-if="transcripts.get(selected.id)" type="button" @click="reveal">
           {{ t("workRevealTranscript") }}
         </button>
@@ -407,12 +438,12 @@ watch(
   min-width: 0;
 }
 .work-heading {
-  font-size: 13px;
+  font-size: 14px;
   margin: 4px 0;
 }
 .work-empty {
   color: var(--text-4);
-  font-size: 12px;
+  font-size: 13px;
   padding: 8px;
 }
 .work-controls,
@@ -421,7 +452,7 @@ watch(
   border: 0;
   display: flex;
   flex-wrap: wrap;
-  font-size: 11px;
+  font-size: 12px;
   gap: 8px;
   margin: 0;
   padding: 0;
@@ -448,7 +479,7 @@ watch(
   cursor: pointer;
   display: grid;
   font: inherit;
-  font-size: 12px;
+  font-size: 13px;
   gap: 6px;
   grid-template-columns: 10px 13px minmax(90px, 1fr) auto auto auto auto auto auto;
   min-height: 29px;
@@ -490,7 +521,7 @@ watch(
   background: var(--accent-soft);
   border-radius: 9px;
   color: var(--accent);
-  font-size: 10px;
+  font-size: 12px;
   padding: 1px 5px;
   white-space: nowrap;
 }
@@ -499,7 +530,7 @@ watch(
   color: var(--text-3);
   display: flex;
   font-family: var(--mono, monospace);
-  font-size: 10px;
+  font-size: 12px;
   gap: 4px;
   min-width: 62px;
 }
@@ -519,14 +550,14 @@ watch(
 }
 .response {
   color: var(--text-3);
-  font-size: 10px;
+  font-size: 12px;
   grid-column: 3/-1;
 }
 .meta,
 .cost {
   color: var(--text-3);
   font-family: var(--mono, monospace);
-  font-size: 10px;
+  font-size: 12px;
 }
 .expensive .cost {
   color: var(--high);
@@ -554,9 +585,17 @@ watch(
   border-radius: var(--r-ctl);
   display: flex;
   flex-direction: column;
-  font-size: 12px;
+  font-size: 13px;
   gap: 6px;
   padding: 9px;
+}
+.cost-lines {
+  font-family: var(--mono, monospace);
+  margin: 0;
+  padding-left: 16px;
+}
+.details small {
+  color: var(--text-3);
 }
 .details pre {
   background: rgba(0, 0, 0, 0.16);

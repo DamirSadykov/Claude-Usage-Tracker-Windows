@@ -228,7 +228,7 @@ onBeforeUnmount(() => {
 .work-trace-summary {
   align-self: stretch;
   border-collapse: collapse;
-  font-size: 11px;
+  font-size: 12px;
   width: 100%;
 }
 .work-trace-summary th {
