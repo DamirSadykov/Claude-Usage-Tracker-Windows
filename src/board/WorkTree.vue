@@ -376,11 +376,12 @@ watch(
             v-if="row.node.tokenBreakdown"
             class="context"
             :title="`${t('workTraceContext')}: ${tokenCount(row.node.tokenBreakdown.input + row.node.tokenBreakdown.cacheRead + row.node.tokenBreakdown.cacheWrite)}`"
-            ><i
-              :style="{
-                width: `${Math.max(4, ((row.node.tokenBreakdown.input + row.node.tokenBreakdown.cacheRead + row.node.tokenBreakdown.cacheWrite) / maxContext) * 100)}%`,
-              }"
-            />{{
+            ><span class="track"
+              ><i
+                :style="{
+                  width: `${Math.max(4, ((row.node.tokenBreakdown.input + row.node.tokenBreakdown.cacheRead + row.node.tokenBreakdown.cacheWrite) / maxContext) * 100)}%`,
+                }" /></span
+            >{{
               tokenCount(
                 row.node.tokenBreakdown.input + row.node.tokenBreakdown.cacheRead + row.node.tokenBreakdown.cacheWrite,
               )
@@ -521,19 +522,17 @@ watch(
   gap: 4px;
   min-width: 62px;
 }
-.context:before {
+.context .track {
   background: color-mix(in srgb, var(--stroke-strong) 60%, transparent);
-  content: "";
+  display: block;
   height: 5px;
-  position: absolute;
   width: 34px;
 }
 .context i {
   background: var(--accent);
   display: block;
-  height: 5px;
+  height: 100%;
   min-width: 2px;
-  position: relative;
 }
 .response {
   color: var(--text-3);
