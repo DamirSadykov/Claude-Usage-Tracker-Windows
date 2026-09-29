@@ -6,7 +6,9 @@ import WorkTraceCharts from "./WorkTraceCharts.vue";
 import {
   aggregateTree,
   modelCallNode,
+  modelCalls,
   nodeType,
+  pathTo,
   timelineBar,
   timelineScale,
   treeView,
@@ -40,7 +42,8 @@ type RawTree = {
   turns: RawTurn[];
 };
 type RawSession = { session: string; source: string; tree: RawTree };
-type RawAttempt = { number: number; startedAt: string; endedAt: string; sessions: RawSession[] };
+type RawEvent = { ts: string; kind: string };
+type RawAttempt = { number: number; startedAt: string; endedAt: string; events?: RawEvent[]; sessions: RawSession[] };
 type Payload = { sessions: RawSession[]; attempts: RawAttempt[] };
 type NodeType = ToolCallType | "text";
 const props = defineProps<{ task: string; heading?: string }>();
@@ -66,7 +69,7 @@ function text(v: unknown) {
 function line(v: string | null) {
   return v?.split(/\r?\n/, 1)[0] || null;
 }
-function makeTree(raw: RawTree, session: string, prefix: string): WorkNode {
+function makeTree(raw: RawTree, session: string, prefix: string, role = t("workSession")): WorkNode {
   const models = raw.turns.map((turn) =>
     modelCallNode({
       id: `${prefix}:${turn.id}`,
@@ -98,7 +101,7 @@ function makeTree(raw: RawTree, session: string, prefix: string): WorkNode {
   const node = aggregateTree({
     id: prefix,
     kind: "session" as const,
-    name: raw.sessionId || session,
+    name: `${role} · ${(raw.sessionId || session).slice(0, 8)}`,
     model: null,
     startedAt: stamp(raw.startedAt),
     endedAt: stamp(raw.endedAt),
@@ -115,6 +118,11 @@ function makeTree(raw: RawTree, session: string, prefix: string): WorkNode {
   };
   visit(node);
   return node;
+}
+function roleOf(attempt: RawAttempt, raw: RawTree) {
+  const done = stamp(attempt.events?.find((event) => event.kind === "worker_done")?.ts),
+    start = stamp(raw.startedAt);
+  return done !== null && start !== null && start >= done ? t("workRoleReviewer") : t("workRoleWorker");
 }
 const roots = computed(() => {
   transcripts.clear();
@@ -136,7 +144,7 @@ const roots = computed(() => {
       result: null,
       transcriptPath: null,
       children: attempt.sessions.map((entry) =>
-        makeTree(entry.tree, entry.session, `attempt:${attempt.number}:${entry.session}`),
+        makeTree(entry.tree, entry.session, `attempt:${attempt.number}:${entry.session}`, roleOf(attempt, entry.tree)),
       ),
     }),
   );
@@ -165,11 +173,13 @@ const visibleRoots = computed(() =>
     .map((n) => treeView(n, { types: enabledTypes.value, headersOnly: headersOnly.value }))
     .filter((n): n is WorkNode => n !== null),
 );
+const modelNumbers = computed(
+  () => new Map(traceRoot.value ? modelCalls(traceRoot.value).map((node, index) => [node.id, index + 1]) : []),
+);
 const rows = computed(() => {
   const out: { node: WorkNode; depth: number; scale: ReturnType<typeof timelineScale>; modelNumber: number }[] = [];
-  let modelNumber = 0;
   const visit = (n: WorkNode, depth: number, scale: ReturnType<typeof timelineScale>) => {
-    out.push({ node: n, depth, scale, modelNumber: n.kind === "model" ? ++modelNumber : 0 });
+    out.push({ node: n, depth, scale, modelNumber: modelNumbers.value.get(n.id) ?? 0 });
     if (!collapsed.value.has(n.id)) n.children.forEach((c) => visit(c, depth + 1, scale));
   };
   visibleRoots.value.forEach((n) => visit(n, 0, timelineScale(n)));
@@ -235,9 +245,19 @@ async function load() {
   }
 }
 async function selectChart(id: string) {
-  const node = rows.value.find((row) => row.node.id === id)?.node;
-  if (!node) return;
-  selected.value = node;
+  let path: WorkNode[] | null = null;
+  for (const n of visibleRoots.value) path ??= pathTo(n, id);
+  if (!path) {
+    headersOnly.value = false;
+    enabledTypes.value = new Set(TYPES);
+    await nextTick();
+    for (const n of visibleRoots.value) path ??= pathTo(n, id);
+  }
+  if (!path) return;
+  const next = new Set(collapsed.value);
+  path.slice(0, -1).forEach((n) => next.delete(n.id));
+  collapsed.value = next;
+  selected.value = path[path.length - 1];
   await nextTick();
   root.value
     ?.querySelector<HTMLElement>(`[data-work-id="${CSS.escape(id)}"]`)
@@ -305,7 +325,11 @@ watch(
           ><span class="name"
             ><template v-if="row.node.sequence">{{ row.node.sequence }}. </template
             ><template v-else-if="row.node.kind === 'model'">{{ row.modelNumber }}. </template
-            >{{ row.node.kind === "tool" && line(row.node.input) ? line(row.node.input) : row.node.name }}</span
+            >{{
+              row.node.kind === "tool" && line(row.node.input)
+                ? line(row.node.input)
+                : row.node.name || t("workTraceReply")
+            }}</span
           ><span v-if="row.node.kind === 'model'" class="type-label">{{ t(`workTraceType_${nodeType(row.node)}`) }}</span
           ><span v-if="row.node.kind === 'tool' && line(row.node.input)" class="meta">{{ row.node.name }}</span
           ><span v-if="row.node.model" class="meta">{{ row.node.model }}</span
@@ -329,7 +353,7 @@ watch(
         </button>
       </nav>
       <aside v-if="selected" class="details">
-        <strong>{{ selected.name }}</strong
+        <strong>{{ selected.name || t("workTraceReply") }}</strong
         ><span v-if="selected.model">{{ selected.model }}</span
         ><template v-if="selected.input"
           ><b>{{ t("workTraceInput") }}</b>
@@ -395,14 +419,14 @@ watch(
   font: inherit;
   font-size: 12px;
   gap: 6px;
-  grid-template-columns: 10px 13px minmax(90px, 1fr) auto auto auto auto;
+  grid-template-columns: 10px 13px minmax(90px, 1fr) auto auto auto auto auto auto;
   min-height: 29px;
   padding: 4px 8px 4px calc(8px + var(--indent));
   text-align: left;
   width: 100%;
 }
 .work-tree.timeline .work-row {
-  grid-template-columns: 10px 13px minmax(90px, 1fr) auto auto auto auto minmax(70px, 22%);
+  grid-template-columns: 10px 13px minmax(90px, 1fr) auto auto auto auto auto auto minmax(70px, 22%);
 }
 .work-row:hover {
   background: var(--card-bg-hover);
@@ -410,6 +434,9 @@ watch(
 .work-row.selected {
   background: var(--accent-soft);
   box-shadow: inset 2px 0 var(--accent);
+}
+.model-row {
+  background: color-mix(in srgb, var(--accent-soft) 38%, transparent);
 }
 .toggle:before {
   color: var(--text-3);
@@ -427,6 +454,37 @@ watch(
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.type-label {
+  background: var(--accent-soft);
+  border-radius: 9px;
+  color: var(--accent);
+  font-size: 10px;
+  padding: 1px 5px;
+  white-space: nowrap;
+}
+.context {
+  align-items: center;
+  color: var(--text-3);
+  display: flex;
+  font-family: var(--mono, monospace);
+  font-size: 10px;
+  gap: 4px;
+  min-width: 62px;
+}
+.context:before {
+  background: color-mix(in srgb, var(--stroke-strong) 60%, transparent);
+  content: "";
+  height: 5px;
+  position: absolute;
+  width: 34px;
+}
+.context i {
+  background: var(--accent);
+  display: block;
+  height: 5px;
+  min-width: 2px;
+  position: relative;
 }
 .response {
   color: var(--text-3);

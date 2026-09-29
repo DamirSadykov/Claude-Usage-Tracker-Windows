@@ -6,6 +6,7 @@ import {
   filterTree,
   headersOnlyTree,
   modelCallNode,
+  pathTo,
   nodeType,
   traceSeries,
   treeView,
@@ -58,6 +59,23 @@ describe("model call nodes", () => {
     expect(node.children[1].children[0].id).toBe("sub-model");
     expect(nodeType(node)).toBe("read");
     expect(contextTokens(node.tokenBreakdown)).toBe(60);
+  });
+
+  it("names a model call by its tools and finds the path to a nested node", () => {
+    const subagent = modelCallNode({ id: "sub-model", model: "small" });
+    const node = modelCallNode({
+      id: "model",
+      model: "main",
+      calls: [
+        { id: "a", name: "exec" },
+        { id: "b", name: "exec" },
+        { id: "c", name: "Agent", subagent },
+      ],
+    });
+    expect(node.name).toBe("exec ×2 · Agent");
+    expect(modelCallNode({ id: "text", model: "main" }).name).toBe("");
+    expect(pathTo(node, "sub-model")?.map((n) => n.id)).toEqual(["model", "c", "sub-model"]);
+    expect(pathTo(node, "missing")).toBeNull();
   });
 
   it("sums model tokens and cost upwards without counting tool wrappers twice", () => {

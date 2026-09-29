@@ -170,7 +170,7 @@ export function modelCallNode(value: ModelCallInput): WorkNode {
   return {
     id: value.id,
     kind: "model",
-    name: value.name ?? "Model call",
+    name: value.name ?? callSummary(calls),
     model: value.model,
     startedAt: value.startedAt ?? null,
     endedAt: value.endedAt ?? null,
@@ -201,7 +201,20 @@ export function aggregateTree(node: WorkNode): WorkNode {
     };
   return { ...node, children };
 }
-function modelCalls(root: WorkNode): WorkNode[] {
+export function callSummary(calls: readonly Pick<WorkNode, "name">[]): string {
+  const counts = new Map<string, number>();
+  calls.forEach((call) => counts.set(call.name, (counts.get(call.name) ?? 0) + 1));
+  return [...counts.entries()].map(([name, count]) => (count > 1 ? `${name} ×${count}` : name)).join(" · ");
+}
+export function pathTo(root: WorkNode, id: string): WorkNode[] | null {
+  if (root.id === id) return [root];
+  for (const child of root.children) {
+    const path = pathTo(child, id);
+    if (path) return [root, ...path];
+  }
+  return null;
+}
+export function modelCalls(root: WorkNode): WorkNode[] {
   const found: WorkNode[] = [];
   const visit = (node: WorkNode) => {
     if (node.kind === "model") found.push(node);
