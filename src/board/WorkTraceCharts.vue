@@ -14,6 +14,7 @@ import {
   Tooltip,
   type ActiveElement,
   type ChartEvent,
+  type TooltipItem,
 } from "chart.js";
 import { traceSeries, typeSummary, type ToolCallType, type TracePoint, type WorkNode } from "./workTree";
 
@@ -96,7 +97,7 @@ function costData() {
     labels: labels(value.cost),
     datasets: [
       {
-        label: t("metricCost"),
+        label: t("workTraceCostCumulative"),
         data: value.cost.map((point) => point.value),
         borderColor: color("--high", "#d97757"),
         backgroundColor: color("--high", "#d97757"),
@@ -114,7 +115,23 @@ function options(withCacheAxis: boolean) {
     responsive: true,
     maintainAspectRatio: false,
     interaction: { mode: "index" as const, intersect: false },
-    plugins: { legend: { display: true, labels: { color: color("--text-3", "#9aa0aa"), boxWidth: 8 } } },
+    plugins: {
+      legend: { display: true, labels: { color: color("--text-3", "#9aa0aa"), boxWidth: 8 } },
+      ...(withCacheAxis
+        ? {}
+        : {
+            tooltip: {
+              callbacks: {
+                label: (item: TooltipItem<"line">) => `${t("workTraceCostTotal")}: ${formatCost(item.parsed.y ?? 0)}`,
+                afterLabel: (item: TooltipItem<"line">) => {
+                  const points = series().cost,
+                    step = (points[item.dataIndex]?.value ?? 0) - (points[item.dataIndex - 1]?.value ?? 0);
+                  return `${t("workTraceCostStep")}: ${formatCost(step)}`;
+                },
+              },
+            },
+          }),
+    },
     scales: {
       x: {
         grid: { color: color("--stroke", "rgba(128,128,128,.16)") },
@@ -125,7 +142,10 @@ function options(withCacheAxis: boolean) {
         position: "left" as const,
         beginAtZero: true,
         grid: { color: color("--stroke", "rgba(128,128,128,.16)") },
-        ticks: { color: color("--text-3", "#9aa0aa") },
+        ticks: {
+          color: color("--text-3", "#9aa0aa"),
+          ...(withCacheAxis ? {} : { callback: (value: string | number) => `$${value}` }),
+        },
       },
       ...(withCacheAxis
         ? {
