@@ -1536,6 +1536,95 @@ describe("rules the CLI enforces instead of explaining", () => {
     expect(first).toContain("change-session rule:");
   });
 
+  it("runs verify and writes the same outcome before an interactive change close", () => {
+    const home = mkdtempSync(path.join(os.tmpdir(), "cut-close-home-"));
+    const session = "close-session";
+    const projectDir = path.join(home, ".claude", "projects", process.cwd().replace(/[:\\/.]/g, "-"));
+    mkdirSync(projectDir, { recursive: true });
+    const at = "2099-01-01T00:00:00.000Z";
+    writeFileSync(
+      path.join(projectDir, `${session}.jsonl`),
+      [
+        JSON.stringify({ timestamp: at, message: { content: [{ type: "tool_use", name: "Agent", input: {} }] } }),
+        JSON.stringify({ timestamp: at, message: { content: [{ type: "tool_use", name: "Write", input: { file_path: path.join(process.cwd(), "out.txt") } }] } }),
+      ].join("\n") + "\n",
+    );
+    seed([
+      todo(1, { verify: 'node -e "process.exit(0)"' }),
+      todo(2, { change: true, depends_on: ["id-1"] }),
+    ]);
+    const env = { ...process.env, APPDATA: dir, USERPROFILE: home, CLAUDE_CODE_SESSION_ID: session };
+    execFileSync(process.execPath, [cli, "todos", "set", "status", "1", "in_progress"], { env, encoding: "utf8" });
+    const out = execFileSync(process.execPath, [cli, "todos", "set", "status", "1", "done"], { env, encoding: "utf8" });
+    expect(out).toContain("verify:");
+    expect(out).toContain("outcome: ok");
+    expect(read(1)).toMatchObject({ status: "done", outcome: "ok", outcome_reason: "ok" });
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("keeps an already-completed interactive close idempotent", () => {
+    const home = mkdtempSync(path.join(os.tmpdir(), "cut-close-repeat-home-"));
+    const session = "close-repeat-session";
+    const projectDir = path.join(home, ".claude", "projects", process.cwd().replace(/[:\\\\/.]/g, "-"));
+    mkdirSync(projectDir, { recursive: true });
+    const at = "2099-01-01T00:00:00.000Z";
+    writeFileSync(
+      path.join(projectDir, `${session}.jsonl`),
+      [
+        JSON.stringify({ timestamp: at, message: { content: [{ type: "tool_use", name: "Agent", input: {} }] } }),
+        JSON.stringify({ timestamp: at, message: { content: [{ type: "tool_use", name: "Write", input: { file_path: path.join(process.cwd(), "out.txt") } }] } }),
+      ].join("\n") + "\n",
+    );
+    seed([
+      todo(1, { verify: 'node -e "process.exit(process.env.VERIFY_FAIL ? 7 : 0)"' }),
+      todo(2, { change: true, depends_on: ["id-1"] }),
+    ]);
+    const env = { ...process.env, APPDATA: dir, USERPROFILE: home, CLAUDE_CODE_SESSION_ID: session };
+    execFileSync(process.execPath, [cli, "todos", "set", "status", "1", "in_progress"], { env, encoding: "utf8" });
+    execFileSync(process.execPath, [cli, "todos", "set", "status", "1", "done"], { env, encoding: "utf8" });
+    const out = execFileSync(process.execPath, [cli, "todos", "set", "status", "1", "done"], {
+      env: { ...env, VERIFY_FAIL: "1" },
+      encoding: "utf8",
+    });
+    expect(out).not.toContain("verify:");
+    expect(read(1)).toMatchObject({ status: "done", outcome: "ok", outcome_reason: "ok" });
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("records a failing interactive close outcome but leaves the task in progress", () => {
+    const home = mkdtempSync(path.join(os.tmpdir(), "cut-close-issue-home-"));
+    const session = "close-issue-session";
+    const projectDir = path.join(home, ".claude", "projects", process.cwd().replace(/[:\\/.]/g, "-"));
+    mkdirSync(projectDir, { recursive: true });
+    writeFileSync(
+      path.join(projectDir, `${session}.jsonl`),
+      JSON.stringify({ timestamp: "2099-01-01T00:00:00.000Z", message: { content: [{ type: "tool_use", name: "Agent", input: {} }] } }) + "\n",
+    );
+    seed([todo(1, { verify: 'node -e "process.exit(7)"' }), todo(2, { change: true, depends_on: ["id-1"] })]);
+    const env = { ...process.env, APPDATA: dir, USERPROFILE: home, CLAUDE_CODE_SESSION_ID: session };
+    execFileSync(process.execPath, [cli, "todos", "set", "status", "1", "in_progress"], { env, encoding: "utf8" });
+    let err = "";
+    try {
+      execFileSync(process.execPath, [cli, "todos", "set", "status", "1", "done"], { env, encoding: "utf8", stdio: "pipe" });
+    } catch (e) {
+      err = String(e.stderr || "");
+    }
+    expect(err).toContain("outcome issue (verify:issue)");
+    expect(read(1)).toMatchObject({ status: "in_progress", outcome: "issue", outcome_reason: "verify:issue" });
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("does not rerun verify or reconcile for the runner-style close without a session", () => {
+    seed([todo(1, { verify: 'node -e "process.exit(7)"' }), todo(2, { change: true, depends_on: ["id-1"] })]);
+    const env = { ...process.env, APPDATA: dir };
+    delete env.CLAUDE_CODE_SESSION_ID;
+    execFileSync(process.execPath, [cli, "todos", "set", "status", "1", "in_progress"], { env, encoding: "utf8" });
+    const out = execFileSync(process.execPath, [cli, "todos", "set", "status", "1", "done"], { env, encoding: "utf8" });
+    expect(out).not.toContain("verify:");
+    expect(read(1)).toMatchObject({ status: "done" });
+    expect(read(1)).not.toHaveProperty("outcome");
+  });
+
   // t#253 field roles: one role each, never the same text in two.
   it("refuses text that is already in another field of the same task", () => {
     seed([todo(1)]);

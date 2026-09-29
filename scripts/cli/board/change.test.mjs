@@ -249,7 +249,7 @@ describe("cli change", () => {
 
   const run = (args, opts = {}) =>
     execFileSync(process.execPath, [cli, ...args], {
-      env: { ...process.env, APPDATA: dir },
+      env: { ...process.env, APPDATA: dir, CLAUDE_CODE_SESSION_ID: "" },
       encoding: "utf8",
       cwd: opts.cwd ?? process.cwd(),
       stdio: "pipe",

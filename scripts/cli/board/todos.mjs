@@ -49,7 +49,8 @@ import { matchPlanCli, specsEnabled } from "../kernel/settings.mjs";
 import { appDataFile } from "../kernel/appdata.mjs";
 import { findChange, changeAddress, CURRENT, BoardUnreadableError, STATUSES, col, isDone, isChangeRoot, normalizeLimit, todosPath, load, save, boardPath, loadBoard, assertBoardWritable, loadBoardForWrite, saveBoard, withDeferredSave, resolveTask, changeRootsFor, changeAsRoot, specAddressesForManual } from "../kernel/board-io.mjs";
 import { withBoardLock } from "../kernel/board-lock.mjs";
-import { findSessionTranscripts, parseTouchedFiles } from "../process/outcome.mjs";
+import { findSessionTranscripts, parseTouchedFiles, reconcileTodo, applyOutcome } from "../process/outcome.mjs";
+import { runVerify } from "../process/run-step.mjs";
 
 let specPort = null;
 export function setSpecPort(port) {
@@ -374,7 +375,7 @@ function cmdTake(args) {
 // puts on a field lives HERE, in the refusal or the warning the handler prints —
 // not in an instruction the caller is expected to have read first.
 
-function setStatus({ data, file, todo, value, flags }) {
+async function setStatus({ data, file, todo, value, flags }) {
   const status = String(value);
   if (!STATUSES.includes(status))
     fail(`invalid status "${value}". valid: ${STATUSES.join(" | ")}`);
@@ -396,6 +397,41 @@ function setStatus({ data, file, todo, value, flags }) {
     }
   }
   const changeSession = guardChangeSession({ data, todo, status, flags });
+  // The interactive change path has a strong session window.  Close it only
+  // after giving its declared check to the same reconciliation used by
+  // `todos outcome --write`; the headless runner has no session id here and
+  // retains its own check/outcome sequence.
+  let closeEventWritten = false;
+  // A repeated `set status … done` is deliberately an idempotent board edit.
+  // It has no new work window to verify, and must not replace an earlier ok
+  // outcome just because the declared check happens to fail now.
+  if (status === "done" && todo.status !== "done" && changeSession.session && !flags.force && changeRootIds(data, todo).size) {
+    const declared = typeof todo.verify === "string" ? todo.verify.trim() : "";
+    let verdict;
+    if (declared) {
+      const check = await runVerify({ cmd: declared, cwd: process.cwd() });
+      verdict = check.code === 0 ? "ok" : "issue";
+      process.stdout.write(`verify: ${declared} -> ${verdict}\n`);
+    }
+    appendTaskSessionEvent({
+      session: changeSession.session,
+      task: todo.id,
+      event: "end",
+      source: "set-status",
+      project: todo.project || null,
+    });
+    closeEventWritten = true;
+    const reconciliation = reconcileTodo({ file, data, todo, verify: verdict });
+    const { report } = reconciliation;
+    if (report.finalized) applyOutcome(file, data, todo, report);
+    if (!report.finalized) {
+      fail(`outcome not finalized (${report.outcome_reason}) — nothing written`);
+    }
+    if (report.outcome === "issue") {
+      fail(`refusing: outcome issue (${report.outcome_reason}); #${todo.number} remains in_progress`);
+    }
+    process.stdout.write(`outcome: ${report.outcome} (${report.outcome_reason})\n`);
+  }
   // The frontier (#88) is derived, so a start off it is legal — but it is worth
   // saying out loud, because the work it builds on is not finished yet.
   if (status === "in_progress") {
@@ -408,7 +444,7 @@ function setStatus({ data, file, todo, value, flags }) {
       );
     }
   }
-  if (status === "in_progress" || status === "review" || status === "done") {
+  if ((status === "in_progress" || status === "review" || status === "done") && !closeEventWritten) {
     appendTaskSessionEvent({
       session: currentSessionId(flags),
       task: todo.id,
@@ -1116,7 +1152,7 @@ export function setField({ data, file, todo, field, value, flags = {} }) {
   const spec = SET_FIELDS[field];
   if (!spec) fail(`unknown field "${field}"\n` + setUsage());
   if (spec.declaration) refuseIfClosed(todo, `the ${field} declaration`);
-  spec.set({ data, file, todo, value, flags });
+  return spec.set({ data, file, todo, value, flags });
 }
 
 // The field list as it appears in the help and in `pipeline`: generated, so the
@@ -1156,7 +1192,7 @@ function setUsage() {
 // presence, and the "declared before the work" rule. Whatever is specific to a
 // field is refused by its handler, with the legal values printed from the table
 // above — an unknown field or value never fails silently.
-function cmdSet(args) {
+async function cmdSet(args) {
   const { positional, flags } = parseArgs(args);
   const [field, task] = positional;
   if (!field) fail(setUsage());
@@ -1174,7 +1210,7 @@ function cmdSet(args) {
   const data = loadBoardForWrite(file);
   const todo = resolveTask(data, task);
   if (!todo) fail(`no todo with id ${task}`);
-  setField({ data, file, todo, field, value, flags });
+  await setField({ data, file, todo, field, value, flags });
 }
 
 // Minimal `--flag value` parser: collects positional args and flag pairs.
@@ -2386,13 +2422,13 @@ export function run(args) {
   return dispatch(cmd, rest);
 }
 
-function dispatch(cmd, rest) {
+async function dispatch(cmd, rest) {
   switch (cmd) {
     case "add":
       cmdAdd(rest);
       break;
     case "set":
-      cmdSet(rest);
+      await cmdSet(rest);
       break;
     case "take":
       cmdTake(rest);

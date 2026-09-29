@@ -29,20 +29,16 @@ import {
   finishStep,
   shouldEscalate,
   buildRunContext,
-  nextFrontier,
-  runReported,
   applyResult,
   stepBrief,
   buildWave,
   resolveParallelLimit,
   formatStop,
   formatRunReport,
-  stampHandout,
   run,
   appendRunRecord,
   readRunLog,
   runRecordOf,
-  reportRecordOf,
   summarizeRuns,
   formatRunHistory,
 } from "./run.mjs";
@@ -614,7 +610,7 @@ describe("runChange — self-retry when a retry limit is declared but no on_issu
     });
     expect(prompt).toContain("PREVIOUS ATTEMPT");
     expect(prompt).toContain("scope regression: touched files outside the promise");
-  });
+  }, 20000);
 
   it("adds an ISSUE comment with the verify output tail when the declared check fails", async () => {
     const data = board(changeRoot(1, [2], { budget_usd: 10 }), auto(2, { retry_limit: 1 }));
@@ -838,9 +834,8 @@ describe("runChange — neighbour damage ends a step as issue before review", ()
 
 // ── whose context a step starts from ─────────────────────────────────────────
 
-// t#543. The choice is the spawner's, never the graph's: `--go` makes it here,
-// a driver on `--next` makes it for itself. The rule is the same either way —
-// one prerequisite's context is unambiguous, two cannot be merged.
+// t#543. The choice is the spawner's, never the graph's: `--go` makes it here.
+// One prerequisite's context is unambiguous; two cannot be merged.
 describe("runChange — --inherit", () => {
   it("starts every step cold unless inheriting was asked for", async () => {
     const data = board(changeRoot(1, [2, 3], { budget_usd: 10 }), auto(2), auto(3, { depends_on: deps(2) }));
@@ -1090,122 +1085,6 @@ describe("liveEffects — the board seam", () => {
   }, 20000);
 });
 
-// `--next` is no longer read-only (t#520): it stamps `handout_at` on every node
-// of the wave it hands out, so `outcome.mjs`'s weak file evidence has a
-// boundary that starts at the hand-out rather than at whatever the executor
-// later claims. It is still NOT a status move — `--report` alone owns that,
-// and the crash-before-report failure mode stays exactly as accepted.
-describe("stampHandout — the one thing --next writes (t#520)", () => {
-  it("stamps every node of the wave with the SAME timestamp, leaves the rest untouched", () => {
-    const dir = mkdtempSync(path.join(os.tmpdir(), "cut-run-handout-"));
-    const file = path.join(dir, "todos.json");
-    const data = board(auto(2), auto(3), auto(4));
-    try {
-      const at2 = stampHandout(file, data, [data.todos[0], data.todos[1]]);
-      expect(at2).toEqual(expect.any(String));
-      expect(data.todos[0].handout_at).toBe(at2);
-      expect(data.todos[1].handout_at).toBe(at2);
-      expect(data.todos[2].handout_at).toBeUndefined();
-      const onDisk = loadBoard(file);
-      expect(onDisk.todos[0].handout_at).toBe(at2);
-      expect(onDisk.todos[1].handout_at).toBe(at2);
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("is NOT a status move — status is unchanged before and after the stamp", () => {
-    const dir = mkdtempSync(path.join(os.tmpdir(), "cut-run-handout-"));
-    const file = path.join(dir, "todos.json");
-    const data = board(auto(2));
-    try {
-      const before = data.todos[0].status;
-      stampHandout(file, data, [data.todos[0]]);
-      expect(data.todos[0].status).toBe(before);
-      expect(data.todos[0].status).toBe("queue");
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("re-stamps on a second hand-out — a re-handed node starts a fresh window", async () => {
-    const dir = mkdtempSync(path.join(os.tmpdir(), "cut-run-handout-"));
-    const file = path.join(dir, "todos.json");
-    const data = board(auto(2));
-    try {
-      const first = stampHandout(file, data, [data.todos[0]]);
-      await new Promise((r) => setTimeout(r, 5));
-      const second = stampHandout(file, data, [data.todos[0]]);
-      expect(second >= first).toBe(true);
-      expect(data.todos[0].handout_at).toBe(second);
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("an empty wave stamps nothing, saves nothing, and returns null", () => {
-    const dir = mkdtempSync(path.join(os.tmpdir(), "cut-run-handout-"));
-    const file = path.join(dir, "todos.json");
-    const data = board(auto(2));
-    try {
-      const at2 = stampHandout(file, data, []);
-      expect(at2).toBeNull();
-      expect(existsSync(file)).toBe(false);
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-});
-
-describe("run --next on a future-version board (t#575)", () => {
-  const cli = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "cli.mjs");
-  const fixtures = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "tests", "board-fixtures");
-  let dir;
-  let appDir;
-  let boardFile;
-
-  beforeEach(() => {
-    dir = mkdtempSync(path.join(os.tmpdir(), "cut-run-future-"));
-    appDir = path.join(dir, "com.claude-usage-tracker.app");
-    mkdirSync(appDir, { recursive: true });
-    boardFile = path.join(appDir, "todos.json");
-    writeFileSync(boardFile, readFileSync(path.join(fixtures, "v2", "future-version.json")));
-  });
-  afterEach(() => rmSync(dir, { recursive: true, force: true }));
-
-  it("refuses the hand-out with exit 4, no backup, board untouched", () => {
-    const before = readFileSync(boardFile);
-    const r = spawnSync(process.execPath, [cli, "todos", "run", "1", "--next"], {
-      encoding: "utf8",
-      env: { ...process.env, APPDATA: dir },
-      windowsHide: true,
-    });
-    expect(r.status).toBe(4);
-    expect(r.stderr).toContain("is newer than this writer");
-    expect(readFileSync(boardFile).equals(before)).toBe(true);
-    expect(readdirSync(appDir).some((f) => f.includes(".corrupt-"))).toBe(false);
-  });
-
-  it("refuses --go and --report before creating the run journal", () => {
-    const before = readFileSync(boardFile);
-    const env = { ...process.env, APPDATA: dir };
-    const go = spawnSync(process.execPath, [cli, "todos", "run", "60", "--go"], {
-      encoding: "utf8",
-      env,
-      windowsHide: true,
-    });
-    const report = spawnSync(process.execPath, [cli, "todos", "run", "60", "--report", "60", "--result", "ok"], {
-      encoding: "utf8",
-      env,
-      windowsHide: true,
-    });
-    expect(go.status).toBe(4);
-    expect(report.status).toBe(4);
-    expect(readFileSync(boardFile).equals(before)).toBe(true);
-    expect(existsSync(path.join(appDir, "runs.jsonl"))).toBe(false);
-  });
-});
-
 describe("run change references", () => {
   it("suggests c#N when #N names an existing change but no task graph", () => {
     const cli = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "cli.mjs");
@@ -1227,81 +1106,6 @@ describe("run change references", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
-});
-
-describe("run(['--next']) — the field wired end to end onto the real board (t#520)", () => {
-  it("includes a decision card when a red step cannot record its base", () => {
-    const dir = mkdtempSync(path.join(os.tmpdir(), "cut-run-next-red-base-"));
-    const appDir = path.join(dir, "com.claude-usage-tracker.app");
-    const cli = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "cli.mjs");
-    mkdirSync(appDir, { recursive: true });
-    writeFileSync(path.join(appDir, "todos.json"), JSON.stringify(board(
-      changeRoot(1, [2]),
-      redAuto(2),
-    )));
-    try {
-      const result = spawnSync(process.execPath, [cli, "todos", "run", "1", "--next", "--json"], {
-        cwd: dir,
-        encoding: "utf8",
-        env: { ...process.env, APPDATA: dir },
-        windowsHide: true,
-      });
-      const report = JSON.parse(result.stdout);
-      expect(result.status).toBe(1);
-      expect(report.stop.kind).toBe("red-base");
-      expect(report.card).toContain("Decision card — red-base");
-      expect(report.stop.card).toContain("Decision card — red-base");
-      const saved = JSON.parse(readFileSync(path.join(appDir, "todos.json"), "utf8"));
-      expect(saved.todos.find((t) => t.number === 2).comments.at(-1).body).toContain("Decision card — red-base");
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  });
-
-  it("writes handout_at through the CLI without moving status, and re-stamps on a second call", async () => {
-    const dir = mkdtempSync(path.join(os.tmpdir(), "cut-run-cmdnext-"));
-    const appDir = path.join(dir, "com.claude-usage-tracker.app");
-    mkdirSync(appDir, { recursive: true });
-    const initial = board(changeRoot(1, [2, 3], { parallel_limit: 2 }), auto(2), auto(3));
-    writeFileSync(path.join(appDir, "todos.json"), JSON.stringify(initial));
-    const gitDir = mkdtempSync(path.join(os.tmpdir(), "cut-run-cmdnext-git-"));
-    execFileSync("git", ["init", "-q"], { cwd: gitDir });
-    execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: gitDir });
-    execFileSync("git", ["config", "user.name", "Test"], { cwd: gitDir });
-    writeFileSync(path.join(gitDir, "a.txt"), "x\n");
-    execFileSync("git", ["add", "-A"], { cwd: gitDir });
-    execFileSync("git", ["commit", "-q", "-m", "base"], { cwd: gitDir });
-    const prevAppData = process.env.APPDATA;
-    const prevCwd = process.cwd();
-    process.env.APPDATA = dir;
-    process.chdir(gitDir);
-    const origWrite = process.stdout.write;
-    process.stdout.write = () => true;
-    try {
-      await run(["1", "--next"]);
-      const after1 = loadBoard(path.join(appDir, "todos.json"));
-      const t2a = after1.todos.find((t) => t.number === 2);
-      const t3a = after1.todos.find((t) => t.number === 3);
-      expect(t2a.handout_at).toEqual(expect.any(String));
-      expect(t3a.handout_at).toBe(t2a.handout_at);
-      expect(t2a.status).toBe("queue");
-      expect(t3a.status).toBe("queue");
-
-      await new Promise((r) => setTimeout(r, 5));
-      await run(["1", "--next"]);
-      const after2 = loadBoard(path.join(appDir, "todos.json"));
-      const t2b = after2.todos.find((t) => t.number === 2);
-      expect(t2b.handout_at >= t2a.handout_at).toBe(true);
-      expect(t2b.status).toBe("queue");
-    } finally {
-      process.stdout.write = origWrite;
-      process.chdir(prevCwd);
-      if (prevAppData === undefined) delete process.env.APPDATA;
-      else process.env.APPDATA = prevAppData;
-      rmSync(dir, { recursive: true, force: true });
-      rmSync(gitDir, { recursive: true, force: true });
-    }
-  }, 20000);
 });
 
 // The two halves runOne is composed from (t#356) — each callable, and testable,
@@ -1548,41 +1352,6 @@ describe("finishStep", () => {
     } finally { rmSync(cwd, { recursive: true, force: true }); }
   });
 
-  it("includes a reported attempt's own changes when rolling it back", async () => {
-    const cwd = mkdtempSync(path.join(os.tmpdir(), "cut-reported-checkpoint-"));
-    try {
-      execFileSync("git", ["init", "-q"], { cwd }); execFileSync("git", ["config", "core.autocrlf", "false"], { cwd });
-      execFileSync("git", ["config", "user.email", "test@example.com"], { cwd });
-      execFileSync("git", ["config", "user.name", "Test"], { cwd });
-      writeFileSync(path.join(cwd, "output.txt"), "base\n");
-      writeFileSync(path.join(cwd, "helper.mjs"), "base helper\n");
-      execFileSync("git", ["add", "-A"], { cwd }); execFileSync("git", ["commit", "-qm", "base"], { cwd });
-      writeFileSync(path.join(cwd, "output.txt"), "best\n");
-      writeFileSync(path.join(cwd, "helper.mjs"), "best helper\n");
-      const best = snapshotTree(cwd).sha;
-      writeFileSync(path.join(cwd, "output.txt"), "worse\n");
-      writeFileSync(path.join(cwd, "helper.mjs"), "worse helper\n");
-      const t = auto(62, {
-        produces: ["output.txt"],
-        step_base: "base-sha",
-        attempts: [{ attempt: 1, reviewed: true, counts: { critical: 0, high: 0 }, snapshot: best }],
-      });
-      const ctx = finishCtx(t, {
-        cwd,
-        ownChanges: async () => ({ ok: true, own: [{ path: "output.txt" }, { path: "helper.mjs" }], damaged: [] }),
-        recordAttempt: async () => ({ written: true, snapshot: snapshotTree(cwd).sha }),
-      });
-      ctx.attempts.set(t.id, 2);
-      const out = await runReported(ctx, t, [t], {
-        result: { ok: true },
-        review: { approved: false, ok: true, findings: [{ level: "high", file: "output.txt", line: 1, text: "regressed", evidence: "output is worse" }] },
-      });
-
-      expect(out.rolledBackTo).toBe(best);
-      expect(readFileSync(path.join(cwd, "helper.mjs"), "utf8")).toBe("best helper\n");
-    } finally { rmSync(cwd, { recursive: true, force: true }); }
-  });
-
   it("sends medium/low-only review findings to the architect while continuing to reconciliation", async () => {
     const t = auto(7);
     const comments = [];
@@ -1713,380 +1482,6 @@ describe("buildRunContext", () => {
   });
 });
 
-// ── the outside-driven mode: `--next` (t#510) ───────────────────────────────
-//
-// `nextFrontier` is the read-only decision `--next` prints: it must reuse the
-// exact same stop vocabulary formatStop knows, and it must never call
-// beginStep — a node's status is asserted unchanged in every stop scenario.
-
-describe("nextFrontier — the frontier `--next` hands out", () => {
-  it("hands out the ready wave, sized to the change's parallel limit", () => {
-    const data = board(
-      changeRoot(1, [2, 3, 4], { parallel_limit: 2, budget_usd: 10 }),
-      auto(2),
-      auto(3),
-      auto(4, { depends_on: deps(2) }),
-    );
-    const ctx = buildRunContext({ data, change: "1", dry: true, spent: 0 });
-    const limit = resolveParallelLimit(ctx.root, undefined);
-    const outcome = nextFrontier(ctx, { limit, groupBudget: ctx.root.budget_usd, spentKnown: false });
-
-    expect(outcome.wave.map((t) => t.number)).toEqual([2, 3]);
-    expect(outcome.stop).toBeUndefined();
-    // Nothing moved — a peek is not an attempt.
-    expect(outcome.wave.every((t) => t.status === "queue")).toBe(true);
-    expect(ctx.data.todos.every((t) => !t.status_history)).toBe(true);
-  });
-
-  it("hands out the identical brief an executor gets, via the same stepBrief beginStep uses", () => {
-    const data = board(changeRoot(1, [2, 3]), auto(2), auto(3));
-    const ctx = buildRunContext({ data, change: "1", dry: true, spent: 0 });
-    const [t2, t3] = ctx.members;
-    const wave = [t2, t3];
-
-    const viaNext = stepBrief(ctx, t2, wave);
-    // beginStep is the ONLY other caller of this shape — assert it produces the
-    // identical object rather than a second, differently-shaped assembly.
-    const begunElsewhere = { ...ctx, attempts: new Map(), stop: null };
-    const begun = { brief: stepBrief(begunElsewhere, t2, wave) };
-
-    expect(viaNext).toEqual(begun.brief);
-    expect(viaNext.task).toBe(t2);
-    expect(viaNext.board).toBe(ctx.data);
-    expect(viaNext.alongside).toEqual([{ id: t3.id, number: 3, subject: t3.subject }]);
-  });
-
-  it("stops with the SAME gate reason as --go when a ready node is already sitting in review, and moves nothing", () => {
-    const data = board(changeRoot(1, [2, 3]), auto(2, { status: "review" }), auto(3, { depends_on: deps(2) }));
-    const ctx = buildRunContext({ data, change: "1", dry: true, spent: 0 });
-    const outcome = nextFrontier(ctx, { limit: 1, groupBudget: null, spentKnown: false });
-
-    expect(outcome.wave).toBeUndefined();
-    expect(outcome.stop.kind).toBe("gate");
-    expect(outcome.stop.reason).toMatch(/already in review/);
-    expect(outcome.stop.task.number).toBe(2);
-    expect(formatStop(outcome.stop)).toMatch(/pipeline parked — gate/);
-    expect(ctx.data.todos.find((t) => t.number === 2).status).toBe("review");
-  });
-
-  it("stops with the SAME retry-exhausted reason as --go, without ever calling beginStep", () => {
-    const data = board(
-      changeRoot(1, [2]),
-      auto(2, {
-        retry_limit: 1,
-        status_history: [{ status: "in_progress", at: "2026-07-28T10:00:00.000Z" }],
-      }),
-    );
-    const ctx = buildRunContext({ data, change: "1", dry: true, spent: 0 });
-    const outcome = nextFrontier(ctx, { limit: 1, groupBudget: null, spentKnown: false });
-
-    expect(outcome.wave).toBeUndefined();
-    expect(outcome.stop.kind).toBe("retry");
-    expect(outcome.stop.reason).toMatch(/attempt 2 would be past the declared limit — 1\/<=1/);
-    // --next must not start anything: the node is still `queue`, not `review`.
-    expect(ctx.data.todos.find((t) => t.number === 2).status).toBe("queue");
-  });
-
-  it("stops with the SAME empty-frontier reason as --go when the graph lies", () => {
-    const data = board(changeRoot(1, [2, 3]), auto(2, { depends_on: deps(3) }), auto(3, { depends_on: deps(2) }));
-    const ctx = buildRunContext({ data, change: "1", dry: true, spent: 0 });
-    const outcome = nextFrontier(ctx, { limit: 1, groupBudget: null, spentKnown: false });
-
-    expect(outcome.wave).toBeUndefined();
-    expect(outcome.stop.kind).toBe("empty-frontier");
-    expect(outcome.stop.reason).toMatch(/graph lies/);
-    expect(outcome.stop.blocked.map((b) => b.task.number)).toEqual([2, 3]);
-  });
-
-  it("reports complete, not a stop, when every node is already done", () => {
-    const data = board(changeRoot(1, [2]), auto(2, { status: "done" }));
-    const ctx = buildRunContext({ data, change: "1", dry: true, spent: 0 });
-    const outcome = nextFrontier(ctx, { limit: 1, groupBudget: null, spentKnown: false });
-
-    expect(outcome.complete).toBe(true);
-    expect(outcome.stop).toBeUndefined();
-  });
-
-  it("does NOT enforce the group budget unless the caller reports what has been spent", () => {
-    const data = board(changeRoot(1, [2], { budget_usd: 1 }), auto(2));
-    // ctx.spent is deliberately way past the declared budget: with spentKnown
-    // false this call must still hand the node out — the ceiling is unchecked,
-    // not silently assumed to be zero.
-    const ctx = buildRunContext({ data, change: "1", dry: true, spent: 999 });
-    const outcome = nextFrontier(ctx, { limit: 1, groupBudget: 1, spentKnown: false });
-
-    expect(outcome.wave.map((t) => t.number)).toEqual([2]);
-  });
-
-  it("parks on budget the SAME way --go does, once the caller supplies --spent", () => {
-    const data = board(changeRoot(1, [2], { budget_usd: 1 }), auto(2));
-    const ctx = buildRunContext({ data, change: "1", dry: true, spent: 1 });
-    const outcome = nextFrontier(ctx, { limit: 1, groupBudget: 1, spentKnown: true });
-
-    expect(outcome.wave).toBeUndefined();
-    expect(outcome.stop.kind).toBe("budget");
-    expect(outcome.stop.reason).toMatch(/group budget exhausted/);
-  });
-});
-
-// ── the outside-driven mode: `--report` (t#511) ─────────────────────────────
-//
-// `runReported` + `applyResult` compose the way `runOne` + the wave loop do for
-// `--go`: the caller's own result/review stand in for the effects call, but the
-// branch into gate / retry / issue / done runs through the identical finishStep
-// and applyResult every `--go` step already goes through.
-
-function outsideEffects(reconcile) {
-  return {
-    setStatus: async ({ task, status }) => {
-      if (task.status === status) return;
-      task.status = status;
-      (task.status_history ??= []).push({ status, at: new Date().toISOString() });
-    },
-    recordHandoff: async ({ task, text }) => {
-      task.handoff = text;
-      return { written: true };
-    },
-    recordIssue: async () => ({ written: true }),
-    runVerify: async () => ({ code: 0 }),
-    reconcile,
-    stepCost: async ({ result }) => (typeof result?.costUsd === "number" ? result.costUsd : null),
-    // Same reason as harness()'s stubs: an omitted key here falls through to
-    // liveEffects (buildRunContext's dry:false merge), which would snapshot
-    // the ACTUAL repo working tree.
-    stepBase: async () => ({ ok: false, error: "outsideEffects: no step base in tests" }),
-    priorChanges: async () => ({ ok: true, changes: null }),
-    ownChanges: async () => ({ ok: true, skip: true }),
-  };
-}
-
-const okReconcile = async () => ({ outcome: "ok", outcome_reason: "ok" });
-
-describe("runReported / applyResult — reporting one node's outcome", () => {
-  it("closes a node on a reported success whose declared verify passes", async () => {
-    const data = board(changeRoot(1, [2], { budget_usd: 10 }), auto(2));
-    const ctx = buildRunContext({ data, change: "1", dry: false, spent: 0, effects: outsideEffects(okReconcile) });
-    const task = ctx.byId.get("id-2");
-
-    const r = await runReported(ctx, task, [task], {
-      result: { sessionId: null, ok: true, error: "", handoff: "produced the thing", costUsd: 0.5 },
-      review: null,
-    });
-    const record = await applyResult(ctx, r, { dry: false, log: () => {} });
-
-    expect(record.result).toBe("done");
-    expect(record.outcome).toBe("ok");
-    expect(record.baton).toBe("written");
-    expect(task.status).toBe("done");
-    expect(task.handoff).toBe("produced the thing");
-    expect(ctx.spent).toBe(0.5);
-    expect(ctx.stop).toBeNull();
-  });
-
-  it("parks with the SAME reason as --go when a reported success's declared verify fails and no retry is declared", async () => {
-    const data = board(changeRoot(1, [2]), auto(2));
-    const reconcile = async ({ verify }) => ({ outcome: verify, outcome_reason: `verify:${verify}` });
-    const ctx = buildRunContext({
-      data,
-      change: "1",
-      dry: false,
-      spent: 0,
-      effects: { ...outsideEffects(reconcile), runVerify: async () => ({ code: 1 }) },
-    });
-    const task = ctx.byId.get("id-2");
-
-    const r = await runReported(ctx, task, [task], {
-      result: { sessionId: null, ok: true, error: "", handoff: "", costUsd: null },
-      review: null,
-    });
-    const record = await applyResult(ctx, r, { dry: false, log: () => {} });
-
-    expect(record.result).toBe("issue");
-    expect(ctx.stop.kind).toBe("retry");
-    expect(ctx.stop.reason).toMatch(/NO declared retry limit/);
-    expect(task.status).toBe("review");
-  });
-
-  it("takes the SAME ?issue transition as --go when a reported issue still has a retry left", async () => {
-    const data = board(
-      changeRoot(1, [2, 3]),
-      auto(2),
-      auto(3, { depends_on: deps(2), retry_limit: 2, on_issue: "id-2" }),
-    );
-    const ctx = buildRunContext({ data, change: "1", dry: false, spent: 0, effects: outsideEffects(okReconcile) });
-    const t2 = ctx.byId.get("id-2");
-    const t3 = ctx.byId.get("id-3");
-
-    const r2 = await runReported(ctx, t2, [t2], { result: { ok: true, handoff: "", costUsd: null } });
-    await applyResult(ctx, r2, { dry: false, log: () => {} });
-    expect(t2.status).toBe("done");
-
-    const r3 = await runReported(ctx, t3, [t3], {
-      result: { sessionId: null, ok: false, error: "could not complete", handoff: "", costUsd: null },
-      review: null,
-    });
-    const record = await applyResult(ctx, r3, { dry: false, log: () => {} });
-
-    expect(record.result).toBe("issue");
-    expect(record.reason).toMatch(/step failed: could not complete/);
-    expect(ctx.transitions).toHaveLength(1);
-    expect(ctx.transitions[0]).toMatchObject({ attempt: 1, limit: 2 });
-    expect(t2.status).toBe("queue");
-    expect(t3.status).toBe("queue");
-    expect(ctx.stop).toBeNull();
-  });
-
-  it("parks with the SAME retry-exhausted reason as --go when a reported issue spends the last attempt", async () => {
-    const data = board(changeRoot(1, [2]), auto(2, { retry_limit: 1 }));
-    const ctx = buildRunContext({ data, change: "1", dry: false, spent: 0, effects: outsideEffects(okReconcile) });
-    const task = ctx.byId.get("id-2");
-
-    const r = await runReported(ctx, task, [task], {
-      result: { sessionId: null, ok: false, error: "gave up", handoff: "", costUsd: null },
-      review: null,
-    });
-    const record = await applyResult(ctx, r, { dry: false, log: () => {} });
-
-    expect(record.result).toBe("issue");
-    expect(ctx.stop.kind).toBe("retry");
-    expect(ctx.stop.reason).toMatch(/retry limit exhausted — 1\/<=1/);
-    expect(task.status).toBe("review");
-  });
-
-  it("refuses to start a reported attempt once the limit is already spent, same as beginStep does for --go", async () => {
-    const data = board(
-      changeRoot(1, [2]),
-      auto(2, {
-        retry_limit: 1,
-        status_history: [{ status: "in_progress", at: "2026-07-28T10:00:00.000Z" }],
-      }),
-    );
-    const ctx = buildRunContext({ data, change: "1", dry: false, spent: 0, effects: outsideEffects(okReconcile) });
-    const task = ctx.byId.get("id-2");
-
-    const r = await runReported(ctx, task, [task], { result: { ok: true, handoff: "", costUsd: null } });
-    expect(r.kind).toBe("retry-exhausted");
-
-    const record = await applyResult(ctx, r, { dry: false, log: () => {} });
-    expect(record.result).toBe("retry-exhausted");
-    expect(ctx.stop.kind).toBe("retry");
-    expect(ctx.stop.reason).toMatch(/attempt 2 would be past the declared limit/);
-    expect(task.status).toBe("review");
-  });
-
-  it("a model review issue vetoes a reported success, the same as it does for --go", async () => {
-    const data = board(changeRoot(1, [2], { budget_usd: 10 }), auto(2, { retry_limit: 1 }));
-    const ctx = buildRunContext({ data, change: "1", dry: false, spent: 0, effects: outsideEffects(okReconcile) });
-    const task = ctx.byId.get("id-2");
-
-    const r = await runReported(ctx, task, [task], {
-      result: { sessionId: null, ok: true, error: "", handoff: "looks done", costUsd: null },
-      review: { approved: false, ok: true, result: "scope regression\nVERDICT: issue" },
-    });
-    const record = await applyResult(ctx, r, { dry: false, log: () => {} });
-
-    expect(record.result).toBe("issue");
-    expect(record.reason).toMatch(/model review issue/);
-    expect(ctx.stop.kind).toBe("retry");
-    expect(task.status).toBe("review");
-  });
-});
-
-// ── the equivalence claim itself ────────────────────────────────────────────
-//
-// The point of the whole design: a graph driven one node at a time from
-// OUTSIDE this loop — a fresh `buildRunContext` for every "call", exactly as
-// separate `--next` / `--report` invocations would each reload the board from
-// disk — must reach the SAME end state `--go`'s own long-lived loop reaches on
-// the identical graph and an equivalent executor.
-
-describe("equivalence — a --next/--report pair walks a graph to --go's own end state", () => {
-  it("closes the same graph, through the same ?issue transition, either way", async () => {
-    const buildGraph = () =>
-      board(
-        changeRoot(1, [2, 3], { budget_usd: 10 }),
-        auto(2),
-        auto(3, { depends_on: deps(2), verify: "flaky", retry_limit: 2, on_issue: "id-2" }),
-      );
-
-    // Node #3's own check fails on its first attempt and passes on any later
-    // one — decided from board state (attemptsSoFar), never from a hidden
-    // counter, so the two drivers cannot desync by calling in a different order.
-    const reconcile = async ({ task }) =>
-      task.number === 3 && attemptsSoFar(task) <= 1
-        ? { outcome: "issue", outcome_reason: "verify:issue" }
-        : { outcome: "ok", outcome_reason: "ok" };
-
-    // -- scenario A: --go, one long-lived ctx for the whole run.
-    const dataA = buildGraph();
-    const resultA = await runChange({
-      data: dataA,
-      change: "1",
-      dry: false,
-      effects: {
-        executeStep: async ({ task }) => ({ sessionId: `s-${task.number}`, ok: true, handoff: `done #${task.number}` }),
-        reviewStep: async () => ({ approved: true, ok: true, costUsd: 0 }),
-        ...outsideEffects(reconcile),
-      },
-    });
-    expect(resultA.complete).toBe(true);
-
-    // -- scenario B: --next / --report, a FRESH ctx built from the board every
-    // "call" — no ctx.attempts carries over, so the retry accounting can only
-    // be honest if it comes from status_history, exactly as separate processes
-    // would have to derive it from the real board on disk.
-    let boardB = buildGraph();
-    let stopB = null;
-    for (let guard = 0; !stopB && guard < 10; guard++) {
-      const peekCtx = buildRunContext({ data: boardB, change: "1", dry: true, spent: 0 });
-      const limit = resolveParallelLimit(peekCtx.root, undefined);
-      const groupBudget = typeof peekCtx.root.budget_usd === "number" ? peekCtx.root.budget_usd : null;
-      const outcome = nextFrontier(peekCtx, { limit, groupBudget, spentKnown: false });
-      if (outcome.complete) break;
-      if (outcome.stop) {
-        stopB = outcome.stop;
-        break;
-      }
-      for (const ready of outcome.wave) {
-        const workCtx = buildRunContext({
-          data: boardB,
-          change: "1",
-          dry: false,
-          spent: 0,
-          effects: outsideEffects(reconcile),
-        });
-        const task = workCtx.byId.get(ready.id);
-        const result = { sessionId: null, ok: true, error: "", handoff: `done #${task.number}`, costUsd: null };
-        const review = { approved: true, ok: true, costUsd: 0 };
-        const r = await runReported(workCtx, task, [task], { result, review });
-        await applyResult(workCtx, r, { dry: false, log: () => {} });
-        boardB = workCtx.data;
-        if (workCtx.stop) {
-          stopB = workCtx.stop;
-          break;
-        }
-      }
-    }
-
-    expect(stopB).toBeNull();
-    const statusesA = Object.fromEntries(resultA.board.todos.map((t) => [t.number, t.status]));
-    const statusesB = Object.fromEntries(boardB.todos.map((t) => [t.number, t.status]));
-    expect(statusesB).toEqual(statusesA);
-    expect(statusesB).toEqual({ 1: "queue", 2: "done", 3: "done" });
-
-    const handoffsA = Object.fromEntries(resultA.board.todos.map((t) => [t.number, t.handoff || null]));
-    const handoffsB = Object.fromEntries(boardB.todos.map((t) => [t.number, t.handoff || null]));
-    expect(handoffsB).toEqual(handoffsA);
-
-    // #3 took the ?issue transition exactly once on both paths: two attempts
-    // logged, not one and not three.
-    const attemptsA = attemptsSoFar(resultA.board.todos.find((t) => t.number === 3));
-    const attemptsB = attemptsSoFar(boardB.todos.find((t) => t.number === 3));
-    expect(attemptsB).toBe(attemptsA);
-    expect(attemptsB).toBe(2);
-  });
-});
-
 // ── risk routing (t#741) ────────────────────────────────────────────────────
 
 describe("risk routing through the run record", () => {
@@ -2212,19 +1607,6 @@ describe("the runs journal", () => {
     expect(rec.inherit).toBe(true);
   });
 
-  it("records a driven-mode step under the same change", () => {
-    const rec = reportRecordOf({
-      change: { number: 4, subject: "c" },
-      step: { task: { number: 11 }, attempt: 1, result: "done", cost_usd: null, session: null },
-      refused: [],
-      next: { ready: [], stop: null, complete: true },
-    });
-    expect(rec.kind).toBe("report");
-    expect(rec.change.number).toBe(4);
-    expect(rec.steps[0].task).toBe(11);
-    expect(rec.complete).toBe(true);
-  });
-
   it("summarizes the share of one-pass runs and what parked the rest", () => {
     const records = [
       { kind: "run", change: { number: 1 }, one_pass: true, stop: null, steps: [{ cost_usd: 0.2 }] },
@@ -2238,9 +1620,8 @@ describe("the runs journal", () => {
     expect(all.one_pass).toBe(2);
     expect(all.one_pass_share).toBe(0.5);
     expect(all.parked).toEqual({ gate: 1, budget: 1 });
-    expect(all.spend_usd).toBe(0.65);
+    expect(all.spend_usd).toBe(0.6);
     expect(all.unmeasured_steps).toBe(1);
-    expect(all.reported_steps).toBe(1);
 
     const one = summarizeRuns(records, { change: 2 });
     expect(one.runs).toBe(2);

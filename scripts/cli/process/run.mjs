@@ -79,7 +79,6 @@ import {
   loadBoard,
   loadBoardForWrite,
   saveBoard,
-  readTaskSessionEvents,
 } from "../board/todos.mjs";
 import { findChange } from "../board/change.mjs";
 import { resolveDuty } from "../agents/agents.mjs";
@@ -555,42 +554,6 @@ export function runRecordOf(report, { inherit = false } = {}) {
     stop: report.stop ? { kind: report.stop.kind, task: report.stop.task ? report.stop.task.number : null, reason: report.stop.reason } : null,
     complete: !!report.complete,
     one_pass: !!report.complete && !report.stop && (report.steps || []).every((s) => (s.attempt ?? 1) === 1),
-  };
-}
-
-// The same line for the driven mode, where a "run" is one reported node and the
-// loop lives in the caller. Kept in the same journal on purpose: the question
-// "what did this change cost end to end" must not depend on who drove it.
-export function reportRecordOf(report) {
-  const s = report.step || {};
-  return {
-    kind: "report",
-    change: report.change ? { number: report.change.number, subject: report.change.subject } : null,
-    steps: [
-      {
-        task: s.task ? s.task.number : null,
-        attempt: s.attempt ?? null,
-        result: s.result,
-        verify: s.verify ?? null,
-        red: s.red ?? null,
-        cost_usd: typeof s.cost_usd === "number" ? s.cost_usd : null,
-        session: s.session || null,
-        requested_mode: s.requested_mode || null,
-        start_mode: s.start_mode || "unknown",
-        parent_session: s.parent_session || null,
-        provider: s.provider || null,
-        model: s.model || null,
-        route: s.route || null,
-        review: s.review || null,
-        reason: s.reason || null,
-        own_changes: typeof s.own_changes === "number" ? s.own_changes : null,
-        outside_changes: typeof s.outside_changes === "number" ? s.outside_changes : null,
-        neighbour_damage: typeof s.neighbour_damage === "number" ? s.neighbour_damage : null,
-      },
-    ],
-    refused: (report.refused || []).length,
-    stop: report.next && report.next.stop ? { kind: report.next.stop.kind, task: null, reason: report.next.stop.reason } : null,
-    complete: !!(report.next && report.next.complete),
   };
 }
 
@@ -1195,24 +1158,6 @@ async function runOne(ctx, task, wave = []) {
   return finishStep(ctx, task, { result, review, baton, cost, ownChanges, outsideChanges });
 }
 
-export async function runReported(ctx, task, wave, { result, review = null }) {
-  const begun = await beginStep(ctx, task, wave);
-  if (begun.kind === "retry-exhausted" || begun.kind === "red-base-failed") return begun;
-  const { baton, cost } = await recordWork(ctx, task, result);
-  const damage = await checkNeighbourDamage(ctx, task, result, baton, cost);
-  if (damage && damage.issue) return damage.issue;
-  const ownChanges = damage ? damage.ownChanges : null;
-  const outsideChanges = damage ? damage.outsideChanges : null;
-  return finishStep(ctx, task, {
-    result,
-    review,
-    baton,
-    cost,
-    ownChanges,
-    outsideChanges,
-  });
-}
-
 // The `?issue` transition and every stop it can produce. All of it runs in board
 // order, after the wave — a parallel step never moves another node's status.
 async function applyIssue(ctx, r) {
@@ -1490,39 +1435,6 @@ export async function applyResult(ctx, r, { dry, log }) {
   return record;
 }
 
-export function nextFrontier(ctx, { limit, groupBudget, spentKnown }) {
-  const ready = frontierOf({ members: ctx.members, byId: ctx.byId });
-  if (!ready.length) {
-    if (ctx.members.every((t) => isDone(t))) return { complete: true };
-    park(ctx, "empty-frontier", null, EMPTY_FRONTIER_REASON, { blocked: blockedDiagnosis(ctx) });
-    return { stop: ctx.stop };
-  }
-  if (spentKnown && groupBudget !== null && ctx.spent >= groupBudget) {
-    park(ctx, "budget", ready[0], budgetExhaustedReason(ctx.spent, groupBudget, ready[0]), {
-      spent: round(ctx.spent),
-      budget: groupBudget,
-      not_started: brief(ready[0]),
-    });
-    return { stop: ctx.stop };
-  }
-  const pending = ready.find((t) => t.status === "review");
-  if (pending) {
-    ctx.parked.add(pending.id);
-    park(ctx, "gate", pending, REVIEW_GATE_REASON);
-    return { stop: ctx.stop };
-  }
-  const exhausted = ready.find((t) => {
-    const lim = retryLimitOf(t);
-    return lim !== null && attemptsSoFar(t) >= lim;
-  });
-  if (exhausted) {
-    ctx.parked.add(exhausted.id);
-    park(ctx, "retry", exhausted, retryExhaustedReason(attemptsSoFar(exhausted), retryLimitOf(exhausted)));
-    return { stop: ctx.stop };
-  }
-  return { wave: buildWave(ready, limit) };
-}
-
 // The run loop. `data` is cloned first, so nothing the engine does is visible on
 // the caller's object — the board changes only through the setStatus seam.
 export async function runChange({
@@ -1741,330 +1653,6 @@ export function formatRunReport(r) {
   return out.join("");
 }
 
-function dutySummary(name) {
-  const d = resolveDuty(name);
-  return { duty: name, mode: d.mode, enabled: d.enabled, provider: d.provider, model: d.model };
-}
-
-// The last session bound to each task, read from the binding journal. `--next`
-// hands it out so the DRIVER can decide whether its step starts cold or forks
-// that session (t#543): the runner has no say there — whoever spawns the step
-// owns the choice, and can only make it if it is told the id.
-function lastSessionByTask() {
-  const map = new Map();
-  let events = [];
-  try {
-    events = readTaskSessionEvents();
-  } catch {
-    return map;
-  }
-  for (const e of events) {
-    if (!e || !e.task || !e.session) continue;
-    map.set(String(e.task), String(e.session));
-  }
-  return map;
-}
-
-function prereqBatons(task, byId, sessions = new Map()) {
-  return (Array.isArray(task.depends_on) ? task.depends_on : [])
-    .map((id) => byId.get(id))
-    .filter(Boolean)
-    .map((p) => ({
-      task: brief(p),
-      status: p.status,
-      handoff: p.handoff && p.handoff.trim() ? p.handoff.trim() : null,
-      session: sessions.get(String(p.id)) || null,
-    }));
-}
-
-function budgetNote(groupBudget, spentKnown, spent) {
-  if (groupBudget === null) return "no budget is declared on this change — there is nothing to enforce.";
-  if (spentKnown)
-    return `checked against the declared $${groupBudget} using the $${round(spent)} you passed via --spent — this process still cannot verify that number on its own.`;
-  return (
-    `NOT enforced this call — $${groupBudget} is declared on the change, but this CLI cannot see what a ` +
-    "subagent spends outside it; pass --spent <usd> yourself if you are tracking the total, or the ceiling will not stop you."
-  );
-}
-
-function nodeHandout(task, byId, handoutAt = null) {
-  return {
-    task: brief(task),
-    status: task.status,
-    why: task.description || "",
-    produces: (Array.isArray(task.produces) ? task.produces : []).filter(Boolean),
-    verify: declaredVerify(task) || null,
-    retry_limit: retryLimitOf(task),
-    budget_usd: typeof task.budget_usd === "number" ? task.budget_usd : null,
-    kind: task.kind === "auto" ? "auto" : "manual",
-    gate: isGate(task),
-    handout_at: handoutAt,
-    inherits: prereqBatons(task, byId, lastSessionByTask()),
-  };
-}
-
-function formatNodeHandout(n) {
-  const out = [`\n#${n.task.number} ${n.task.subject}  [${n.kind}]${n.gate ? " — GATE" : ""}\n`];
-  out.push(`  why:      ${n.why || "(no description declared)"}\n`);
-  out.push(`  produces: ${n.produces.length ? n.produces.join(", ") : "(none declared)"}\n`);
-  out.push(`  verify:   ${n.verify || "(none — this node runs as a gate)"}\n`);
-  out.push(`  retry:    ${n.retry_limit === null ? "(none declared)" : `<=${n.retry_limit}`}\n`);
-  out.push(`  budget:   ${n.budget_usd === null ? "(none declared)" : `$${n.budget_usd}`}\n`);
-  out.push(`  handed out: ${n.handout_at || "(not recorded)"} — status unchanged, still ${n.status}\n`);
-  if (n.inherits.length) {
-    out.push("  inherits (direct prerequisites' handoff):\n");
-    for (const p of n.inherits)
-      out.push(`    t#${p.task.number} "${p.task.subject}" [${p.status}] — ${p.handoff ? p.handoff : "(no handoff)"}\n`);
-  } else {
-    out.push("  inherits: (a root of the change — nothing upstream)\n");
-  }
-  const forkable = n.inherits.filter((p) => p.session);
-  if (forkable.length === 1)
-    out.push(
-      `  context:  the prerequisite ran as session ${forkable[0].session} — YOUR call whether this step\n` +
-        `            starts cold or forks it (claude -p --resume <id> --fork-session): a fork is\n` +
-        `            cheaper and keeps its own id, but the step then sees that session, while the\n` +
-        `            brief above tells it there is no earlier conversation.\n`,
-    );
-  else if (forkable.length > 1)
-    out.push(
-      `  context:  ${forkable.length} prerequisites ran in their own sessions (${forkable
-        .map((p) => `#${p.task.number} ${p.session}`)
-        .join(", ")}) — forking one of them drops the others' context silently; a cold start is the honest default here.\n`,
-    );
-  return out.join("");
-}
-
-function formatDutyLine(label, d) {
-  return `  ${label.padEnd(8)} ${d.enabled ? `${d.provider}/${d.model}` : "off"}  [${d.mode}]\n`;
-}
-
-function formatNextReport(r) {
-  const out = [];
-  const th = r.change;
-  out.push(
-    `change c#${th.number} "${th.subject}" — parallel limit ${th.parallel_limit}` +
-      `${th.budget_usd === null ? ", budget UNDECLARED" : `, budget $${th.budget_usd}`}\n`,
-  );
-  out.push("the models this loop must bill to (agents.mjs; read, never hardcoded):\n");
-  out.push(formatDutyLine("worker", r.worker));
-  out.push(formatDutyLine("review", r.review));
-  out.push(`budget: ${r.budget_note}\n`);
-  if (!r.ready.length) {
-    out.push(
-      r.complete
-        ? "\nnothing to hand out — every node of the change is already closed.\n"
-        : formatStop(r.stop),
-    );
-    return out.join("");
-  }
-  out.push(`\nready (${r.ready.length} of up to ${th.parallel_limit}):\n`);
-  for (const n of r.ready) out.push(formatNodeHandout(n));
-  return out.join("");
-}
-
-function formatReportResult(r) {
-  const out = [];
-  const s = r.step;
-  out.push(`#${s.task.number} ${s.task.subject} — ${s.result}\n`);
-  out.push(`  attempt: ${s.retry_limit !== null ? `${s.attempt}/<=${s.retry_limit}` : s.attempt}\n`);
-  if (s.verify !== null) out.push(`  verify:  ${s.verify}\n`);
-  if (s.outcome !== null) out.push(`  outcome: ${s.outcome}${s.reason ? ` (${s.reason})` : ""}\n`);
-  else if (s.reason) out.push(`  reason:  ${s.reason}\n`);
-  out.push(
-    `  baton:   ${s.baton === null ? "(not reported)" : s.baton === "written" ? "written" : s.baton === "refused" ? "REFUSED by the board" : s.baton}\n`,
-  );
-  out.push(
-    `  cost:    ${typeof s.cost_usd === "number" ? `$${round(s.cost_usd)} (this report only — not accumulated across calls)` : "unknown"}\n`,
-  );
-  out.push(`  status:  ${s.status}\n`);
-  for (const t of r.transitions) out.push(formatTransitionLine(t));
-  out.push("\nwhat the next --next will hand out:\n");
-  if (r.next.complete) out.push("  nothing — every node of the change is now closed.\n");
-  else if (r.next.stop) out.push(formatStop(r.next.stop));
-  else out.push(`  ${r.next.ready.map((t) => `#${t.number}`).join(", ") || "(none)"}\n`);
-  return out.join("");
-}
-
-// The one place `--next` writes: every node of the wave it hands out gets a
-// fresh `handout_at` (t#520) — NOT a status move, `--report` still owns that —
-// so `outcome.mjs`'s weak file evidence has a boundary that is not the
-// executor's own word about when it started. Overwritten on a re-hand-out, so
-// a node that comes back after a crashed attempt starts a clean window rather
-// than measuring against the stamp of the attempt that never reported.
-export function stampHandout(file, data, wave) {
-  if (!wave.length) return null;
-  const at = new Date().toISOString();
-  const ids = new Set(wave.map((t) => t.id));
-  for (const t of data.todos) if (t && ids.has(t.id)) t.handout_at = at;
-  saveBoard(file, data);
-  return at;
-}
-
-function attachStepBase(data, wave, cwd) {
-  if (!wave.length) return { wave, stop: null };
-  let warned = false;
-  for (const t of wave) {
-    if (t.step_base) continue;
-    const head = gitBase(cwd);
-    if (!head.ok) {
-      if (declaredRed(t)) {
-        return {
-          wave: [],
-          stop: {
-            kind: "red-base",
-            task: brief(t),
-            status: t.status,
-            reason: `red declared but ${cwd} is not a git work tree${head.error ? `: ${head.error}` : ""}`,
-            parked: true,
-          },
-        };
-      }
-      if (!warned) {
-        warned = true;
-        process.stderr.write(
-          `run: step base unavailable for ${cwd}${head.error ? `: ${head.error}` : ""} — continuing without it, this run's produces/scope checks are best-effort\n`,
-        );
-      }
-      continue;
-    }
-    const todo = data.todos.find((x) => x && x.id === t.id);
-    if (todo) todo.step_base = head.sha;
-    t.step_base = head.sha;
-  }
-  return { wave, stop: null };
-}
-
-async function cmdNext(ref, f) {
-  recoverRedGate(process.cwd());
-  let parallel;
-  if (f.parallel !== undefined) {
-    parallel = Number(f.parallel);
-    if (!Number.isInteger(parallel) || parallel <= 0) fail(`--parallel takes a positive whole number`);
-  }
-  let timeoutMs;
-  if (f.timeout !== undefined) {
-    const min = Number(f.timeout);
-    if (!Number.isFinite(min) || min <= 0) fail("--timeout takes a positive number of minutes");
-    timeoutMs = min * 60_000;
-  }
-  const spentKnown = f.spent !== undefined;
-  let spent = 0;
-  if (spentKnown) {
-    spent = Number(f.spent);
-    if (!Number.isFinite(spent) || spent < 0) fail("--spent takes a non-negative number of dollars");
-  }
-
-  const file = appDataFile("todos.json");
-  const { root, limit, groupBudget, ctx, outcome, handoutAt } = withBoardLock(file, () => {
-    const data = loadBoardForWrite(file);
-    const c = buildRunContext({ data, change: ref, dry: true, cwd: process.cwd(), timeoutMs, spent, persistDecisionCard: true });
-    const l = resolveParallelLimit(c.root, parallel);
-    const gb = typeof c.root.budget_usd === "number" ? c.root.budget_usd : null;
-    let o = nextFrontier(c, { limit: l, groupBudget: gb, spentKnown });
-    if (o.wave) {
-      const based = attachStepBase(data, o.wave, process.cwd());
-      o = based.stop ? { stop: based.stop } : { ...o, wave: based.wave };
-    }
-    const at = stampHandout(file, data, o.wave || []);
-    return { root: c.root, limit: l, groupBudget: gb, ctx: c, outcome: o, handoutAt: at };
-  });
-
-  if (outcome.stop) ctx.stop = outcome.stop;
-  const report = {
-    version: 1,
-    kind: "change.next",
-    change: {
-      ...brief(root),
-      is_change: Boolean(root.record) || isChangeRoot(root),
-      parallel_limit: limit,
-      budget_usd: groupBudget,
-    },
-    worker: dutySummary("worker"),
-    review: dutySummary("review"),
-    budget_note: budgetNote(groupBudget, spentKnown, spent),
-    ready: (outcome.wave || []).map((t) => nodeHandout(t, ctx.byId, handoutAt)),
-    handout_at: handoutAt,
-    stop: outcome.stop || null,
-    card: outcome.stop ? await attachDecisionCard(ctx) : null,
-    complete: !!outcome.complete,
-  };
-
-  if (f.json) process.stdout.write(JSON.stringify(report, null, 2) + "\n");
-  else process.stdout.write(formatNextReport(report));
-
-  if (report.stop && report.stop.kind !== "gate") process.exit(1);
-}
-
-async function cmdReport(ref, f) {
-  recoverRedGate(process.cwd());
-  const taskRef = f.report;
-  if (f.result !== "ok" && f.result !== "issue") fail('--report needs --result "ok" or "issue"');
-  let cost;
-  if (f.cost !== undefined) {
-    cost = Number(f.cost);
-    if (!Number.isFinite(cost)) fail("--cost takes a number of dollars");
-  }
-  let review = null;
-  if (f.review !== undefined) {
-    const v = String(f.review).trim().toLowerCase();
-    if (v !== "approve" && v !== "issue") fail('--review takes "approve" or "issue"');
-    review = { approved: v === "approve", ok: true, skipped: false };
-  }
-  let timeoutMs;
-  if (f.timeout !== undefined) {
-    const min = Number(f.timeout);
-    if (!Number.isFinite(min) || min <= 0) fail("--timeout takes a positive number of minutes");
-    timeoutMs = min * 60_000;
-  }
-
-  const file = appDataFile("todos.json");
-  const data = loadBoardForWrite(file);
-  const ctx = buildRunContext({ data, change: ref, dry: false, cwd: process.cwd(), timeoutMs, spent: 0 });
-  const task = resolveTask(ctx.data, taskRef);
-  if (!task) fail(`no such task: ${taskRef}`);
-  if (!ctx.members.some((t) => t.id === task.id))
-    fail(`#${task.number ?? task.id} is not a member of ${ref}'s dependency closure`);
-  if (!isReadyNode(task, ctx.byId))
-    fail(`#${task.number} is not ready — its prerequisites are not all closed, so there is nothing to report yet`);
-
-  const result = {
-    sessionId: null,
-    ok: f.result !== "issue",
-    error: f.result === "issue" ? String(f.reason || "") : "",
-    handoff: String(f.handoff || ""),
-    costUsd: typeof cost === "number" ? cost : null,
-  };
-
-  const r = await runReported(ctx, task, [task], { result, review });
-  const record = await applyResult(ctx, r, { dry: false, log: () => {} });
-
-  const limit = resolveParallelLimit(ctx.root, undefined);
-  const groupBudget = typeof ctx.root.budget_usd === "number" ? ctx.root.budget_usd : null;
-  const preview = nextFrontier(ctx, { limit, groupBudget, spentKnown: false });
-  const card = preview.stop ? await attachDecisionCard(ctx) : null;
-
-  const report = {
-    version: 1,
-    kind: "change.report",
-    change: brief(ctx.root),
-    step: record,
-    transitions: ctx.transitions,
-    refused: ctx.refused,
-    next: {
-      ready: (preview.wave || []).map((t) => brief(t)),
-      stop: preview.stop || null,
-      complete: !!preview.complete,
-    },
-    card,
-  };
-
-  appendRunRecord(reportRecordOf(report));
-
-  if (f.json) process.stdout.write(JSON.stringify(report, null, 2) + "\n");
-  else process.stdout.write(formatReportResult(report));
-}
-
 // ── the history ──────────────────────────────────────────────────────────────
 
 // The one number the journal exists for: how often ONE pass over the graph was
@@ -2074,23 +1662,21 @@ async function cmdReport(ref, f) {
 export function summarizeRuns(records, { change } = {}) {
   const mine = (r) => !change || (r.change && r.change.number === change);
   const runs = records.filter((r) => r && r.kind === "run" && mine(r));
-  const reported = records.filter((r) => r && r.kind === "report" && mine(r));
   const onePass = runs.filter((r) => r.one_pass).length;
   const parked = {};
-  for (const r of [...runs, ...reported]) {
+  for (const r of runs) {
     if (!r.stop) continue;
     parked[r.stop.kind] = (parked[r.stop.kind] || 0) + 1;
   }
   let usd = 0;
   let unmeasured = 0;
-  for (const r of [...runs, ...reported])
+  for (const r of runs)
     for (const s of r.steps || []) {
       if (typeof s.cost_usd === "number") usd += s.cost_usd;
       else unmeasured += 1;
     }
   return {
     runs: runs.length,
-    reported_steps: reported.length,
     one_pass: onePass,
     one_pass_share: runs.length ? onePass / runs.length : null,
     parked,
@@ -2109,7 +1695,7 @@ const money = (steps = []) => {
 export function formatRunHistory(records, summary, { limit = 20 } = {}) {
   const out = [];
   if (!records.length) {
-    out.push("no runs recorded yet — the journal fills on `--go` and on every `--report`.\n");
+    out.push("no runs recorded yet — the journal fills on `--go`.\n");
     return out.join("");
   }
   out.push(`runs journal — ${records.length} record(s), newest last\n\n`);
@@ -2128,13 +1714,6 @@ export function formatRunHistory(records, summary, { limit = 20 } = {}) {
         `  ${when}  ${ch.padEnd(6)} ${String(r.nodes ?? "?").padStart(2)} node(s)  ${verdict.padEnd(24)} ${money(r.steps)}${r.inherit ? "  (inherit)" : ""}\n`,
       );
       if (r.stop && r.stop.reason) out.push(`      ${r.stop.reason}\n`);
-    } else {
-      const s = (r.steps || [])[0] || {};
-      out.push(
-        `  ${when}  ${ch.padEnd(6)} reported #${s.task ?? "?"} — ${s.result || "?"}${
-          s.attempt > 1 ? ` (attempt ${s.attempt})` : ""
-        }  ${money(r.steps)}\n`,
-      );
     }
   }
   out.push("\n");
@@ -2148,10 +1727,6 @@ export function formatRunHistory(records, summary, { limit = 20 } = {}) {
   out.push(
     `spend: $${summary.spend_usd} recorded${summary.unmeasured_steps ? `, ${summary.unmeasured_steps} step(s) unmeasured` : ""}\n`,
   );
-  if (summary.reported_steps)
-    out.push(
-      `note: ${summary.reported_steps} step(s) came from the driven mode (--report), where the loop lives in the caller and one pass is not a property this journal can see.\n`,
-    );
   return out.join("");
 }
 
@@ -2189,21 +1764,6 @@ function parseFlags(args) {
     else if (a === "--from") f.from = args[++i];
     else if (a.startsWith("--from=")) f.from = a.slice("--from=".length);
     else if (a === "--force") f.force = true;
-    else if (a === "--next") f.next = true;
-    else if (a === "--report") f.report = args[++i];
-    else if (a.startsWith("--report=")) f.report = a.slice("--report=".length);
-    else if (a === "--result") f.result = args[++i];
-    else if (a.startsWith("--result=")) f.result = a.slice("--result=".length);
-    else if (a === "--handoff") f.handoff = args[++i];
-    else if (a.startsWith("--handoff=")) f.handoff = a.slice("--handoff=".length);
-    else if (a === "--reason") f.reason = args[++i];
-    else if (a.startsWith("--reason=")) f.reason = a.slice("--reason=".length);
-    else if (a === "--cost") f.cost = args[++i];
-    else if (a.startsWith("--cost=")) f.cost = a.slice("--cost=".length);
-    else if (a === "--review") f.review = args[++i];
-    else if (a.startsWith("--review=")) f.review = a.slice("--review=".length);
-    else if (a === "--spent") f.spent = args[++i];
-    else if (a.startsWith("--spent=")) f.spent = a.slice("--spent=".length);
     else if (a === "--parallel") f.parallel = args[++i];
     else if (a.startsWith("--parallel=")) f.parallel = a.slice("--parallel=".length);
     else if (a === "--timeout") f.timeout = args[++i];
@@ -2218,10 +1778,8 @@ function parseFlags(args) {
 function usage(code) {
   process.stdout.write(
     "usage: cli todos run <change> [--dry-run | --go] [--inherit] [--parallel N] [--timeout <min>] [--json]\n" +
-      "       cli todos run <change> --next [--parallel N] [--spent <usd>] [--json]\n" +
       "       cli todos run watch <change> [--from start]\n" +
-      "       cli todos run <change> --report <task> --result ok|issue [--handoff <text>]\n" +
-      '                     [--reason <text>] [--cost <usd>] [--review approve|issue] [--json]\n\n' +
+      "\n" +
       "  Executes a change's task graph: frontier -> step -> verify -> outcome, one\n" +
       "  session per step, until the run parks. What it executes is what already\n" +
       "  stands in the graph — the runner creates no tasks and closes no change.\n\n" +
@@ -2244,27 +1802,13 @@ function usage(code) {
       "                 executor's own defaults stand (run-step.mjs)\n" +
       "  --json         the run report, machine-readable\n\n" +
       "  --history [<change>]  what past runs did, from the journal beside the board\n" +
-      "                 (runs.jsonl, one line per --go run and per --report step):\n" +
+      "                 (runs.jsonl, one line per --go run):\n" +
       "                 what each cost, where it parked, and the share of runs that\n" +
       "                 needed exactly ONE pass over the graph — the number that says\n" +
       "                 whether plans hold up, and which stop eats them when they do not.\n\n" +
       "  watch <change>       print live events for one change and stop when its run parks or ends;\n" +
       "                       --from start replays the latest run of the change first\n" +
       "    --from start       include existing events; otherwise starts at the current end of the journal\n\n" +
-      "  --next         hand the frontier to a caller driving the loop itself — the\n" +
-      "                 worker/review provider+model to bill (agents.mjs), each ready\n" +
-      "                 node's declarations and inherited handoff. Moves no status —\n" +
-      "                 a node still enters in_progress only on --report — but it DOES\n" +
-      "                 stamp handout_at on every node it hands out (t#520): the floor\n" +
-      "                 outcome.mjs's weak file evidence measures an mtime against, so\n" +
-      "                 it cannot be the executor's own word about when it started.\n" +
-      "  --report <task> apply one node's outcome through the same finishStep --go uses:\n" +
-      "                 the declared verify, reconcile, the status move, retry/on-issue.\n" +
-      "    --result ok|issue   did the work itself complete, or did it hit an issue\n" +
-      "    --handoff <text>    the baton the step produced\n" +
-      "    --reason <text>     why, when --result issue\n" +
-      "    --cost <usd>        what it cost, if known — unmeasured stays unmeasured\n" +
-      "    --review approve|issue   the review verdict, when the caller ran one\n\n" +
       "  Four stops, all printed the same way (node in review + reason + parked):\n" +
       "    gate            a manual node, or an `auto` one with no declared verify\n" +
       "    retry           the declared limit is spent (M/<=M), or none was declared\n" +
@@ -2273,8 +1817,7 @@ function usage(code) {
       "    empty-frontier  the change is open but nothing is workable — the graph lies\n\n" +
       "  Exit code: 0 when the change finished or parked at a gate, 1 otherwise.\n" +
       "  There is no --force here: overriding a failed check is a human exception.\n\n" +
-      "  --next / --report never see what a subagent spends: the group budget is\n" +
-      "  enforced only when you pass --spent yourself; without it, it is not checked.\n",
+      "",
   );
   process.exit(code);
 }
@@ -2291,9 +1834,6 @@ export async function run(args) {
   if (f.help) usage(0);
   if (f.history) return cmdHistory(ref || "", f);
   if (!ref) usage(1);
-  if (f.next && f.report !== undefined) fail("--next and --report ask for opposite things — pick one");
-  if (f.next) return cmdNext(ref, f);
-  if (f.report !== undefined) return cmdReport(ref, f);
   if (f.force)
     fail(
       "--force is not the runner's to use: a failed check is overridden by a human, never by an autonomous run.\n" +

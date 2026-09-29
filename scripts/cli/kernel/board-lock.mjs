@@ -263,9 +263,22 @@ export function withBoardLock(file, fn, opts = {}) {
   sweepOrphanTmp(file);
   held.set(key, 1);
   try {
-    return fn();
-  } finally {
+    const result = fn();
+    // A close-time verify is asynchronous.  Keep the process-wide lock until
+    // its reconciliation and status write are one transaction, rather than
+    // releasing it as soon as the promise is created.
+    if (result && typeof result.then === "function") {
+      return Promise.resolve(result).finally(() => {
+        held.set(key, (held.get(key) || 1) - 1);
+        releaseBoardLock(got.lock);
+      });
+    }
     held.set(key, (held.get(key) || 1) - 1);
     releaseBoardLock(got.lock);
+    return result;
+  } catch (err) {
+    held.set(key, (held.get(key) || 1) - 1);
+    releaseBoardLock(got.lock);
+    throw err;
   }
 }
