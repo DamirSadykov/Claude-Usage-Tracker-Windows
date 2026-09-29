@@ -1512,6 +1512,30 @@ describe("rules the CLI enforces instead of explaining", () => {
     expect(run("set", "status", "1", "in_progress")).not.toContain("not on the frontier");
   });
 
+  it("keeps one interactive change task open per session and records forced corrections", () => {
+    seed([
+      todo(1),
+      todo(2),
+      todo(3, { change: true, depends_on: ["id-1", "id-2"] }),
+    ]);
+    const first = run("set", "status", "1", "in_progress", "--session", "change-session");
+    expect(first).toContain("change-session rule:");
+    expect(refuse("set", "status", "2", "in_progress", "--session", "change-session")).toContain("close #1 first");
+    expect(refuse("set", "status", "2", "review", "--session", "change-session")).toContain("has no start in this session");
+
+    run("set", "status", "2", "done", "--force", "--session", "change-session");
+    const events = readTaskSessionEvents(path.join(dir, "com.claude-usage-tracker.app", "task-sessions.jsonl"));
+    expect(events.at(-1)).toMatchObject({ task: "id-2", event: "end", source: "force", session: "change-session" });
+  });
+
+  it("prints the change-session form after take, at the first in_progress transition", () => {
+    seed([todo(1), todo(2, { change: true, depends_on: ["id-1"] })]);
+    run("take", "1", "--session", "taken-change-session");
+
+    const first = run("set", "status", "1", "in_progress", "--session", "taken-change-session");
+    expect(first).toContain("change-session rule:");
+  });
+
   // t#253 field roles: one role each, never the same text in two.
   it("refuses text that is already in another field of the same task", () => {
     seed([todo(1)]);

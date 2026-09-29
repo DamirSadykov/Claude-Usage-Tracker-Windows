@@ -49,6 +49,7 @@ import { matchPlanCli, specsEnabled } from "../kernel/settings.mjs";
 import { appDataFile } from "../kernel/appdata.mjs";
 import { findChange, changeAddress, CURRENT, BoardUnreadableError, STATUSES, col, isDone, isChangeRoot, normalizeLimit, todosPath, load, save, boardPath, loadBoard, assertBoardWritable, loadBoardForWrite, saveBoard, withDeferredSave, resolveTask, changeRootsFor, changeAsRoot, specAddressesForManual } from "../kernel/board-io.mjs";
 import { withBoardLock } from "../kernel/board-lock.mjs";
+import { findSessionTranscripts, parseTouchedFiles } from "../process/outcome.mjs";
 
 let specPort = null;
 export function setSpecPort(port) {
@@ -226,6 +227,99 @@ export function lastTaskSessionEvent(session, file = taskSessionsPath()) {
   return mine.length ? mine[mine.length - 1] : null;
 }
 
+// An interactive change is deliberately a single-file line of work: the
+// journal, rather than the mutable board status, says what THIS session last
+// opened.  A change root is itself part of its change; children inherit their
+// nearest roots through changeRootsFor.
+function changeRootIds(data, task) {
+  if (!task) return new Set();
+  const roots = isChangeRoot(task) ? [task] : changeRootsFor(data, task);
+  return new Set(roots.map((root) => root.id));
+}
+
+function sharesChange(data, left, right) {
+  const leftRoots = changeRootIds(data, left);
+  if (!leftRoots.size) return false;
+  for (const id of changeRootIds(data, right)) if (leftRoots.has(id)) return true;
+  return false;
+}
+
+const CHANGE_SESSION_TEMPLATE =
+  "change-session rule:\n" +
+  "  todos set status #N in_progress → do the work → todos set status #N done\n" +
+  "  close this task before opening another task in this change; use --force only for a manual board correction.";
+
+function changeSessionRefusal(reason) {
+  return `refusing: ${reason}\n\n${CHANGE_SESSION_TEMPLATE}`;
+}
+
+// `parseTouchedFiles` is the canonical parser for editing tool_use entries.
+// Agent has no file_path, so it is intentionally the one small extra predicate
+// here; a successful Agent call is work even when its subagent made no edit.
+function transcriptHasAgentCallSince(raw, since) {
+  for (const line of String(raw || "").split("\n")) {
+    if (!line.includes('"tool_use"') || !line.includes('"Agent"')) continue;
+    let rec;
+    try {
+      rec = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (typeof rec.timestamp !== "string" || rec.timestamp < since) continue;
+    const content = rec?.message?.content;
+    if (Array.isArray(content) && content.some((item) => item?.type === "tool_use" && item.name === "Agent")) return true;
+  }
+  return false;
+}
+
+function hasChangeSessionWork(session, startAt) {
+  for (const transcript of findSessionTranscripts(session)) {
+    let raw;
+    try {
+      raw = readFileSync(transcript, "utf8");
+    } catch {
+      continue;
+    }
+    if (transcriptHasAgentCallSince(raw, startAt)) return true;
+    if (parseTouchedFiles(raw).touches.some((touch) => touch.mutates && touch.ts && touch.ts >= startAt)) return true;
+  }
+  return false;
+}
+
+function guardChangeSession({ data, todo, status, flags }) {
+  const session = currentSessionId(flags);
+  const roots = changeRootIds(data, todo);
+  if (!session || !roots.size || flags.force) return { session, firstStart: false };
+  const events = readTaskSessionEvents();
+  const taskFor = new Map(data.todos.filter(Boolean).map((task) => [task.id, task]));
+  const inChange = events.filter((event) => event.session === session && sharesChange(data, todo, taskFor.get(event.task)));
+  const latest = inChange[inChange.length - 1];
+  const startsHere = events.filter((event) => event.session === session && event.task === todo.id && event.event === "start");
+
+  if (status === "in_progress" && latest?.event === "start" && latest.task !== todo.id) {
+    const open = taskFor.get(latest.task);
+    fail(changeSessionRefusal(`close #${open?.number ?? latest.task} first — it is still open in this session`));
+  }
+  if ((status === "done" || status === "review") && !startsHere.length) {
+    fail(changeSessionRefusal(`#${todo.number} has no start in this session`));
+  }
+  if (status === "done") {
+    const start = startsHere[startsHere.length - 1];
+    if (!hasChangeSessionWork(session, start.ts)) {
+      fail(changeSessionRefusal(`no work in the window of #${todo.number} — no Agent call and no edit since its start`));
+    }
+  }
+  // `take` binds a session to a task before its status changes.  It is not the
+  // interactive `in_progress` transition, so it must not consume the one-time
+  // form reminder printed at that transition.
+  return {
+    session,
+    firstStart:
+      status === "in_progress" &&
+      !inChange.some((event) => event.event === "start" && event.source === "set-status"),
+  };
+}
+
 function cmdTake(args) {
   const { positional, flags } = parseArgs(args);
   const [id] = positional;
@@ -301,6 +395,7 @@ function setStatus({ data, file, todo, value, flags }) {
       );
     }
   }
+  const changeSession = guardChangeSession({ data, todo, status, flags });
   // The frontier (#88) is derived, so a start off it is legal — but it is worth
   // saying out loud, because the work it builds on is not finished yet.
   if (status === "in_progress") {
@@ -315,12 +410,12 @@ function setStatus({ data, file, todo, value, flags }) {
   }
   if (status === "in_progress" || status === "review" || status === "done") {
     appendTaskSessionEvent({
-      session: currentSessionId(),
+      session: currentSessionId(flags),
       task: todo.id,
       event: status === "in_progress" ? "start" : "end",
-      // Wire value, NOT the command name: task_sessions.rs::EXPLICIT_SOURCES is a
-      // two-item allowlist ("take", "set-status") and marks anything else a guess.
-      source: "set-status",
+      // Forced manual corrections remain explicit evidence, but retain their own
+      // source so trace/outcome never mistake them for ordinary interactive work.
+      source: flags.force ? "force" : "set-status",
       project: todo.project || null,
     });
   }
@@ -343,6 +438,7 @@ function setStatus({ data, file, todo, value, flags }) {
   // right here — the agent gets the baton without being told to ask for it. Only
   // when there's actually a handoff to carry, so root/handoff-less starts stay quiet.
   if (status === "in_progress") {
+    if (changeSession.firstStart) process.stdout.write(`\n${CHANGE_SESSION_TEMPLATE}\n`);
     const prereqs = directPrereqs(data, todo);
     if (prereqs.some((p) => p.handoff && p.handoff.trim())) {
       process.stdout.write("\n" + formatInheritedHandoff(todo, prereqs));
