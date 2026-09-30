@@ -381,10 +381,19 @@ const detailSiblings = computed(() => {
   if (!current?.change_id) return current ? [current] : [];
   return detailSiblingPages(todos.value, current.change_id, current.id, Number.MAX_SAFE_INTEGER, "change").visible;
 });
+type OverviewTree = { cost?: number; turns?: Array<{ calls?: Array<{ subagent?: OverviewTree | null }> }> };
 type OverviewWork = {
-  sessions?: Array<{ context?: { role?: "worker" | "review" | null }; tree?: { cost?: number } }>;
-  attempts?: Array<{ number: number; review?: { approved?: boolean; counts?: { critical: number; high: number; medium: number; low: number } | null } | null; sessions?: Array<{ context?: { role?: "worker" | "review" | null }; tree?: { cost?: number } }> }>;
+  sessions?: Array<{ context?: { role?: "worker" | "review" | null }; tree?: OverviewTree }>;
+  attempts?: Array<{ number: number; review?: { approved?: boolean; counts?: { critical: number; high: number; medium: number; low: number } | null } | null; sessions?: Array<{ context?: { role?: "worker" | "review" | null }; tree?: OverviewTree }> }>;
 };
+function treeModelCalls(tree?: OverviewTree | null): number {
+  return (tree?.turns ?? []).reduce((total, turn) => total + 1 + (turn.calls ?? []).reduce((sum, call) => sum + treeModelCalls(call.subagent), 0), 0);
+}
+function workModelCalls(work: OverviewWork | null) {
+  if (!work) return null;
+  const sessions = [...(work.sessions ?? []), ...(work.attempts ?? []).flatMap((attempt) => attempt.sessions ?? [])];
+  return sessions.reduce((total, session) => total + treeModelCalls(session.tree), 0);
+}
 const overviewWork = ref<OverviewWork | null>(null);
 const overviewHandoff = computed(() => parseHandoff(detail.value?.handoff));
 const overviewComments = computed(() => [...detailComments.value].slice(-2).reverse().map((comment) => ({
@@ -613,7 +622,10 @@ async function removeComment(id: string) {
 }
 
 function commentAuthorLabel(author: string) {
-  return author === "claude" ? t("todoAuthorClaude") : t("todoAuthorYou");
+  if (author === "claude") return t("todoAuthorClaude");
+  if (author === "review") return t("workRoleReviewer");
+  if (author === "architect") return t("todoAuthorArchitect");
+  return author === "user" || !author ? t("todoAuthorYou") : author;
 }
 
 // Format an ISO timestamp for a comment line. Empty/garbage → "" so a hand-
@@ -1448,7 +1460,7 @@ const blocksSum = computed(() =>
 );
 
 const detailTraceCalls = computed(() =>
-  taskBlocks.value.reduce((total, block) => total + block.tool_calls, 0),
+  workModelCalls(overviewWork.value) ?? taskBlocks.value.reduce((total, block) => total + block.tool_calls, 0),
 );
 
 const blocksOutside = computed(() => {
@@ -2026,10 +2038,10 @@ onUnmounted(() => {
                 v-for="c in renderedDetailComments"
                 :key="c.id"
                 class="tw-comment"
-                :class="{ ai: c.author === 'claude' }"
+                :class="{ ai: c.author !== 'user' }"
               >
                 <div class="tw-comment-head">
-                  <span class="tw-comment-author" :class="{ ai: c.author === 'claude' }">{{ commentAuthorLabel(c.author) }}</span>
+                  <span class="tw-comment-author" :class="{ ai: c.author !== 'user' }">{{ commentAuthorLabel(c.author) }}</span>
                   <span v-if="fmtTime(c.created_at)" class="tw-comment-time">{{ fmtTime(c.created_at) }}</span>
                   <button class="tw-comment-del" :title="t('todoDelete')" @click="removeComment(c.id)">
                     <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M4 4l8 8M12 4l-8 8" /></svg>

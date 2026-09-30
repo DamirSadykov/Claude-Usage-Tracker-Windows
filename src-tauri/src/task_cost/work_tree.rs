@@ -838,6 +838,22 @@ mod tests {
     }
 
     #[test]
+    fn keeps_tool_result_error_flag_when_slicing_a_task_tree() {
+        let path = std::env::temp_dir().join("task-work-tree-tool-error.jsonl");
+        std::fs::write(&path, concat!(
+            r#"{"type":"assistant","timestamp":"2026-01-01T00:00:01Z","message":{"id":"turn","model":"claude-sonnet","usage":{},"content":[{"type":"tool_use","id":"tool","name":"Bash","input":{}}]}}"#, "\n",
+            r#"{"type":"user","timestamp":"2026-01-01T00:00:02Z","message":{"content":[{"type":"tool_result","tool_use_id":"tool","is_error":true,"content":"failed"}]}}"#,
+        )).unwrap();
+        let tree = work_tree::build_work_tree(&path, &WorkTreeInterval::default()).unwrap();
+        let sliced = slice_tree(tree, &WorkTreeInterval {
+            start: Some("2026-01-01T00:00:00Z".into()),
+            end: Some("2026-01-01T00:01:00Z".into()),
+        });
+        assert!(sliced.turns[0].calls[0].result.as_ref().unwrap().is_error);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn cache_fingerprint_includes_subagent_transcripts() {
         let dir = std::env::temp_dir().join("task-work-tree-cache-subagent");
         let root = dir.join("session.jsonl");
