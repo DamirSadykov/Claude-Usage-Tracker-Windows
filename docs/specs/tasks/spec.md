@@ -331,8 +331,8 @@ part: требования
 part: требования
 
 - Колонка (kanban): `backlog | queue | in_progress | review | done` — куда
-  задачу положил человек (или CLI). На графе (`GraphView.vue`) это заливка
-  узла.
+  задачу положил человек (или CLI). На графе волн в карточке change (`NodeCard.vue`) это
+  вид узла.
 - Pipeline-состояние: `blocked | ready` — выводится из графа, не хранится
   (`todos.mjs::isReadyNode`). `blocked` = есть незакрытый прямой prerequisite;
   `ready` = все закрыты (задача без рёбер — ready). На графе — точка в углу
