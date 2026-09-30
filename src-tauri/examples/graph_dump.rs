@@ -22,7 +22,9 @@ fn db_path() -> std::path::PathBuf {
 fn main() {
     let dir = app_dir();
     let theme = std::env::args().nth(1).unwrap_or_else(|| "294".to_string());
-    let format = std::env::args().nth(2).unwrap_or_else(|| "mermaid".to_string());
+    let format = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| "mermaid".to_string());
 
     let board = todos::load(&dir.join("todos.json"));
     let events = task_sessions::load(&dir.join("task-sessions.jsonl"));

@@ -2,7 +2,7 @@ import type { BoardChange } from "../contracts/board";
 import type { BoardIndexes, BoardRow } from "./boardStore";
 import { projectTodos, type TodoFilters } from "./todoFilter";
 
-export type BoardTreeNodeKind = "change" | "legacy" | "group" | "task";
+export type BoardTreeNodeKind = "change" | "legacy" | "group" | "ungrouped" | "task";
 
 export interface BoardTreeProgress {
   done: number;
@@ -29,6 +29,12 @@ export interface BoardTreeRow extends BoardRow {
 export interface VisibleBoardTreeRow {
   node: BoardTreeNode;
   depth: number;
+}
+
+export interface BoardTreeSummary {
+  active: number;
+  total: number;
+  cost: number;
 }
 
 const taskSort = (left: BoardTreeRow, right: BoardTreeRow) => left.number - right.number || left.id.localeCompare(right.id);
@@ -140,7 +146,20 @@ export function buildBoardTree(
   const projectNodes = [...projects].map((project) => {
     const loose = [...(groups.get(project) ?? [])].sort(taskSort);
     const changeChildren = changeNodes.filter((entry) => entry.project === project).map((entry) => entry.node);
-    const children = [...changeChildren, ...loose.map(taskNode)];
+    const looseChildren = loose.map(taskNode);
+    const children: BoardTreeNode[] = looseChildren.length
+      ? [...changeChildren, {
+        kind: "ungrouped" as const,
+        id: `project:${project}:ungrouped`,
+        number: null,
+        title: "",
+        status: null,
+        progress: progress(loose),
+        cost: looseChildren.reduce((sum, node) => sum + node.cost, 0),
+        children: looseChildren,
+        closed: looseChildren.every((node) => node.closed),
+      }]
+      : changeChildren;
     const done = changeChildren.reduce((sum, node) => sum + node.progress.done, 0) + loose.filter(closedTask).length;
     const total = changeChildren.reduce((sum, node) => sum + node.progress.total, 0) + loose.length;
     return {
@@ -180,4 +199,19 @@ export function visibleBoardTreeRows(
   };
   for (const node of tree) visit(node, 0);
   return visible;
+}
+
+export function boardTreeSummary(tree: readonly BoardTreeNode[]): BoardTreeSummary {
+  const summary: BoardTreeSummary = { active: 0, total: 0, cost: 0 };
+  const visit = (node: BoardTreeNode) => {
+    if (node.kind === "task") {
+      summary.total += 1;
+      summary.active += Number(!node.closed);
+      summary.cost += node.cost;
+      return;
+    }
+    node.children.forEach(visit);
+  };
+  tree.forEach(visit);
+  return summary;
 }

@@ -23,4 +23,15 @@ describe("detailSiblingPages", () => {
     expect(pager.pages([first, second], "app", null).open.map((item) => item.subject)).toEqual(["first", "before"]);
     expect(pager.pages([{ ...first, subject: "after" }, second], "app", null).open.map((item) => item.subject)).toEqual(["first", "after"]);
   });
+
+  it("can page siblings within one change instead of the whole project", () => {
+    const rows = [
+      { ...row("a", "backlog"), change_id: "c1" },
+      { ...row("b", "queue"), change_id: "c1" },
+      { ...row("outside", "in_progress"), change_id: "c2" },
+      { ...row("none", "review"), change_id: undefined },
+    ];
+    const pages = detailSiblingPages(rows, "c1", "a", 50, "change");
+    expect(pages.visible.map((item) => item.id)).toEqual(["a", "b"]);
+  });
 });

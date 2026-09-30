@@ -1,32 +1,65 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import type { TodoFilters } from "./todoFilter";
+import { isNotDoneFilter, type TodoFilterField, type TodoFilters } from "./todoFilter";
 
+type FilterKey = TodoFilterField | "date";
 const props = defineProps<{ modelValue: TodoFilters; projects: string[] }>();
 const emit = defineEmits<{ "update:modelValue": [TodoFilters] }>();
 const { t } = useI18n();
 const queryInput = ref(props.modelValue.query);
+const open = ref<FilterKey | "">("");
 let timer: ReturnType<typeof setTimeout> | undefined;
 const value = computed({ get: () => props.modelValue, set: (next) => emit("update:modelValue", next) });
-function set(key: keyof TodoFilters, next: string | boolean) { value.value = { ...value.value, [key]: next }; }
+const searchEl = ref<HTMLInputElement | null>(null);
+const projectEl = ref<HTMLButtonElement | null>(null);
+const toggle = (key: FilterKey) => { open.value = open.value === key ? "" : key; };
+const set = (key: keyof TodoFilters, next: string | boolean) => { value.value = { ...value.value, [key]: next }; };
+const clear = (key: keyof TodoFilters) => set(key, typeof value.value[key] === "boolean" ? false : "");
+const select = (key: keyof TodoFilters, next: string) => { set(key, next); open.value = ""; };
+const clearStatus = () => {
+  if (value.value.status) clear("status");
+  else set("showDone", true);
+};
+const showAllStatuses = () => { value.value = { ...value.value, status: "", showDone: true }; open.value = ""; };
+const statusLabel = computed(() => ({ backlog: t("colBacklog"), queue: t("colQueue"), in_progress: t("statusInProgress"), review: t("colReview"), done: t("statusDone") }[value.value.status] ?? ""));
+const hasStatusFilter = computed(() => !!value.value.status || isNotDoneFilter(value.value));
+const displayedStatusLabel = computed(() => statusLabel.value || t("todoFilterNotDone"));
+const priorityLabel = computed(() => ({ high: t("todoPriorityHigh"), medium: t("todoPriorityMedium"), low: t("todoPriorityLow") }[value.value.priority] ?? ""));
+const authorLabel = computed(() => ({ user: t("todoAuthorYou"), claude: t("todoAuthorClaude") }[value.value.createdBy] ?? ""));
+const changeLabel = computed(() => value.value.change === "change" ? t("todoFilterChanges") : value.value.change === "task" ? t("todoFilterTasks") : "");
+const dateLabel = computed(() => value.value.createdFrom || value.value.createdTo ? `${value.value.createdFrom || "…"} — ${value.value.createdTo || "…"}` : "");
+const statusOptions = computed(() => [
+  ["backlog", t("colBacklog")], ["queue", t("colQueue")], ["in_progress", t("statusInProgress")], ["review", t("colReview")], ["done", t("statusDone")],
+] as const);
+const priorityOptions = computed(() => [["high", t("todoPriorityHigh")], ["medium", t("todoPriorityMedium")], ["low", t("todoPriorityLow")]] as const);
 watch(() => props.modelValue.query, q => { if (q !== queryInput.value) queryInput.value = q; });
 watch(queryInput, q => { clearTimeout(timer); timer = setTimeout(() => set("query", q), 200); });
-const searchEl = ref<HTMLInputElement | null>(null);
-const projectEl = ref<HTMLSelectElement | null>(null);
 defineExpose({ focusSearch: () => searchEl.value?.focus(), focusProject: () => projectEl.value?.focus() });
 </script>
 
 <template>
   <div class="tw-filters">
     <div class="tw-search"><input ref="searchEl" v-model="queryInput" class="tw-search-input" :placeholder="t('todoSearch')" /></div>
-    <select :value="value.status" class="tw-select sm" @change="set('status', ($event.target as HTMLSelectElement).value)"><option value="">{{ t('todoFilterStatus') }}</option><option value="backlog">{{ t('colBacklog') }}</option><option value="queue">{{ t('colQueue') }}</option><option value="in_progress">{{ t('statusInProgress') }}</option><option value="review">{{ t('colReview') }}</option><option value="done">{{ t('statusDone') }}</option></select>
-    <select ref="projectEl" :value="value.project" class="tw-select sm" @change="set('project', ($event.target as HTMLSelectElement).value)"><option value="">{{ t('todoFilterAll') }}</option><option v-for="project in projects" :key="project" :value="project">{{ project }}</option></select>
-    <select :value="value.priority" class="tw-select sm" @change="set('priority', ($event.target as HTMLSelectElement).value)"><option value="">{{ t('todoPriority') }}</option><option value="high">{{ t('todoPriorityHigh') }}</option><option value="medium">{{ t('todoPriorityMedium') }}</option><option value="low">{{ t('todoPriorityLow') }}</option></select>
-    <select :value="value.createdBy" class="tw-select sm" @change="set('createdBy', ($event.target as HTMLSelectElement).value)"><option value="">{{ t('todoFilterAuthor') }}</option><option value="user">{{ t('todoAuthorYou') }}</option><option value="claude">{{ t('todoAuthorClaude') }}</option></select>
-    <select :value="value.change" class="tw-select sm" @change="set('change', ($event.target as HTMLSelectElement).value)"><option value="">{{ t('todoFilterChange') }}</option><option value="change">{{ t('todoFilterChanges') }}</option><option value="task">{{ t('todoFilterTasks') }}</option></select>
-    <input :value="value.createdFrom" class="tw-filter-date" type="date" :title="t('todoFilterCreatedFrom')" @change="set('createdFrom', ($event.target as HTMLInputElement).value)" />
-    <input :value="value.createdTo" class="tw-filter-date" type="date" :title="t('todoFilterCreatedTo')" @change="set('createdTo', ($event.target as HTMLInputElement).value)" />
-    <label class="tw-toggle"><input :checked="value.showDone" type="checkbox" @change="set('showDone', ($event.target as HTMLInputElement).checked)" />{{ t('todoShowDone') }}</label>
+    <div class="tw-filter-menu"><button class="tw-filter-chip" :class="{ active: hasStatusFilter }" type="button" @click="toggle('status')">{{ hasStatusFilter ? `${t('todoStatus')}: ${displayedStatusLabel}` : `+ ${t('todoFilterStatus')}` }}<span v-if="hasStatusFilter" class="tw-filter-clear" @click.stop="clearStatus">×</span></button><div v-if="open === 'status'" class="tw-filter-options"><button type="button" @click="showAllStatuses">{{ t('todoFilterStatus') }}</button><button v-for="[status, label] in statusOptions" :key="status" type="button" @click="select('status', status)">{{ label }}</button></div></div>
+    <div class="tw-filter-menu"><button ref="projectEl" class="tw-filter-chip" :class="{ active: !!value.project }" type="button" @click="toggle('project')">{{ value.project || `+ ${t('todoProject')}` }}<span v-if="value.project" class="tw-filter-clear" @click.stop="clear('project')">×</span></button><div v-if="open === 'project'" class="tw-filter-options"><button v-for="project in projects" :key="project" type="button" @click="select('project', project)">{{ project }}</button></div></div>
+    <div class="tw-filter-menu"><button class="tw-filter-chip" :class="{ active: !!value.priority }" type="button" @click="toggle('priority')">{{ priorityLabel ? `${t('todoPriority')}: ${priorityLabel}` : `+ ${t('todoPriority')}` }}<span v-if="priorityLabel" class="tw-filter-clear" @click.stop="clear('priority')">×</span></button><div v-if="open === 'priority'" class="tw-filter-options"><button v-for="[priority, label] in priorityOptions" :key="priority" type="button" @click="select('priority', priority)">{{ label }}</button></div></div>
+    <div class="tw-filter-menu"><button class="tw-filter-chip" :class="{ active: !!value.createdBy }" type="button" @click="toggle('createdBy')">{{ authorLabel ? `${t('todoFilterAuthor')}: ${authorLabel}` : `+ ${t('todoFilterAuthor')}` }}<span v-if="authorLabel" class="tw-filter-clear" @click.stop="clear('createdBy')">×</span></button><div v-if="open === 'createdBy'" class="tw-filter-options"><button type="button" @click="select('createdBy', 'user')">{{ t('todoAuthorYou') }}</button><button type="button" @click="select('createdBy', 'claude')">{{ t('todoAuthorClaude') }}</button></div></div>
+    <div class="tw-filter-menu"><button class="tw-filter-chip" :class="{ active: !!value.change }" type="button" @click="toggle('change')">{{ changeLabel ? `${t('todoFilterChange')}: ${changeLabel}` : `+ ${t('todoFilterChange')}` }}<span v-if="changeLabel" class="tw-filter-clear" @click.stop="clear('change')">×</span></button><div v-if="open === 'change'" class="tw-filter-options"><button type="button" @click="select('change', 'change')">{{ t('todoFilterChanges') }}</button><button type="button" @click="select('change', 'task')">{{ t('todoFilterTasks') }}</button></div></div>
+    <div class="tw-filter-menu"><button class="tw-filter-chip" :class="{ active: !!dateLabel }" type="button" @click="toggle('date')">{{ dateLabel || `+ ${t('todoFilterCreatedFrom')}` }}<span v-if="dateLabel" class="tw-filter-clear" @click.stop="clear('createdFrom'); clear('createdTo')">×</span></button><div v-if="open === 'date'" class="tw-filter-options tw-filter-dates"><label>{{ t('todoFilterCreatedFrom') }}<input :value="value.createdFrom" type="date" @change="set('createdFrom', ($event.target as HTMLInputElement).value)" /></label><label>{{ t('todoFilterCreatedTo') }}<input :value="value.createdTo" type="date" @change="set('createdTo', ($event.target as HTMLInputElement).value)" /></label></div></div>
   </div>
 </template>
+
+<style scoped>
+.tw-filters { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.tw-filter-menu { position: relative; }
+.tw-filter-chip { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; padding: 4px 8px; border: 1px dashed var(--stroke-strong); border-radius: var(--r-ctl); background: transparent; color: var(--text-3); font: 11px/1 var(--segoe); cursor: pointer; }
+.tw-filter-chip.active { border-style: solid; border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
+.tw-filter-clear { font-size: 15px; line-height: 10px; }
+.tw-filter-options { position: absolute; z-index: 10; top: calc(100% + 5px); left: 0; display: grid; min-width: max-content; padding: 4px; border: 1px solid var(--stroke-strong); border-radius: var(--r-ctl); background: var(--layer); box-shadow: 0 6px 16px var(--canvas-bg); }
+.tw-filter-options button { padding: 5px 7px; border: 0; border-radius: 3px; background: transparent; color: var(--text-2); font: 11px/1.2 var(--segoe); text-align: left; cursor: pointer; }
+.tw-filter-options button:hover { background: var(--layer-hover); color: var(--text); }
+.tw-filter-dates { gap: 6px; padding: 7px; }
+.tw-filter-dates label { display: grid; gap: 3px; color: var(--text-3); font: 10px/1 var(--segoe); }
+.tw-filter-dates input { border: 1px solid var(--stroke-strong); border-radius: 3px; background: var(--input-bg); color: var(--text-2); color-scheme: dark; font: 11px/1 var(--segoe); padding: 3px 5px; }
+</style>

@@ -11,7 +11,6 @@ import { useI18n, type Composer } from "vue-i18n";
 import { invoke } from "@tauri-apps/api/core";
 import ProjectAutocomplete from "../kernel/ProjectAutocomplete.vue";
 import GraphView from "../board/GraphView.vue";
-import SpecView from "../spec/SpecView.vue";
 import PipelineGraph from "../process/pipeline/PipelineGraph.vue";
 import type { PipelineMode } from "../process/pipeline/modes";
 import { selectChange } from "../process/pipeline/useChange";
@@ -38,6 +37,8 @@ import TodoTree from "../board/TodoTree.vue";
 import WorkTree from "../board/WorkTree.vue";
 import { buildBoardTree, findBoardTreeNode, type BoardTreeNode, type BoardTreeRow } from "../board/boardTree";
 import { defaultTodoFilters, type TodoFilters } from "../board/todoFilter";
+import { detailSiblingPages } from "../board/detailSiblings";
+import { blockingTasks, commentAttempt, commentSeverity, parseHandoff, reviewOutcome, sessionRoleCosts } from "../board/taskOverview";
 
 const { t, locale } = useI18n();
 
@@ -217,7 +218,7 @@ const detailChangeNode = computed<BoardTreeNode | null>(() => {
   const visit = (nodes: readonly BoardTreeNode[], change: BoardTreeNode | null): BoardTreeNode | null => {
     for (const node of nodes) {
       if (node.id === id) return change;
-      const hit = visit(node.children, node.kind === "change" ? node : change);
+      const hit = visit(node.children, node.kind === "change" || node.kind === "legacy" ? node : change);
       if (hit) return hit;
     }
     return null;
@@ -364,6 +365,70 @@ const detail = computed(() => {
   return detailRecord.value?.id === row.id ? { ...row, ...detailRecord.value } : row;
 });
 
+type DetailTab = "overview" | "trace" | "comments";
+const detailTab = ref<DetailTab>("overview");
+const detailMenuOpen = ref(false);
+const detailChange = computed<{ number: number | null; title: string } | null>(() => {
+  const changeId = detail.value?.change_id;
+  if (!changeId) return null;
+  const change = changes.value.find((item) => item.id === changeId);
+  if (change) return { number: change.number, title: change.title };
+  const legacy = detailChangeNode.value;
+  return legacy ? { number: legacy.number, title: legacy.title } : null;
+});
+const detailSiblings = computed(() => {
+  const current = detail.value;
+  if (!current?.change_id) return current ? [current] : [];
+  return detailSiblingPages(todos.value, current.change_id, current.id, Number.MAX_SAFE_INTEGER, "change").visible;
+});
+type OverviewWork = {
+  sessions?: Array<{ context?: { role?: "worker" | "review" | null }; tree?: { cost?: number } }>;
+  attempts?: Array<{ number: number; review?: { approved?: boolean; counts?: { critical: number; high: number; medium: number; low: number } | null } | null; sessions?: Array<{ context?: { role?: "worker" | "review" | null }; tree?: { cost?: number } }> }>;
+};
+const overviewWork = ref<OverviewWork | null>(null);
+const overviewHandoff = computed(() => parseHandoff(detail.value?.handoff));
+const overviewComments = computed(() => [...detailComments.value].slice(-2).reverse().map((comment) => ({
+  ...comment,
+  severity: commentSeverity(comment.author, comment.body),
+  attempt: commentAttempt(comment.body),
+})));
+const overviewBlockedBy = computed(() => (detail.value?.depends_on ?? []).map((id) => todos.value.find((todo) => todo.id === id)).filter((todo): todo is Todo => !!todo));
+const overviewBlocks = computed(() => detail.value ? blockingTasks(detail.value, todos.value) : []);
+const overviewChange = computed(() => {
+  const current = detail.value;
+  if (!current?.change_id) return null;
+  const change = changes.value.find((item) => item.id === current.change_id);
+  if (!change) return null;
+  const members = todos.value.filter((todo) => todo.change_id === change.id);
+  const spent = members.reduce((sum, todo) => sum + (costOf(todo)?.cost ?? 0), 0);
+  return { ...change, done: members.filter((todo) => todo.status === "done").length, total: members.length, spent };
+});
+const overviewRoleCosts = computed(() => sessionRoleCosts(overviewWork.value));
+const overviewReview = computed(() => reviewOutcome(overviewWork.value?.attempts ?? []));
+const overviewAttemptCount = computed(() => overviewWork.value?.attempts?.length ?? 0);
+async function loadOverviewWork(id: string | null) {
+  overviewWork.value = null;
+  if (!id) return;
+  try {
+    const work = await invoke<OverviewWork>("get_task_work_tree", { task: id });
+    if (detailId.value === id) overviewWork.value = work;
+  } catch {}
+}
+function openOverviewTodo(todo: Todo) { void openDetail(todo); }
+const detailSiblingIndex = computed(() => detailSiblings.value.findIndex((item) => item.id === detailId.value));
+function openDetailSibling(offset: number) {
+  const target = detailSiblings.value[detailSiblingIndex.value + offset];
+  if (!target) return;
+  const node = findBoardTreeNode(tree.value, target.id);
+  if (node) selectedTreeNode.value = node;
+  void openDetail(target);
+}
+function selectDetailProject() {
+  if (!detail.value?.project) return;
+  projectFilter.value = detail.value.project;
+  closeDetail();
+}
+
 // Transient "Saved ✓" confirmation shown after a successful detail save.
 const saved = ref(false);
 let savedTimer: ReturnType<typeof setTimeout> | null = null;
@@ -450,6 +515,9 @@ async function openDetail(todo: { id: string }) {
   descMode.value = "edit";
   mention.value = null;
   saved.value = false;
+  detailTab.value = "overview";
+  detailMenuOpen.value = false;
+  void loadOverviewWork(todo.id);
   try {
     const full = await invoke<Todo | null>("get_task_detail", { id: todo.id });
     if (full && detailId.value === todo.id) {
@@ -468,11 +536,7 @@ function closeDetail() {
   detailRecord.value = null;
   detailLoading.value = false;
   detailLoadFailed.value = false;
-}
-
-function changeDetailStatus(event: Event) {
-  const todo = detail.value;
-  if (todo) void moveStatus(todo, (event.target as HTMLSelectElement).value);
+  overviewWork.value = null;
 }
 
 async function saveDetail() {
@@ -694,29 +758,12 @@ async function openSettings() {
 // Board vs graph view (#88): the graph is an alternative rendering of the SAME
 // filtered board, toggled in place — not a separate window. It shares this
 // window's `todos` and `projectFilter`.
-// `specs` is the third rendering (t#346): not another view of the board, but
-// the level ABOVE it — the spec section a change points at, with that change's
-// graph under it.
-const viewMode = ref<"board" | "graph" | "specs">("board");
+const viewMode = ref<"board" | "graph">("board");
 const graphMode = ref<PipelineMode>("lanes");
 // The graph tab has two renderings while the redesign lands: the new lane/wire
 // screens (default) and the classic force layout. The choice is remembered per
 // machine so a session that prefers the old picture keeps it.
 const graphUiNew = ref(localStorage.getItem("graph-ui") !== "classic");
-// `specsTab` is a per-machine opt-in; `settings.specsEnabled` (t#361) is the
-// master switch — the tab needs BOTH. With the switch off (its default) the
-// tab is gone even on a machine that opted in, and any view already parked on
-// `specs` (a stored state, or the switch flipped while this window is open)
-// falls back to the board rather than rendering with no tab to reach it from.
-const specsTab = ref(localStorage.getItem("specs-tab") === "on");
-const specsTabVisible = computed(() => specsTab.value && settings.value.specsEnabled);
-watch(
-  () => settings.value.specsEnabled,
-  (on) => {
-    if (!on && viewMode.value === "specs") viewMode.value = "board";
-  },
-);
-const specMode = ref<PipelineMode>("reader");
 watch(graphUiNew, (on) =>
   localStorage.setItem("graph-ui", on ? "next" : "classic"),
 );
@@ -765,65 +812,6 @@ function onGraphUpdate(list: Todo[]) {
   void boardStore.reload(true);
 }
 
-// --- the spec a task is about (t#339/t#346) ----------------------------------
-//
-// A task's `spec` is written by the CLI and, until now, was invisible here: the
-// board showed the delta and never what the delta was TO. That gap is what the
-// whole mechanic exists to close, so the link belongs on the card, not only in
-// the session's injected context.
-//
-// The walk mirrors `todos.mjs::specAddressesFor`: the task's OWN addresses win
-// outright, and only a task without any inherits its nearest change's.
-// Inheritance is REPLACEMENT, not a merge — otherwise one section would be
-// listed twice for the same task.
-function changeRootsOf(t: Todo): { spec: string[] }[] {
-  if (t.change_id) {
-    const record = changes.value.find((c) => c.id === t.change_id);
-    if (record) return [{ spec: record.spec ?? [] }];
-  }
-  const roots: Todo[] = [];
-  const seen = new Set<string>([t.id]);
-  let frontier = [t.id];
-  while (frontier.length && !roots.length) {
-    const next: string[] = [];
-    for (const parent of todos.value) {
-      if (!(parent.depends_on ?? []).some((d) => frontier.includes(d))) continue;
-      if (seen.has(parent.id)) continue;
-      seen.add(parent.id);
-      if (parent.change) roots.push(parent);
-      else next.push(parent.id);
-    }
-    frontier = next;
-  }
-  return roots.map((r) => ({ spec: r.spec ?? [] }));
-}
-
-function specLinkOf(t: Todo): { addresses: string[]; inherited: boolean } {
-  const own = (t.spec ?? []).filter(Boolean);
-  if (own.length) return { addresses: own, inherited: false };
-  const seen = new Set<string>();
-  for (const r of changeRootsOf(t)) for (const a of r.spec ?? []) seen.add(a);
-  return { addresses: [...seen], inherited: true };
-}
-
-const detailSpec = computed(() =>
-  detail.value ? specLinkOf(detail.value) : { addresses: [], inherited: false },
-);
-// The closing answers recorded for THIS task (`cli spec answer`, t#341) — the
-// board's own copy of what the guard was told.
-const detailAnswers = computed(() => detail.value?.spec_answers ?? []);
-
-// Jump from a task to the section it is about. Opening the Specs tab rather
-// than a popup keeps one place where a section is read — the tab also shows the
-// other changes on it, which is the context a reader wants next.
-const specTarget = ref<{ address: string; project: string } | null>(null);
-function openSpecSection(address: string) {
-  if (!settings.value.specsEnabled) return;
-  specTarget.value = { address, project: detail.value?.project ?? "" };
-  viewMode.value = "specs";
-  closeDetail();
-}
-
 // Clicking a graph node opens that task's card — the same detail panel the board
 // uses (it overlays the graph and returns to it on close).
 // The pipeline screens address a task the way a human does — "#345" — while the
@@ -832,7 +820,11 @@ function onPipelineOpen(ref: string) {
   const byRef = ref.startsWith("#")
     ? byNumber.value.get(Number(ref.slice(1)))
     : todos.value.find((x) => x.id === ref);
-  if (byRef) openDetail(byRef);
+  if (!byRef) return;
+  viewMode.value = "board";
+  const node = findBoardTreeNode(tree.value, byRef.id);
+  selectedTreeNode.value = node;
+  void openDetail(byRef);
 }
 
 // Navigate a t#N reference to that task's detail; a @name reference back to the
@@ -1455,6 +1447,10 @@ const blocksSum = computed(() =>
   taskBlocks.value.reduce((acc, b) => acc + (b.cost || 0), 0),
 );
 
+const detailTraceCalls = computed(() =>
+  taskBlocks.value.reduce((total, block) => total + block.tool_calls, 0),
+);
+
 const blocksOutside = computed(() => {
   const total = detail.value ? (costOf(detail.value)?.cost ?? 0) : 0;
   return Math.max(0, total - blocksSum.value);
@@ -1663,25 +1659,9 @@ onUnmounted(() => {
           </svg>
           {{ t("viewGraph") }}
         </button>
-        <button
-          v-if="specsTabVisible"
-          class="tw-vt"
-          :class="{ active: viewMode === 'specs' }"
-          role="tab"
-          :aria-selected="viewMode === 'specs'"
-          :title="t('viewSpecs')"
-          @click="viewMode = 'specs'"
-        >
-          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M3 2.5h7l3 3v8H3z" />
-            <path d="M9.5 2.5v3.5H13" />
-            <path d="M5.5 8.5h5M5.5 11h3" />
-          </svg>
-          {{ t("viewSpecs") }}
-        </button>
       </div>
       <button
-        v-if="viewMode === 'graph' || viewMode === 'specs'"
+        v-if="viewMode === 'graph'"
         class="tw-guide"
         :title="graphUiNew ? t('graphUiOld') : t('graphUiNew')"
         @click="graphUiNew = !graphUiNew"
@@ -1759,24 +1739,7 @@ onUnmounted(() => {
       @open="onPipelineOpen"
     />
 
-    <!-- Specs, new rendering: reader and review over the same registry -->
-    <PipelineGraph
-      v-else-if="viewMode === 'specs' && graphUiNew"
-      v-model:mode="specMode"
-      @open="onPipelineOpen"
-    />
-
-    <!-- Specs: the level above the board — section, its changes, their graph -->
-    <SpecView
-      v-else-if="viewMode === 'specs'"
-      :todos="todos"
-      :changes="changes"
-      :project="projectFilter"
-      :target="specTarget"
-      @open="onPipelineOpen"
-    />
-
-    <div v-else class="tw-tree-layout" :style="{ '--tree-width': `${treeWidth}px` }">
+    <div v-else class="tw-tree-layout" :style="{ '--tree-width': `${detailTab === 'trace' ? 300 : treeWidth}px` }">
       <TodoTree
         :tree="tree"
         :selected-id="selectedTreeNode?.id"
@@ -1785,44 +1748,63 @@ onUnmounted(() => {
       />
       <div class="tw-tree-resize" @pointerdown.prevent="startTreeResize"></div>
       <div v-if="detailId" class="tw-tree-detail">
-        <button v-if="detailChangeNode" class="tw-back" @click="selectTreeNode(detailChangeNode)">
-          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 3.5 5 8l4.5 4.5" /></svg>
-          c#{{ detailChangeNode.number }} {{ detailChangeNode.title }}
-        </button>
         <section v-if="detail && detailRecord && !detailLoading" class="tw-detail-main">
+          <nav class="tw-detail-crumbs" :aria-label="t('todoBreadcrumbs')">
+            <button class="tw-crumb" :disabled="!detail.project" @click="selectDetailProject">{{ detail.project || t('todoNoProject') }}</button>
+            <span class="tw-crumb-separator">›</span>
+            <button v-if="detailChange" class="tw-crumb tw-crumb-change" @click="detailChangeNode && selectTreeNode(detailChangeNode)">c#{{ detailChange.number }} {{ detailChange.title }}</button>
+            <span v-if="detailChange" class="tw-crumb-separator">›</span>
+            <button class="tw-crumb tw-crumb-current" @click="openDetail(detail)">#{{ detail.number }}</button>
+            <div class="tw-detail-pager">
+              <button :disabled="detailSiblingIndex <= 0" :aria-label="t('todoPreviousTask')" @click="openDetailSibling(-1)">‹</button>
+              <span>{{ detailSiblingIndex + 1 }} / {{ detailSiblings.length }}</span>
+              <button :disabled="detailSiblingIndex < 0 || detailSiblingIndex >= detailSiblings.length - 1" :aria-label="t('todoNextTask')" @click="openDetailSibling(1)">›</button>
+            </div>
+          </nav>
           <div class="tw-detail-pane-head">
             <h2><span v-if="detail.number" class="tw-detail-num">#{{ detail.number }}</span>{{ detail.subject }}</h2>
-            <button class="tw-btn ghost" @click="removeTodo(detail)">{{ t('todoDelete') }}</button>
-          </div>
-          <label class="tw-field">
-            <span>{{ t('todoStatus') }}</span>
-            <select :value="detail.status" class="tw-select" @change="changeDetailStatus">
-              <option v-for="column in COLUMNS" :key="column.id" :value="column.id">{{ t(column.labelKey) }}</option>
-            </select>
-          </label>
-          <label class="tw-field">
-            <span>{{ t('todoDescription') }}</span>
-            <div class="tw-richtext">{{ detail.description || t('todoNoDescription') }}</div>
-          </label>
-          <label class="tw-field">
-            <span>{{ t('todoHandoff') }}</span>
-            <div class="tw-richtext">{{ detail.handoff || t('todoNoDescription') }}</div>
-          </label>
-          <div class="tw-comments">
-            <div class="tw-comments-hd">{{ t('todoComments') }}</div>
-            <div v-if="!detailComments.length" class="tw-comments-empty">{{ t('todoCommentsEmpty') }}</div>
-            <ul v-else class="tw-comment-list">
-              <li v-for="comment in renderedDetailComments" :key="comment.id" class="tw-comment">
-                <div class="tw-comment-head"><span class="tw-comment-author">{{ commentAuthorLabel(comment.author) }}</span><span class="tw-comment-time">{{ fmtTime(comment.created_at) }}</span></div>
-                <p class="tw-comment-body">{{ comment.body }}</p>
-              </li>
-            </ul>
-            <div class="tw-comment-compose">
-              <textarea v-model="newComment" class="tw-input tw-area" :placeholder="t('todoCommentPlaceholder')" rows="2" @keydown.ctrl.enter="addComment" @keydown.meta.enter="addComment"></textarea>
-              <button class="tw-btn" :disabled="!newComment.trim()" @click="addComment">{{ t('todoCommentAdd') }}</button>
+            <div class="tw-detail-menu-wrap">
+              <button class="tw-detail-menu-button" :aria-label="t('todoMore')" @click="detailMenuOpen = !detailMenuOpen">⋯</button>
+              <div v-if="detailMenuOpen" class="tw-detail-menu">
+                <button @click="detailMenuOpen = false; removeTodo(detail)">{{ t('todoDelete') }}</button>
+              </div>
             </div>
           </div>
-          <WorkTree :task="detail.id" :heading="t('workTree')" />
+          <div class="tw-detail-meta">
+            <div class="tw-status-segments" :aria-label="t('todoStatus')">
+              <button v-for="column in COLUMNS" :key="column.id" :class="['tw-status-segment', { active: detail.status === column.id, done: column.id === 'done', progress: column.id === 'in_progress' }]" @click="moveStatus(detail, column.id)">{{ t(column.labelKey) }}</button>
+            </div>
+            <span v-if="detail.priority" class="tw-detail-chip">{{ priorityLabel(detail.priority) }}</span>
+            <span v-if="detail.kind" class="tw-detail-chip">{{ detail.kind }}</span>
+            <span v-if="costOf(detail)" class="tw-detail-chip tw-detail-cost">{{ fmtCost(costOf(detail)!.cost) }}</span>
+            <span v-if="overviewAttemptCount" class="tw-detail-chip">{{ overviewAttemptCount }} {{ t('todoAttempts') }} · {{ overviewReview ? t(overviewReview === 'approved' ? 'todoReviewApproved' : 'todoReviewFindings') : t('todoReviewPending') }}</span>
+          </div>
+          <div class="tw-detail-tabs" role="tablist">
+            <button :class="{ active: detailTab === 'overview' }" @click="detailTab = 'overview'">{{ t('todoOverview') }}</button>
+            <button :class="{ active: detailTab === 'trace' }" @click="detailTab = 'trace'">{{ t('todoTrace') }} <span>{{ detailTraceCalls }} {{ t('todoBlocksCalls') }}</span> <span v-if="costOf(detail)">{{ fmtCost(costOf(detail)!.cost) }}</span></button>
+            <button :class="{ active: detailTab === 'comments' }" @click="detailTab = 'comments'">{{ t('todoComments') }} <span>{{ detailComments.length }}</span></button>
+          </div>
+          <template v-if="detailTab === 'overview'">
+            <div class="tw-overview">
+              <div class="tw-overview-main">
+                <section class="tw-overview-section"><h3>{{ t('todoDescription') }}</h3><div class="tw-overview-description">{{ detail.description || t('todoNoDescription') }}</div></section>
+                <section class="tw-overview-section"><h3>{{ t('todoHandoff') }}</h3><div v-if="overviewHandoff.parts.length" class="tw-handoff-card"><div v-for="part in overviewHandoff.parts" :key="part.part" class="tw-handoff-row"><b>{{ overviewHandoff.fallback ? t('todoHandoff') : t(`todoHandoff${part.part[0].toUpperCase()}${part.part.slice(1)}`) }}</b><span>{{ part.text }}</span></div></div><div v-else class="tw-overview-empty">{{ t('todoNoDescription') }}</div></section>
+                <section class="tw-overview-section"><h3>{{ t('todoRecentComments') }}</h3><div v-if="!overviewComments.length" class="tw-overview-empty">{{ t('todoCommentsEmpty') }}</div><ul v-else class="tw-overview-comments"><li v-for="comment in overviewComments" :key="comment.id"><div><b>{{ commentAuthorLabel(comment.author) }}</b><span v-if="comment.severity" :class="['tw-severity', comment.severity]">{{ comment.severity }}</span><span v-if="comment.attempt !== null" class="tw-attempt-chip">{{ t('todoAttempt') }} {{ comment.attempt }} / {{ overviewAttemptCount || 1 }} · {{ t('todoReview') }}</span></div><p>{{ comment.body }}</p></li></ul></section>
+              </div>
+              <aside class="tw-overview-side">
+                <section v-if="overviewChange" class="tw-overview-card"><h3>c#{{ overviewChange.number }} {{ overviewChange.title }}</h3><div class="tw-overview-stat"><span>{{ overviewChange.done }} / {{ overviewChange.total }}</span><span>{{ fmtCost(overviewChange.spent) }}<template v-if="overviewChange.budget_usd != null"> / {{ fmtCost(overviewChange.budget_usd) }}</template></span></div><div class="tw-overview-bar"><i :style="{ width: `${overviewChange.total ? overviewChange.done / overviewChange.total * 100 : 0}%` }"></i></div></section>
+                <section class="tw-overview-section"><h3>{{ t('todoDependsOn') }}</h3><button v-for="todo in overviewBlockedBy" :key="todo.id" class="tw-relation" @click="openOverviewTodo(todo)"><i :class="todo.status"></i>#{{ todo.number }} {{ todo.subject }}</button><div v-if="!overviewBlockedBy.length" class="tw-overview-empty">—</div></section>
+                <section class="tw-overview-section"><h3>{{ t('todoBlocksTasks') }}</h3><button v-for="todo in overviewBlocks" :key="todo.id" class="tw-relation" @click="openOverviewTodo(todo)"><i :class="todo.status"></i>#{{ todo.number }} {{ todo.subject }}</button><div v-if="!overviewBlocks.length" class="tw-overview-empty">—</div></section>
+                <section class="tw-overview-section"><h3>{{ t('todoSessionCost') }}</h3><div class="tw-role-cost"><span>{{ t('workRoleWorker') }}</span><b>{{ fmtCost(overviewRoleCosts.worker) }}</b></div><div class="tw-role-cost"><span>{{ t('workRoleReviewer') }}</span><b>{{ fmtCost(overviewRoleCosts.review) }}</b></div><div class="tw-role-bar"><i :style="{ width: `${(overviewRoleCosts.worker + overviewRoleCosts.review) ? overviewRoleCosts.worker / (overviewRoleCosts.worker + overviewRoleCosts.review) * 100 : 0}%` }"></i></div></section>
+              </aside>
+            </div>
+          </template>
+          <WorkTree v-else-if="detailTab === 'trace'" :task="detail.id" :heading="t('workTree')" />
+          <div v-else class="tw-comments">
+            <div v-if="!detailComments.length" class="tw-comments-empty">{{ t('todoCommentsEmpty') }}</div>
+            <ul v-else class="tw-comment-list"><li v-for="comment in renderedDetailComments" :key="comment.id" class="tw-comment"><div class="tw-comment-head"><span class="tw-comment-author">{{ commentAuthorLabel(comment.author) }}</span><span class="tw-comment-time">{{ fmtTime(comment.created_at) }}</span></div><p class="tw-comment-body">{{ comment.body }}</p></li></ul>
+            <div class="tw-comment-compose"><textarea v-model="newComment" class="tw-input tw-area" :placeholder="t('todoCommentPlaceholder')" rows="2" @keydown.ctrl.enter="addComment" @keydown.meta.enter="addComment"></textarea><button class="tw-btn" :disabled="!newComment.trim()" @click="addComment">{{ t('todoCommentAdd') }}</button></div>
+          </div>
         </section>
         <section v-else class="tw-detail-main tw-detail-empty">{{ detailLoading ? t('loading') : t('todoDetailLoadFailed') }}</section>
       </div>
@@ -1987,33 +1969,6 @@ onUnmounted(() => {
               <div class="tw-handoff-item-hd">t#{{ p.number }} · {{ p.subject }}</div>
               <p v-if="p.handoff" class="tw-handoff-item-body">{{ p.handoff }}</p>
               <p v-else class="tw-handoff-item-empty">{{ t("todoHandoffItemEmpty") }}</p>
-            </div>
-          </div>
-
-          <!-- The spec this task is about (t#339/t#346): read-only here on
-               purpose — the link is written by `todos set spec`, which validates
-               the address against the registry, and the answers by `spec answer`.
-               A field typed here would accept an address that resolves to
-               nothing, which is the one thing the link must never be. -->
-          <div v-if="detailSpec.addresses.length || detailAnswers.length" class="tw-field tw-spec-box">
-            <span class="tw-handoff-in-hd">
-              {{ t("todoSpec") }}
-              <em v-if="detailSpec.inherited" class="tw-hint">{{ t("todoSpecInherited") }}</em>
-            </span>
-            <div class="tw-spec-links">
-              <button
-                v-for="a in detailSpec.addresses"
-                :key="a"
-                class="tw-spec-link"
-                :title="t('todoSpecHint')"
-                @click.prevent="openSpecSection(a)"
-              >📘 {{ a }}</button>
-            </div>
-            <div v-for="(a, i) in detailAnswers" :key="i" class="tw-spec-answer">
-              <span class="tw-spec-verdict" :class="`v-${a.verdict}`">{{ a.verdict }}</span>
-              <span class="tw-spec-answer-addr">{{ a.address }}</span>
-              <span class="tw-spec-answer-at">{{ (a.at || "").slice(0, 10) }}</span>
-              <p class="tw-spec-answer-note">{{ a.note }}</p>
             </div>
           </div>
 
@@ -2861,12 +2816,64 @@ onUnmounted(() => {
 .tw-tree-layout > :last-child { min-height: 0; overflow: auto; }
 .tw-tree-detail { display: flex; flex-direction: column; gap: 10px; padding: 14px 16px; }
 .tw-tree-detail > .tw-back { align-self: flex-start; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tw-detail-crumbs { align-items: center; border-bottom: 1px solid var(--stroke); display: flex; flex: 0 0 30px; gap: 6px; min-width: 0; }
+.tw-crumb { background: transparent; border: 0; color: var(--text-3); cursor: pointer; font-family: var(--mono); font-size: 12px; overflow: hidden; padding: 3px 0; text-overflow: ellipsis; white-space: nowrap; }
+.tw-crumb:hover:not(:disabled) { background: var(--layer); color: var(--text); }
+.tw-crumb:disabled { cursor: default; }
+.tw-crumb-change { color: var(--theme); max-width: 45%; }
+.tw-crumb-current { color: var(--text); }
+.tw-crumb-separator { color: var(--text-4); }
+.tw-detail-pager { align-items: center; display: flex; gap: 5px; margin-left: auto; font-family: var(--mono); font-size: 12px; white-space: nowrap; }
+.tw-detail-pager button, .tw-detail-menu-button { background: var(--layer); border: 1px solid var(--stroke); border-radius: 4px; color: var(--text-2); cursor: pointer; height: 24px; min-width: 26px; }
+.tw-detail-pager button:disabled { color: var(--text-4); cursor: default; }
+.tw-detail-pane-head { align-items: flex-start; display: flex; gap: 12px; justify-content: space-between; }
+.tw-detail-pane-head h2 { margin: 0; }
+.tw-detail-menu-wrap { position: relative; }
+.tw-detail-menu { background: var(--layer); border: 1px solid var(--stroke-strong); border-radius: 6px; padding: 4px; position: absolute; right: 0; top: 28px; z-index: 2; }
+.tw-detail-menu button { background: transparent; border: 0; color: var(--crit); cursor: pointer; font-family: var(--segoe); padding: 6px 10px; text-align: left; white-space: nowrap; }
+.tw-detail-meta { align-items: center; display: flex; flex-wrap: wrap; gap: 7px; }
+.tw-status-segments { display: flex; flex-wrap: wrap; }
+.tw-status-segment { background: var(--layer); border: 1px solid var(--stroke); color: var(--text-3); cursor: pointer; font-family: var(--segoe); font-size: 11px; padding: 5px 8px; }
+.tw-status-segment:first-child { border-radius: 5px 0 0 5px; }
+.tw-status-segment:last-child { border-radius: 0 5px 5px 0; }
+.tw-status-segment.active { background: var(--accent-soft); border-color: var(--accent); color: var(--text); }
+.tw-status-segment.active.done { background: var(--theme-bg-2); border-color: var(--ok); }
+.tw-detail-chip { background: var(--layer); border: 1px solid var(--stroke); border-radius: 999px; color: var(--text-2); font-size: 11px; padding: 4px 8px; }
+.tw-detail-cost { color: var(--tree-cost); font-family: var(--mono); }
+.tw-detail-tabs { border-bottom: 1px solid var(--stroke); display: flex; gap: 16px; }
+.tw-detail-tabs button { background: transparent; border: 0; border-bottom: 2px solid transparent; color: var(--text-3); cursor: pointer; font-family: var(--segoe); padding: 8px 1px; }
+.tw-detail-tabs button.active { border-bottom-color: var(--accent); color: var(--text); }
+.tw-detail-tabs span { color: var(--text-4); font-family: var(--mono); }
+.tw-overview { display: grid; gap: 22px; grid-template-columns: minmax(0, 1fr) 300px; padding-top: 8px; }
+.tw-overview-main, .tw-overview-side { display: flex; flex-direction: column; gap: 18px; min-width: 0; }
+.tw-overview-section h3, .tw-overview-card h3 { color: var(--text-2); font-size: 13px; margin: 0 0 8px; }
+.tw-overview-description { color: var(--text-2); font-size: 13.5px; line-height: 1.62; max-width: 780px; white-space: pre-wrap; }
+.tw-handoff-card, .tw-overview-card { background: var(--layer); border: 1px solid var(--stroke); border-radius: var(--r-card); padding: 10px 12px; }
+.tw-handoff-row { display: grid; gap: 10px; grid-template-columns: 78px minmax(0, 1fr); padding: 5px 0; }
+.tw-handoff-row b { color: var(--text-3); font-size: 12px; }
+.tw-handoff-row span { color: var(--text-2); font-size: 13px; white-space: pre-wrap; }
+.tw-overview-empty { color: var(--text-4); font-size: 12px; }
+.tw-overview-comments { display: flex; flex-direction: column; gap: 8px; list-style: none; margin: 0; padding: 0; }
+.tw-overview-comments li { border-left: 2px solid var(--stroke-strong); padding: 7px 10px; }
+.tw-overview-comments b { color: var(--text-2); font-size: 12px; }
+.tw-overview-comments p { color: var(--text-3); font-size: 12px; line-height: 1.45; margin: 5px 0 0; white-space: pre-wrap; }
+.tw-severity, .tw-attempt-chip { border-radius: var(--r-pill); display: inline-block; font-family: var(--mono); font-size: 10px; margin-left: 6px; padding: 2px 5px; }
+.tw-severity { background: var(--layer-2); color: var(--text-3); }
+.tw-severity.critical { color: var(--crit); }.tw-severity.high { color: var(--high); }.tw-severity.medium { color: var(--warn); }.tw-severity.low { color: var(--accent-2); }
+.tw-attempt-chip { background: var(--accent-soft); color: var(--text-3); }
+.tw-overview-stat, .tw-role-cost { color: var(--text-3); display: flex; font-family: var(--mono); font-size: 11px; justify-content: space-between; }
+.tw-overview-stat { margin-bottom: 8px; }.tw-role-cost + .tw-role-cost { margin-top: 6px; }.tw-role-cost b { color: var(--tree-cost); font-weight: 400; }
+.tw-overview-bar, .tw-role-bar { background: var(--track); border-radius: var(--r-pill); height: 5px; overflow: hidden; }
+.tw-overview-bar i, .tw-role-bar i { background: var(--ok); display: block; height: 100%; }.tw-role-bar i { background: var(--accent-2); }
+.tw-relation { align-items: center; background: transparent; border: 0; color: var(--text-3); cursor: pointer; display: flex; font-family: var(--segoe); font-size: 12px; gap: 7px; padding: 4px 0; text-align: left; width: 100%; }.tw-relation:hover { color: var(--text); }
+.tw-relation i { background: var(--text-4); border-radius: 50%; height: 6px; width: 6px; }.tw-relation i.done { background: var(--ok); }.tw-relation i.in_progress { background: var(--accent-2); }.tw-relation i.review { background: var(--tree-review); }
 .tw-tree-resize { cursor: col-resize; margin-left: -3px; position: relative; width: 6px; z-index: 1; }
 .tw-tree-resize::after { background: var(--stroke-strong); content: ""; inset: 0 2px; position: absolute; }
 @media (max-width: 720px) {
   .tw-tree-layout { grid-template-columns: 1fr; grid-template-rows: minmax(180px, 40%) minmax(0, 1fr); }
   .tw-tree-layout > :first-child { border-bottom: 1px solid var(--stroke-strong); border-right: 0; }
   .tw-tree-resize { display: none; }
+  .tw-overview { grid-template-columns: 1fr; }
 }
 .tw-board {
   flex: 1;
@@ -2999,71 +3006,6 @@ onUnmounted(() => {
   -webkit-box-orient: vertical;
   overflow: hidden;
   word-break: break-word;
-}
-
-/* The spec link (t#339/t#346) — a chip on the card, a read-only block in the
-   detail. Blue, like every other "this opens somewhere else" affordance here. */
-.tw-spec {
-  cursor: pointer;
-  color: #4cc2ff;
-  border-color: color-mix(in srgb, #4cc2ff 40%, transparent);
-}
-.tw-spec:hover {
-  border-color: #4cc2ff;
-}
-.tw-spec-box {
-  display: block;
-}
-.tw-spec-links {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin: 4px 0 8px;
-}
-.tw-spec-link {
-  font-family: ui-monospace, Consolas, monospace;
-  font-size: 11.5px;
-  background: none;
-  border: 1px solid color-mix(in srgb, #4cc2ff 40%, transparent);
-  border-radius: 5px;
-  color: #4cc2ff;
-  cursor: pointer;
-  padding: 2px 7px;
-}
-.tw-spec-link:hover {
-  border-color: #4cc2ff;
-}
-.tw-spec-answer {
-  border-left: 2px solid var(--tw-border, #2a2f3a);
-  padding: 2px 0 2px 9px;
-  margin-bottom: 7px;
-}
-.tw-spec-verdict {
-  font-size: 9.5px;
-  border-radius: 4px;
-  padding: 1px 5px;
-  background: #3a4150;
-}
-.tw-spec-verdict.v-updated {
-  background: #2f5a2a;
-}
-.tw-spec-answer-addr {
-  font-family: ui-monospace, Consolas, monospace;
-  font-size: 11px;
-  opacity: 0.7;
-  margin-left: 6px;
-}
-.tw-spec-answer-at {
-  font-family: ui-monospace, Consolas, monospace;
-  font-size: 11px;
-  opacity: 0.45;
-  margin-left: 6px;
-}
-.tw-spec-answer-note {
-  margin: 3px 0 0;
-  font-size: 12px;
-  line-height: 1.45;
-  opacity: 0.85;
 }
 
 /* Inherited handoff (#141): read-only summary of what upstream deps left off. */

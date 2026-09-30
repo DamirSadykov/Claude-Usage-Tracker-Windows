@@ -811,7 +811,7 @@ watch(
     <LegendBar :items="legendItems">
         <template #right>
             <span class="rings-hints">
-                ЛКМ — сделать фокусом · двойной ЛКМ — открыть в доске · колесо —
+                ЛКМ — сделать фокусом · двойной ЛКМ — открыть в дереве · колесо —
                 масштаб · перетаскивание — панорама
             </span>
         </template>
@@ -992,7 +992,7 @@ watch(
                             class="rings-open"
                             @click="openNode(focusTodo!.id)"
                         >
-                            Открыть {{ focusNumber }} в доске
+                            Открыть {{ focusNumber }} в дереве
                         </ToolButton>
                     </template>
                 </SidePanel>
@@ -1038,7 +1038,7 @@ watch(
                                 Показать всё
                             </ToolButton>
                             <ToolButton variant="pri" @click="openNode(pick.id)">
-                                Открыть в доске
+                                Открыть в дереве
                             </ToolButton>
                         </div>
                     </template>

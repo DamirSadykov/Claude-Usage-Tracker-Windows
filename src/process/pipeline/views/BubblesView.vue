@@ -686,7 +686,7 @@ const pick = computed(() => {
         label: node.label,
         title: node.title,
         project: node.project ?? todo?.project ?? "без проекта",
-        status: todo ? (STATUS_TEXT[todo.status] ?? todo.status) : "нет в доске",
+        status: todo ? (STATUS_TEXT[todo.status] ?? todo.status) : "нет среди задач",
         health: healthOf(id),
         home,
         homeLabel: bubbleById.value.get(home)?.address ?? home,
@@ -909,7 +909,7 @@ watch([bounds, () => size.value.w, () => size.value.h], fit, { immediate: true }
         <template #right>
             <span class="bub-hints">
                 ЛКМ по пузырю — раскрыть · ЛКМ по узлу — панель · двойной ЛКМ —
-                открыть в доске · колесо — масштаб
+                открыть в дереве · колесо — масштаб
             </span>
         </template>
     </LegendBar>
@@ -1207,7 +1207,7 @@ watch([bounds, () => size.value.w, () => size.value.h], fit, { immediate: true }
                                 Свернуть пузырь
                             </ToolButton>
                             <ToolButton variant="pri" @click="openNode(pick!.id)">
-                                Открыть в доске
+                                Открыть в дереве
                             </ToolButton>
                         </div>
                     </template>

@@ -63,3 +63,47 @@ export interface BoardChange {
     updated_at?: string;
     closed_at?: string;
 }
+
+export interface ReviewCounts {
+  critical: number;
+  high: number;
+  medium: number;
+  low: number;
+}
+
+export interface RunReview {
+  session?: string | null;
+  counts?: ReviewCounts;
+  approved?: boolean;
+  findings?: unknown[];
+}
+
+export interface RunEvent {
+  ts: string;
+  task: string;
+  kind: string;
+  attempt?: number;
+  limit?: number;
+  route?: string;
+  counts?: ReviewCounts;
+  approved?: boolean;
+  findings?: unknown[];
+}
+
+export interface WorkTree {
+  sessionId?: string;
+  transcriptPath: string;
+  startedAt?: string;
+  endedAt?: string;
+  compacted: boolean;
+  compactionAt: string[];
+}
+
+export interface TaskWorkAttempt {
+  number: number;
+  startedAt: string;
+  endedAt: string;
+  events: RunEvent[];
+  review?: RunReview;
+  result?: string;
+}

@@ -42,7 +42,9 @@ impl TempBoardDir {
     }
 
     fn board_path(&self) -> PathBuf {
-        self.0.join("com.claude-usage-tracker.app").join("todos.json")
+        self.0
+            .join("com.claude-usage-tracker.app")
+            .join("todos.json")
     }
 }
 
@@ -74,7 +76,10 @@ fn add_via_cli(appdata: &Path, subject: &str) -> u32 {
 }
 
 fn assert_board_dir_clean(board_path: &Path) {
-    for entry in fs::read_dir(board_path.parent().unwrap()).unwrap().flatten() {
+    for entry in fs::read_dir(board_path.parent().unwrap())
+        .unwrap()
+        .flatten()
+    {
         let name = entry.file_name().to_string_lossy().into_owned();
         if name == "todos.json" {
             continue;
