@@ -299,7 +299,10 @@ mod tests {
             RestartProvider::OpenAi,
             &RestartPointParams::default(),
         );
-        assert!(point.scenarios.iter().all(|s| s.k.map_or(true, |k| k >= 31)));
+        assert!(point
+            .scenarios
+            .iter()
+            .all(|s| s.k.map_or(true, |k| k >= 31)));
         let none = calculate_restart_point(
             &linear(38, 19_000, 94_000, 99),
             RestartProvider::OpenAi,

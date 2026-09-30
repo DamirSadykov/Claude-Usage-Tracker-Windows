@@ -966,6 +966,50 @@ fn spawn_corrections_publisher(app: AppHandle) {
     });
 }
 
+/// Historical runner traces can be expensive to parse on Windows.  Start this
+/// only after the window is live, then do all filesystem and parser work on the
+/// blocking pool; it is best-effort and will be retried next startup.
+fn spawn_restart_backfill(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        let _ = tokio::task::spawn_blocking(move || {
+            let Ok(todo_path) = todos_path(&app) else {
+                return;
+            };
+            let Ok(board) = todos::load_known(&todo_path) else {
+                return;
+            };
+            let Ok(task_sessions) = task_sessions_path(&app) else {
+                return;
+            };
+            let Ok(runs) = runs_path(&app) else {
+                return;
+            };
+            let Ok(calibration) = restart_calibration_path(&app) else {
+                return;
+            };
+            let Ok(restart_points) = restart_points_path(&app) else {
+                return;
+            };
+            let paths = task_cost::restart_backfill::RestartBackfillPaths {
+                task_sessions,
+                runs,
+                calibration,
+                restart_points,
+                claude_base: claude_dir(),
+                codex_base: codex::codex_dir(),
+            };
+            let task_numbers = board
+                .todos
+                .iter()
+                .map(|todo| (todo.id.clone(), todo.number))
+                .collect();
+            let _ = task_cost::restart_backfill::backfill(&paths, &task_numbers);
+        })
+        .await;
+    });
+}
+
 // --- System resource monitor (whole-machine CPU + RAM for the mini panel) ---
 
 // How often the mini panel gets a fresh CPU/RAM reading.
@@ -1768,6 +1812,16 @@ fn task_sessions_path(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir.join("task-sessions.jsonl"))
 }
 
+/// Restart observations and their Node-produced calibration live beside the
+/// session journal. Rust only appends observations; the CLI owns calibration.
+fn restart_points_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(task_sessions_path(app)?.with_file_name("restart-points.jsonl"))
+}
+
+fn restart_calibration_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(task_sessions_path(app)?.with_file_name("restart-calibration.json"))
+}
+
 fn run_events_path(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     Ok(dir.join("run-events.jsonl"))
@@ -1964,6 +2018,8 @@ async fn get_task_work_tree(
         .collect();
     let claude = claude_dir();
     let codex = codex::codex_dir();
+    let restart_params = task_cost::restart_store::load_params(&restart_calibration_path(&app)?);
+    let restart_points = restart_points_path(&app)?;
     Ok(task_cost::build_task_work_tree(
         &task_id,
         number,
@@ -1973,6 +2029,8 @@ async fn get_task_work_tree(
         &task_numbers,
         claude.as_deref(),
         codex.as_deref(),
+        &restart_params,
+        Some(&restart_points),
     ))
 }
 
@@ -3657,6 +3715,7 @@ pub fn run() {
             spawn_triage_loop(app.handle().clone());
             spawn_triage_scheduler(app.handle().clone());
             spawn_corrections_publisher(app.handle().clone());
+            spawn_restart_backfill(app.handle().clone());
             spawn_external_poll_loop(app.handle().clone());
 
             Ok(())

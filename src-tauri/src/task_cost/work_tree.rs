@@ -5,8 +5,10 @@ use std::time::UNIX_EPOCH;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+use super::restart_store::{self, RestartParams};
 use crate::analytics::{
     cc, codex_work_tree,
+    restart_point::{calculate_restart_point, RestartPoint, RestartProvider},
     work_tree::{self, WorkTree, WorkTreeInterval},
 };
 use crate::board::task_sessions::TaskBlock;
@@ -28,6 +30,7 @@ pub struct TaskWorkSession {
     pub source: String,
     pub tree: WorkTree,
     pub context: TaskWorkContext,
+    pub restart_point: RestartPoint,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -202,6 +205,8 @@ pub fn build_task_work_tree(
     task_numbers: &HashMap<String, u32>,
     claude_base: Option<&Path>,
     codex_base: Option<&Path>,
+    restart_params: &RestartParams,
+    restart_points_path: Option<&Path>,
 ) -> TaskWorkTree {
     let task_blocks: Vec<&TaskBlock> = blocks.iter().filter(|block| block.task == task).collect();
     let events: Vec<RunEvent> = run_events
@@ -219,11 +224,44 @@ pub fn build_task_work_tree(
     }
 
     for block in task_blocks {
-        let Some(tree) = tree_for_block(block, claude_base, codex_base) else {
+        let Some((tree, transcript, provider)) = tree_for_block(block, claude_base, codex_base)
+        else {
             continue;
         };
         let context =
             context_for_block(block, run_steps, task_numbers, &session_tasks, claude_base);
+        let restart_point = calculate_restart_point(&tree.turns, provider, &restart_params.params);
+        if let (Some(store), Some(stamp)) = (
+            restart_points_path,
+            restart_store::transcript_stamp(&transcript),
+        ) {
+            let role = match context.role.as_ref() {
+                Some(WorkRole::Worker) => Some("worker"),
+                Some(WorkRole::Review) => Some("review"),
+                None => None,
+            };
+            let model = tree
+                .turns
+                .last()
+                .map(|turn| turn.model.as_str())
+                .unwrap_or("");
+            let provider_name = match provider {
+                RestartProvider::OpenAi => "codex",
+                RestartProvider::Anthropic => "claude",
+            };
+            let _ = restart_store::append_if_new(
+                store,
+                &block.session,
+                task,
+                task_number,
+                provider_name,
+                model,
+                role,
+                &stamp,
+                &restart_point,
+                restart_params,
+            );
+        }
         let session = TaskWorkSession {
             session: block.session.clone(),
             from: block.from.clone(),
@@ -231,6 +269,7 @@ pub fn build_task_work_tree(
             source: block.source.clone(),
             tree,
             context,
+            restart_point,
         };
         if block.source == "run-step" {
             if let Some(number) = attempt_at(&events, &block.from) {
@@ -462,7 +501,7 @@ fn tree_for_block(
     block: &TaskBlock,
     claude_base: Option<&Path>,
     codex_base: Option<&Path>,
-) -> Option<WorkTree> {
+) -> Option<(WorkTree, PathBuf, RestartProvider)> {
     let interval = WorkTreeInterval {
         start: Some(block.from.clone()),
         end: Some(block.to.clone()),
@@ -471,12 +510,31 @@ fn tree_for_block(
     {
         return cached(&path, work_tree::build_session_work_tree)
             .ok()
-            .map(|tree| slice_tree(tree, &interval));
+            .map(|tree| {
+                (
+                    slice_tree(tree, &interval),
+                    path,
+                    RestartProvider::Anthropic,
+                )
+            });
     }
     let path = codex_base.and_then(|base| codex_transcript_path(base, &block.session))?;
     cached(&path, codex_work_tree::build_codex_work_tree)
         .ok()
-        .map(|tree| slice_tree(tree, &interval))
+        .map(|tree| (slice_tree(tree, &interval), path, RestartProvider::OpenAi))
+}
+
+/// Locate the transcript selected by the same provider precedence as a task
+/// work tree.  Backfill uses this only for the cheap current-stamp check before
+/// it asks `tree_for_block` to parse the transcript.
+pub fn transcript_path_for_block(
+    block: &TaskBlock,
+    claude_base: Option<&Path>,
+    codex_base: Option<&Path>,
+) -> Option<PathBuf> {
+    claude_base
+        .and_then(|base| cc::transcript_path(base, &block.session, None))
+        .or_else(|| codex_base.and_then(|base| codex_transcript_path(base, &block.session)))
 }
 
 fn slice_tree(mut tree: WorkTree, interval: &WorkTreeInterval) -> WorkTree {
@@ -717,7 +775,21 @@ mod tests {
                 findings: Some(vec![serde_json::json!({"level": "medium"})]),
             },
         ];
-        let tree = build_task_work_tree("task", 5, &[], &events, &[], &HashMap::new(), None, None);
+        let tree = build_task_work_tree(
+            "task",
+            5,
+            &[],
+            &events,
+            &[],
+            &HashMap::new(),
+            None,
+            None,
+            &RestartParams {
+                params: Default::default(),
+                rho_source: "default",
+            },
+            None,
+        );
         let review = tree.attempts[0].review.as_ref().unwrap();
         assert_eq!(review.approved, Some(true));
         assert_eq!(review.counts.as_ref().unwrap().medium, 2);
