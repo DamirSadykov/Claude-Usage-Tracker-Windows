@@ -33,9 +33,9 @@ use std::collections::{HashMap, HashSet};
 
 use serde::Serialize;
 
-use crate::contracts::analytics_read::BlockTotals;
 use crate::board::task_sessions::{self, TaskBlock};
 use crate::board::todos::{Todo, TodoFile};
+use crate::contracts::analytics_read::BlockTotals;
 
 /// A difference below half a cent is rounding, not unattributed work.
 const COST_EPSILON: f64 = 0.005;

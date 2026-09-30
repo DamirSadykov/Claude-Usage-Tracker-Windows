@@ -854,9 +854,6 @@ mod tests {
             "leftover stale file(s): {leftovers:?}"
         );
         assert!(lock_path.exists());
-        assert_eq!(
-            std::fs::read_to_string(&lock_path).unwrap(),
-            fresh_content
-        );
+        assert_eq!(std::fs::read_to_string(&lock_path).unwrap(), fresh_content);
     }
 }

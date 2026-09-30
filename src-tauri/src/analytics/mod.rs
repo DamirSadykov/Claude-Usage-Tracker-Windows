@@ -1,6 +1,7 @@
 pub mod alerts;
 pub mod cc;
 pub mod codex;
+pub mod codex_work_tree;
 pub mod corrections;
 pub mod domain;
 pub mod memory;
@@ -8,3 +9,4 @@ pub mod project_groups;
 pub mod stats;
 pub mod status;
 pub mod usage;
+pub mod work_tree;

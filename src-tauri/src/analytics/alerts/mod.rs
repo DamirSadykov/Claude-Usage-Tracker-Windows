@@ -491,7 +491,10 @@ mod tests {
     }
 
     // Turn `warm` into a cold prefix rewrite with the given gap (cause driver).
-    fn cold(mut s: crate::analytics::alerts::ActiveSession, gap: f64) -> crate::analytics::alerts::ActiveSession {
+    fn cold(
+        mut s: crate::analytics::alerts::ActiveSession,
+        gap: f64,
+    ) -> crate::analytics::alerts::ActiveSession {
         s.last_cache_read = 0;
         s.last_cache_create = 300_000;
         s.gap_minutes = gap;

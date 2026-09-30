@@ -35,6 +35,7 @@ import TodoFiltersBar from "../board/TodoFiltersBar.vue";
 import TodoDetailPane from "../board/TodoDetailPane.vue";
 import ChangeDetail from "../process/pipeline/ChangeDetail.vue";
 import TodoTree from "../board/TodoTree.vue";
+import WorkTree from "../board/WorkTree.vue";
 import { buildBoardTree, findBoardTreeNode, type BoardTreeNode, type BoardTreeRow } from "../board/boardTree";
 import { defaultTodoFilters, type TodoFilters } from "../board/todoFilter";
 
@@ -1821,6 +1822,7 @@ onUnmounted(() => {
               <button class="tw-btn" :disabled="!newComment.trim()" @click="addComment">{{ t('todoCommentAdd') }}</button>
             </div>
           </div>
+          <WorkTree :task="detail.id" :heading="t('workTree')" />
         </section>
         <section v-else class="tw-detail-main tw-detail-empty">{{ detailLoading ? t('loading') : t('todoDetailLoadFailed') }}</section>
       </div>

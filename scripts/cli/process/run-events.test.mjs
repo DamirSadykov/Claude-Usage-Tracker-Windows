@@ -31,4 +31,23 @@ describe("run events", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it("replays from the latest run start of the change, not from an older run's park", async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), "run-events-"));
+    const file = path.join(dir, "run-events.jsonl");
+    const lines = [];
+    try {
+      appendRunEvent({ change: 62, kind: "run_start" }, file);
+      appendRunEvent({ change: 62, task: 790, kind: "park", park_kind: "retry", reason: "old" }, file);
+      appendRunEvent({ change: 62, kind: "run_start" }, file);
+      appendRunEvent({ change: 62, task: 791, kind: "step_start", attempt: 1, limit: 2 }, file);
+      appendRunEvent({ change: 99, kind: "run_start" }, file);
+      const watching = watchRunEvents({ change: "c#62", file, from: "start", onLine: (line) => lines.push(line) });
+      appendRunEvent({ change: 62, kind: "run_end" }, file);
+      await watching;
+      expect(lines).toEqual(["c#62: run start", "c#62 t#791 attempt 1/2: step start", "c#62: run end"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
