@@ -78,6 +78,8 @@ export interface ChangeMeasure {
   how: string;
   target?: string | null;
   actual?: string | null;
+  ok?: boolean | null;
+  note?: string | null;
 }
 
 export interface ReviewCounts {

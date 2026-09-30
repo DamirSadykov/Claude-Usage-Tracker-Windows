@@ -17,6 +17,8 @@ const emit = defineEmits<{
 const COLLAPSED_KEY = "todo-tree:collapsed";
 const SELECTED_KEY = "todo-tree:selected";
 const collapsed = ref<Set<string>>(new Set());
+const manuallyExpanded = new Set<string>();
+const completedChanges = ref<Set<string>>(new Set());
 const localSelectedId = ref<string | null>(readSelected());
 const root = ref<HTMLElement | null>(null);
 const initialized = ref(false);
@@ -65,10 +67,31 @@ function activate(node: BoardTreeNode): void {
 function toggle(node: BoardTreeNode): void {
   if (!node.children.length) return;
   const next = new Set(collapsed.value);
-  if (next.has(node.id)) next.delete(node.id);
+  if (next.has(node.id)) {
+    next.delete(node.id);
+    if (node.kind === "change" || node.kind === "legacy") manuallyExpanded.add(node.id);
+  }
   else next.add(node.id);
   collapsed.value = next;
   persistCollapsed(next);
+}
+
+function expandAll(): void {
+  const next = expandSelectedAncestors(props.tree, selectedId.value, new Set());
+  collapsed.value = next;
+  persistCollapsed(next);
+}
+
+function collapseAll(): void {
+  const next = new Set<string>();
+  const visit = (node: BoardTreeNode) => {
+    if (node.kind !== "group" && node.children.length) next.add(node.id);
+    node.children.forEach(visit);
+  };
+  props.tree.forEach(visit);
+  const visibleSelection = expandSelectedAncestors(props.tree, selectedId.value, next);
+  collapsed.value = visibleSelection;
+  persistCollapsed(visibleSelection);
 }
 
 function toggleFromCaret(event: MouseEvent, node: BoardTreeNode): void {
@@ -145,16 +168,29 @@ function expandSelectedAncestors(tree: readonly BoardTreeNode[], id: string | nu
 }
 
 watch(() => props.tree, (tree) => {
-  if (initialized.value || !tree.length) return;
-  const saved = readCollapsed();
-  const defaults = new Set<string>();
+  if (!tree.length) return;
+  const complete = new Set<string>();
   const visit = (node: BoardTreeNode) => {
-    if (node.children.length && node.closed) defaults.add(node.id);
+    if ((node.kind === "change" || node.kind === "legacy") && node.children.length && node.closed) complete.add(node.id);
     node.children.forEach(visit);
   };
   tree.forEach(visit);
-  collapsed.value = expandSelectedAncestors(tree, selectedId.value, new Set([...defaults, ...saved]));
-  initialized.value = true;
+  if (!initialized.value) {
+    const saved = readCollapsed();
+    collapsed.value = expandSelectedAncestors(tree, selectedId.value, new Set([...complete, ...saved]));
+    initialized.value = true;
+  } else {
+    const next = new Set(collapsed.value);
+    for (const id of complete) {
+      if (!completedChanges.value.has(id) && !manuallyExpanded.has(id)) next.add(id);
+    }
+    const visibleSelection = expandSelectedAncestors(tree, selectedId.value, next);
+    if (visibleSelection.size !== collapsed.value.size || [...visibleSelection].some((id) => !collapsed.value.has(id))) {
+      collapsed.value = visibleSelection;
+      persistCollapsed(visibleSelection);
+    }
+  }
+  completedChanges.value = complete;
 }, { immediate: true });
 
 watch([() => props.tree, selectedId], ([tree, id]) => {
@@ -177,6 +213,10 @@ watch(rows, () => scrollSelected(selectedId.value), { flush: "post" });
 
 <template>
   <nav ref="root" class="todo-tree" tabindex="0" @keydown="onKeydown">
+    <div class="todo-tree-actions">
+      <button type="button" @click="expandAll">{{ t('todoTreeExpandAll') }}</button>
+      <button type="button" @click="collapseAll">{{ t('todoTreeCollapseAll') }}</button>
+    </div>
     <div class="todo-tree-head">
       <span>{{ t('todoTreeColumns') }}</span><span>{{ t('todoTreeDone') }}</span><span>{{ t('todoTreeCost') }}</span>
     </div>
@@ -207,6 +247,9 @@ watch(rows, () => scrollSelected(selectedId.value), { flush: "post" });
 <style scoped>
 .todo-tree { min-width: 0; overflow: hidden; background: var(--card-bg); color: var(--text); display: flex; flex-direction: column; font-family: var(--segoe); outline: none; }
 .todo-tree:focus-visible { box-shadow: inset 0 0 0 1px var(--accent); }
+.todo-tree-actions { border-bottom: 1px solid var(--stroke); display: flex; gap: 6px; padding: 7px 10px; }
+.todo-tree-actions button { background: transparent; border: 1px solid var(--stroke); border-radius: 3px; color: var(--text-3); cursor: pointer; font: 600 10px var(--segoe); padding: 3px 6px; }
+.todo-tree-actions button:hover { background: var(--card-bg-hover); color: var(--text); }
 .todo-tree-head { border-bottom: 1px solid var(--stroke); color: var(--text-4); display: grid; font-size: 10px; font-weight: 600; gap: 6px; grid-template-columns: minmax(0, 1fr) 62px 54px; letter-spacing: .09em; line-height: 1; padding: 8px 14px 7px 30px; text-transform: uppercase; }
 .todo-tree-head span:not(:first-child) { text-align: right; }
 .todo-tree-rows { flex: 1; min-height: 0; overflow: auto; padding: 4px 0; }

@@ -55,6 +55,32 @@ describe("buildBoardTree", () => {
     expect(tree[0].children.map((node) => node.id)).toEqual(["c-1"]);
     expect(tree[0].children[0].children.map((node) => node.id)).toEqual(["queue"]);
   });
+
+  it("marks a change complete when it is closed or all of its tasks are done", () => {
+    const allDone = buildBoardTree([
+      row({ id: "done-a", change_id: "c-1", status: "done" }),
+      row({ id: "done-b", change_id: "c-1", status: "done" }),
+    ], [change()], { ...defaultTodoFilters(), showDone: true });
+    const explicitlyClosed = buildBoardTree([
+      row({ id: "open", change_id: "c-1" }),
+    ], [change({ closed_at: "2026-09-03" })], defaultTodoFilters());
+
+    expect(allDone[0].children[0].closed).toBe(true);
+    expect(explicitlyClosed[0].children[0].closed).toBe(true);
+  });
+
+  it("does not mark a partially done change complete when a status filter hides its open task", () => {
+    const filters = { ...defaultTodoFilters(), status: "done" };
+    const tree = buildBoardTree([
+      row({ id: "done", change_id: "c-1", status: "done" }),
+      row({ id: "open", change_id: "c-1", status: "queue" }),
+    ], [change()], filters);
+
+    expect(tree[0].children[0]).toMatchObject({
+      progress: { done: 1, total: 1 },
+      closed: false,
+    });
+  });
 });
 
 describe("boardTreeSummary", () => {

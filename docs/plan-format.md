@@ -83,6 +83,11 @@ Rules that are not visible in the shape:
   measurement covers: write «геометрия строк trace», not «соответствие дизайну». The
   latter reads as an assessment of the entire change. A missing `actual` never
   blocks closing a change; final acceptance remains the user's decision.
+  A measure is about what the change delivers, not how it was built: runner
+  attempts, retries and hand fixes are already in the runner journal
+  (`runs.jsonl`) and do not belong here. `actual` is the value itself
+  («0.9 s», «212 / 219 · 97%»); the explanation goes to `note`, and the user
+  marks the item within range or not (`ok`) with `change measure set`.
 - `retry: 2` and `retry: <=2` are the same value, as are `budget: 3` and
   `budget: $3`.
 - A `#` comment must be on its own line — a `#` inside a value belongs to the

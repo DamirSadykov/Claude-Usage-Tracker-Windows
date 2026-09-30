@@ -91,7 +91,7 @@ export const DSL_DOC_FIELDS = ["change", "vision", "out", "measure", "parallel",
 
 export const DOC_FIELDS = [...DSL_DOC_FIELDS, "plan"];
 
-export const CHANGE_ITEM_FIELDS = { out: ["what", "why", "ref"], measure: ["what", "how", "target", "actual"] };
+export const CHANGE_ITEM_FIELDS = { out: ["what", "why", "ref"], measure: ["what", "how", "target", "actual", "ok", "note"] };
 
 // The step keys of the DSL proper (§4–§13) and, separately, the board niceties
 // a file may also carry. Only the first list is what the plan-mode instruction

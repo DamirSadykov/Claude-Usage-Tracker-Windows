@@ -186,7 +186,8 @@ const USAGE =
   "       cli change out add <c#N> \"<what>\" --why \"<why>\" [--ref <c#M|t#N|path>]\n" +
   "       cli change out rm <c#N> \"<what>\"\n" +
   "       cli change measure add <c#N> \"<what>\" --how \"<how>\" [--target \"<target>\"]\n" +
-  "       cli change measure set <c#N> \"<what>\" --actual \"<actual>\"\n" +
+  "       cli change measure rm <c#N> \"<what>\"\n" +
+  "       cli change measure set <c#N> \"<what>\" [--actual \"<actual>\"] [--ok | --off] [--note \"<note>\"]\n" +
   "       cli change set title|delta|spec|budget|parallel <c#N> <value>\n" +
   "       cli change migrate [--go]        root tasks -> records; dry run by default\n\n" +
   "A change is a RECORD, not a task: it holds the delta, the spec sections and the\n" +
@@ -339,7 +340,13 @@ function cmdShow(args) {
   process.stdout.write("\nКак измерить:\n");
   if (change.measure?.length) {
     for (const item of change.measure) {
-      const details = [item.how, item.target ? `цель: ${item.target}` : "", item.actual ? `факт: ${item.actual}` : ""]
+      const details = [
+        item.how,
+        item.target ? `цель: ${item.target}` : "",
+        item.actual ? `факт: ${item.actual}` : "",
+        item.ok === true ? "отметка: в норме" : item.ok === false ? "отметка: не в норме" : "",
+        item.note ? `заметка: ${item.note}` : "",
+      ]
         .filter(Boolean)
         .join(" · ");
       process.stdout.write(`  - ${item.what} — ${details}\n`);
@@ -444,23 +451,36 @@ function cmdMeasure(args) {
   const { positional, flags } = parseArgs(args);
   const [action, ref, rawWhat] = positional;
   const what = String(rawWhat ?? "").trim();
-  if (!what || !["add", "set"].includes(action)) fail(USAGE);
+  if (!what || !["add", "set", "rm"].includes(action)) fail(USAGE);
   if (action === "add" && flags.how === undefined) fail(USAGE);
-  if (action === "set" && flags.actual === undefined) fail(USAGE);
+  if (action === "set" && flags.actual === undefined && flags.ok === undefined && flags.off === undefined && flags.note === undefined)
+    fail(USAGE);
+  if (action === "set" && flags.ok !== undefined && flags.off !== undefined)
+    fail("refusing: --ok and --off cannot be used together");
   const file = boardPath();
   const result = withBoardLock(file, () => {
     const data = loadBoardForWrite(file);
     const change = editableChange(data, ref);
     const items = Array.isArray(change.measure) ? change.measure : (change.measure = []);
     const index = items.findIndex((item) => item?.what === what);
-    if (action === "set") {
+    if (action === "rm") {
       if (index < 0) fail(`refusing: ${changeAddress(change)} has no measure item ${JSON.stringify(what)}`);
-      items[index] = { ...items[index], actual: requiredText(flags.actual, "actual") };
+      items.splice(index, 1);
+    } else if (action === "set") {
+      if (index < 0) fail(`refusing: ${changeAddress(change)} has no measure item ${JSON.stringify(what)}`);
+      const item = { ...items[index] };
+      if (flags.actual !== undefined) item.actual = requiredText(flags.actual, "actual");
+      if (flags.ok !== undefined) item.ok = true;
+      if (flags.off !== undefined) item.ok = false;
+      if (flags.note !== undefined) item.note = requiredText(flags.note, "note");
+      items[index] = item;
     } else {
       const previous = index < 0 ? {} : items[index];
       const item = { what, how: requiredText(flags.how, "how") };
       if (flags.target !== undefined) item.target = requiredText(flags.target, "target");
       if (previous.actual !== undefined) item.actual = previous.actual;
+      if (previous.ok !== undefined) item.ok = previous.ok;
+      if (previous.note !== undefined) item.note = previous.note;
       if (index < 0) items.push(item);
       else items[index] = item;
     }

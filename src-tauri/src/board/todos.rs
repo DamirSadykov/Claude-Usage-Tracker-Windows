@@ -362,6 +362,10 @@ pub struct ChangeMeasure {
     pub target: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actual: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ok: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// A CHANGE as a RECORD rather than a task (t#360): the delta of one round, the
@@ -4268,7 +4272,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         std::fs::write(
             &path,
-            r#"{"version":2,"todos":[],"changes":[{"id":"c1","out":[{"what":"Не делать UI","why":"Пока нужен только CLI","ref":"t#837"}],"measure":[{"what":"Доля change с out","how":"Посчитать через месяц","target":"50%","actual":"25%"}],"plan":"1. Сначала модель"}]}"#,
+            r#"{"version":2,"todos":[],"changes":[{"id":"c1","out":[{"what":"Не делать UI","why":"Пока нужен только CLI","ref":"t#837"}],"measure":[{"what":"Доля change с out","how":"Посчитать через месяц","target":"50%","actual":"25%","ok":true,"note":"Цель достигнута"}],"plan":"1. Сначала модель"}]}"#,
         )
         .unwrap();
 
@@ -4289,7 +4293,7 @@ mod tests {
         assert_eq!(
             change["measure"],
             serde_json::json!([{
-                "what": "Доля change с out", "how": "Посчитать через месяц", "target": "50%", "actual": "25%"
+                "what": "Доля change с out", "how": "Посчитать через месяц", "target": "50%", "actual": "25%", "ok": true, "note": "Цель достигнута"
             }])
         );
         assert_eq!(change["plan"], "1. Сначала модель");

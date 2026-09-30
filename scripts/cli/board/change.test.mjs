@@ -370,6 +370,43 @@ describe("cli change", () => {
     expect(run(["change", "show", "c#1"])).toContain("факт: 57%");
   });
 
+  it("удаляет measure по what и отказывает, если такого нет", () => {
+    run(["change", "new", "CHANGE: метрики", "--project", "board"]);
+    run(["change", "measure", "add", "c#1", "лишняя", "--how", "считаем"]);
+    run(["change", "measure", "add", "c#1", "нужная", "--how", "считаем"]);
+    run(["change", "measure", "rm", "c#1", "лишняя"]);
+    expect(read().changes[0].measure.map((item) => item.what)).toEqual(["нужная"]);
+    expect(refuse(["change", "measure", "rm", "c#1", "лишняя"])).toContain("has no measure item");
+  });
+
+  it("ставит отметку и заметку метрики, не перезаписывая остальные поля", () => {
+    run(["change", "new", "Перевод на записи", "--project", "board"]);
+    run(["change", "measure", "add", "c#1", "доля заполненных", "--how", "считаем записи", "--target", "50%"]);
+    run(["change", "measure", "set", "c#1", "доля заполненных", "--actual", "57%"]);
+    run(["change", "measure", "set", "c#1", "доля заполненных", "--ok"]);
+    run(["change", "measure", "set", "c#1", "доля заполненных", "--note", "выше цели"]);
+    expect(read().changes[0].measure[0]).toEqual({
+      what: "доля заполненных",
+      how: "считаем записи",
+      target: "50%",
+      actual: "57%",
+      ok: true,
+      note: "выше цели",
+    });
+    run(["change", "measure", "set", "c#1", "доля заполненных", "--off"]);
+    expect(read().changes[0].measure[0]).toMatchObject({
+      actual: "57%",
+      ok: false,
+      note: "выше цели",
+    });
+    const shown = run(["change", "show", "c#1"]);
+    expect(shown).toContain("отметка: не в норме");
+    expect(shown).toContain("заметка: выше цели");
+    expect(
+      refuse(["change", "measure", "set", "c#1", "доля заполненных", "--ok", "--off"]),
+    ).toContain("cannot be used together");
+  });
+
   it("перечисляет немигрированные корни под адресом t#N", () => {
     const data = read();
     data.todos.push({

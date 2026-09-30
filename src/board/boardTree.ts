@@ -67,6 +67,7 @@ function membersNode(
   title: string,
   rows: readonly BoardTreeRow[],
   closed: boolean,
+  allMembers: readonly BoardTreeRow[] = rows,
 ): BoardTreeNode {
   const children = [...rows].sort(taskSort).map(taskNode);
   return {
@@ -78,7 +79,7 @@ function membersNode(
     progress: progress(rows),
     cost: rows.reduce((total, row) => total + costOf(row), 0),
     children,
-    closed,
+    closed: closed || (allMembers.length > 0 && allMembers.every(closedTask)),
   };
 }
 
@@ -103,16 +104,23 @@ export function buildBoardTree(
   }
 
   const memberRows = new Map<string, BoardTreeRow[]>();
+  const allMemberRows = new Map<string, BoardTreeRow[]>();
   const groups = new Map<string, BoardTreeRow[]>();
 
   for (const row of rows) {
-    if (!visibleIds.has(row.id) || row.change) continue;
+    if (row.change) continue;
     if (row.change_id && (changeById.has(row.change_id) || legacyById.has(row.change_id))) {
-      const members = memberRows.get(row.change_id) ?? [];
-      members.push(row);
-      memberRows.set(row.change_id, members);
+      const allMembers = allMemberRows.get(row.change_id) ?? [];
+      allMembers.push(row);
+      allMemberRows.set(row.change_id, allMembers);
+      if (visibleIds.has(row.id)) {
+        const members = memberRows.get(row.change_id) ?? [];
+        members.push(row);
+        memberRows.set(row.change_id, members);
+      }
       continue;
     }
+    if (!visibleIds.has(row.id)) continue;
     const project = row.filterProject ?? row.project ?? "";
     const members = groups.get(project) ?? [];
     members.push(row);
@@ -124,7 +132,7 @@ export function buildBoardTree(
     const members = memberRows.get(change.id) ?? [];
     if (!members.length) continue;
     changeNodes.push({
-      node: membersNode("change", change.id, change.number, change.title, members, !!change.closed_at),
+      node: membersNode("change", change.id, change.number, change.title, members, !!change.closed_at, allMemberRows.get(change.id)),
       activity: change.updated_at ?? members.reduce((latest, row) => latest > activityOf(row) ? latest : activityOf(row), ""),
       project: members[0].filterProject ?? change.project ?? members[0].project ?? "",
     });
@@ -134,7 +142,7 @@ export function buildBoardTree(
     if (!members.length && !visibleIds.has(legacy.id)) continue;
     const allRows = members.length ? members : [legacy];
     changeNodes.push({
-      node: membersNode("legacy", legacy.id, legacy.number, legacy.subject, allRows, closedTask(legacy)),
+      node: membersNode("legacy", legacy.id, legacy.number, legacy.subject, allRows, closedTask(legacy), allMemberRows.get(legacy.id)),
       activity: activityOf(legacy),
       project: legacy.filterProject ?? legacy.project ?? "",
     });

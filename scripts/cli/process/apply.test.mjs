@@ -87,7 +87,7 @@ describe("change brief fields in apply", () => {
       expect(applyDocument(doc, { go: true, project: "fixture", board: { data: initial, file } }).ok).toBe(true);
       const change = initial.changes[0];
       expect(change.out).toHaveLength(5);
-      expect(change.measure).toHaveLength(3);
+      expect(change.measure).toHaveLength(2);
       change.out.push({ what: "Командный пункт", why: "добавлен по ходу работы" });
       change.measure.push({ what: "Ручной замер", how: "командой" });
       const repeated = {
