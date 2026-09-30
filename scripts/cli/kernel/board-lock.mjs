@@ -263,9 +263,13 @@ export function withBoardLock(file, fn, opts = {}) {
   sweepOrphanTmp(file);
   held.set(key, 1);
   try {
-    return fn();
-  } finally {
+    const result = fn();
     held.set(key, (held.get(key) || 1) - 1);
     releaseBoardLock(got.lock);
+    return result;
+  } catch (err) {
+    held.set(key, (held.get(key) || 1) - 1);
+    releaseBoardLock(got.lock);
+    throw err;
   }
 }

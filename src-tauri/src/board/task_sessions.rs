@@ -28,7 +28,7 @@ use crate::contracts::analytics_read::BlockTotals;
 /// a guess. `run-step` is the autonomous runner (t#305): it mints the step's
 /// session id itself and binds it to the node it is executing, so its binding is
 /// as stated as `take` is — the graph said so instead of a human.
-const EXPLICIT_SOURCES: [&str; 3] = ["take", "set-status", "run-step"];
+const EXPLICIT_SOURCES: [&str; 4] = ["take", "set-status", "run-step", "force"];
 
 /// One line of the journal. Everything defaults so a partial/older line loads.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -389,6 +389,14 @@ mod tests {
         );
         // A near-miss is NOT waved through: the allowlist is exact.
         assert!(!out[1].explicit);
+    }
+
+    #[test]
+    fn a_forced_manual_correction_is_explicit_and_keeps_its_own_name() {
+        let out = blocks(&[ev("T1", "s1", "a", "start", "force")], &ends(&[]));
+        // The source allowlist is the contract: force must be stated, never
+        // downgraded to an inferred event, and a trace retains its own name.
+        assert_eq!((out[0].explicit, out[0].source.as_str()), (true, "force"));
     }
 
     #[test]

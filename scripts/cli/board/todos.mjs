@@ -51,8 +51,16 @@ import { findChange, changeAddress, CURRENT, BoardUnreadableError, STATUSES, col
 import { withBoardLock } from "../kernel/board-lock.mjs";
 
 let specPort = null;
+let closePort = null;
 export function setSpecPort(port) {
   specPort = port;
+}
+
+// Process owns transcripts, reconciliation and execution.  Board receives just
+// the closing capability at the composition root (cli.mjs), keeping this layer
+// dependent on kernel only.
+export function setClosePort(port) {
+  closePort = port;
 }
 
 export { findChange, changeAddress, CURRENT, BoardUnreadableError, STATUSES, col, isDone, isChangeRoot, normalizeLimit, boardPath, loadBoard, assertBoardWritable, loadBoardForWrite, saveBoard, withDeferredSave, resolveTask, changeRootsFor, changeAsRoot, specAddressesForManual } from "../kernel/board-io.mjs";
@@ -226,6 +234,68 @@ export function lastTaskSessionEvent(session, file = taskSessionsPath()) {
   return mine.length ? mine[mine.length - 1] : null;
 }
 
+// An interactive change is deliberately a single-file line of work: the
+// journal, rather than the mutable board status, says what THIS session last
+// opened.  A change root is itself part of its change; children inherit their
+// nearest roots through changeRootsFor.
+function changeRootIds(data, task) {
+  if (!task) return new Set();
+  const roots = isChangeRoot(task) ? [task] : changeRootsFor(data, task);
+  return new Set(roots.map((root) => root.id));
+}
+
+function sharesChange(data, left, right) {
+  const leftRoots = changeRootIds(data, left);
+  if (!leftRoots.size) return false;
+  for (const id of changeRootIds(data, right)) if (leftRoots.has(id)) return true;
+  return false;
+}
+
+const CHANGE_SESSION_TEMPLATE =
+  "change-session rule:\n" +
+  "  todos set status #N in_progress → do the work → todos set status #N done\n" +
+  "  close this task before opening another task in this change; use --force only for a manual board correction.";
+
+function changeSessionRefusal(reason) {
+  return `refusing: ${reason}\n\n${CHANGE_SESSION_TEMPLATE}`;
+}
+
+function guardChangeSession({ data, todo, status, flags }) {
+  const session = currentSessionId(flags);
+  const roots = changeRootIds(data, todo);
+  if (!session || !roots.size || flags.force) return { session, firstStart: false };
+  const events = readTaskSessionEvents();
+  const taskFor = new Map(data.todos.filter(Boolean).map((task) => [task.id, task]));
+  const inChange = events.filter((event) => event.session === session && sharesChange(data, todo, taskFor.get(event.task)));
+  const latest = inChange[inChange.length - 1];
+  const startsHere = events.filter((event) => event.session === session && event.task === todo.id && event.event === "start");
+
+  if (status === "in_progress" && latest?.event === "start" && latest.task !== todo.id) {
+    const open = taskFor.get(latest.task);
+    fail(changeSessionRefusal(`close #${open?.number ?? latest.task} first — it is still open in this session`));
+  }
+  if ((status === "done" || status === "review") && !startsHere.length) {
+    fail(changeSessionRefusal(`#${todo.number} has no start in this session`));
+  }
+  if (status === "done") {
+    const start = startsHere[startsHere.length - 1];
+    // Without the process port this capability is unavailable: preserve the
+    // ordinary board mutation rather than failing because a host omitted it.
+    if (closePort?.hasSessionWork && !closePort.hasSessionWork(session, start.ts)) {
+      fail(changeSessionRefusal(`no work in the window of #${todo.number} — no Agent call and no edit since its start`));
+    }
+  }
+  // `take` binds a session to a task before its status changes.  It is not the
+  // interactive `in_progress` transition, so it must not consume the one-time
+  // form reminder printed at that transition.
+  return {
+    session,
+    firstStart:
+      status === "in_progress" &&
+      !inChange.some((event) => event.event === "start" && event.source === "set-status"),
+  };
+}
+
 function cmdTake(args) {
   const { positional, flags } = parseArgs(args);
   const [id] = positional;
@@ -280,8 +350,9 @@ function cmdTake(args) {
 // puts on a field lives HERE, in the refusal or the warning the handler prints —
 // not in an instruction the caller is expected to have read first.
 
-function setStatus({ data, file, todo, value, flags }) {
+function setStatus({ data, file, todo, value, flags, changeSession, close }) {
   const status = String(value);
+  changeSession ??= guardChangeSession({ data, todo, status, flags });
   if (!STATUSES.includes(status))
     fail(`invalid status "${value}". valid: ${STATUSES.join(" | ")}`);
   // Done-gate (#88): `done` is the ONLY status that releases downstream tasks
@@ -301,6 +372,37 @@ function setStatus({ data, file, todo, value, flags }) {
       );
     }
   }
+  // The interactive change path has a strong session window.  Close it only
+  // after giving its declared check to the same reconciliation used by
+  // `todos outcome --write`; the headless runner has no session id here and
+  // retains its own check/outcome sequence.
+  let closeEventWritten = false;
+  // A repeated `set status … done` is deliberately an idempotent board edit.
+  // It has no new work window to verify, and must not replace an earlier ok
+  // outcome just because the declared check happens to fail now.
+  if (close && todo.status !== "done") {
+    appendTaskSessionEvent({
+      session: changeSession.session,
+      task: todo.id,
+      event: "end",
+      source: "set-status",
+      project: todo.project || null,
+    });
+    closeEventWritten = true;
+    const reconciliation = closePort.reconcileTodo({ file, data, todo, verify: close.verdict });
+    const { report } = reconciliation;
+    if (report.finalized) closePort.applyOutcomeToTodo(todo, report);
+    if (!report.finalized) {
+      fail(`outcome not finalized (${report.outcome_reason}) — nothing written`);
+    }
+    if (report.outcome === "issue") {
+      // The rejected close still records its reconciliation; status deliberately
+      // remains in_progress, so persist the outcome before reporting failure.
+      save(file, data);
+      fail(`refusing: outcome issue (${report.outcome_reason}); #${todo.number} remains in_progress`);
+    }
+    process.stdout.write(`outcome: ${report.outcome} (${report.outcome_reason})\n`);
+  }
   // The frontier (#88) is derived, so a start off it is legal — but it is worth
   // saying out loud, because the work it builds on is not finished yet.
   if (status === "in_progress") {
@@ -313,14 +415,14 @@ function setStatus({ data, file, todo, value, flags }) {
       );
     }
   }
-  if (status === "in_progress" || status === "review" || status === "done") {
+  if ((status === "in_progress" || status === "review" || status === "done") && !closeEventWritten) {
     appendTaskSessionEvent({
-      session: currentSessionId(),
+      session: currentSessionId(flags),
       task: todo.id,
       event: status === "in_progress" ? "start" : "end",
-      // Wire value, NOT the command name: task_sessions.rs::EXPLICIT_SOURCES is a
-      // two-item allowlist ("take", "set-status") and marks anything else a guess.
-      source: "set-status",
+      // Forced manual corrections remain explicit evidence, but retain their own
+      // source so trace/outcome never mistake them for ordinary interactive work.
+      source: flags.force ? "force" : "set-status",
       project: todo.project || null,
     });
   }
@@ -343,6 +445,7 @@ function setStatus({ data, file, todo, value, flags }) {
   // right here — the agent gets the baton without being told to ask for it. Only
   // when there's actually a handoff to carry, so root/handoff-less starts stay quiet.
   if (status === "in_progress") {
+    if (changeSession.firstStart) process.stdout.write(`\n${CHANGE_SESSION_TEMPLATE}\n`);
     const prereqs = directPrereqs(data, todo);
     if (prereqs.some((p) => p.handoff && p.handoff.trim())) {
       process.stdout.write("\n" + formatInheritedHandoff(todo, prereqs));
@@ -1020,7 +1123,7 @@ export function setField({ data, file, todo, field, value, flags = {} }) {
   const spec = SET_FIELDS[field];
   if (!spec) fail(`unknown field "${field}"\n` + setUsage());
   if (spec.declaration) refuseIfClosed(todo, `the ${field} declaration`);
-  spec.set({ data, file, todo, value, flags });
+  return spec.set({ data, file, todo, value, flags });
 }
 
 // The field list as it appears in the help and in `pipeline`: generated, so the
@@ -1060,7 +1163,7 @@ function setUsage() {
 // presence, and the "declared before the work" rule. Whatever is specific to a
 // field is refused by its handler, with the legal values printed from the table
 // above — an unknown field or value never fails silently.
-function cmdSet(args) {
+async function cmdSet(args) {
   const { positional, flags } = parseArgs(args);
   const [field, task] = positional;
   if (!field) fail(setUsage());
@@ -1075,10 +1178,40 @@ function cmdSet(args) {
   if (typeof value !== "string")
     fail(`usage: cli todos set ${field} <task> ${spec.values}`);
   const file = todosPath();
-  const data = loadBoardForWrite(file);
-  const todo = resolveTask(data, task);
-  if (!todo) fail(`no todo with id ${task}`);
-  setField({ data, file, todo, field, value, flags });
+  // The guard reads transcripts and verify may run for minutes.  Both happen
+  // before acquiring the board lock; only the fresh reconciliation and write
+  // below are one short board transaction.
+  if (field === "status") {
+    const before = loadBoardForWrite(file);
+    const beforeTodo = resolveTask(before, task);
+    if (!beforeTodo) fail(`no todo with id ${task}`);
+    const status = String(value);
+    if (!STATUSES.includes(status)) fail(`invalid status "${value}". valid: ${STATUSES.join(" | ")}`);
+    const changeSession = guardChangeSession({ data: before, todo: beforeTodo, status, flags });
+    let close = null;
+    if (status === "done" && beforeTodo.status !== "done" && changeSession.session && !flags.force && changeRootIds(before, beforeTodo).size && closePort) {
+      const declared = typeof beforeTodo.verify === "string" ? beforeTodo.verify.trim() : "";
+      let verdict;
+      if (declared) {
+        const check = await closePort.runVerify({ cmd: declared, cwd: process.cwd() });
+        verdict = check.code === 0 ? "ok" : "issue";
+        process.stdout.write(`verify: ${declared} -> ${verdict}\n`);
+      }
+      close = { session: changeSession.session, verdict };
+    }
+    return withBoardLock(file, () => {
+      const data = loadBoardForWrite(file);
+      const todo = resolveTask(data, task);
+      if (!todo) fail(`no todo with id ${task}`);
+      return setStatus({ data, file, todo, value, flags, changeSession, close });
+    });
+  }
+  return withBoardLock(file, () => {
+    const data = loadBoardForWrite(file);
+    const todo = resolveTask(data, task);
+    if (!todo) fail(`no todo with id ${task}`);
+    return setField({ data, file, todo, field, value, flags });
+  });
 }
 
 // Minimal `--flag value` parser: collects positional args and flag pairs.
@@ -2286,6 +2419,7 @@ export const MUTATING = new Set([
 
 export function run(args) {
   const [cmd, ...rest] = args;
+  if (cmd === "set") return cmdSet(rest);
   if (MUTATING.has(cmd)) return withBoardLock(todosPath(), () => dispatch(cmd, rest));
   return dispatch(cmd, rest);
 }

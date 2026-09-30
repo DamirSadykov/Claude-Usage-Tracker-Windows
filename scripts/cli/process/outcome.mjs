@@ -5,18 +5,10 @@
 // Same layer split as task-cost.mjs / corrections.mjs: Node owns TRANSCRIPT
 // PARSING, Rust owns the join with SQLite. It has to be that way here — the
 // database has no project file paths at all (`cc_files` stores transcripts), so
-// "what did the step actually produce" is knowable from two sources, one
-// strong and one weak (t#520). The strong one — a mutating tool_use in the
-// transcript of the session bound to the task — is all `todos run <change>
-// --go` ever needs, because that flow binds every step to its own session.
-// The agent-driven flow (`--next` / `--report`) hands the work to a subagent
-// whose session id nobody records, so there is no transcript to read; the
-// weak source — the declared file still on disk, with an mtime after the
-// window's start — is consulted only then, and every `produces` line says
-// which of the two it rests on. The window starts at `handout_at` (stamped by
-// `--next`, scripts/cli/process/run.mjs) when the node has one, and falls back to the
-// `in_progress` boundary below only for a node `--next` never touched — a
-// `--go` step, which binds and starts its own session in the same breath.
+// "what did the step actually produce" is knowable from the strong source: a
+// mutating tool_use in the transcript of the session bound to the task. Both
+// supported workflows bind every step to its session, so no filesystem-mtime
+// inference is needed.
 //
 // What the reconciliation reads:
 //   produces (t#302)          what the step promised BEFORE the work (DSL §6)
@@ -25,13 +17,6 @@
 //                             THIS step (block fold mirrors task_sessions.rs)
 //   the session transcripts   Write / Edit / MultiEdit / NotebookEdit tool_use
 //                             entries = what was really touched (strong)
-//   handout_at                the last time `--next` handed this node out —
-//                             the floor an mtime must clear to count as weak
-//                             evidence, when the node has one (t#520)
-//   status_history            the latest entry into in_progress — the SAME
-//                             floor for a node `handout_at` never touched
-//                             (`--go`; same field `attemptsSoFar` in run.mjs
-//                             counts on)
 //   depends_on (reversed)     the dependent nodes; a promised output counts as
 //                             CONSUMED when it shows up in their blocks
 //
@@ -48,7 +33,6 @@ import {
   readFileSync,
   readdirSync,
   existsSync,
-  statSync,
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -220,78 +204,20 @@ function touchesIn(blocks, touchesBySession) {
   return out.sort((a, b) => String(a.ts || "").localeCompare(String(b.ts || "")));
 }
 
-// ── weak evidence (t#520) ───────────────────────────────────────────────────
-export function attemptStartOf(todo) {
-  const h = Array.isArray(todo?.status_history) ? todo.status_history : [];
-  const entries = h.filter(
-    (e) => e && e.status === "in_progress" && typeof e.at === "string" && e.at,
-  );
-  return entries.length ? entries[entries.length - 1].at : null;
-}
-
-// `--next` (scripts/cli/process/run.mjs) stamps `handout_at` on every node of the wave
-// it hands out, overwritten on each re-hand-out. A `--go` step never goes
-// through `--next`, so it never gets one — that path is untouched by design.
-export function handoutStartOf(todo) {
-  const at = typeof todo?.handout_at === "string" ? todo.handout_at.trim() : "";
-  return at || null;
-}
-
-// The boundary an mtime must clear to count as weak evidence: `handout_at`
-// when the node has one, else the `in_progress` floor `attemptStartOf` reads —
-// the fallback that keeps a `--go` step's behaviour exactly as it was before
-// t#520 gave `--next` a stamp of its own.
-export function evidenceWindowStartOf(todo) {
-  const handout = handoutStartOf(todo);
-  if (handout) return { at: handout, source: "handout" };
-  const attempt = attemptStartOf(todo);
-  if (attempt) return { at: attempt, source: "in_progress" };
-  return { at: null, source: null };
-}
-
-function defaultStatFile(absPath) {
-  return statSync(absPath).mtime.toISOString();
-}
-
-export function weakFileEvidence(
-  item,
-  { root = process.cwd(), windowStart, statFile = defaultStatFile } = {},
-) {
-  if (!windowStart) return null;
-  const rel = normalizePath(item);
-  if (!rel) return null;
-  const abs = path.resolve(root, rel);
-  const fromRoot = path.relative(path.resolve(root), abs);
-  if (!fromRoot || fromRoot.startsWith("..") || path.isAbsolute(fromRoot)) return null;
-  let mtime;
-  try {
-    mtime = statFile(abs);
-  } catch {
-    return null;
-  }
-  if (typeof mtime !== "string" || !(mtime > windowStart)) return null;
-  return { path: rel, at: mtime };
-}
-
 // ── the reconciliation ───────────────────────────────────────────────────────
-// Mostly pure: everything but the weak file-evidence stat is passed in or
-// injected, so the transcript-only verdict stays unit-testable without a real
-// filesystem.
+// Mostly pure, so the transcript-only verdict stays unit-testable without a
+// real filesystem.
 //   data      the board (for depends_on and the dependents' numbers)
 //   todo      the node under reconciliation
 //   blocks    ALL folded blocks (this node's and its dependents')
 //   touches   Map<session, touch[]> — un-windowed; windows are applied here
 //   verify    "ok" | "issue" | undefined — the runner's verdict, never run here
-//   root      repo root declared outputs resolve against for weak evidence
-//   statFile  injectable fs.statSync wrapper (t#520)
 export function buildOutcomeReport({
   data,
   todo,
   blocks = [],
   touches = new Map(),
   verify,
-  root = process.cwd(),
-  statFile = defaultStatFile,
   gitChanged = null,
 }) {
   const board = (data && Array.isArray(data.todos) ? data.todos : []).filter(Boolean);
@@ -319,17 +245,12 @@ export function buildOutcomeReport({
     .map((p) => String(p ?? "").trim())
     .filter(Boolean);
 
-  const window = evidenceWindowStartOf(todo);
   const produces = declared.map((item) => {
     const checkable = isPathLike(item);
     const hit = checkable ? wrote.find((t) => pathMatches(item, t.path)) : undefined;
     const gitHit =
       checkable && !hit && gitChanged ? [...gitChanged].find((p) => pathMatches(item, p)) : undefined;
-    const fileHit =
-      checkable && !hit && !gitHit
-        ? weakFileEvidence(item, { root, windowStart: window.at, statFile })
-        : null;
-    const evidence = hit ? "transcript" : gitHit ? "git" : fileHit ? "file" : null;
+    const evidence = hit ? "transcript" : gitHit ? "git" : null;
     const consumers = checkable
       ? dependents.filter((d) =>
           (seenByDependent.get(d.id) || []).some((t) => pathMatches(item, t.path)),
@@ -338,8 +259,8 @@ export function buildOutcomeReport({
     return {
       path: item,
       checkable,
-      produced: !!hit || !!gitHit || !!fileHit,
-      produced_at: hit ? hit.ts : fileHit ? fileHit.at : null,
+      produced: !!hit || !!gitHit,
+      produced_at: hit ? hit.ts : null,
       produced_by: hit ? hit.tool : null,
       produced_in_session: hit ? hit.session : null,
       evidence,
@@ -395,7 +316,6 @@ export function buildOutcomeReport({
       source: b.source || "",
     })),
     dependents: dependents.map((d) => ({ id: d.id, number: d.number })),
-    evidence_window: window,
     produces,
     missing,
     unconsumed,
@@ -453,6 +373,29 @@ export function findSessionTranscripts(session, root = claudeProjectsDir()) {
   return [];
 }
 
+// The interactive-close guard's strong-work predicate.  It belongs here with
+// transcript discovery/parsing, rather than making board depend on process.
+function transcriptHasAgentCallSince(raw, since) {
+  for (const line of String(raw || "").split("\n")) {
+    if (!line.includes('"tool_use"') || !line.includes('"Agent"')) continue;
+    let rec;
+    try { rec = JSON.parse(line); } catch { continue; }
+    if (typeof rec.timestamp !== "string" || rec.timestamp < since) continue;
+    if (Array.isArray(rec?.message?.content) && rec.message.content.some((item) => item?.type === "tool_use" && item.name === "Agent")) return true;
+  }
+  return false;
+}
+
+export function hasSessionWork(session, startAt) {
+  for (const transcript of findSessionTranscripts(session)) {
+    let raw;
+    try { raw = readFileSync(transcript, "utf8"); } catch { continue; }
+    if (transcriptHasAgentCallSince(raw, startAt)) return true;
+    if (parseTouchedFiles(raw).touches.some((touch) => touch.mutates && touch.ts && touch.ts >= startAt)) return true;
+  }
+  return false;
+}
+
 // ── command ──────────────────────────────────────────────────────────────────
 function parseFlags(args) {
   const f = { positional: [] };
@@ -473,6 +416,13 @@ function reconcile(ref, verify, write = false) {
   const data = write ? loadBoardForWrite(file) : loadBoard(file);
   const todo = resolveTask(data, ref);
   if (!todo) fail(`no such task: ${ref}`);
+  return reconcileTodo({ file, data, todo, verify });
+}
+
+// Shared by `todos outcome --write` and the interactive close path.  The
+// latter already owns a locked, freshly loaded board, so it must reconcile
+// that same in-memory row rather than opening a second load/save race.
+export function reconcileTodo({ file, data, todo, verify }) {
 
   const dependents = data.todos.filter(
     (t) => t && Array.isArray(t.depends_on) && t.depends_on.includes(todo.id),
@@ -527,14 +477,19 @@ export function stepChanges(todo, cwd) {
   return new Set(diff.filter((c) => c.status === "A" || c.status === "M" || c.status === "D").map((c) => c.path));
 }
 
-function applyOutcome(file, data, todo, report) {
+export function applyOutcome(file, data, todo, report) {
   const t = data.todos.find((x) => x && x.id === todo.id);
   if (!t) return false;
-  t.outcome = report.outcome;
-  t.outcome_reason = report.outcome_reason;
-  t.outcome_at = new Date().toISOString();
+  applyOutcomeToTodo(t, report);
   saveBoard(file, data);
   return true;
+}
+
+export function applyOutcomeToTodo(todo, report) {
+  todo.outcome = report.outcome;
+  todo.outcome_reason = report.outcome_reason;
+  todo.outcome_at = new Date().toISOString();
+  return todo;
 }
 
 function printReport(r) {
@@ -559,9 +514,8 @@ function printReport(r) {
       ? `consumed by ${p.consumed_by.map((c) => `#${c.number}`).join(", ")}`
       : "not consumed — unclaimed output (not an error, §15)";
     const by =
-      p.evidence === "file"
-        ? `file evidence only, mtime ${p.produced_at} — no session bound, weaker than a transcript hit ` +
-          `(window since ${r.evidence_window.source} ${r.evidence_window.at})`
+      p.evidence === "git"
+        ? "git diff"
         : `${p.produced_by}${p.produced_at ? ` ${p.produced_at}` : ""}`;
     out.push(`  ✓ ${p.path} — produced (${by}), ${taken}\n`);
   }
