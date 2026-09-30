@@ -51,17 +51,35 @@ export interface Todo {
 }
 
 export interface BoardChange {
-    id: string;
-    number: number;
-    title: string;
-    delta?: string;
-    project?: string | null;
-    spec?: string[];
-    budget_usd?: number;
-    parallel_limit?: number;
-    created_at?: string;
-    updated_at?: string;
-    closed_at?: string;
+  id: string;
+  number: number;
+  title: string;
+  delta?: string;
+  out?: ChangeOut[];
+  measure?: ChangeMeasure[];
+  plan?: string | null;
+  project?: string | null;
+  spec?: string[];
+  budget_usd?: number;
+  parallel_limit?: number;
+  created_at?: string;
+  updated_at?: string;
+  closed_at?: string;
+}
+
+export interface ChangeOut {
+  what: string;
+  why: string;
+  ref?: string | null;
+}
+
+export interface ChangeMeasure {
+  what: string;
+  how: string;
+  target?: string | null;
+  actual?: string | null;
+  ok?: boolean | null;
+  note?: string | null;
 }
 
 export interface ReviewCounts {

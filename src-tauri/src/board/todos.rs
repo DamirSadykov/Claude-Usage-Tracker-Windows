@@ -340,6 +340,34 @@ pub fn board_json_schema() -> schemars::Schema {
     schemars::schema_for!(TodoFile)
 }
 
+/// A decision deliberately kept out of a change's scope.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ChangeOut {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub what: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub why: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub r#ref: Option<String>,
+}
+
+/// A user-facing measure for evaluating a change after it lands.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ChangeMeasure {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub what: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub how: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ok: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
 /// A CHANGE as a RECORD rather than a task (t#360): the delta of one round, the
 /// spec sections it moves and the group's ceilings. A task points at it through
 /// [`Todo::change_id`]; membership is a field, not a `depends_on` edge, so a
@@ -356,6 +384,12 @@ pub struct Change {
     pub title: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub delta: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub out: Vec<ChangeOut>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub measure: Vec<ChangeMeasure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1943,6 +1977,8 @@ mod tests {
         for name in [
             "Todo",
             "Change",
+            "ChangeOut",
+            "ChangeMeasure",
             "StatusChange",
             "Comment",
             "SpecAnswer",
@@ -4228,6 +4264,41 @@ mod tests {
         assert_eq!(c1.spec, Vec::<String>::new());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn change_brief_fields_survive_a_rust_round_trip() {
+        let path = std::env::temp_dir().join("cut_todos_change_brief_round_trip.json");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(
+            &path,
+            r#"{"version":2,"todos":[],"changes":[{"id":"c1","out":[{"what":"Не делать UI","why":"Пока нужен только CLI","ref":"t#837"}],"measure":[{"what":"Доля change с out","how":"Посчитать через месяц","target":"50%","actual":"25%","ok":true,"note":"Цель достигнута"}],"plan":"1. Сначала модель"}]}"#,
+        )
+        .unwrap();
+
+        let file = match load_checked(&path) {
+            LoadOutcome::Ok(f) => f,
+            other => panic!("change brief fixture: expected Ok, got {other:?}"),
+        };
+        save(&path, &file).unwrap();
+
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let change = &saved["changes"][0];
+        assert_eq!(
+            change["out"],
+            serde_json::json!([{
+                "what": "Не делать UI", "why": "Пока нужен только CLI", "ref": "t#837"
+            }])
+        );
+        assert_eq!(
+            change["measure"],
+            serde_json::json!([{
+                "what": "Доля change с out", "how": "Посчитать через месяц", "target": "50%", "actual": "25%", "ok": true, "note": "Цель достигнута"
+            }])
+        );
+        assert_eq!(change["plan"], "1. Сначала модель");
+
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

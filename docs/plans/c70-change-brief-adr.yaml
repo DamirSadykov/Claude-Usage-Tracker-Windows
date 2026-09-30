@@ -1,0 +1,156 @@
+change: "CHANGE: бриф change как проектный ADR — не входит, как измерить, карточка change по #fTC"
+vision: |
+  **Задача.** Change хранит только «зачем»; решения «не делаем, потому что» и
+  метрики изменения теряются в прозе и комментариях.
+
+  **Решение.** Change становится проектным ADR: поля `out` и `measure`, бриф
+  карточки по кадру #fTC (`docs/design/handoff-tasks/change.html`) — Зачем,
+  Входит (итоги шагов ✓/○), Не входит, Как измерить. Отдельной сущности ADR
+  нет; решение, переживающее проект, уходит в KB `decisions/`.
+
+  **Риск.** Потеря данных: Rust-структура `Change` выкидывает неизвестные поля
+  при каждой записи `todos.json`, поэтому поля сначала появляются в Rust.
+out:
+  - what: Редактирование брифа в окне (кнопка «Редактировать» из макета)
+    why: |
+      Бриф пишется в плане и командами CLI по ходу работы; редактор в окне —
+      вторая точка записи с конфликтами правок, а спроса на неё пока нет.
+  - what: Вкладки Trace и Комментарии у change
+    why: Trace change — сумма trace задач; сначала проверить, нужен ли он поверх таблицы задач.
+  - what: Разбивка бюджета исполнитель/ревью и счётчики попыток в правой колонке
+    why: |
+      В данных доски их нет; каждый вызов get_task_work_tree на задачу — N
+      чтений транскриптов при открытии карточки.
+  - what: Отдельная сущность ADR в трекере
+    why: Change и есть проектный ADR; вторая сущность — одно решение в двух местах.
+  - what: Обязательный measure при закрытии change
+    why: measure — ориентир пользователя, финальная приёмка за ним (300 мс против 400 мс решает он).
+measure:
+  - what: Доля новых change с непустым out
+    how: node scripts/cli.mjs change list --json — доля с непустым out среди созданных после влития
+    target: больше половины через месяц
+  - what: Решения «не делаем», оставшиеся прозой
+    how: вручную — просмотреть delta и комментарии change за месяц на «не делаем / вне / отступление»
+    target: ноль, всё в out
+parallel: 2
+budget: 22
+steps:
+  1:
+    title: Запись change в Rust хранит out, measure и plan без потерь при перезаписи todos.json
+    why: |
+      struct Change в src-tauri/src/board/todos.rs:350 не знает этих полей,
+      и любая Rust-запись (transact, replace_locked, backfill номеров при
+      старте, write_export) их стирает. Добавить out: Vec<ChangeOut>
+      {what, why, ref: Option}, measure: Vec<ChangeMeasure> {what, how,
+      target: Option, actual: Option} и plan: Option<String>; serde default
+      и skip_serializing_if пустое, camelCase как у соседей. Round-trip тест
+      рядом с существующим (todos.rs:4066): change с out/measure/plan
+      читается и пишется без потерь. Перегенерировать
+      tests/board-fixtures/board.schema.json и BoardChange в
+      src/contracts/board.ts.
+    produces: [src-tauri/src/board/todos.rs, tests/board-fixtures/board.schema.json, src/contracts/board.ts]
+    verify: cd src-tauri && cargo test board::todos && cd .. && npx vitest run scripts/cli/board && npx vue-tsc --noEmit
+    retry: 2
+    budget: 3
+    risk: high
+    kind: auto
+  2:
+    title: CLI change ведёт out и measure — добавление, удаление, факт, показ и напоминание при закрытии
+    why: |
+      Большинство решений «не делаем» появляется по ходу работы, не в плане:
+      отклонённая находка ревью, отступление от дизайна, слова пользователя.
+      Нужны команды в scripts/cli/board/change.mjs:
+      change out add <c#N> "<what>" --why "<…>" [--ref <c#M|t#N|path>],
+      change out rm <c#N> "<what>",
+      change measure add <c#N> "<what>" --how "<…>" [--target "<…>"],
+      change measure set <c#N> "<what>" --actual "<…>".
+      Ключ пункта — what; повторный add обновляет пункт, а не дублирует.
+      createChange принимает out/measure. change show печатает оба списка.
+      change close не блокируется measure: печатает пункты без actual и
+      команду measure set. USAGE обновить.
+    produces: [scripts/cli/board/change.mjs, scripts/cli/board/change.test.mjs]
+    verify: npx vitest run scripts/cli/board
+    retry: 2
+    budget: 3
+    kind: auto
+  3:
+    title: Формат плана принимает out и measure на уровне change, apply записывает их слиянием по what
+    why: |
+      Сейчас readDocument (scripts/cli/process/apply.mjs:184) молча
+      выбрасывает неизвестные ключи верхнего уровня — out, написанный в
+      плане, пропал бы без следа. Добавить out и measure в DSL_DOC_FIELDS,
+      readDocument и validate (out: what и why обязательны; measure: what и
+      how обязательны). apply при создании передаёт их в createChange, при
+      повторном применении сливает по what: пункт плана обновляет пункт с
+      тем же what, пункты, добавленные командой, остаются. Неизвестный ключ
+      верхнего уровня — предупреждение, как у шагов. Словарь в
+      plan-guard.mjs и текст подсказки в plan-hook.mjs дополнить.
+    needs: [2]
+    produces: [scripts/cli/process/apply.mjs, scripts/cli/process/apply.test.mjs, scripts/cli/process/plan-guard.mjs, scripts/cli/process/plan-hook.mjs]
+    verify: npx vitest run scripts/cli/process
+    retry: 2
+    budget: 3
+    kind: auto
+  4:
+    title: Карточка change показывает шапку и бриф — зачем, входит, не входит, как измерить
+    why: |
+      src/process/pipeline/ChangeDetail.vue сейчас не показывает delta
+      вовсе. Разметку и классы брать из change.html/change.css, не
+      придумывать заново. По #fTC (change.html, change.css, README раздел C): шапка —
+      c#N жёлтым + title, статус Открыт/Закрыт, чипы done/total задач,
+      $spent / $budget, «с <дата> · N дн.», кнопка «Открыть в графе». Бриф —
+      карточка: абзац delta (markdown через marked, как в карточке задачи);
+      Входит — задачи change с ✓ для done и ○ для прочих; Не входит — out с
+      «– what», why мелко под ним, ref кликабелен для c#/t#; Как измерить —
+      measure: what, how, ориентир, факт (пустой факт — «—»). Пустой блок не
+      выводится. Строки через i18n, цвета только из токенов.
+      Задачи-таблицу и правую колонку не трогать — это шаг 5.
+    needs: [1]
+    produces: [src/process/pipeline/ChangeDetail.vue, src/kernel/i18n.ts]
+    verify: npx vitest run src && npx vue-tsc --noEmit
+    retry: 2
+    budget: 4
+    kind: auto
+  5:
+    title: Карточка change показывает таблицу задач и правую колонку бюджета, прогресса и дорогих задач
+    why: |
+      По #fTC: таблица статус | # | задача | вид | попытки | $ с мини-баром
+      (доля от самой дорогой) | время, порядок по зависимостям; клик по
+      строке открывает карточку задачи; на hover справа «Trace ↗» открывает
+      задачу сразу на вкладке Trace. Кнопка «Дерево работы» у строки и
+      «нет данных» уходят. Правая колонка: Бюджет (потрачено / бюджет,
+      остаток, полоса), Прогресс (done из total, полоса, что осталось —
+      номера открытых задач), Дорогие задачи — топ-3. Колонки и строки,
+      для которых в данных доски нет значения без запроса на каждую задачу
+      (попытки, разбивка по ролям), скрываются, а не заполняются нулями.
+    needs: [4]
+    produces: [src/process/pipeline/ChangeDetail.vue, src/windows/TodoWindow.vue, src/kernel/i18n.ts]
+    verify: npx vitest run src && npx vue-tsc --noEmit
+    retry: 2
+    budget: 4
+    kind: auto
+  6:
+    title: Формат плана и спека описывают out и measure change
+    why: |
+      Следующие сессии пишут план по docs/plan-format.md — без полей там
+      out так и останется прозой в vision. Дописать §1 (поля change: out,
+      measure, их обязательные части), §2 (что отвергается), пример в §4.
+      Правило для measure: what называет ровно то, что меряется, — не шире
+      покрытия («геометрия строк trace», а не «соответствие дизайну»);
+      иначе пункт читается как оценка целого.
+      В docs/specs/tasks/spec.md раздел changes: поля записи, что measure
+      — ориентир и не блокирует close, откуда берётся блок «Входит».
+    needs: [3]
+    produces: [docs/plan-format.md, docs/specs/tasks/spec.md]
+    verify: node scripts/cli.mjs spec lint
+    retry: 2
+    budget: 2
+    kind: auto
+  7:
+    title: Карточка change проходит ручную сверку с кадром tasks-C-change-card на c#66
+    why: |
+      Совпадение с макетом и полезность брифа — суждение пользователя.
+      Проверять на c#66 (11 задач, одна открытая) и на новом change с
+      заполненными out и measure.
+    needs: [5, 6]
+    kind: manual

@@ -39,6 +39,8 @@ export function createChange(data, fields = {}) {
     delta: String(fields.delta ?? ""),
     project: fields.project ?? null,
     spec: Array.isArray(fields.spec) ? [...fields.spec] : [],
+    out: Array.isArray(fields.out) ? fields.out.map((item) => ({ ...item })) : [],
+    measure: Array.isArray(fields.measure) ? fields.measure.map((item) => ({ ...item })) : [],
     created_at: now,
     updated_at: now,
   };
@@ -181,6 +183,11 @@ const USAGE =
   "       cli change list [--project <name> | --all] [--json]\n" +
   "       cli change show <c#N> [--json]\n" +
   "       cli change close <c#N>\n" +
+  "       cli change out add <c#N> \"<what>\" --why \"<why>\" [--ref <c#M|t#N|path>]\n" +
+  "       cli change out rm <c#N> \"<what>\"\n" +
+  "       cli change measure add <c#N> \"<what>\" --how \"<how>\" [--target \"<target>\"]\n" +
+  "       cli change measure rm <c#N> \"<what>\"\n" +
+  "       cli change measure set <c#N> \"<what>\" [--actual \"<actual>\"] [--ok | --off] [--note \"<note>\"]\n" +
   "       cli change set title|delta|spec|budget|parallel <c#N> <value>\n" +
   "       cli change migrate [--go]        root tasks -> records; dry run by default\n\n" +
   "A change is a RECORD, not a task: it holds the delta, the spec sections and the\n" +
@@ -325,6 +332,26 @@ function cmdShow(args) {
   process.stdout.write(formatChangeLine(data, change) + "\n");
   if (change.delta) process.stdout.write(`\n${change.delta}\n`);
   if (change.spec?.length) process.stdout.write(`\nразделы спеки: ${change.spec.join(", ")}\n`);
+  process.stdout.write("\nНе входит:\n");
+  if (change.out?.length) {
+    for (const item of change.out)
+      process.stdout.write(`  - ${item.what} — ${item.why}${item.ref ? ` · ${item.ref}` : ""}\n`);
+  } else process.stdout.write("  (пусто)\n");
+  process.stdout.write("\nКак измерить:\n");
+  if (change.measure?.length) {
+    for (const item of change.measure) {
+      const details = [
+        item.how,
+        item.target ? `цель: ${item.target}` : "",
+        item.actual ? `факт: ${item.actual}` : "",
+        item.ok === true ? "отметка: в норме" : item.ok === false ? "отметка: не в норме" : "",
+        item.note ? `заметка: ${item.note}` : "",
+      ]
+        .filter(Boolean)
+        .join(" · ");
+      process.stdout.write(`  - ${item.what} — ${details}\n`);
+    }
+  } else process.stdout.write("  (пусто)\n");
   if (!members.length) {
     process.stdout.write("\nни одной задачи не смотрит на этот change\n");
     return;
@@ -361,9 +388,107 @@ function cmdClose(args) {
   });
   if (already) {
     process.stdout.write(`ok: ${changeAddress(change)} already closed at ${change.closed_at}\n`);
+    printMeasureReminder(change);
     return;
   }
   process.stdout.write(`ok: ${changeAddress(change)} closed — ${total} task(s) done\n`);
+  printMeasureReminder(change);
+}
+
+function printMeasureReminder(change) {
+  const pending = (change.measure ?? []).filter((item) => !String(item.actual ?? "").trim());
+  if (pending.length) {
+    process.stdout.write("measurements without actual:\n");
+    for (const item of pending) {
+      process.stdout.write(`  - ${item.what}\n`);
+      process.stdout.write(`    cli change measure set ${changeAddress(change)} ${JSON.stringify(item.what)} --actual \"<actual>\"\n`);
+    }
+  }
+}
+
+function requiredText(value, flag) {
+  const text = value === undefined || value === true ? "" : String(value).trim();
+  if (!text) fail(`refusing: --${flag} needs non-empty text`);
+  return text;
+}
+
+function editableChange(data, ref) {
+  const change = resolveOrFail(data, ref);
+  if (change.legacy)
+    fail(`refusing: ${changeAddress(change)} is still a root task — migrate the board first.`);
+  return change;
+}
+
+function cmdOut(args) {
+  const { positional, flags } = parseArgs(args);
+  const [action, ref, rawWhat] = positional;
+  const what = String(rawWhat ?? "").trim();
+  if (!what || !["add", "rm"].includes(action)) fail(USAGE);
+  if (action === "add" && flags.why === undefined) fail(USAGE);
+  const file = boardPath();
+  const result = withBoardLock(file, () => {
+    const data = loadBoardForWrite(file);
+    const change = editableChange(data, ref);
+    const items = Array.isArray(change.out) ? change.out : (change.out = []);
+    const index = items.findIndex((item) => item?.what === what);
+    if (action === "rm") {
+      if (index < 0) fail(`refusing: ${changeAddress(change)} has no out item ${JSON.stringify(what)}`);
+      items.splice(index, 1);
+    } else {
+      const item = { what, why: requiredText(flags.why, "why") };
+      if (flags.ref !== undefined) item.ref = requiredText(flags.ref, "ref");
+      if (index < 0) items.push(item);
+      else items[index] = item;
+    }
+    change.updated_at = new Date().toISOString();
+    saveBoard(file, data);
+    return change;
+  });
+  process.stdout.write(`ok: ${changeAddress(result)} out ${action} ${JSON.stringify(what)}\n`);
+}
+
+function cmdMeasure(args) {
+  const { positional, flags } = parseArgs(args);
+  const [action, ref, rawWhat] = positional;
+  const what = String(rawWhat ?? "").trim();
+  if (!what || !["add", "set", "rm"].includes(action)) fail(USAGE);
+  if (action === "add" && flags.how === undefined) fail(USAGE);
+  if (action === "set" && flags.actual === undefined && flags.ok === undefined && flags.off === undefined && flags.note === undefined)
+    fail(USAGE);
+  if (action === "set" && flags.ok !== undefined && flags.off !== undefined)
+    fail("refusing: --ok and --off cannot be used together");
+  const file = boardPath();
+  const result = withBoardLock(file, () => {
+    const data = loadBoardForWrite(file);
+    const change = editableChange(data, ref);
+    const items = Array.isArray(change.measure) ? change.measure : (change.measure = []);
+    const index = items.findIndex((item) => item?.what === what);
+    if (action === "rm") {
+      if (index < 0) fail(`refusing: ${changeAddress(change)} has no measure item ${JSON.stringify(what)}`);
+      items.splice(index, 1);
+    } else if (action === "set") {
+      if (index < 0) fail(`refusing: ${changeAddress(change)} has no measure item ${JSON.stringify(what)}`);
+      const item = { ...items[index] };
+      if (flags.actual !== undefined) item.actual = requiredText(flags.actual, "actual");
+      if (flags.ok !== undefined) item.ok = true;
+      if (flags.off !== undefined) item.ok = false;
+      if (flags.note !== undefined) item.note = requiredText(flags.note, "note");
+      items[index] = item;
+    } else {
+      const previous = index < 0 ? {} : items[index];
+      const item = { what, how: requiredText(flags.how, "how") };
+      if (flags.target !== undefined) item.target = requiredText(flags.target, "target");
+      if (previous.actual !== undefined) item.actual = previous.actual;
+      if (previous.ok !== undefined) item.ok = previous.ok;
+      if (previous.note !== undefined) item.note = previous.note;
+      if (index < 0) items.push(item);
+      else items[index] = item;
+    }
+    change.updated_at = new Date().toISOString();
+    saveBoard(file, data);
+    return change;
+  });
+  process.stdout.write(`ok: ${changeAddress(result)} measure ${action} ${JSON.stringify(what)}\n`);
 }
 
 const SET_FIELDS = {
@@ -440,6 +565,8 @@ export function run(args) {
   if (cmd === "list") return cmdList(rest);
   if (cmd === "show") return cmdShow(rest);
   if (cmd === "close") return cmdClose(rest);
+  if (cmd === "out") return cmdOut(rest);
+  if (cmd === "measure") return cmdMeasure(rest);
   if (cmd === "set") return cmdSet(rest);
   fail(`unknown command: ${cmd}\n\n${USAGE}`);
 }

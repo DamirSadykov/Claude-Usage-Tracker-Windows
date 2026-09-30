@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { parseYamlSubset, readDocument, validate } from "./apply.mjs";
+import { parseYamlSubset, readDocument, validate, applyDocument } from "./apply.mjs";
 import { loadBoard, withDeferredSave, saveBoard, setField } from "../board/todos.mjs";
 
 const cli = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "cli.mjs");
@@ -52,6 +52,57 @@ describe("the YAML subset apply reads", () => {
   it("reads a bare string step as its title", () => {
     const doc = readDocument(["steps:", "  1: Собираю каркас"].join("\n"));
     expect(doc.steps[0]).toMatchObject({ id: "1", title: "Собираю каркас", needs: [] });
+  });
+
+  it("keeps change out and measure instead of silently dropping them", () => {
+    const doc = readDocument([
+      "out:", "  - what: Окно", "    why: нет запроса",
+      "measure:", "  - what: Доля", "    how: считаем через месяц",
+      "unknown-top: preserved nowhere",
+      "steps:", "  1: Работа",
+    ].join("\n"));
+    expect(doc.out).toEqual([{ what: "Окно", why: "нет запроса" }]);
+    expect(doc.measure).toEqual([{ what: "Доля", how: "считаем через месяц" }]);
+    expect(validate(doc).warnings).toContain('document: unknown key "unknown-top" — ignored');
+  });
+
+  it("requires the durable reason and measurement method", () => {
+    const { errors } = validate(readDocument([
+      "out:", "  - what: Окно",
+      "measure:", "  - what: Доля",
+      "steps:", "  1: Работа",
+    ].join("\n")));
+    expect(errors).toEqual(expect.arrayContaining(["out[1]: why is required", "measure[1]: how is required"]));
+  });
+});
+
+describe("change brief fields in apply", () => {
+  it("uses c#70's plan input and merges planned items by what", () => {
+    const file = path.join(mkdtempSync(path.join(os.tmpdir(), "cut-change-brief-")), "todos.json");
+    try {
+      const fixture = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "docs", "plans", "c70-change-brief-adr.yaml");
+      const initial = { version: 1, todos: [], changes: [] };
+      const doc = readDocument(readFileSync(fixture, "utf8"));
+      expect(validate(doc).errors).toEqual([]);
+      expect(applyDocument(doc, { go: true, project: "fixture", board: { data: initial, file } }).ok).toBe(true);
+      const change = initial.changes[0];
+      expect(change.out).toHaveLength(5);
+      expect(change.measure).toHaveLength(2);
+      change.out.push({ what: "Командный пункт", why: "добавлен по ходу работы" });
+      change.measure.push({ what: "Ручной замер", how: "командой" });
+      const repeated = {
+        ...doc,
+        out: [{ what: change.out[0].what, why: "обновлённый повод" }],
+        measure: [{ what: change.measure[0].what, how: "обновлённый способ" }],
+      };
+      expect(applyDocument(repeated, { go: true, project: "fixture", board: { data: initial, file } }).ok).toBe(true);
+      expect(change.out.find((item) => item.what === "Командный пункт")).toBeTruthy();
+      expect(change.measure.find((item) => item.what === "Ручной замер")).toBeTruthy();
+      expect(change.out[0].why).toBe("обновлённый повод");
+      expect(change.measure[0].how).toBe("обновлённый способ");
+    } finally {
+      rmSync(path.dirname(file), { recursive: true, force: true });
+    }
   });
 });
 

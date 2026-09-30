@@ -26,7 +26,7 @@ const props = withDefaults(defineProps<{
 }>(), { query: "", activeHit: null });
 
 const emit = defineEmits<{
-    (e: "mode", value: "lanes" | "wires" | "bubbles" | "rings" | "specs"): void;
+    (e: "mode", value: "bubbles" | "rings" | "specs"): void;
     (e: "open", id: string): void;
     (e: "update:activeHit", id: string | null): void;
 }>();
@@ -122,7 +122,6 @@ interface PlacedPlaque {
     y: number;
 }
 
-const relation = ref("refs");
 const depth = ref("2");
 const collapseForeign = ref(false);
 const specOnly = ref(false);
@@ -588,11 +587,6 @@ function pickLayout(value: string) {
     if (value === "bubbles") emit("mode", "bubbles");
 }
 
-function pickRelation(value: string) {
-    relation.value = value;
-    if (value === "deps") emit("mode", "lanes");
-}
-
 function selectNode(id: string) {
     if (dragged || !byId.value.has(id)) return;
     picked.value = id;
@@ -741,14 +735,6 @@ watch(
 
 <template>
     <ToolBar>
-        <SegControl
-            :model-value="relation"
-            :options="[
-                { id: 'deps', label: 'Зависимости' },
-                { id: 'refs', label: 'Ссылки' },
-            ]"
-            @update:model-value="pickRelation"
-        />
         <SegControl
             model-value="rings"
             :options="[

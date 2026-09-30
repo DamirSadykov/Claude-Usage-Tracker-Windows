@@ -35,12 +35,13 @@ const statusOptions = computed(() => [
 const priorityOptions = computed(() => [["high", t("todoPriorityHigh")], ["medium", t("todoPriorityMedium")], ["low", t("todoPriorityLow")]] as const);
 watch(() => props.modelValue.query, q => { if (q !== queryInput.value) queryInput.value = q; });
 watch(queryInput, q => { clearTimeout(timer); timer = setTimeout(() => set("query", q), 200); });
+function clearQuery() { queryInput.value = ""; clearTimeout(timer); set("query", ""); searchEl.value?.focus(); }
 defineExpose({ focusSearch: () => searchEl.value?.focus(), focusProject: () => projectEl.value?.focus() });
 </script>
 
 <template>
   <div class="tw-filters">
-    <div class="tw-search"><input ref="searchEl" v-model="queryInput" class="tw-search-input" :placeholder="t('todoSearch')" /></div>
+    <div class="tw-search"><input ref="searchEl" v-model="queryInput" class="tw-search-input" :placeholder="t('todoSearch')" @keydown.esc="clearQuery" /><button v-if="queryInput" class="tw-search-clear" type="button" :title="t('todoSearchClear')" @click="clearQuery">×</button></div>
     <div class="tw-filter-menu"><button class="tw-filter-chip" :class="{ active: hasStatusFilter }" type="button" @click="toggle('status')">{{ hasStatusFilter ? `${t('todoStatus')}: ${displayedStatusLabel}` : `+ ${t('todoFilterStatus')}` }}<span v-if="hasStatusFilter" class="tw-filter-clear" @click.stop="clearStatus">×</span></button><div v-if="open === 'status'" class="tw-filter-options"><button type="button" @click="showAllStatuses">{{ t('todoFilterStatus') }}</button><button v-for="[status, label] in statusOptions" :key="status" type="button" @click="select('status', status)">{{ label }}</button></div></div>
     <div class="tw-filter-menu"><button ref="projectEl" class="tw-filter-chip" :class="{ active: !!value.project }" type="button" @click="toggle('project')">{{ value.project || `+ ${t('todoProject')}` }}<span v-if="value.project" class="tw-filter-clear" @click.stop="clear('project')">×</span></button><div v-if="open === 'project'" class="tw-filter-options"><button v-for="project in projects" :key="project" type="button" @click="select('project', project)">{{ project }}</button></div></div>
     <div class="tw-filter-menu"><button class="tw-filter-chip" :class="{ active: !!value.priority }" type="button" @click="toggle('priority')">{{ priorityLabel ? `${t('todoPriority')}: ${priorityLabel}` : `+ ${t('todoPriority')}` }}<span v-if="priorityLabel" class="tw-filter-clear" @click.stop="clear('priority')">×</span></button><div v-if="open === 'priority'" class="tw-filter-options"><button v-for="[priority, label] in priorityOptions" :key="priority" type="button" @click="select('priority', priority)">{{ label }}</button></div></div>
@@ -56,6 +57,8 @@ defineExpose({ focusSearch: () => searchEl.value?.focus(), focusProject: () => p
 .tw-filter-chip { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; padding: 4px 8px; border: 1px dashed var(--stroke-strong); border-radius: var(--r-ctl); background: transparent; color: var(--text-3); font: 11px/1 var(--segoe); cursor: pointer; }
 .tw-filter-chip.active { border-style: solid; border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
 .tw-filter-clear { font-size: 15px; line-height: 10px; }
+.tw-search-clear { padding: 0 2px; border: 0; background: transparent; color: var(--text-3); font-size: 15px; line-height: 1; cursor: pointer; }
+.tw-search-clear:hover { color: var(--text); }
 .tw-filter-options { position: absolute; z-index: 10; top: calc(100% + 5px); left: 0; display: grid; min-width: max-content; padding: 4px; border: 1px solid var(--stroke-strong); border-radius: var(--r-ctl); background: var(--layer); box-shadow: 0 6px 16px var(--canvas-bg); }
 .tw-filter-options button { padding: 5px 7px; border: 0; border-radius: 3px; background: transparent; color: var(--text-2); font: 11px/1.2 var(--segoe); text-align: left; cursor: pointer; }
 .tw-filter-options button:hover { background: var(--layer-hover); color: var(--text); }

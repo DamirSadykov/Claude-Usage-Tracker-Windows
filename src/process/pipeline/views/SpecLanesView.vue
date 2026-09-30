@@ -18,7 +18,7 @@ import { useSpecs } from "../useSpecs";
 import type { SpecLane } from "../types";
 
 const emit = defineEmits<{
-    (e: "mode", value: "lanes" | "wires" | "rings" | "specs"): void;
+    (e: "mode", value: "bubbles" | "rings" | "specs"): void;
 }>();
 
 interface LaneWire {
@@ -125,7 +125,7 @@ function laneWires(lane: SpecLane): LaneWire[] {
 
 function onLayer(value: string) {
     if (value === "deps") {
-        emit("mode", "lanes");
+        emit("mode", "bubbles");
         return;
     }
     layer.value = value;
@@ -133,7 +133,7 @@ function onLayer(value: string) {
 
 function onLayout(value: string) {
     if (value === "themes") {
-        emit("mode", "lanes");
+        emit("mode", "bubbles");
         return;
     }
     layout.value = value;

@@ -30,7 +30,7 @@ const props = withDefaults(defineProps<{
 }>(), { query: "", activeHit: null });
 
 const emit = defineEmits<{
-    (e: "mode", value: "lanes" | "wires" | "rings" | "specs"): void;
+    (e: "mode", value: "bubbles" | "rings" | "specs"): void;
     (e: "open", id: string): void;
     (e: "update:activeHit", id: string | null): void;
 }>();
@@ -154,7 +154,6 @@ const picked = ref<string | null>(null);
 const pickedEdge = ref<string | null>(null);
 const crossOnly = ref(false);
 const lockAll = ref(false);
-const relation = ref("refs");
 const shell = ref("bubbles");
 
 const frame = ref<HTMLElement | null>(null);
@@ -715,11 +714,6 @@ function healthTone(health: Health): "ok" | "crit" | "theme" {
     return health === "done" ? "ok" : health === "blocked" ? "crit" : "theme";
 }
 
-function pickRelation(value: string) {
-    relation.value = value;
-    if (value === "deps") emit("mode", "lanes");
-}
-
 function pickShell(value: string) {
     shell.value = value;
     if (value === "rings") emit("mode", "rings");
@@ -880,14 +874,6 @@ watch([bounds, () => size.value.w, () => size.value.h], fit, { immediate: true }
 
 <template>
     <ToolBar>
-        <SegControl
-            :model-value="relation"
-            :options="[
-                { id: 'deps', label: 'Зависимости' },
-                { id: 'refs', label: 'Ссылки' },
-            ]"
-            @update:model-value="pickRelation"
-        />
         <SegControl
             :model-value="shell"
             :options="[

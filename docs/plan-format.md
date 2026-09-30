@@ -23,6 +23,15 @@ not commentary.
 change: "CHANGE: <name>"  # the delta this plan makes to a spec; without it steps land rootless
 vision: |                 # WHAT & WHY — the paragraph that opens a plan
   <...>
+out:                      # durable decisions not to do: every item has what: and why:
+  - what: <excluded scope>
+    why: <reason it is excluded>
+    ref: <c#N|t#N|KB path> # optional: decision or evidence this exclusion rests on
+measure:                  # user-facing measures: every item has what: and how:
+  - what: <exact thing being measured, not an assessment of the whole change>
+    how: <how it is measured>
+    target: <desired result> # optional
+    actual: <observed result> # optional; useful when a plan continues a change
 parallel: <N>             # steps of the group the runner may drive at once
 budget: <usd>             # the group's ceiling
 steps:
@@ -57,6 +66,28 @@ Rules that are not visible in the shape:
   parallel.
 - **Declare only what the plan decides.** An absent field means *not declared*:
   never a default the runner fills in, never a value copied from a neighbour.
+- **`vision` is written in meaning blocks, not one solid paragraph.** It is
+  the «Зачем» of the change card. Use 2–5 short paragraphs separated by a
+  blank line, each opening with a bold label: `**Задача.**` what is wrong and
+  what should exist; `**Модель.**` or `**Решение.**` how it works;
+  `**Хранение.**` where the data lives; `**Пример.**` on a concrete task;
+  `**Риск.**`. Formulas, paths and identifiers go in backticks, parameter
+  lists go in a markdown list.
+- **`out` records a decision not to do something.** Every item has a non-empty
+  `what` and `why`; `ref` is optional and points at the change/task or KB
+  decision that explains it. Do not leave an exclusion only in `vision`:
+  `out` is the durable, scannable record.
+- **`measure` is the user's measuring guide, not an acceptance gate.** Every
+  item has a non-empty `what` and `how`; `target` and `actual` are optional.
+  Its `what` names exactly the thing measured, no wider than what the
+  measurement covers: write «геометрия строк trace», not «соответствие дизайну». The
+  latter reads as an assessment of the entire change. A missing `actual` never
+  blocks closing a change; final acceptance remains the user's decision.
+  A measure is about what the change delivers, not how it was built: runner
+  attempts, retries and hand fixes are already in the runner journal
+  (`runs.jsonl`) and do not belong here. `actual` is the value itself
+  («0.9 s», «212 / 219 · 97%»); the explanation goes to `note`, and the user
+  marks the item within range or not (`ok`) with `change measure set`.
 - `retry: 2` and `retry: <=2` are the same value, as are `budget: 3` and
   `budget: $3`.
 - A `#` comment must be on its own line — a `#` inside a value belongs to the
@@ -74,7 +105,9 @@ pointing at a step that does not exist; a step with neither a `title` nor a
 `task`; a `task` naming no task on the board, or one already bound to an earlier
 step; an invalid number or an unknown `kind`; `red` declared without
 `red-tests`, or `red-tests` declared without `red` — the gate needs both halves
-or neither; a `risk` other than `high`.
+or neither; a `risk` other than `high`; an `out` item that is not a mapping or
+has no `what` or `why`; a `measure` item that is not a mapping or has no `what`
+or `how`.
 
 **Prose is refused too.** The language is required of every plan, not only of
 the texts that already look like one — a rule the guard declines to check is a
@@ -170,13 +203,34 @@ overwrites in either case, without filing a comment.
 
 ## 4. Worked example
 
+The current project example is
+[`docs/plans/c70-change-brief-adr.yaml`](plans/c70-change-brief-adr.yaml): it
+uses `out` for the change's explicit non-goals and `measure` for its user-facing
+measures. The compact graph below shows the same fields in a different domain,
+including an optional `ref` and measurable, bounded `what` values.
+
 ```yaml
 change: "CHANGE: приём вебхуков без потери событий"
 vision: |
-  Должен появиться разбор входящих вебхуков, который не теряет события при
-  падении обработчика: приём отделён от обработки очередью, а повтор идёт по
-  лимиту, а не бесконечно. Решили не брать внешнюю очередь — таблица в той же
-  базе дешевле в эксплуатации и достаточна на нашем объёме.
+  **Задача.** Входящие вебхуки теряются, когда падает обработчик: приём и
+  обработка идут одним вызовом.
+
+  **Решение.** Приём только пишет событие в таблицу `events` и отвечает;
+  обработку ведёт очередь, повтор — по лимиту, а не бесконечно.
+
+  **Риск.** Гонка двух воркеров на одном событии — обработчик идемпотентен по
+  ключу события.
+out:
+  - what: Внешняя очередь сообщений
+    why: Таблица в той же базе дешевле в эксплуатации и достаточна на нашем объёме.
+    ref: docs/decisions/queue-storage.md
+measure:
+  - what: Возраст старейшего события в очереди
+    how: Нагрузочный сценарий на 10к событий читает метрику после пика.
+    target: не больше пяти минут
+  - what: Доля принятых событий, которые дошли до обработчика
+    how: Сопоставить число принятых и обработанных id в отчёте сценария.
+    target: 100%
 parallel: 2
 budget: 25
 steps:

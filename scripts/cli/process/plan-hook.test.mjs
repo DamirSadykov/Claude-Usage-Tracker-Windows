@@ -74,6 +74,7 @@ describe("buildCriticContext", () => {
   });
 });
 import {
+  CHANGE_ITEM_FIELDS,
   DOC_FIELDS,
   DSL_DOC_FIELDS,
   DSL_STEP_FIELDS,
@@ -161,7 +162,7 @@ describe("the plan-format document", () => {
     for (const key of DSL_DOC_FIELDS) expect(doc).toContain(`${key}:`);
     for (const key of DSL_STEP_FIELDS) expect(doc).toContain(`${key}:`);
     expect(doc).toContain("why:");
-    const known = new Set([...DOC_FIELDS, ...STEP_FIELDS]);
+    const known = new Set([...DOC_FIELDS, ...STEP_FIELDS, ...Object.values(CHANGE_ITEM_FIELDS).flat()]);
     const inYaml = [...doc.matchAll(/^\s{2,}([a-z][a-z-]*):/gm)].map((m) => m[1]);
     expect(inYaml.length).toBeGreaterThan(8);
     for (const key of inYaml) expect([...known]).toContain(key);

@@ -10,10 +10,8 @@ import { ref, computed, watch, onMounted, onUnmounted, nextTick } from "vue";
 import { useI18n, type Composer } from "vue-i18n";
 import { invoke } from "@tauri-apps/api/core";
 import ProjectAutocomplete from "../kernel/ProjectAutocomplete.vue";
-import GraphView from "../board/GraphView.vue";
 import PipelineGraph from "../process/pipeline/PipelineGraph.vue";
 import type { PipelineMode } from "../process/pipeline/modes";
-import { selectChange } from "../process/pipeline/useChange";
 import type { BoardChange, Todo } from "../contracts/board";
 import { boardStore, type BoardMutation } from "../board/boardStore";
 import { useProjectLinks } from "../analytics/projectLinks";
@@ -231,6 +229,14 @@ function selectChangeTask(address: string) {
   const row = boardStore.rows.value.find((candidate) => candidate.number === number);
   const node = row ? findBoardTreeNode(tree.value, row.id) : null;
   if (node) selectTreeNode(node);
+}
+function selectChangeTaskTrace(address: string) {
+  const number = Number(address.replace(/^#/, ""));
+  const row = boardStore.rows.value.find((candidate) => candidate.number === number);
+  const node = row ? findBoardTreeNode(tree.value, row.id) : null;
+  if (!node) return;
+  selectTreeNode(node);
+  void nextTick(() => { detailTab.value = "trace"; });
 }
 
 const openCount = computed(
@@ -771,30 +777,12 @@ async function openSettings() {
 // filtered board, toggled in place — not a separate window. It shares this
 // window's `todos` and `projectFilter`.
 const viewMode = ref<"board" | "graph">("board");
-const graphMode = ref<PipelineMode>("lanes");
-// The graph tab has two renderings while the redesign lands: the new lane/wire
-// screens (default) and the classic force layout. The choice is remembered per
-// machine so a session that prefers the old picture keeps it.
-const graphUiNew = ref(localStorage.getItem("graph-ui") !== "classic");
-watch(graphUiNew, (on) =>
-  localStorage.setItem("graph-ui", on ? "next" : "classic"),
-);
-const graphFocusLane = ref("");
-function openChangeGraph(change: BoardChange) {
-  selectChange(`c#${change.number}`);
-  graphMode.value = "lanes";
-  graphUiNew.value = true;
-  viewMode.value = "graph";
-  graphFocusLane.value = "";
-  void nextTick(() => { graphFocusLane.value = change.id; });
-}
-const graphRef = ref<InstanceType<typeof GraphView> | null>(null);
+const graphMode = ref<PipelineMode>("bubbles");
 const pipelineGraphRef = ref<InstanceType<typeof PipelineGraph> | null>(null);
 const pipelineActiveHit = ref<string | null>(null);
 function onSearchEnter(event?: KeyboardEvent) {
   if (viewMode.value !== "graph") return;
-  if (graphUiNew.value) pipelineGraphRef.value?.cycleHit(event?.shiftKey ? -1 : 1);
-  else graphRef.value?.cycleNext();
+  pipelineGraphRef.value?.cycleHit(event?.shiftKey ? -1 : 1);
 }
 
 // Keyboard shortcuts (registry in ../hotkeys): Ctrl+F → search, Ctrl+P → project.
@@ -817,13 +805,6 @@ useHotkeys({
   project: () => filtersBarRef.value?.focusProject(),
 });
 
-// GraphView mutates dependencies through the backend and hands back the fresh
-// list; adopt it so both views stay in lockstep without a reload round-trip.
-function onGraphUpdate(list: Todo[]) {
-  void list;
-  void boardStore.reload(true);
-}
-
 // Clicking a graph node opens that task's card — the same detail panel the board
 // uses (it overlays the graph and returns to it on close).
 // The pipeline screens address a task the way a human does — "#345" — while the
@@ -837,6 +818,18 @@ function onPipelineOpen(ref: string) {
   const node = findBoardTreeNode(tree.value, byRef.id);
   selectedTreeNode.value = node;
   void openDetail(byRef);
+}
+
+function onPipelineTrace(ref: string) {
+  const byRef = ref.startsWith("#")
+    ? byNumber.value.get(Number(ref.slice(1)))
+    : todos.value.find((x) => x.id === ref);
+  if (!byRef) return;
+  viewMode.value = "board";
+  const node = findBoardTreeNode(tree.value, byRef.id);
+  if (!node) return;
+  selectTreeNode(node);
+  void nextTick(() => { detailTab.value = "trace"; });
 }
 
 // Navigate a t#N reference to that task's detail; a @name reference back to the
@@ -1672,19 +1665,6 @@ onUnmounted(() => {
           {{ t("viewGraph") }}
         </button>
       </div>
-      <button
-        v-if="viewMode === 'graph'"
-        class="tw-guide"
-        :title="graphUiNew ? t('graphUiOld') : t('graphUiNew')"
-        @click="graphUiNew = !graphUiNew"
-      >
-        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M2.5 5.5h11M2.5 10.5h11" />
-          <circle cx="6" cy="5.5" r="1.6" />
-          <circle cx="10" cy="10.5" r="1.6" />
-        </svg>
-        {{ graphUiNew ? t("graphUiOld") : t("graphUiNew") }}
-      </button>
       <button class="tw-guide" :title="t('todoGuideHint')" @click="openGuide">
         <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round">
           <path d="M2.5 3.2c1.8-.6 3.7-.6 5.5.3 1.8-.9 3.7-.9 5.5-.3v8.6c-1.8-.6-3.7-.6-5.5.3-1.8-.9-3.7-.9-5.5-.3z" />
@@ -1728,33 +1708,23 @@ onUnmounted(() => {
 
     <div v-if="loading" class="tw-empty">{{ t("loading") }}</div>
 
-    <!-- Task graph, new rendering: lanes by theme, artifacts on wires, ref rings -->
+    <!-- Task links, rendered as bubbles or rings. -->
     <PipelineGraph
       ref="pipelineGraphRef"
-      v-else-if="viewMode === 'graph' && graphUiNew"
+      v-else-if="viewMode === 'graph'"
       :query="search"
       :filters="filters"
-      :focus-lane="graphFocusLane"
       v-model:mode="graphMode"
       v-model:active-hit="pipelineActiveHit"
       @open="onPipelineOpen"
-    />
-
-    <!-- Task graph: an alternative view of the same filtered board (#88) -->
-    <GraphView
-      ref="graphRef"
-      v-else-if="viewMode === 'graph'"
-      :todos="todos"
-      :project="projectFilter"
-      :query="search"
-      @update="onGraphUpdate"
-      @open="onPipelineOpen"
+      @trace="onPipelineTrace"
     />
 
     <div v-else class="tw-tree-layout" :style="{ '--tree-width': `${detailTab === 'trace' ? 300 : treeWidth}px` }">
       <TodoTree
         :tree="tree"
         :selected-id="selectedTreeNode?.id"
+        :searching="Boolean(filters.query.trim())"
         @select="selectTreeNode"
         @open="selectTreeNode($event)"
       />
@@ -1823,10 +1793,9 @@ onUnmounted(() => {
       <ChangeDetail
         v-if="selectedChange && selectedTreeNode"
         :address="`c#${selectedChange.number}`"
-        show-graph
         show-heading
         @open="selectChangeTask"
-        @graph="openChangeGraph(selectedChange)"
+        @trace="selectChangeTaskTrace"
       />
       <div v-if="!detailId && !selectedChange" class="tw-empty">{{ t("tasks") }}</div>
     </div>
@@ -2825,8 +2794,8 @@ onUnmounted(() => {
   min-height: 0;
 }
 .tw-tree-layout > :first-child { border-right: 1px solid var(--stroke-strong); }
-.tw-tree-layout > :last-child { min-height: 0; overflow: auto; }
-.tw-tree-detail { display: flex; flex-direction: column; gap: 10px; padding: 14px 16px; }
+.tw-tree-layout > :last-child { min-height: 0; overflow: auto; padding: 14px 16px; }
+.tw-tree-detail { display: flex; flex-direction: column; gap: 10px; }
 .tw-tree-detail > .tw-back { align-self: flex-start; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .tw-detail-crumbs { align-items: center; border-bottom: 1px solid var(--stroke); display: flex; flex: 0 0 30px; gap: 6px; min-width: 0; }
 .tw-crumb { background: transparent; border: 0; color: var(--text-3); cursor: pointer; font-family: var(--mono); font-size: 12px; overflow: hidden; padding: 3px 0; text-overflow: ellipsis; white-space: nowrap; }
