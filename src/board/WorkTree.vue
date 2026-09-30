@@ -2,6 +2,7 @@
 import { computed, nextTick, ref, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { useI18n } from "vue-i18n";
+import type { RestartPoint } from "../contracts/board";
 import WorkTraceCharts from "./WorkTraceCharts.vue";
 import {
   aggregateTree,
@@ -55,7 +56,7 @@ type RawTree = {
   turns: RawTurn[];
 };
 type RawContext = WorkContextInput & { role?: "worker" | "review" | null };
-type RawSession = { session: string; source: string; tree: RawTree; context: RawContext };
+type RawSession = { session: string; source: string; tree: RawTree; context: RawContext; restartPoint: RestartPoint };
 type RawAttempt = { number: number; startedAt: string; endedAt: string; sessions: RawSession[]; result?: string; review?: unknown };
 type Payload = { sessions: RawSession[]; attempts: RawAttempt[] };
 type NodeType = ToolCallType | "text";
@@ -81,7 +82,7 @@ function text(v: unknown) {
 function line(v: string | null) {
   return v?.split(/\r?\n/, 1)[0] || null;
 }
-function makeTree(raw: RawTree, session: string, prefix: string, context?: RawContext): WorkNode {
+function makeTree(raw: RawTree, session: string, prefix: string, context?: RawContext, restartPoint?: RestartPoint): WorkNode {
   const labels = contextLabels(context),
     role =
       context?.role === "worker"
@@ -149,6 +150,7 @@ function makeTree(raw: RawTree, session: string, prefix: string, context?: RawCo
     contextLabels: labels,
     role: context?.role ?? null,
     compactionAt: (raw.compactionAt ?? []).map(stamp).filter((at): at is number => at !== null),
+    restartPoint,
   });
   const visit = (n: WorkNode) => {
     transcripts.set(n.id, n.transcriptPath ?? raw.transcriptPath);
@@ -161,7 +163,7 @@ const roots = computed(() => {
   transcripts.clear();
   if (!tree.value) return [];
   const sessions = tree.value.sessions.map((entry) =>
-    makeTree(entry.tree, entry.session, `session:${entry.session}:${entry.source}`, entry.context),
+    makeTree(entry.tree, entry.session, `session:${entry.session}:${entry.source}`, entry.context, entry.restartPoint),
   );
   const attempts = tree.value.attempts.map((attempt) =>
     aggregateTree({
@@ -178,7 +180,7 @@ const roots = computed(() => {
       transcriptPath: null,
       review: attemptReview(attempt.review),
       children: attempt.sessions.map((entry) =>
-        makeTree(entry.tree, entry.session, `attempt:${attempt.number}:${entry.session}`, entry.context),
+        makeTree(entry.tree, entry.session, `attempt:${attempt.number}:${entry.session}`, entry.context, entry.restartPoint),
       ),
     }),
   );

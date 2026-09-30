@@ -1,3 +1,5 @@
+import type { RestartPoint } from "../contracts/board";
+
 export type ToolCallType = "read" | "edit" | "shell" | "agent" | "web" | "other";
 /** Shared by the trace bars and the type chips. */
 export const TRACE_TYPE_COLORS = {
@@ -45,6 +47,7 @@ export interface WorkNode {
   role?: "worker" | "review" | null;
   compactionAt?: readonly number[];
   review?: AttemptReview | null;
+  restartPoint?: RestartPoint;
 }
 export interface AttemptReview {
   approved?: boolean;
@@ -118,11 +121,18 @@ export interface TraceSeries {
   context: readonly TracePoint[];
   cacheRead: readonly TracePoint[];
   cost: readonly TracePoint[];
+  restartTailOverpayment: readonly TracePoint[];
 }
 export interface TraceMarkerPart {
-  kind: "attempt" | "session" | "compacted";
+  kind: "attempt" | "session" | "compacted" | "restart";
   attempt: string | null;
   role: "worker" | "review" | null;
+  restart?: {
+    rho: number;
+    p25SavePct: number;
+    medianSavePct: number;
+    p75SavePct: number;
+  };
 }
 export interface TraceMarker {
   index: number;
@@ -408,13 +418,38 @@ export function modelCalls(root: WorkNode): WorkNode[] {
   visit(root);
   return found;
 }
+function sessionModelCalls(session: WorkNode): readonly WorkNode[] {
+  return session.children.filter((child) => child.kind === "model");
+}
+type RestartPlan = { k: number; rho: number; delta: number; calls: readonly WorkNode[] };
+function restartPlans(root: WorkNode): readonly RestartPlan[] {
+  const plans: RestartPlan[] = [];
+  const visit = (node: WorkNode) => {
+    if (node.kind === "session" && node.restartPoint) {
+      const scenarios = node.restartPoint.scenarios.slice().sort((left, right) => left.rho - right.rho);
+      const median = scenarios[Math.floor(scenarios.length / 2)], calls = sessionModelCalls(node);
+      const contextAtK = median?.k === null || median?.k === undefined ? null : node.restartPoint.observed.ctx[median.k - 1];
+      const initialContext = node.restartPoint.observed.ctx[0];
+      if (median?.k && contextAtK != null && initialContext !== undefined && median.k <= calls.length)
+        plans.push({ k: median.k, rho: median.rho, delta: Math.max(0, contextAtK - initialContext), calls });
+    }
+    node.children.forEach(visit);
+  };
+  visit(root);
+  return plans;
+}
 export function traceSeries(root: WorkNode): TraceSeries {
   let cacheRead = 0,
     cost = 0;
   const context: TracePoint[] = [],
     cache: TracePoint[] = [],
-    prices: TracePoint[] = [];
-  modelCalls(root).forEach((node, index) => {
+    prices: TracePoint[] = [],
+    restartTailOverpayment: TracePoint[] = [];
+  const calls = modelCalls(root), plans = restartPlans(root);
+  const tailPlan = new Map<string, RestartPlan>();
+  for (const plan of plans) plan.calls.slice(plan.k).forEach((call) => tailPlan.set(call.id, plan));
+  const overpayment = new Map<RestartPlan, number>();
+  calls.forEach((node, index) => {
     const usage = tokenBreakdown(node.tokenBreakdown),
       type = nodeType(node),
       point = { index: index + 1, nodeId: node.id, type };
@@ -423,8 +458,15 @@ export function traceSeries(root: WorkNode): TraceSeries {
     context.push({ ...point, value: contextTokens(usage) });
     cache.push({ ...point, value: cacheRead });
     prices.push({ ...point, value: cost });
+    const plan = tailPlan.get(node.id);
+    if (plan) {
+      const readRate = tokenCosts(node.model, { cacheRead: 1 }).cacheReadCost;
+      const value = (overpayment.get(plan) ?? 0) + ((1 - plan.rho) * plan.delta - 300) * readRate;
+      overpayment.set(plan, value);
+      restartTailOverpayment.push({ ...point, value });
+    }
   });
-  return { context, cacheRead: cache, cost: prices };
+  return { context, cacheRead: cache, cost: prices, restartTailOverpayment };
 }
 export function traceMarkers(root: WorkNode): readonly TraceMarker[] {
   const calls = modelCalls(root);
@@ -440,7 +482,22 @@ export function traceMarkers(root: WorkNode): readonly TraceMarker[] {
     const currentAttempt = node.kind === "run" ? attemptNumber(node) : attempt;
     if (node.kind === "run" && !node.children.some((child) => child.kind === "session"))
       push(node.startedAt, { kind: "attempt", attempt: currentAttempt, role: null });
-    if (node.kind === "session") push(node.startedAt, { kind: "session", attempt: currentAttempt, role: node.role ?? null });
+    if (node.kind === "session") {
+      push(node.startedAt, { kind: "session", attempt: currentAttempt, role: node.role ?? null });
+      const scenarios = node.restartPoint?.scenarios.slice().sort((left, right) => left.rho - right.rho) ?? [];
+      const median = scenarios[Math.floor(scenarios.length / 2)];
+      const sessionCalls = sessionModelCalls(node), restartCall = median?.k ? sessionCalls[median.k - 1] : undefined;
+      const restartIndex = restartCall ? calls.indexOf(restartCall) + 1 : 0;
+      if (median?.k !== null && median?.k !== undefined && restartIndex > 0) {
+        const p25 = scenarios[0]?.savePct ?? median.savePct,
+          p75 = scenarios[scenarios.length - 1]?.savePct ?? median.savePct;
+        markers.push({
+          index: restartIndex,
+          kind: "restart",
+          parts: [{ kind: "restart", attempt: currentAttempt, role: node.role ?? null, restart: { rho: median.rho, p25SavePct: p25, medianSavePct: median.savePct, p75SavePct: p75 } }],
+        });
+      }
+    }
     for (const at of node.compactionAt ?? []) push(at, { kind: "compacted", attempt: currentAttempt, role: null });
     node.children.forEach((child) => visit(child, currentAttempt));
   };
