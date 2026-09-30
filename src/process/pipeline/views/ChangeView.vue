@@ -14,6 +14,7 @@ withDefaults(defineProps<{ chrome?: boolean }>(), { chrome: true });
 const emit = defineEmits<{
     (e: "mode", value: "lanes" | "wires" | "rings" | "specs" | "reader" | "review" | "change"): void;
     (e: "open", id: string): void;
+    (e: "trace", id: string): void;
 }>();
 const cc = useChange();
 const address = computed(() => cc.current.value ? changeAddress(cc.current.value) : "");
@@ -30,7 +31,7 @@ const budgetText = computed(() => cc.current.value?.budget_usd !== undefined ? `
             <ToolButton v-if="cc.current.value && cc.live.value" variant="warn" :active="cc.closing.value" @click="cc.closeChange()">Закрыть change</ToolButton>
         </template>
     </AppBar>
-    <div class="pipe-canvas plain change-shell"><ChangeDetail :address="address" @open="emit('open', $event)" /></div>
+    <div class="pipe-canvas plain change-shell"><ChangeDetail :address="address" @open="emit('open', $event)" @trace="emit('trace', $event)" /></div>
 </template>
 
 <style scoped>

@@ -64,7 +64,7 @@ const USAGE =
   "       reads a process graph and records it: tasks, dep edges, declarations.\n" +
   "       --dry-run is the DEFAULT (prints what would change); --go writes.\n" +
   "       --force overwrites a vision/plan that is already there.\n" +
-  "keys:  change, vision, plan, parallel, budget, steps{<id>: {title, needs,\n" +
+  "keys:  change, vision, out, measure, plan, parallel, budget, steps{<id>: {title, needs,\n" +
   "       produces, verify, retry, on-issue, kind, budget, red, red-tests, risk,\n" +
   "       why, priority}}";
 
@@ -87,9 +87,11 @@ export { parseYamlSubset } from "../kernel/yaml-subset.mjs";
 // The document keys of the language proper, and separately the one the parser
 // still takes for compatibility: `plan` used to carry the prose steps, and since
 // t#317 the plan IS the file — the prose lives in `vision` and per-step `why`.
-export const DSL_DOC_FIELDS = ["change", "vision", "parallel", "budget", "steps"];
+export const DSL_DOC_FIELDS = ["change", "vision", "out", "measure", "parallel", "budget", "steps"];
 
 export const DOC_FIELDS = [...DSL_DOC_FIELDS, "plan"];
+
+export const CHANGE_ITEM_FIELDS = { out: ["what", "why", "ref"], measure: ["what", "how", "target", "actual"] };
 
 // The step keys of the DSL proper (§4–§13) and, separately, the board niceties
 // a file may also carry. Only the first list is what the plan-mode instruction
@@ -128,6 +130,14 @@ const asList = (v) => {
   if (Array.isArray(v)) return v.map((x) => String(x).trim()).filter(Boolean);
   return [String(v).trim()].filter(Boolean);
 };
+
+// Unlike a step declaration, these are durable parts of the change record.
+// Keep their optional fields too: `actual` is normally filled through the CLI,
+// but a plan may carry a measured fact when it continues an existing change.
+function readChangeItems(raw) {
+  if (raw == null || raw === "") return [];
+  return Array.isArray(raw) ? raw : [raw];
+}
 
 // A step may be written as a mapping of fields or, when it declares nothing but
 // its phrase, as a bare string: `1: собрать граф прогона`.
@@ -192,7 +202,12 @@ export function readDocument(text) {
     plan: String(doc.plan ?? "").trim(),
     parallel: doc.parallel == null ? "" : String(doc.parallel).trim(),
     budget: doc.budget == null ? "" : String(doc.budget).trim(),
+    out: readChangeItems(doc.out),
+    measure: readChangeItems(doc.measure),
     steps: readSteps(doc.steps),
+    unknown: Object.keys(doc).filter(
+      (key) => ![...DOC_FIELDS, "theme", "group", "description"].includes(key),
+    ),
   };
 }
 
@@ -281,6 +296,18 @@ export function validate(
     }
     for (const u of s.unknown || []) warnings.push(`step "${s.id}": unknown key "${u}" — ignored`);
   }
+  for (const key of doc.unknown || []) warnings.push(`document: unknown key "${key}" — ignored`);
+  for (const [field, required] of [["out", ["what", "why"]], ["measure", ["what", "how"]]]) {
+    for (const [index, item] of (doc[field] || []).entries()) {
+      if (!item || typeof item !== "object" || Array.isArray(item)) {
+        errors.push(`${field}[${index + 1}]: must be a mapping with ${required.join(" and ")}`);
+        continue;
+      }
+      for (const key of required) {
+        if (!String(item[key] ?? "").trim()) errors.push(`${field}[${index + 1}]: ${key} is required`);
+      }
+    }
+  }
   if (doc.parallel && normalizeLimit(doc.parallel) === undefined)
     errors.push(`invalid parallel "${doc.parallel}"`);
   if (doc.budget && normalizeLimit(doc.budget, { integer: false }) === undefined)
@@ -297,6 +324,16 @@ export function validate(
 
 const boardOf = (t) => t?.project || "";
 const sameSubject = (a, b) => a.trim().toLowerCase() === b.trim().toLowerCase();
+
+function mergeChangeItems(existing, planned) {
+  const merged = Array.isArray(existing) ? existing.map((item) => ({ ...item })) : [];
+  for (const item of planned) {
+    const index = merged.findIndex((current) => current?.what === item.what);
+    if (index < 0) merged.push({ ...item });
+    else merged[index] = { ...merged[index], ...item };
+  }
+  return merged;
+}
 
 // Re-applying a file must not fork the graph, so a step is matched to a task by
 // its phrase. Matching is by subject because that is the only thing a plan and a
@@ -441,6 +478,8 @@ export function applyDocument(doc, { go = false, force = false, project, board }
   }
   if (doc.parallel) say(`  parallel change  ${doc.parallel}`);
   if (doc.budget) say(`  budget change  $${doc.budget}`);
+  for (const item of doc.out) say(`  out change  ${clipLine(item.what)}`);
+  for (const item of doc.measure) say(`  measure change  ${clipLine(item.what)}`);
 
   if (!go)
     return {
@@ -478,6 +517,8 @@ export function applyDocument(doc, { go = false, force = false, project, board }
           project,
           budget_usd: doc.budget ? Number(String(doc.budget).replace(/^\$/, "")) : undefined,
           parallel_limit: doc.parallel ? Number(doc.parallel) : undefined,
+          out: doc.out,
+          measure: doc.measure,
         });
         if (doc.plan) change.plan = doc.plan;
         changeCreated = true;
@@ -517,6 +558,8 @@ export function applyDocument(doc, { go = false, force = false, project, board }
             `keep: ${changeAddress(change)} already carries a delta — left as is (--force overwrites)`,
           );
         if (doc.plan && (force || !String(change.plan || "").trim())) change.plan = doc.plan;
+        if (doc.out.length) change.out = mergeChangeItems(change.out, doc.out);
+        if (doc.measure.length) change.measure = mergeChangeItems(change.measure, doc.measure);
       }
       for (const s of doc.steps) {
         const t = tasks.get(s.id);

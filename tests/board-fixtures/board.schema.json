@@ -22,6 +22,12 @@
         "id": {
           "type": "string"
         },
+        "measure": {
+          "items": {
+            "$ref": "#/$defs/ChangeMeasure"
+          },
+          "type": "array"
+        },
         "migrated_from": {
           "description": "Task number this record was migrated from — the only bridge back to the\nera when a change was a root task, and what makes the migration idempotent.",
           "format": "uint32",
@@ -36,6 +42,18 @@
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
+        },
+        "out": {
+          "items": {
+            "$ref": "#/$defs/ChangeOut"
+          },
+          "type": "array"
+        },
+        "plan": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "project": {
           "type": [
@@ -54,6 +72,48 @@
       "required": [
         "id"
       ],
+      "type": "object"
+    },
+    "ChangeMeasure": {
+      "description": "A user-facing measure for evaluating a change after it lands.",
+      "properties": {
+        "actual": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "how": {
+          "type": "string"
+        },
+        "target": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "what": {
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "ChangeOut": {
+      "description": "A decision deliberately kept out of a change's scope.",
+      "properties": {
+        "ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "what": {
+          "type": "string"
+        },
+        "why": {
+          "type": "string"
+        }
+      },
       "type": "object"
     },
     "Comment": {

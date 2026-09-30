@@ -19,7 +19,7 @@ const props = withDefaults(defineProps<{
     focusLane?: string;
 }>(), { chrome: false, query: "", focusLane: "" });
 
-const emit = defineEmits<{ (e: "open", id: string): void }>();
+const emit = defineEmits<{ (e: "open", id: string): void; (e: "trace", id: string): void }>();
 
 const mode = defineModel<PipelineMode>("mode", { default: "lanes" });
 const activeHit = defineModel<string | null>("activeHit", { default: null });
@@ -54,6 +54,7 @@ const isSpecDoc = computed(() => SPEC_MODES.includes(mode.value));
             :chrome="chrome"
             @mode="mode = $event"
             @open="emit('open', $event)"
+            @trace="emit('trace', $event)"
         />
         <component
             :is="current"
@@ -66,6 +67,7 @@ const isSpecDoc = computed(() => SPEC_MODES.includes(mode.value));
             @update:active-hit="activeHit = $event"
             @mode="mode = $event"
             @open="emit('open', $event)"
+            @trace="emit('trace', $event)"
         />
     </div>
 </template>

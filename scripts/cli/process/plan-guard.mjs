@@ -67,8 +67,9 @@ export const planFormatDoc = () => FORMAT_DOC;
 // judge: one document key is enough to read the text as a document and answer
 // with the validator's own sentences, which are more useful than the generic
 // "this is not the language". A text with no key at all gets the generic one.
-// The vocabulary is imported, not copied — the guard must not have its own idea
-// of what the language's top-level words are.
+// The vocabulary is imported, not copied — including durable change-brief
+// fields such as `out` and `measure`; the guard must not have its own idea of
+// what the language's top-level words are.
 const DOC_KEY_RE = /^([a-z][a-z-]*)[ \t]*:(?:[ \t].*)?$/;
 const MIN_DISTINCT_KEYS = 1;
 

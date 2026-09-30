@@ -845,10 +845,13 @@ mod tests {
             r#"{"type":"user","timestamp":"2026-01-01T00:00:02Z","message":{"content":[{"type":"tool_result","tool_use_id":"tool","is_error":true,"content":"failed"}]}}"#,
         )).unwrap();
         let tree = work_tree::build_work_tree(&path, &WorkTreeInterval::default()).unwrap();
-        let sliced = slice_tree(tree, &WorkTreeInterval {
-            start: Some("2026-01-01T00:00:00Z".into()),
-            end: Some("2026-01-01T00:01:00Z".into()),
-        });
+        let sliced = slice_tree(
+            tree,
+            &WorkTreeInterval {
+                start: Some("2026-01-01T00:00:00Z".into()),
+                end: Some("2026-01-01T00:01:00Z".into()),
+            },
+        );
         assert!(sliced.turns[0].calls[0].result.as_ref().unwrap().is_error);
         std::fs::remove_file(path).unwrap();
     }

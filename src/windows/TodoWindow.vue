@@ -232,6 +232,14 @@ function selectChangeTask(address: string) {
   const node = row ? findBoardTreeNode(tree.value, row.id) : null;
   if (node) selectTreeNode(node);
 }
+function selectChangeTaskTrace(address: string) {
+  const number = Number(address.replace(/^#/, ""));
+  const row = boardStore.rows.value.find((candidate) => candidate.number === number);
+  const node = row ? findBoardTreeNode(tree.value, row.id) : null;
+  if (!node) return;
+  selectTreeNode(node);
+  void nextTick(() => { detailTab.value = "trace"; });
+}
 
 const openCount = computed(
   () => todos.value.filter((t) => t.status !== "done").length,
@@ -837,6 +845,18 @@ function onPipelineOpen(ref: string) {
   const node = findBoardTreeNode(tree.value, byRef.id);
   selectedTreeNode.value = node;
   void openDetail(byRef);
+}
+
+function onPipelineTrace(ref: string) {
+  const byRef = ref.startsWith("#")
+    ? byNumber.value.get(Number(ref.slice(1)))
+    : todos.value.find((x) => x.id === ref);
+  if (!byRef) return;
+  viewMode.value = "board";
+  const node = findBoardTreeNode(tree.value, byRef.id);
+  if (!node) return;
+  selectTreeNode(node);
+  void nextTick(() => { detailTab.value = "trace"; });
 }
 
 // Navigate a t#N reference to that task's detail; a @name reference back to the
@@ -1738,6 +1758,7 @@ onUnmounted(() => {
       v-model:mode="graphMode"
       v-model:active-hit="pipelineActiveHit"
       @open="onPipelineOpen"
+      @trace="onPipelineTrace"
     />
 
     <!-- Task graph: an alternative view of the same filtered board (#88) -->
@@ -1826,6 +1847,7 @@ onUnmounted(() => {
         show-graph
         show-heading
         @open="selectChangeTask"
+        @trace="selectChangeTaskTrace"
         @graph="openChangeGraph(selectedChange)"
       />
       <div v-if="!detailId && !selectedChange" class="tw-empty">{{ t("tasks") }}</div>

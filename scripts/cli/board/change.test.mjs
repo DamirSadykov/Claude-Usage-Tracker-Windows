@@ -344,6 +344,32 @@ describe("cli change", () => {
     expect(refuse(["change", "close", "c#1"])).toContain("has no tasks");
   });
 
+  it("ведёт out по ключу what и показывает его в карточке", () => {
+    run(["change", "new", "Перевод на записи", "--project", "board"]);
+    run(["change", "out", "add", "c#1", "не трогаем окно", "--why", "нет запроса", "--ref", "docs/decision.md"]);
+    run(["change", "out", "add", "c#1", "не трогаем окно", "--why", "в следующем change"]);
+    expect(read().changes[0].out).toEqual([{ what: "не трогаем окно", why: "в следующем change" }]);
+    expect(run(["change", "show", "c#1"])).toContain("Не входит:\n  - не трогаем окно — в следующем change");
+    run(["change", "out", "rm", "c#1", "не трогаем окно"]);
+    expect(read().changes[0].out).toEqual([]);
+  });
+
+  it("ведёт measure, не дублирует what и напоминает о факте при закрытии", () => {
+    run(["change", "new", "Перевод на записи", "--project", "board"]);
+    run(["todos", "set", "change", "1", "c#1"]);
+    run(["todos", "set", "change", "2", "c#1"]);
+    run(["todos", "set", "status", "1", "done"]);
+    run(["change", "measure", "add", "c#1", "доля заполненных", "--how", "считаем записи", "--target", "50%"]);
+    run(["change", "measure", "add", "c#1", "доля заполненных", "--how", "считаем через месяц"]);
+    expect(read().changes[0].measure).toEqual([{ what: "доля заполненных", how: "считаем через месяц" }]);
+    const closed = run(["change", "close", "c#1"]);
+    expect(closed).toContain("measurements without actual:");
+    expect(closed).toContain('cli change measure set c#1 "доля заполненных" --actual');
+    run(["change", "measure", "set", "c#1", "доля заполненных", "--actual", "57%"]);
+    expect(read().changes[0].measure[0].actual).toBe("57%");
+    expect(run(["change", "show", "c#1"])).toContain("факт: 57%");
+  });
+
   it("перечисляет немигрированные корни под адресом t#N", () => {
     const data = read();
     data.todos.push({
