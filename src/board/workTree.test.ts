@@ -15,6 +15,7 @@ import {
   nodeType,
   traceSeries,
   traceMarkers,
+  TRACE_TYPE_COLORS,
   treeView,
   tokenCosts,
   typeSummary,
@@ -273,10 +274,28 @@ describe("trace views", () => {
     const session = { ...marked, id: "session-marked", kind: "session" as const, name: "session", startedAt: 10 };
     const attempt = { ...marked, id: "attempt", kind: "run" as const, name: "Attempt 1", startedAt: 10, children: [session] };
     expect(traceMarkers({ ...container([attempt]), children: [attempt] })).toEqual([
-      { index: 1, kind: "attempt", label: "Attempt 1" },
-      { index: 1, kind: "session", label: "session" },
-      { index: 2, kind: "compacted", label: "compacted" },
+      { index: 1, kind: "session", parts: [{ kind: "session", attempt: "1", role: null }] },
+      { index: 2, kind: "compacted", parts: [{ kind: "compacted", attempt: "1", role: null }] },
     ]);
+  });
+  it("labels session markers by attempt and role, merging markers at one call", () => {
+    const worker = { ...container([{ ...first, startedAt: 10 }]), id: "worker", startedAt: 10, role: "worker" as const, compactionAt: [10] };
+    const review = { ...container([{ ...second, startedAt: 20 }]), id: "review", startedAt: 10, role: "review" as const };
+    const attempt = { ...container([worker, review]), id: "attempt:2", kind: "run" as const, name: "Attempt 2", startedAt: 10, children: [worker, review] };
+    expect(traceMarkers({ ...container([attempt]), children: [attempt] })).toEqual([
+      {
+        index: 1,
+        kind: "session",
+        parts: [
+          { kind: "session", attempt: "2", role: "worker" },
+          { kind: "compacted", attempt: "2", role: null },
+          { kind: "session", attempt: "2", role: "review" },
+        ],
+      },
+    ]);
+  });
+  it("exports the design color table for every trace type", () => {
+    expect(TRACE_TYPE_COLORS).toEqual({ read: "#4cc2ff", edit: "#6ccb5f", shell: "#b388ff", text: "#8a8a8a", agent: "#f0a0c8", web: "#e79878", other: "var(--text-4)" });
   });
   it("removes tool rows in headings-only mode but preserves subagent branches", () => {
     const agentModel = modelCallNode({ id: "agent-model", model: "m", calls: [{ id: "x", name: "Read" }] });

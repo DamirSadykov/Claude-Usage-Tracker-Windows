@@ -97,6 +97,33 @@ export interface WorkTree {
   endedAt?: string;
   compacted: boolean;
   compactionAt: string[];
+  turns: WorkTurn[];
+}
+
+export interface WorkToolResult {
+  timestamp: string;
+  isError: boolean;
+  content: unknown;
+}
+
+export interface WorkToolCall {
+  id: string;
+  name: string;
+  input: unknown;
+  result?: WorkToolResult;
+  subagent?: WorkTree;
+}
+
+export interface WorkTurn {
+  id: string;
+  timestamp: string;
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  cacheCreationTokens: number;
+  cacheReadTokens: number;
+  cost: number;
+  calls: WorkToolCall[];
 }
 
 export interface TaskWorkAttempt {

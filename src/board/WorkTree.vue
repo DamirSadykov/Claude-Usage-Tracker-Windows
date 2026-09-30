@@ -16,6 +16,7 @@ import {
   tokenCosts,
   treeView,
   typeSummary,
+  TRACE_TYPE_COLORS,
   type ToolCallType,
   type ContextLabel,
   type WorkContextInput,
@@ -27,7 +28,7 @@ type RawCall = {
   id: string;
   name: string;
   input: unknown;
-  result?: { timestamp: string; content: unknown };
+  result?: { timestamp: string; isError: boolean; content: unknown };
   subagent?: RawTree;
 };
 type RawTurn = {
@@ -122,6 +123,7 @@ function makeTree(raw: RawTree, session: string, prefix: string, context?: RawCo
           name: call.name,
           input: text(call.input),
           result: call.result ? text(call.result.content) : null,
+          isError: call.result?.isError,
           startedAt: stamp(turn.timestamp),
           endedAt: stamp(call.result?.timestamp) ?? stamp(turn.timestamp),
           subagent: call.subagent
@@ -237,9 +239,13 @@ function label(row: { node: WorkNode; modelNumber: number }) {
     number = n.sequence ?? row.modelNumber;
   if (call)
     return `${number}. ${n.sequence ? "" : `${call.name} `}${line(call.input) ?? (n.sequence ? call.name : "")}`;
-  if (n.kind === "tool") return `${n.sequence}. ${line(n.input) ?? n.name}`;
+  if (n.kind === "tool") return line(n.input) ?? n.name;
   if (n.kind === "model") return `${number}. ${n.name || t("workTraceReply")}`;
   return n.name;
+}
+function sessionParts(n: WorkNode) {
+  const separator = n.name.lastIndexOf(" · ");
+  return separator < 0 ? [n.name, ""] : [n.name.slice(0, separator), n.name.slice(separator + 3)];
 }
 function contextText(label: ContextLabel) {
   if (label.kind === "inherits")
@@ -278,15 +284,35 @@ function costLines(n: WorkNode) {
   if (n.kind === "model" && n.cost > own(n)) out.push(`${t("workCostWithNested")}: ${cost(n.cost)}`);
   return out;
 }
+function tokenRows(n: WorkNode) {
+  const usage = n.kind === "model" && n.tokenBreakdown ? n.tokenBreakdown : usageOf(n),
+    prices = tokenCosts(n.model, usage);
+  return [
+    [t("workCostInput"), usage.input, prices.inputCost],
+    [t("workCostCacheRead"), usage.cacheRead, prices.cacheReadCost],
+    [t("workCostCacheWrite"), usage.cacheWrite, prices.cacheWriteCost],
+    [t("workCostOutput"), usage.output, prices.outputCost],
+  ] as const;
+}
 function inspectorResponse(response: string | null) {
   return response?.trim() === "Script completed" ? null : response;
 }
+function inspectorCall(n: WorkNode) {
+  return n.kind === "tool" || n.kind === "agent" ? n : singleCall(n);
+}
+function hasInspectorResult(n: WorkNode) {
+  return inspectorCall(n)?.result != null;
+}
+function inspectorTitle(n: WorkNode) {
+  const call = inspectorCall(n);
+  if (call)
+    return [t(`workTraceType_${call.callType ?? "other"}`), `#${call.sequence ?? 1}`, call.name, duration(call)]
+      .filter(Boolean)
+      .join(" · ");
+  return [(n.model ?? n.name) || t("workTraceReply"), duration(n)].filter(Boolean).join(" · ");
+}
 function costTitle(n: WorkNode) {
   return [`${t("workCost")} ${cost(own(n))}`, ...costLines(n), t("workCostHint")].join("\n");
-}
-function responseOf(n: WorkNode) {
-  const response = n.kind === "tool" ? line(n.result) : singleCall(n) ? line(singleCall(n)!.result) : null;
-  return response === "Script completed" ? null : response;
 }
 function reviewText(n: WorkNode) {
   const summary = attemptReviewSummary(n.result, n.review);
@@ -320,9 +346,11 @@ function toggle(n: WorkNode) {
   } catch {}
 }
 function activate(n: WorkNode) {
-  const same = selected.value?.id === n.id;
   selected.value = n;
-  if (same) toggle(n);
+  toggle(n);
+}
+function select(n: WorkNode) {
+  selected.value = n;
 }
 function toggleType(type: NodeType) {
   const next = new Set(enabledTypes.value);
@@ -347,7 +375,21 @@ function icon(n: WorkNode) {
 function duration(n: WorkNode) {
   if (n.startedAt === null || n.endedAt === null) return "";
   const seconds = Math.max(0, Math.round((n.endedAt - n.startedAt) / 1000));
-  return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+  return seconds < 60 ? `${seconds}s` : `${Math.round(seconds / 60)}m`;
+}
+function rootTranscript() {
+  const visit = (node: WorkNode): string | null =>
+    node.transcriptPath ?? node.children.map(visit).find((path): path is string => Boolean(path)) ?? null;
+  return traceRoot.value ? visit(traceRoot.value) : null;
+}
+async function revealRootTranscript() {
+  const transcriptPath = rootTranscript();
+  if (!transcriptPath) return;
+  try {
+    await invoke("reveal_work_transcript", { transcriptPath });
+  } catch (e) {
+    error.value = String(e);
+  }
 }
 async function load() {
   if (!props.task) return;
@@ -412,14 +454,17 @@ watch(
     <div v-else-if="error" class="work-empty">{{ error }}</div>
     <div v-else-if="!roots.length" class="work-empty">{{ t("workEmpty") }}</div>
     <template v-else
-      ><WorkTraceCharts :root="traceRoot" @select="selectChart" />
+      ><WorkTraceCharts :root="traceRoot" :selected-node-id="selected?.id" @select="selectChart" />
       <div class="work-controls">
         <div class="type-chips">
           <button v-for="type in TYPES" :key="type" type="button" :disabled="!typeMetrics.get(type)" :class="{ off: !enabledTypes.has(type) }" @click="toggleType(type)">
-            <i :class="`type-${type}`">●</i>{{ t(`workTraceType_${type}`) }} · {{ typeMetrics.get(type)?.nodes ?? 0 }} · {{ cost(typeMetrics.get(type)?.cost ?? 0) }} · {{ percent(typeMetrics.get(type)?.share ?? 0) }}
+            <i :style="{ color: TRACE_TYPE_COLORS[type] }">●</i>{{ t(`workTraceType_${type}`) }} · {{ typeMetrics.get(type)?.nodes ?? 0 }} · {{ cost(typeMetrics.get(type)?.cost ?? 0) }} · {{ percent(typeMetrics.get(type)?.share ?? 0) }}
           </button>
         </div>
-        <label><input v-model="headersOnly" type="checkbox" />{{ t("workTraceHeadersOnly") }}</label>
+        <div class="trace-actions">
+          <button type="button" class="headers-toggle" :class="{ active: headersOnly }" :aria-pressed="headersOnly" @click="headersOnly = !headersOnly">{{ t("workTraceHeadersOnly") }}</button>
+          <button v-if="rootTranscript()" type="button" class="transcript-link" @click="revealRootTranscript">{{ t("workRevealTranscript") }} ↗</button>
+        </div>
       </div>
       <div class="trace-body"><nav ref="root" class="work-tree">
         <button
@@ -431,6 +476,7 @@ watch(
             selected: selected?.id === row.node.id,
             expensive: own(row.node) >= 1,
             'model-row': row.node.kind === 'model',
+            'attempt-row': row.node.kind === 'run',
           }"
           :style="{ '--depth': row.depth }"
           :data-work-id="row.node.id"
@@ -440,20 +486,20 @@ watch(
             class="toggle"
             :class="{ empty: !expandable(row.node), closed: collapsed.has(row.node.id) }"
             @click.stop="toggle(row.node)"
-          /><span>{{ icon(row.node) }}</span
-          ><span class="name">{{ label(row) }}</span
+          /><span class="row-main"><span class="row-icon">{{ icon(row.node) }}</span
+          ><span v-if="row.node.kind === 'tool'" class="tool-number">#{{ row.node.sequence ?? row.modelNumber }}</span
+          ><span v-if="row.node.kind === 'tool'" class="type-label">{{ t(`workTraceType_${nodeType(row.node)}`) }}</span
+          ><template v-if="row.node.kind === 'session'"><span class="session-role">{{ sessionParts(row.node)[0] }}</span><code class="session-id">{{ sessionParts(row.node)[1] }}</code></template
+          ><span v-else class="name">{{ label(row) }}</span
           ><span
             v-for="context in row.node.contextLabels"
             :key="context.kind"
             class="type-label"
             :title="contextTitle(context)"
             >{{ contextText(context) }}</span
-          ><span v-if="row.node.kind === 'model'" class="type-label">{{
-            t(`workTraceType_${nodeType(row.node)}`)
-          }}</span
-          ><span v-if="row.node.kind === 'tool' && line(row.node.input)" class="meta">{{ row.node.name }}</span
-          ><span v-if="row.node.sequence && row.modelNumber" class="meta">#{{ row.modelNumber }}</span
+          ><span v-if="row.node.kind === 'model'" class="type-label">{{ t(`workTraceType_${nodeType(row.node)}`) }}</span
           ><span v-if="row.node.model && !row.node.sequence" class="meta">{{ row.node.model }}</span
+          ><span v-if="row.node.kind === 'run' && reviewText(row.node)" class="review" :class="{ passed: attemptReviewSummary(row.node.result, row.node.review)?.passed }" @click.stop="select(row.node)">{{ reviewText(row.node) }}</span></span
           ><span
             v-if="row.node.tokenBreakdown"
             class="context"
@@ -468,15 +514,13 @@ watch(
                 row.node.tokenBreakdown.input + row.node.tokenBreakdown.cacheRead + row.node.tokenBreakdown.cacheWrite,
               )
             }}</span
-          ><span v-if="own(row.node)" class="cost" :title="costTitle(row.node)">{{ cost(own(row.node)) }}</span
-          ><span v-if="expandable(row.node)" class="meta">{{ row.node.children.length }}</span
-          ><span v-if="duration(row.node)" class="meta" :title="t('workTraceDuration')">{{ duration(row.node) }}</span
-          ><span v-if="responseOf(row.node)" class="response">{{ responseOf(row.node) }}</span>
-          <span v-if="row.node.kind === 'run' && reviewText(row.node)" class="review" @click.stop="activate(row.node)">{{ reviewText(row.node) }}</span>
+          ><span v-else class="context"></span
+          ><span v-if="own(row.node)" class="cost" :title="costTitle(row.node)">{{ cost(own(row.node)) }}</span><span v-else class="cost"></span
+          ><span class="duration" :title="t('workTraceDuration')">{{ duration(row.node) }}</span>
         </button>
       </nav>
       <aside v-if="selected" class="details">
-        <strong>{{ selected.name || t("workTraceReply") }}</strong
+        <strong class="details-title">{{ inspectorTitle(selected) }}</strong
         ><section v-if="selectedReview" class="review-summary">
           <b>{{ t("todoReview") }}</b>
           <span>{{ selectedReview.passed ? t("todoReviewApproved") : t("todoReviewFindings") }}</span>
@@ -492,31 +536,21 @@ watch(
             </li>
           </ul>
         </section>
-        ><template v-if="singleCall(selected)"
+        ><template v-if="inspectorCall(selected)?.input"
           ><b>{{ t("workTraceInput") }}</b>
-          <pre>{{ singleCall(selected)!.input }}</pre><button type="button" @click="copyInput">{{ t("workCopyInput") }}</button>
-          <template v-if="inspectorResponse(singleCall(selected)!.result)"
-            ><b>{{ t("workTraceResponse") }}</b>
-            <pre>{{ inspectorResponse(singleCall(selected)!.result) }}</pre>
-          </template></template
-        ><span v-if="selected.model">{{ selected.model }}</span
-        ><template v-if="selected.input"
-          ><b>{{ t("workTraceInput") }}</b>
-          <pre>{{ selected.input }}</pre><button type="button" @click="copyInput">{{ t("workCopyInput") }}</button></template
-        ><template v-if="inspectorResponse(selected.result)"
-          ><b>{{ t("workTraceResponse") }}</b>
-          <pre>{{ inspectorResponse(selected.result) }}</pre></template
+          <pre>{{ inspectorCall(selected)!.input }}</pre></template
+        ><template v-if="hasInspectorResult(selected)"
+          ><b class="response-label" :class="{ error: inspectorCall(selected)!.isError }">{{ inspectorCall(selected)!.isError ? t("workTraceResultError") : t("workTraceResultOk") }}</b>
+          <pre v-if="inspectorResponse(inspectorCall(selected)!.result)">{{ inspectorResponse(inspectorCall(selected)!.result) }}</pre></template
         ><template v-if="selected.tokenBreakdown"
           ><div class="token-stack"><i :style="{ flex: selected.tokenBreakdown.input }" /><i :style="{ flex: selected.tokenBreakdown.cacheRead }" /><i :style="{ flex: selected.tokenBreakdown.cacheWrite }" /><i :style="{ flex: selected.tokenBreakdown.output }" /></div></template
-        ><template v-if="own(selected)"
-          ><b>{{ t("workCost") }} {{ cost(own(selected)) }}</b>
-          <ul class="cost-lines">
-            <li v-for="item in costLines(selected)" :key="item">{{ item }}</li>
-          </ul>
+        ><template v-if="selected.tokenBreakdown"
+          ><table class="token-table"><tbody><tr v-for="[label, tokens, price] in tokenRows(selected)" :key="label"><th>{{ label }}</th><td>{{ tokenCount(tokens) || 0 }}</td><td>{{ cost(price) }}</td></tr></tbody></table>
+          <b class="call-total">{{ t("workCost") }} {{ cost(own(selected)) }}</b>
           <small>{{ t("workCostHint") }}</small></template
-        ><button v-if="transcripts.get(selected.id)" type="button" @click="reveal">
+        ><div class="details-actions"><button v-if="transcripts.get(selected.id)" type="button" @click="reveal">
           {{ t("workRevealTranscript") }}
-        </button>
+        </button><button v-if="inspectorCall(selected)?.input" type="button" @click="copyInput">{{ t("workCopyInput") }}</button></div>
       </aside></div></template
     >
   </section>
@@ -548,6 +582,8 @@ watch(
   margin: 0;
   padding: 0;
 }
+.work-controls { justify-content: space-between; }
+.trace-actions { align-items: center; display: flex; gap: 8px; margin-left: auto; }
 .work-controls input {
   margin: 0 3px 0 0;
 }
@@ -561,9 +597,22 @@ watch(
   font-size: 12px;
   padding: 3px 7px;
 }
-.type-chips button.off { color: var(--text-3); opacity: .5; }
+.type-chips button.off,
+.type-chips button:disabled { background: transparent; border-color: transparent; color: var(--text-3); opacity: .45; }
 .type-chips i { font-style: normal; margin-right: 3px; }
-.type-read { color: var(--accent); }.type-edit { color: var(--ok); }.type-shell { color: var(--warn); }.type-agent { color: var(--high); }.type-web { color: var(--accent-2); }.type-other, .type-text { color: var(--text-3); }
+.headers-toggle,
+.transcript-link {
+  background: transparent;
+  border: 0;
+  color: var(--text-3);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  padding: 3px 0;
+}
+.headers-toggle { border: 1px solid var(--stroke-strong); border-radius: var(--r-pill); padding: 3px 8px; }
+.headers-toggle.active { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+.transcript-link { color: var(--accent); }
 .trace-body { display: grid; gap: 8px; grid-template-columns: minmax(0, 1fr) minmax(250px, .65fr); }
 .work-tree {
   border: 1px solid var(--stroke-strong);
@@ -572,7 +621,7 @@ watch(
   overflow: auto;
 }
 .work-row {
-  --indent: calc(var(--depth) * 15px);
+  --indent: calc(var(--depth) * 18px);
   align-items: center;
   background: transparent;
   border: 0;
@@ -581,10 +630,11 @@ watch(
   display: grid;
   font: inherit;
   font-size: 13px;
-  gap: 6px;
-  grid-template-columns: 10px 13px minmax(90px, 1fr) auto auto auto auto auto auto;
-  min-height: 29px;
-  padding: 4px 8px 4px calc(8px + var(--indent));
+  column-gap: 8px;
+  grid-template-columns: 14px minmax(0, 1fr) 108px 52px 44px;
+  height: 28px;
+  min-height: 28px;
+  padding: 0 8px 0 calc(12px + var(--indent));
   text-align: left;
   width: 100%;
 }
@@ -598,6 +648,15 @@ watch(
 .model-row {
   background: color-mix(in srgb, var(--accent-soft) 38%, transparent);
 }
+.attempt-row { background: rgba(255, 255, 255, .025); font-weight: 600; height: 32px; min-height: 32px; }
+.work-row.attempt-row.selected { background: var(--accent-soft); }
+.row-main { align-items: center; display: flex; gap: 6px; min-width: 0; overflow: hidden; white-space: nowrap; }
+.row-main > * { flex-shrink: 0; }
+.row-main > .name { flex-shrink: 1; }
+.row-icon { flex: 0 0 13px; }
+.tool-number { color: var(--text-3); flex: 0 0 auto; font-family: var(--mono); font-size: 12px; }
+.session-role { flex: 0 0 auto; }
+.session-id { color: var(--text-3); font-family: var(--mono); font-size: 12px; }
 .toggle:before {
   color: var(--text-3);
   content: "▾";
@@ -615,7 +674,8 @@ watch(
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.review { color: var(--tree-review); font-size: 12px; grid-column: 3 / -1; }
+.review { background: color-mix(in srgb, var(--crit) 22%, transparent); border-radius: var(--r-pill); color: var(--crit); font-size: 12px; font-weight: 600; margin-left: auto; padding: 2px 7px; white-space: nowrap; }
+.review.passed { background: color-mix(in srgb, var(--ok) 20%, transparent); color: var(--ok); }
 .review-summary { border-bottom: 1px solid var(--stroke-strong); display: flex; flex-direction: column; gap: 6px; padding-bottom: 8px; }
 .review-counts { display: flex; flex-wrap: wrap; gap: 4px; }
 .review-count, .finding-level { border-radius: var(--r-pill); font-size: 11px; padding: 2px 6px; }
@@ -643,7 +703,7 @@ watch(
   font-family: var(--mono);
   font-size: 12px;
   gap: 4px;
-  min-width: 62px;
+  min-width: 0;
 }
 .context .track {
   background: color-mix(in srgb, var(--stroke-strong) 60%, transparent);
@@ -668,6 +728,8 @@ watch(
   font-family: var(--mono);
   font-size: 12px;
 }
+.cost { text-align: right; }
+.duration { color: var(--text-3); font-family: var(--mono); font-size: 12px; text-align: right; }
 .expensive .cost {
   color: var(--high);
   font-weight: 700;
@@ -681,6 +743,7 @@ watch(
   gap: 6px;
   padding: 9px;
 }
+.details-title { font-size: 13px; }
 .cost-lines {
   font-family: var(--mono);
   margin: 0;
@@ -690,13 +753,21 @@ watch(
   color: var(--text-3);
 }
 .details pre {
-  background: rgba(0, 0, 0, 0.16);
+  background: #161616;
   margin: 0;
   max-height: 130px;
   overflow: auto;
   padding: 7px;
   white-space: pre-wrap;
 }
+.response-label { color: var(--ok); }
+.response-label.error { color: var(--crit); }
+.token-table { border-collapse: collapse; font-family: var(--mono); font-size: 12px; width: 100%; }
+.token-table th, .token-table td { border-bottom: 1px solid var(--stroke); padding: 4px 0; }
+.token-table th { color: var(--text-3); font-weight: 400; text-align: left; }
+.token-table td { text-align: right; }
+.call-total { font-size: 16px; margin-top: 2px; }
+.details-actions { align-items: end; display: flex; gap: 6px; margin-top: auto; padding-top: 8px; }
 .details button {
   align-self: start;
   background: var(--node-bg);

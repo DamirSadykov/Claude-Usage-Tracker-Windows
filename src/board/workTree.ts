@@ -1,4 +1,14 @@
 export type ToolCallType = "read" | "edit" | "shell" | "agent" | "web" | "other";
+/** Shared by the trace bars and the type chips. */
+export const TRACE_TYPE_COLORS = {
+  read: "#4cc2ff",
+  edit: "#6ccb5f",
+  shell: "#b388ff",
+  text: "#8a8a8a",
+  agent: "#f0a0c8",
+  web: "#e79878",
+  other: "var(--text-4)",
+} as const satisfies Record<ToolCallType | "text", string>;
 export type WorkNodeKind = "task" | "session" | "run" | "group" | "model" | "tool" | "agent";
 export interface TokenBreakdown {
   input: number;
@@ -24,6 +34,7 @@ export interface WorkNode {
   input: string | null;
   result: string | null;
   transcriptPath: string | null;
+  isError?: boolean;
   children: readonly WorkNode[];
   callType?: ToolCallType;
   tokenBreakdown?: TokenBreakdown;
@@ -78,6 +89,7 @@ export interface ToolCallInput {
   name: string;
   input?: string | null;
   result?: string | null;
+  isError?: boolean;
   startedAt?: number | null;
   endedAt?: number | null;
   subagent?: WorkNode | null;
@@ -107,10 +119,15 @@ export interface TraceSeries {
   cacheRead: readonly TracePoint[];
   cost: readonly TracePoint[];
 }
+export interface TraceMarkerPart {
+  kind: "attempt" | "session" | "compacted";
+  attempt: string | null;
+  role: "worker" | "review" | null;
+}
 export interface TraceMarker {
   index: number;
-  kind: "attempt" | "session" | "compacted";
-  label: string;
+  kind: TraceMarkerPart["kind"];
+  parts: readonly TraceMarkerPart[];
 }
 export interface TypeSummary {
   type: ToolCallType | "text";
@@ -267,6 +284,7 @@ export function modelCallNode(value: ModelCallInput): WorkNode {
       input: call.input ?? null,
       result: call.result ?? null,
       transcriptPath: agent?.transcriptPath ?? null,
+      isError: call.isError,
       children: agent ? [agent] : [],
       callType,
       sequence: index + 1,
@@ -416,14 +434,24 @@ export function traceMarkers(root: WorkNode): readonly TraceMarker[] {
     return next < 0 ? calls.length : next + 1;
   };
   const markers: TraceMarker[] = [];
-  const visit = (node: WorkNode) => {
-    if (node.kind === "run") markers.push({ index: indexAt(node.startedAt), kind: "attempt", label: node.name });
-    if (node.kind === "session") markers.push({ index: indexAt(node.startedAt), kind: "session", label: node.name });
-    for (const at of node.compactionAt ?? []) markers.push({ index: indexAt(at), kind: "compacted", label: "compacted" });
-    node.children.forEach(visit);
+  const attemptNumber = (node: WorkNode) => node.id.match(/^attempt:(\d+)/)?.[1] ?? node.name.match(/(\d+)/)?.[1] ?? "?";
+  const push = (at: number | null, part: TraceMarkerPart) => markers.push({ index: indexAt(at), kind: part.kind, parts: [part] });
+  const visit = (node: WorkNode, attempt: string | null) => {
+    const currentAttempt = node.kind === "run" ? attemptNumber(node) : attempt;
+    if (node.kind === "run" && !node.children.some((child) => child.kind === "session"))
+      push(node.startedAt, { kind: "attempt", attempt: currentAttempt, role: null });
+    if (node.kind === "session") push(node.startedAt, { kind: "session", attempt: currentAttempt, role: node.role ?? null });
+    for (const at of node.compactionAt ?? []) push(at, { kind: "compacted", attempt: currentAttempt, role: null });
+    node.children.forEach((child) => visit(child, currentAttempt));
   };
-  root.children.forEach(visit);
-  return markers.filter((marker) => marker.index > 0);
+  root.children.forEach((child) => visit(child, null));
+  const merged = new Map<number, TraceMarker>();
+  for (const marker of markers.filter((entry) => entry.index > 0)) {
+    const existing = merged.get(marker.index);
+    if (existing) merged.set(marker.index, { ...existing, parts: [...existing.parts, ...marker.parts] });
+    else merged.set(marker.index, marker);
+  }
+  return [...merged.values()].sort((left, right) => left.index - right.index);
 }
 export function typeSummary(root: WorkNode): readonly TypeSummary[] {
   const calls = modelCalls(root),
