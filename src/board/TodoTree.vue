@@ -6,7 +6,8 @@ import { boardTreeSummary, visibleBoardTreeRows, type BoardTreeNode } from "./bo
 const props = withDefaults(defineProps<{
   tree: readonly BoardTreeNode[];
   selectedId?: string | null;
-}>(), { selectedId: null });
+  searching?: boolean;
+}>(), { selectedId: null, searching: false });
 
 const emit = defineEmits<{
   select: [node: BoardTreeNode];
@@ -23,7 +24,8 @@ const localSelectedId = ref<string | null>(readSelected());
 const root = ref<HTMLElement | null>(null);
 const initialized = ref(false);
 const selectedId = computed(() => props.selectedId ?? localSelectedId.value);
-const rows = computed(() => visibleBoardTreeRows(props.tree, collapsed.value));
+const shownCollapsed = computed(() => props.searching ? new Set([...collapsed.value].filter((id) => !completedChanges.value.has(id))) : collapsed.value);
+const rows = computed(() => visibleBoardTreeRows(props.tree, shownCollapsed.value));
 const summary = computed(() => boardTreeSummary(props.tree));
 const { t } = useI18n();
 
@@ -231,7 +233,7 @@ watch(rows, () => scrollSelected(selectedId.value), { flush: "post" });
         @click="activate(row.node)"
         @dblclick="open(row.node)"
       >
-        <span class="todo-tree-toggle" :class="{ empty: !row.node.children.length, collapsed: collapsed.has(row.node.id) }" @click="toggleFromCaret($event, row.node)"></span>
+        <span class="todo-tree-toggle" :class="{ empty: !row.node.children.length, collapsed: shownCollapsed.has(row.node.id) }" @click="toggleFromCaret($event, row.node)"></span>
         <span class="todo-tree-title"><span v-if="row.node.status" class="todo-tree-status" :class="statusClass(row.node.status)"></span><span v-if="row.node.number !== null" class="todo-tree-number">{{ row.node.kind === 'change' || row.node.kind === 'legacy' ? 'c#' : '#' }}{{ row.node.number }}</span>{{ row.node.kind === 'ungrouped' ? t('todoTreeWithoutChange') : row.node.title }}</span>
         <span v-if="row.node.kind !== 'task' && row.node.kind !== 'ungrouped'" class="todo-tree-progress" :class="{ complete: row.node.progress.done === row.node.progress.total }">{{ row.node.progress.done }}/{{ row.node.progress.total }}</span>
         <span v-else></span>
@@ -245,7 +247,7 @@ watch(rows, () => scrollSelected(selectedId.value), { flush: "post" });
 </template>
 
 <style scoped>
-.todo-tree { min-width: 0; overflow: hidden; background: var(--card-bg); color: var(--text); display: flex; flex-direction: column; font-family: var(--segoe); outline: none; }
+.todo-tree { min-width: 0; overflow: hidden; background: transparent; color: var(--text); display: flex; flex-direction: column; font-family: var(--segoe); outline: none; }
 .todo-tree:focus-visible { box-shadow: inset 0 0 0 1px var(--accent); }
 .todo-tree-actions { border-bottom: 1px solid var(--stroke); display: flex; gap: 6px; padding: 7px 10px; }
 .todo-tree-actions button { background: transparent; border: 1px solid var(--stroke); border-radius: 3px; color: var(--text-3); cursor: pointer; font: 600 10px var(--segoe); padding: 3px 6px; }

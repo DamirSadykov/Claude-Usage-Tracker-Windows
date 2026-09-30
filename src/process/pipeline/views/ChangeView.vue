@@ -12,7 +12,7 @@ import { formatMoney } from "../adapt";
 
 withDefaults(defineProps<{ chrome?: boolean }>(), { chrome: true });
 const emit = defineEmits<{
-    (e: "mode", value: "lanes" | "wires" | "rings" | "specs" | "reader" | "review" | "change"): void;
+    (e: "mode", value: "bubbles" | "rings" | "specs" | "reader" | "review" | "change"): void;
     (e: "open", id: string): void;
     (e: "trace", id: string): void;
 }>();
@@ -26,7 +26,7 @@ const budgetText = computed(() => cc.current.value?.budget_usd !== undefined ? `
     <AppBar v-if="chrome" :title="headline">
         <template #center><StatusChip v-if="cc.current.value" :text="budgetText" tone="cost" /><StatusChip v-if="cc.current.value" :text="cc.open.value ? 'открыт' : 'закрыт'" :tone="cc.open.value ? 'default' : 'spec'" /></template>
         <template #right>
-            <SegControl :model-value="'change'" :options="[{ id: 'graph', label: 'Граф' }, { id: 'specs', label: 'Спеки' }, { id: 'change', label: 'Change' }]" @update:model-value="(value: string) => emit('mode', value === 'specs' ? 'reader' : value === 'change' ? 'change' : 'lanes')" />
+            <SegControl :model-value="'change'" :options="[{ id: 'graph', label: 'Ссылки' }, { id: 'specs', label: 'Спеки' }, { id: 'change', label: 'Change' }]" @update:model-value="(value: string) => emit('mode', value === 'specs' ? 'reader' : value === 'change' ? 'change' : 'bubbles')" />
             <div class="change-picker"><MetaChip v-for="c in cc.changes.value" :key="c.id" class="picker-chip" :tone="changeAddress(c) === address ? 'spec' : 'muted'" @click="cc.select(changeAddress(c))">{{ changeAddress(c) }}</MetaChip></div>
             <ToolButton v-if="cc.current.value && cc.live.value" variant="warn" :active="cc.closing.value" @click="cc.closeChange()">Закрыть change</ToolButton>
         </template>

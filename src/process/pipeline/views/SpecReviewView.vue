@@ -33,7 +33,7 @@ withDefaults(defineProps<{ chrome?: boolean }>(), { chrome: true });
 const emit = defineEmits<{
     (
         e: "mode",
-        value: "lanes" | "wires" | "rings" | "specs" | "reader" | "review",
+        value: "bubbles" | "rings" | "specs" | "reader" | "review",
     ): void;
 }>();
 
@@ -200,7 +200,7 @@ function onView(value: string) {
 
 function onTab(value: string) {
     if (value === "graph") {
-        emit("mode", "lanes");
+        emit("mode", "bubbles");
         return;
     }
     tab.value = value;
@@ -406,7 +406,7 @@ const mergeSummary = computed(() => {
                                         ✓ Принять
                                     </ToolButton>
                                     <ToolButton @click="reject(row.id)">Отклонить</ToolButton>
-                                    <ToolButton @click="emit('mode', 'lanes')">
+                                    <ToolButton @click="emit('mode', 'bubbles')">
                                         Открыть задачу
                                     </ToolButton>
                                 </template>
@@ -481,7 +481,7 @@ const mergeSummary = computed(() => {
                                     </ToolButton>
                                     <ToolButton
                                         v-if="row.edit.actions.includes('open')"
-                                        @click="emit('mode', 'lanes')"
+                                        @click="emit('mode', 'bubbles')"
                                     >
                                         Открыть задачу
                                     </ToolButton>

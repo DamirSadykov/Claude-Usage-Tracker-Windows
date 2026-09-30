@@ -9,7 +9,7 @@ import PipelineGraph from "./PipelineGraph.vue";
 import { SPEC_MODES, type PipelineMode } from "./modes";
 import "./pipeline.css";
 
-const mode = ref<PipelineMode>("lanes");
+const mode = ref<PipelineMode>("bubbles");
 const tab = ref("graph");
 const scope = ref("local");
 const query = ref("");
@@ -18,7 +18,6 @@ const isSpecDoc = computed(() => SPEC_MODES.includes(mode.value));
 
 const headline = computed(() => {
     if (mode.value === "specs") return "Реестр спек: 24 раздела, 3 предупреждения";
-    if (mode.value === "wires") return "graph/tasks.flow · синхронизирован";
     if (mode.value === "rings") return "";
     return "Доска в норме: 0 просрочек";
 });
@@ -51,7 +50,7 @@ const headline = computed(() => {
                     ]"
                     @update:model-value="
                         (value: string) =>
-                            (mode = value === 'specs' ? 'reader' : value === 'change' ? 'change' : 'lanes')
+                            (mode = value === 'specs' ? 'reader' : value === 'change' ? 'change' : 'bubbles')
                     "
                 />
                 <ToolButton variant="pri">+ Добавить</ToolButton>

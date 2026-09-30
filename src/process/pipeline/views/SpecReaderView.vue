@@ -37,7 +37,7 @@ withDefaults(defineProps<{ chrome?: boolean }>(), { chrome: true });
 const emit = defineEmits<{
     (
         e: "mode",
-        value: "lanes" | "wires" | "rings" | "specs" | "reader" | "review" | "change",
+        value: "bubbles" | "rings" | "specs" | "reader" | "review" | "change",
     ): void;
 }>();
 
@@ -180,7 +180,7 @@ function onScope(value: string) {
 
 function onTab(value: string) {
     if (value === "graph") {
-        emit("mode", "lanes");
+        emit("mode", "bubbles");
         return;
     }
     tab.value = value;

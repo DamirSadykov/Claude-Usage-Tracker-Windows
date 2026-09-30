@@ -1,8 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
 import type { TodoFilters } from "../../board/todoFilter";
-import LanesView from "./views/LanesView.vue";
-import WiresView from "./views/WiresView.vue";
 import RingsView from "./views/RingsView.vue";
 import BubblesView from "./views/BubblesView.vue";
 import SpecLanesView from "./views/SpecLanesView.vue";
@@ -16,12 +14,11 @@ const props = withDefaults(defineProps<{
     chrome?: boolean;
     query?: string;
     filters?: TodoFilters;
-    focusLane?: string;
-}>(), { chrome: false, query: "", focusLane: "" });
+}>(), { chrome: false, query: "" });
 
 const emit = defineEmits<{ (e: "open", id: string): void; (e: "trace", id: string): void }>();
 
-const mode = defineModel<PipelineMode>("mode", { default: "lanes" });
+const mode = defineModel<PipelineMode>("mode", { default: "bubbles" });
 const activeHit = defineModel<string | null>("activeHit", { default: null });
 const viewRef = ref<{ cycleHit?: (direction: 1 | -1) => void } | null>(null);
 
@@ -31,8 +28,6 @@ function cycleHit(direction: 1 | -1 = 1) {
 defineExpose({ cycleHit });
 
 const views = {
-    lanes: LanesView,
-    wires: WiresView,
     bubbles: BubblesView,
     rings: RingsView,
     specs: SpecLanesView,
@@ -62,7 +57,6 @@ const isSpecDoc = computed(() => SPEC_MODES.includes(mode.value));
             v-else
             :query="props.query"
             :filters="props.filters"
-            :focus-lane="props.focusLane"
             :active-hit="activeHit"
             @update:active-hit="activeHit = $event"
             @mode="mode = $event"
