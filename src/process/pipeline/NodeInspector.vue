@@ -198,7 +198,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
         </div>
 
         <ToolButton class="ni-open" @click="emit('open', id)">
-            Открыть {{ id }} в доске
+            Открыть {{ id }} в дереве
         </ToolButton>
     </div>
 </template>

@@ -5,16 +5,22 @@ import { useI18n } from "vue-i18n";
 import WorkTraceCharts from "./WorkTraceCharts.vue";
 import {
   aggregateTree,
+  attemptReview,
+  attemptReviewSummary,
   contextLabels,
   modelCallNode,
   modelCalls,
   nodeType,
   pathTo,
   singleCall,
+  tokenCosts,
   treeView,
+  typeSummary,
   type ToolCallType,
   type ContextLabel,
   type WorkContextInput,
+  type AttemptReviewSummary,
+  type ReviewLevel,
   type WorkNode,
 } from "./workTree";
 type RawCall = {
@@ -44,11 +50,12 @@ type RawTree = {
   agentType?: string | null;
   fork?: boolean;
   compacted?: boolean;
+  compactionAt?: string[];
   turns: RawTurn[];
 };
 type RawContext = WorkContextInput & { role?: "worker" | "review" | null };
 type RawSession = { session: string; source: string; tree: RawTree; context: RawContext };
-type RawAttempt = { number: number; startedAt: string; endedAt: string; sessions: RawSession[] };
+type RawAttempt = { number: number; startedAt: string; endedAt: string; sessions: RawSession[]; result?: string; review?: unknown };
 type Payload = { sessions: RawSession[]; attempts: RawAttempt[] };
 type NodeType = ToolCallType | "text";
 const props = defineProps<{ task: string; heading?: string }>();
@@ -138,6 +145,8 @@ function makeTree(raw: RawTree, session: string, prefix: string, context?: RawCo
     transcriptPath: raw.transcriptPath,
     children: models,
     contextLabels: labels,
+    role: context?.role ?? null,
+    compactionAt: (raw.compactionAt ?? []).map(stamp).filter((at): at is number => at !== null),
   });
   const visit = (n: WorkNode) => {
     transcripts.set(n.id, n.transcriptPath ?? raw.transcriptPath);
@@ -163,8 +172,9 @@ const roots = computed(() => {
       tokens: 0,
       cost: 0,
       input: null,
-      result: null,
+      result: attempt.result ?? null,
       transcriptPath: null,
+      review: attemptReview(attempt.review),
       children: attempt.sessions.map((entry) =>
         makeTree(entry.tree, entry.session, `attempt:${attempt.number}:${entry.session}`, entry.context),
       ),
@@ -217,6 +227,7 @@ const maxContext = computed(() => {
   traceRoot.value?.children.forEach(visit);
   return Math.max(1, ...values);
 });
+const typeMetrics = computed(() => new Map(traceRoot.value ? typeSummary(traceRoot.value).map((item) => [item.type, item]) : []));
 function expandable(n: WorkNode) {
   return n.children.length > 0 && !singleCall(n);
 }
@@ -257,20 +268,47 @@ function usageOf(n: WorkNode) {
 }
 function costLines(n: WorkNode) {
   const usage = n.kind === "model" && n.tokenBreakdown ? n.tokenBreakdown : usageOf(n),
+    prices = tokenCosts(n.model, usage),
     out = [
-      `${t("workCostInput")}: ${tokenCount(usage.input) || 0}`,
-      `${t("workCostCacheRead")}: ${tokenCount(usage.cacheRead) || 0}`,
-      `${t("workCostCacheWrite")}: ${tokenCount(usage.cacheWrite) || 0}`,
-      `${t("workCostOutput")}: ${tokenCount(usage.output) || 0}`,
+      `${t("workCostInput")}: ${tokenCount(usage.input) || 0} · ${cost(prices.inputCost)}`,
+      `${t("workCostCacheRead")}: ${tokenCount(usage.cacheRead) || 0} · ${cost(prices.cacheReadCost)}`,
+      `${t("workCostCacheWrite")}: ${tokenCount(usage.cacheWrite) || 0} · ${cost(prices.cacheWriteCost)}`,
+      `${t("workCostOutput")}: ${tokenCount(usage.output) || 0} · ${cost(prices.outputCost)}`,
     ];
   if (n.kind === "model" && n.cost > own(n)) out.push(`${t("workCostWithNested")}: ${cost(n.cost)}`);
   return out;
+}
+function inspectorResponse(response: string | null) {
+  return response?.trim() === "Script completed" ? null : response;
 }
 function costTitle(n: WorkNode) {
   return [`${t("workCost")} ${cost(own(n))}`, ...costLines(n), t("workCostHint")].join("\n");
 }
 function responseOf(n: WorkNode) {
-  return n.kind === "tool" ? line(n.result) : singleCall(n) ? line(singleCall(n)!.result) : null;
+  const response = n.kind === "tool" ? line(n.result) : singleCall(n) ? line(singleCall(n)!.result) : null;
+  return response === "Script completed" ? null : response;
+}
+function reviewText(n: WorkNode) {
+  const summary = attemptReviewSummary(n.result, n.review);
+  if (!summary) return "";
+  const findings = summary.counts.critical + summary.counts.high + summary.counts.medium + summary.counts.low;
+  return summary.passed ? t("todoReviewApproved") : `${t("todoReviewFindings")} ${findings}`;
+}
+const selectedReview = computed<AttemptReviewSummary | null>(() => {
+  if (!selected.value || !traceRoot.value) return null;
+  const path = pathTo(traceRoot.value, selected.value.id);
+  if (!path) return null;
+  const attempt = [...path].reverse().find((node) => node.kind === "run");
+  if (!attempt || (selected.value.kind !== "run" && selected.value.role !== "review")) return null;
+  return attemptReviewSummary(attempt.result, attempt.review);
+});
+const reviewLevels: readonly ReviewLevel[] = ["critical", "high", "medium", "low"];
+function findingLocation(finding: AttemptReviewSummary["findings"][number]) {
+  return finding.file ? `${finding.file}${finding.line === null ? "" : `:${finding.line}`}` : "";
+}
+async function copyInput() {
+  const source = singleCall(selected.value!)?.input ?? selected.value?.input;
+  if (source) await navigator.clipboard.writeText(source);
 }
 function toggle(n: WorkNode) {
   if (!expandable(n)) return;
@@ -299,6 +337,9 @@ function cost(n: number) {
 }
 function own(n: WorkNode) {
   return n.ownCost ?? n.cost;
+}
+function percent(value: number) {
+  return new Intl.NumberFormat(undefined, { style: "percent", maximumFractionDigits: 0 }).format(value);
 }
 function icon(n: WorkNode) {
   return n.kind === "model" ? "●" : n.kind === "agent" ? "↳" : n.kind === "tool" ? "›" : n.kind === "group" ? "≡" : "◆";
@@ -373,17 +414,14 @@ watch(
     <template v-else
       ><WorkTraceCharts :root="traceRoot" @select="selectChart" />
       <div class="work-controls">
-        <fieldset>
-          <legend>{{ t("workTraceFilters") }}</legend>
-          <label v-for="type in TYPES" :key="type"
-            ><input type="checkbox" :checked="enabledTypes.has(type)" @change="toggleType(type)" />{{
-              t(`workTraceType_${type}`)
-            }}</label
-          >
-        </fieldset>
+        <div class="type-chips">
+          <button v-for="type in TYPES" :key="type" type="button" :disabled="!typeMetrics.get(type)" :class="{ off: !enabledTypes.has(type) }" @click="toggleType(type)">
+            <i :class="`type-${type}`">●</i>{{ t(`workTraceType_${type}`) }} · {{ typeMetrics.get(type)?.nodes ?? 0 }} · {{ cost(typeMetrics.get(type)?.cost ?? 0) }} · {{ percent(typeMetrics.get(type)?.share ?? 0) }}
+          </button>
+        </div>
         <label><input v-model="headersOnly" type="checkbox" />{{ t("workTraceHeadersOnly") }}</label>
       </div>
-      <nav ref="root" class="work-tree">
+      <div class="trace-body"><nav ref="root" class="work-tree">
         <button
           v-for="row in rows"
           :key="row.node.id"
@@ -434,24 +472,42 @@ watch(
           ><span v-if="expandable(row.node)" class="meta">{{ row.node.children.length }}</span
           ><span v-if="duration(row.node)" class="meta" :title="t('workTraceDuration')">{{ duration(row.node) }}</span
           ><span v-if="responseOf(row.node)" class="response">{{ responseOf(row.node) }}</span>
+          <span v-if="row.node.kind === 'run' && reviewText(row.node)" class="review" @click.stop="activate(row.node)">{{ reviewText(row.node) }}</span>
         </button>
       </nav>
       <aside v-if="selected" class="details">
         <strong>{{ selected.name || t("workTraceReply") }}</strong
+        ><section v-if="selectedReview" class="review-summary">
+          <b>{{ t("todoReview") }}</b>
+          <span>{{ selectedReview.passed ? t("todoReviewApproved") : t("todoReviewFindings") }}</span>
+          <div class="review-counts">
+            <span v-for="level in reviewLevels" :key="level" class="review-count" :class="`review-${level}`">{{ t(`workReviewLevel_${level}`) }} · {{ selectedReview.counts[level] }}</span>
+          </div>
+          <ul v-if="selectedReview.findings.length" class="review-findings">
+            <li v-for="finding in selectedReview.findings" :key="`${finding.level}:${finding.file}:${finding.line}:${finding.text}`">
+              <span class="finding-level" :class="finding.level ? `review-${finding.level}` : 'review-unknown'">{{ finding.level ? t(`workReviewLevel_${finding.level}`) : t("workReviewLevel_unknown") }}</span>
+              <code v-if="findingLocation(finding)">{{ findingLocation(finding) }}</code>
+              <span>{{ finding.text }}</span>
+              <small v-if="finding.evidence">{{ finding.evidence }}</small>
+            </li>
+          </ul>
+        </section>
         ><template v-if="singleCall(selected)"
           ><b>{{ t("workTraceInput") }}</b>
-          <pre>{{ singleCall(selected)!.input }}</pre>
-          <template v-if="singleCall(selected)!.result"
+          <pre>{{ singleCall(selected)!.input }}</pre><button type="button" @click="copyInput">{{ t("workCopyInput") }}</button>
+          <template v-if="inspectorResponse(singleCall(selected)!.result)"
             ><b>{{ t("workTraceResponse") }}</b>
-            <pre>{{ line(singleCall(selected)!.result) }}</pre>
+            <pre>{{ inspectorResponse(singleCall(selected)!.result) }}</pre>
           </template></template
         ><span v-if="selected.model">{{ selected.model }}</span
         ><template v-if="selected.input"
           ><b>{{ t("workTraceInput") }}</b>
-          <pre>{{ selected.input }}</pre></template
-        ><template v-if="selected.result"
+          <pre>{{ selected.input }}</pre><button type="button" @click="copyInput">{{ t("workCopyInput") }}</button></template
+        ><template v-if="inspectorResponse(selected.result)"
           ><b>{{ t("workTraceResponse") }}</b>
-          <pre>{{ line(selected.result) }}</pre></template
+          <pre>{{ inspectorResponse(selected.result) }}</pre></template
+        ><template v-if="selected.tokenBreakdown"
+          ><div class="token-stack"><i :style="{ flex: selected.tokenBreakdown.input }" /><i :style="{ flex: selected.tokenBreakdown.cacheRead }" /><i :style="{ flex: selected.tokenBreakdown.cacheWrite }" /><i :style="{ flex: selected.tokenBreakdown.output }" /></div></template
         ><template v-if="own(selected)"
           ><b>{{ t("workCost") }} {{ cost(own(selected)) }}</b>
           <ul class="cost-lines">
@@ -461,7 +517,7 @@ watch(
         ><button v-if="transcripts.get(selected.id)" type="button" @click="reveal">
           {{ t("workRevealTranscript") }}
         </button>
-      </aside></template
+      </aside></div></template
     >
   </section>
 </template>
@@ -482,7 +538,7 @@ watch(
   padding: 8px;
 }
 .work-controls,
-.work-controls fieldset {
+.type-chips {
   align-items: center;
   border: 0;
   display: flex;
@@ -492,13 +548,23 @@ watch(
   margin: 0;
   padding: 0;
 }
-.work-controls legend {
-  color: var(--text-3);
-  margin-right: 5px;
-}
 .work-controls input {
   margin: 0 3px 0 0;
 }
+.type-chips button {
+  background: var(--node-bg);
+  border: 1px solid var(--stroke-strong);
+  border-radius: var(--r-pill);
+  color: var(--text-2);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  padding: 3px 7px;
+}
+.type-chips button.off { color: var(--text-3); opacity: .5; }
+.type-chips i { font-style: normal; margin-right: 3px; }
+.type-read { color: var(--accent); }.type-edit { color: var(--ok); }.type-shell { color: var(--warn); }.type-agent { color: var(--high); }.type-web { color: var(--accent-2); }.type-other, .type-text { color: var(--text-3); }
+.trace-body { display: grid; gap: 8px; grid-template-columns: minmax(0, 1fr) minmax(250px, .65fr); }
 .work-tree {
   border: 1px solid var(--stroke-strong);
   border-radius: var(--r-ctl);
@@ -549,6 +615,19 @@ watch(
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.review { color: var(--tree-review); font-size: 12px; grid-column: 3 / -1; }
+.review-summary { border-bottom: 1px solid var(--stroke-strong); display: flex; flex-direction: column; gap: 6px; padding-bottom: 8px; }
+.review-counts { display: flex; flex-wrap: wrap; gap: 4px; }
+.review-count, .finding-level { border-radius: var(--r-pill); font-size: 11px; padding: 2px 6px; }
+.review-critical { background: var(--crit); color: var(--text-2); }
+.review-high { background: var(--high); color: var(--text-2); }
+.review-medium { background: var(--warn); color: var(--text); }
+.review-low { background: var(--accent-soft); color: var(--accent); }
+.review-unknown { background: var(--node-bg); color: var(--text-3); }
+.review-findings { display: flex; flex-direction: column; gap: 6px; list-style: none; margin: 0; padding: 0; }
+.review-findings li { display: flex; flex-wrap: wrap; gap: 5px; }
+.review-findings code { color: var(--text-2); font-family: var(--mono); font-size: 12px; }
+.review-findings small { color: var(--text-3); flex-basis: 100%; }
 .type-label {
   background: var(--accent-soft);
   border-radius: 9px;
@@ -561,7 +640,7 @@ watch(
   align-items: center;
   color: var(--text-3);
   display: flex;
-  font-family: var(--mono, monospace);
+  font-family: var(--mono);
   font-size: 12px;
   gap: 4px;
   min-width: 62px;
@@ -586,7 +665,7 @@ watch(
 .meta,
 .cost {
   color: var(--text-3);
-  font-family: var(--mono, monospace);
+  font-family: var(--mono);
   font-size: 12px;
 }
 .expensive .cost {
@@ -603,7 +682,7 @@ watch(
   padding: 9px;
 }
 .cost-lines {
-  font-family: var(--mono, monospace);
+  font-family: var(--mono);
   margin: 0;
   padding-left: 16px;
 }
@@ -628,4 +707,7 @@ watch(
   font: inherit;
   padding: 5px 8px;
 }
+.token-stack { display: flex; height: 7px; overflow: hidden; width: 100%; }
+.token-stack i:nth-child(1) { background: var(--accent); }.token-stack i:nth-child(2) { background: var(--accent-2); }.token-stack i:nth-child(3) { background: var(--warn); }.token-stack i:nth-child(4) { background: var(--high); }
+@media (max-width: 720px) { .trace-body { grid-template-columns: 1fr; } }
 </style>

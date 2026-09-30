@@ -24,6 +24,7 @@ pub struct WorkTree {
     pub agent_type: Option<String>,
     pub fork: bool,
     pub compacted: bool,
+    pub compaction_at: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -100,6 +101,7 @@ fn parse_work_tree(
     let mut turn_by_message = HashMap::<String, usize>::new();
     let mut results = HashMap::<String, WorkToolResult>::new();
     let mut compacted = false;
+    let mut compaction_at = Vec::new();
 
     for line in BufReader::new(file).lines() {
         let line = line.map_err(|e| format!("{}: {e}", path.display()))?;
@@ -122,6 +124,13 @@ fn parse_work_tree(
             )
         {
             compacted = true;
+            compaction_at.push(
+                record
+                    .get("timestamp")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            );
         }
         match record.get("type").and_then(Value::as_str) {
             Some("assistant") => {
@@ -160,6 +169,7 @@ fn parse_work_tree(
         agent_type: None,
         fork: false,
         compacted,
+        compaction_at,
     };
     for turn in &tree.turns {
         tree.input_tokens += turn.input_tokens;
@@ -494,7 +504,9 @@ second"}])),
             r#"{"type":"system","subtype":"compact_boundary","timestamp":"2026-01-01T00:00:00Z"}"#,
         )
         .unwrap();
-        assert!(build_session_work_tree(&path).unwrap().compacted);
+        let tree = build_session_work_tree(&path).unwrap();
+        assert!(tree.compacted);
+        assert_eq!(tree.compaction_at, vec!["2026-01-01T00:00:00Z"]);
         std::fs::remove_file(path).unwrap();
     }
 

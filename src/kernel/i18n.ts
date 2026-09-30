@@ -171,6 +171,11 @@ const messages = {
     todoBack: "Back",
     todoSubject: "Subject",
     todoStatus: "Status",
+    todoBreadcrumbs: "Task breadcrumbs",
+    todoPreviousTask: "Previous task",
+    todoNextTask: "Next task",
+    todoOverview: "Overview",
+    todoTrace: "Trace",
     todoNoProject: "No project",
     todoAi: "AI",
     todoAiHint: "Composed by AI (Claude), not hand-written",
@@ -189,6 +194,19 @@ const messages = {
     todoHandoffHint: "what this task hands to the tasks that depend on it",
     todoHandoffInherited: "Inherited from dependencies",
     todoHandoffItemEmpty: "no handoff — nothing carried forward",
+    todoHandoffDone: "Done",
+    todoHandoffGotcha: "Gotcha",
+    todoHandoffNext: "Next",
+    todoRecentComments: "Recent comments",
+    todoDependsOn: "Depends on",
+    todoBlocksTasks: "Blocks",
+    todoSessionCost: "Cost by session",
+    todoAttempt: "attempt",
+    todoAttempts: "attempts",
+    todoReview: "review",
+    todoReviewApproved: "passed",
+    todoReviewFindings: "findings",
+    todoReviewPending: "review pending",
     taskGuardSetting: "HANDOFF guard for tasks",
     taskGuardDesc:
       "Which tasks must leave a handoff before the session ends. A task's baton is what a dependent task inherits — without it, the next task starts blind.",
@@ -203,6 +221,7 @@ const messages = {
     todoPriorityMedium: "Medium",
     todoPriorityLow: "Low",
     todoFilterStatus: "All statuses",
+    todoFilterNotDone: "Not done",
     todoFilterAuthor: "Any author",
     todoFilterChange: "All kinds",
     todoFilterChanges: "Changes",
@@ -279,6 +298,11 @@ const messages = {
     todoProject: "Project",
     todoProjectPlaceholder: "e.g. my-app (optional)",
     todoShowDone: "Show done",
+    todoTreeColumns: "Project · change · task",
+    todoTreeDone: "Done",
+    todoTreeCost: "$",
+    todoTreeWithoutChange: "Without change",
+    todoTreeSummary: "{active} active · {total} total · {cost}",
     todoGuide: "Guide",
     todoGuideHint: "Open the docs: how tasks and analytics work",
     todoModeLocal: "My tasks",
@@ -316,55 +340,8 @@ const messages = {
     statusMapEmpty: "Statuses will appear here after the first external-task poll.",
     viewBoard: "Tasks",
     viewGraph: "Graph",
-    viewSpecs: "Specs",
     graphUiNew: "New layout",
     graphUiOld: "Classic layout",
-    specRefresh: "Re-read the registry",
-    specNoDomains: "No specs in this project — the registry looks for <domain>/spec.md under specRoot",
-    specTryThese: "Projects that do have one:",
-    specBySection: "By section",
-    specByChange: "By change",
-    specConcurrent: "Two or more open changes touch this section — the second stamp overwrites the first's provenance",
-    specFocus: "Show only the bullets this change wrote",
-    specFocusOff: "show all",
-    specDiffLive: "in flight — against the file as it stands now",
-    specDiffFrozen: "recorded when the change closed",
-    todoSpec: "Spec",
-    todoSpecInherited: "inherited from the change root",
-    todoSpecHint: "Open this section on the Specs tab",
-    // --- per-block help for the Specs tab (shared insight-help markdown) ---
-    specHelpRegistry:
-      "## What this list is\n" +
-      "The spec domains of the selected project and the sections inside each. The registry reads `<domain>/spec.md` under `specRoot` (a setting, `docs/specs` by default); the project directory itself comes from the Claude Code transcripts.\n\n" +
-      "- Projects that have a registry are listed first; the rest are marked with a dot.\n" +
-      "- A section's address is `<domain>#<slug>` — the same string a task uses to link to it.\n" +
-      "- `part` is the section's role: requirements (what must exist), design (how it is built), invariants (what must not break).\n" +
-      "- A section marked external is declared here while its text lives in another repository.",
-    specHelpSection:
-      "## The spec section\n" +
-      "The long-lived state of a subsystem — what stays true between tasks. The SECTION, not the file, is the unit of reading: taking a linked task puts exactly this into the session's context.\n\n" +
-      "- The date and `t#N` on the right say when the section last moved and which change moved it.\n" +
-      "- `refs` are the neighbouring sections this one looks at. They are kept as addresses, never as text: follow one only when you actually need it.\n" +
-      "- The size guide is about 120 lines. A section past it is split in two, or injecting one section quietly becomes injecting half the file again.",
-    specHelpChanges:
-      "## Changes on this section\n" +
-      "Tasks whose `spec` field names this address. A change is the DELTA to the spec — what this round changes and why now. Under a change root its task graph is expanded.\n\n" +
-      "- The link is made with `todos set spec <task> <domain>#<slug>`.\n" +
-      "- A step inherits its change root's address when it declares none of its own.\n" +
-      "- Clicking a row opens that task's card.",
-    specHelpAnswers:
-      "## Closing answers\n" +
-      "When a session closes a linked task, the Stop hook shows it this section IN FULL and will not let it stop without an answer: `unchanged` — the section still holds, `updated` — it drifted and was edited.\n\n" +
-      "- The answer is given with `cli spec answer`, not as a phrase in the conversation: the guard looks for a record, because a guard that matches wording only teaches you to reword.\n" +
-      "- `updated` stamps the section's date and change for you.\n" +
-      "- The answers are listed together on purpose: the same boilerplate given to different sections is only visible side by side.",
-
-    specPickSection: "Pick a section on the left",
-    specExternal: "external",
-    specChanges: "Changes on this section",
-    specNoChanges: "No task links to this section (todos set spec <task> <domain>#<slug>)",
-    specAnswers: "Closing answers",
-    specNoAnswers: "No task has answered for this section yet",
     graphTabDeps: "Dependencies",
     graphTabRef: "References",
     graphExternal: "other project",
@@ -516,6 +493,14 @@ const messages = {
     workCostWithNested: "with subagents",
     workCostHint: "Each token kind is priced at its own model rate: cache read is far cheaper than input, output the most expensive. Subagent cost is shown on its branch.",
     workTraceResponse: "Response",
+    workCopyInput: "Copy input",
+    workReviewApproved: "Review approved",
+    workReviewFindings: "Review findings:",
+    workReviewLevel_critical: "critical",
+    workReviewLevel_high: "high",
+    workReviewLevel_medium: "medium",
+    workReviewLevel_low: "low",
+    workReviewLevel_unknown: "unknown",
     todoRefs: "Linked tasks",
     todoSaved: "Saved",
     todoOpenItems: "open",
@@ -1052,6 +1037,11 @@ const messages = {
     todoBack: "Назад",
     todoSubject: "Заголовок",
     todoStatus: "Статус",
+    todoBreadcrumbs: "Крошки задачи",
+    todoPreviousTask: "Предыдущая задача",
+    todoNextTask: "Следующая задача",
+    todoOverview: "Обзор",
+    todoTrace: "Trace",
     todoNoProject: "Без проекта",
     todoAi: "ИИ",
     todoAiHint: "Составлено ИИ (Claude), не вручную",
@@ -1070,6 +1060,19 @@ const messages = {
     todoHandoffHint: "что задача передаёт тем, кто от неё зависит",
     todoHandoffInherited: "Наследуется от зависимостей",
     todoHandoffItemEmpty: "нет handoff — переносить нечего",
+    todoHandoffDone: "Сделано",
+    todoHandoffGotcha: "Подвох",
+    todoHandoffNext: "Дальше",
+    todoRecentComments: "Последние комментарии",
+    todoDependsOn: "Зависит от",
+    todoBlocksTasks: "Блокирует",
+    todoSessionCost: "Стоимость по сессиям",
+    todoAttempt: "попытка",
+    todoAttempts: "попыток",
+    todoReview: "ревью",
+    todoReviewApproved: "прошла",
+    todoReviewFindings: "есть замечания",
+    todoReviewPending: "ревью ожидается",
     taskGuardSetting: "Guard HANDOFF для задач",
     taskGuardDesc:
       "Какие задачи обязаны оставить handoff до конца сессии. Батон задачи — это то, что наследует зависимая задача; без него следующая задача стартует вслепую.",
@@ -1084,6 +1087,7 @@ const messages = {
     todoPriorityMedium: "Средний",
     todoPriorityLow: "Низкий",
     todoFilterStatus: "Все статусы",
+    todoFilterNotDone: "не готово",
     todoFilterAuthor: "Любой автор",
     todoFilterChange: "Все виды",
     todoFilterChanges: "Изменения",
@@ -1160,6 +1164,11 @@ const messages = {
     todoProject: "Проект",
     todoProjectPlaceholder: "напр. my-app (необязательно)",
     todoShowDone: "Показать готовые",
+    todoTreeColumns: "Проект · change · задача",
+    todoTreeDone: "Готово",
+    todoTreeCost: "$",
+    todoTreeWithoutChange: "Без change",
+    todoTreeSummary: "{active} активных · {total} всего · {cost}",
     todoGuide: "Гайд",
     todoGuideHint: "Открыть доку: как устроены задачи и аналитика",
     todoModeLocal: "Мои задачи",
@@ -1197,55 +1206,8 @@ const messages = {
     statusMapEmpty: "Статусы появятся здесь после первого поллинга внешних задач.",
     viewBoard: "Задачи",
     viewGraph: "Граф",
-    viewSpecs: "Спеки",
     graphUiNew: "Новый вид",
     graphUiOld: "Классический вид",
-    specRefresh: "Перечитать реестр",
-    specNoDomains: "В проекте нет спек — реестр ищет <домен>/spec.md внутри specRoot",
-    specTryThese: "Спеки есть у проектов:",
-    specBySection: "По разделам",
-    specByChange: "По change'ам",
-    specConcurrent: "На раздел открыто больше одного change'а — штамп второго затрёт провенанс первого",
-    specFocus: "Показать только пункты, которые написал этот change",
-    specFocusOff: "показать все",
-    specDiffLive: "в работе — против файла, каким он сейчас",
-    specDiffFrozen: "записан при закрытии change'а",
-    todoSpec: "Спека",
-    todoSpecInherited: "унаследована от change-root'а",
-    todoSpecHint: "Открыть раздел на вкладке «Спеки»",
-    // --- пояснения к блокам вкладки Specs (общий insight-help markdown) ---
-    specHelpRegistry:
-      "## Что это за список\n" +
-      "Домены реестра спек выбранного проекта и разделы внутри каждого. Реестр читает `<домен>/spec.md` внутри `specRoot` (настройка, по умолчанию `docs/specs`), а каталог самого проекта берётся из транскриптов Claude Code.\n\n" +
-      "- Проекты со спеками стоят в списке первыми, остальные помечены точкой.\n" +
-      "- Адрес раздела — `<домен>#<слаг>`, той же строкой задача на него ссылается.\n" +
-      "- `part` — роль раздела: требования (что должно быть), устройство (как сделано), инварианты (что не должно ломаться).\n" +
-      "- Раздел, помеченный как внешний, объявлен здесь, а текст его живёт в другом репозитории.",
-    specHelpSection:
-      "## Раздел спеки\n" +
-      "Долгоживущее состояние подсистемы — то, что остаётся верным между задачами. Единица чтения — РАЗДЕЛ, а не файл: при взятии слинкованной задачи в контекст сессии попадает ровно он.\n\n" +
-      "- Дата и `t#N` справа — когда раздел двигали в последний раз и какой change это сделал.\n" +
-      "- `refs` — соседние разделы, на которые этот смотрит. Хранятся адресами, а не текстом: разворачивать по ссылке стоит только тогда, когда сосед реально понадобился.\n" +
-      "- Ориентир размера — около 120 строк. Переросший раздел делят надвое, иначе впрыск одного раздела снова тихо становится впрыском половины файла.",
-    specHelpChanges:
-      "## Change'и на этом разделе\n" +
-      "Задачи, чьё поле `spec` называет этот адрес. Change — это ДЕЛЬТА к спеке: что меняется в этом заходе и почему сейчас. Под change-root'ом раскрыт его граф задач.\n\n" +
-      "- Связь ставится командой `todos set spec <задача> <домен>#<слаг>`.\n" +
-      "- Шаг наследует адрес своего change-root'а, если не объявил собственного.\n" +
-      "- Клик по строке открывает карточку задачи.",
-    specHelpAnswers:
-      "## Ответы при закрытии\n" +
-      "Когда сессия закрывает слинкованную задачу, Stop-хук показывает ей этот раздел ЦЕЛИКОМ и не отпускает без ответа: `unchanged` — раздел всё ещё верен, `updated` — разошёлся и правлен.\n\n" +
-      "- Ответ даётся командой `cli spec answer`, а не фразой в переписке: гард ищет запись, потому что гард, сверяющий формулировку, учит переформулировать, а не думать.\n" +
-      "- `updated` сам проставляет разделу дату и change.\n" +
-      "- Ответы стоят списком намеренно: одинаковая отписка на разные разделы видна только рядом.",
-
-    specPickSection: "Выберите раздел слева",
-    specExternal: "внешний",
-    specChanges: "Change'ы на этом разделе",
-    specNoChanges: "Ни одна задача не ссылается на раздел (todos set spec <задача> <домен>#<слаг>)",
-    specAnswers: "Ответы при закрытии",
-    specNoAnswers: "По этому разделу ещё никто не отвечал",
     graphTabDeps: "Зависимости",
     graphTabRef: "Ссылки",
     graphExternal: "другой проект",
@@ -1397,6 +1359,14 @@ const messages = {
     workCostWithNested: "с субагентами",
     workCostHint: "Каждый вид токенов считается по своей ставке модели: чтение кэша намного дешевле входа, выход дороже всего. Цена субагента показана на его ветке.",
     workTraceResponse: "Ответ",
+    workCopyInput: "Копировать ввод",
+    workReviewApproved: "Ревью одобрено",
+    workReviewFindings: "Замечаний ревью:",
+    workReviewLevel_critical: "критично",
+    workReviewLevel_high: "высокий",
+    workReviewLevel_medium: "средний",
+    workReviewLevel_low: "низкий",
+    workReviewLevel_unknown: "неизвестно",
     todoRefs: "Связанные задачи",
     todoSaved: "Сохранено",
     todoOpenItems: "активных",

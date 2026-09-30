@@ -15,10 +15,14 @@ export interface TodoFilters {
   showDone: boolean;
 }
 
+export type TodoFilterField = keyof Omit<TodoFilters, "query">;
+
 export const defaultTodoFilters = (): TodoFilters => ({
   status: "", project: "", priority: "", createdBy: "", change: "",
   createdFrom: "", createdTo: "", query: "", showDone: false,
 });
+
+export const isNotDoneFilter = (filters: Pick<TodoFilters, "status" | "showDone">): boolean => !filters.status && !filters.showDone;
 
 export interface FilterableTodoRow {
   id: string; number?: number; subject: string; description: string; status: string;

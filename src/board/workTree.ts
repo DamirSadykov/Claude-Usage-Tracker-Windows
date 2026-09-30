@@ -6,6 +6,12 @@ export interface TokenBreakdown {
   cacheWrite: number;
   output: number;
 }
+export interface TokenCostBreakdown extends TokenBreakdown {
+  inputCost: number;
+  cacheReadCost: number;
+  cacheWriteCost: number;
+  outputCost: number;
+}
 export interface WorkNode {
   id: string;
   kind: WorkNodeKind;
@@ -25,6 +31,33 @@ export interface WorkNode {
   sequence?: number;
   count?: number;
   contextLabels?: readonly ContextLabel[];
+  role?: "worker" | "review" | null;
+  compactionAt?: readonly number[];
+  review?: AttemptReview | null;
+}
+export interface AttemptReview {
+  approved?: boolean;
+  counts?: ReviewCounts;
+  findings: readonly ReviewFinding[];
+}
+export type ReviewLevel = "critical" | "high" | "medium" | "low";
+export interface ReviewCounts {
+  critical: number;
+  high: number;
+  medium: number;
+  low: number;
+}
+export interface ReviewFinding {
+  level: ReviewLevel | null;
+  file: string | null;
+  line: number | null;
+  text: string;
+  evidence: string | null;
+}
+export interface AttemptReviewSummary {
+  passed: boolean;
+  counts: ReviewCounts;
+  findings: readonly ReviewFinding[];
 }
 export type ContextLabelKind = "fresh" | "inherits" | "continued" | "compacted";
 export interface ContextLabel {
@@ -74,6 +107,11 @@ export interface TraceSeries {
   cacheRead: readonly TracePoint[];
   cost: readonly TracePoint[];
 }
+export interface TraceMarker {
+  index: number;
+  kind: "attempt" | "session" | "compacted";
+  label: string;
+}
 export interface TypeSummary {
   type: ToolCallType | "text";
   nodes: number;
@@ -92,6 +130,59 @@ const WRITE_BASH =
 function number(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
+const REVIEW_LEVELS: readonly ReviewLevel[] = ["critical", "high", "medium", "low"];
+function reviewLevel(value: unknown): ReviewLevel | null {
+  return typeof value === "string" && REVIEW_LEVELS.includes(value as ReviewLevel) ? (value as ReviewLevel) : null;
+}
+function reviewCount(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+}
+function reviewCounts(value: unknown): ReviewCounts {
+  const raw = value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+  return {
+    critical: reviewCount(raw.critical),
+    high: reviewCount(raw.high),
+    medium: reviewCount(raw.medium),
+    low: reviewCount(raw.low),
+  };
+}
+export function attemptReview(value: unknown): AttemptReview | null {
+  if (!value || typeof value !== "object") return null;
+  const raw = value as Record<string, unknown>;
+  const findings = Array.isArray(raw.findings)
+    ? raw.findings.flatMap((item): ReviewFinding[] => {
+        if (!item || typeof item !== "object") return [];
+        const finding = item as Record<string, unknown>;
+        if (typeof finding.text !== "string" || !finding.text.trim()) return [];
+        return [{
+          level: reviewLevel(finding.level),
+          file: typeof finding.file === "string" ? finding.file : null,
+          line: typeof finding.line === "number" && Number.isFinite(finding.line) ? Math.floor(finding.line) : null,
+          text: finding.text,
+          evidence: typeof finding.evidence === "string" ? finding.evidence : null,
+        }];
+      })
+    : [];
+  return {
+    approved: typeof raw.approved === "boolean" ? raw.approved : undefined,
+    counts: raw.counts && typeof raw.counts === "object" ? reviewCounts(raw.counts) : undefined,
+    findings,
+  };
+}
+export function attemptReviewSummary(result: string | null | undefined, review: AttemptReview | null | undefined): AttemptReviewSummary | null {
+  if (!review) return null;
+  const derived = review.findings.reduce<ReviewCounts>(
+    (counts, finding) => (finding.level ? { ...counts, [finding.level]: counts[finding.level] + 1 } : counts),
+    { critical: 0, high: 0, medium: 0, low: 0 },
+  );
+  const counts = review.counts ?? derived;
+  const rank = (finding: ReviewFinding) => (finding.level ? REVIEW_LEVELS.indexOf(finding.level) : REVIEW_LEVELS.length);
+  return {
+    passed: result === "done" || result === "ok",
+    counts,
+    findings: [...review.findings].sort((left, right) => rank(left) - rank(right)),
+  };
+}
 export function tokenBreakdown(value?: Partial<TokenBreakdown>): TokenBreakdown {
   return {
     input: number(value?.input),
@@ -107,6 +198,31 @@ export function contextTokens(usage?: Partial<TokenBreakdown>): number {
 export function totalTokens(usage?: Partial<TokenBreakdown>): number {
   const normalized = tokenBreakdown(usage);
   return contextTokens(normalized) + normalized.output;
+}
+export function tokenCosts(model: string | null, usage?: Partial<TokenBreakdown>): TokenCostBreakdown {
+  const tokens = tokenBreakdown(usage),
+    name = model?.toLowerCase() ?? "";
+  let input = 0,
+    cacheRead = 0,
+    output = 0;
+  if (name.includes("fable")) [input, cacheRead, output] = [10, 1, 50];
+  else if (name.includes("opus")) [input, cacheRead, output] = [5, 0.5, 25];
+  else if (name.includes("sonnet")) [input, cacheRead, output] = [3, 0.3, 15];
+  else if (name.includes("haiku")) [input, cacheRead, output] = [1, 0.1, 5];
+  else if (name.includes("gpt-5.6-terra")) [input, cacheRead, output] = [2, 0.2, 12];
+  else if (name.includes("gpt-5.6-luna")) [input, cacheRead, output] = [0.2, 0.02, 1.2];
+  else if (name === "gpt-5.6" || name.includes("gpt-5.6-sol")) [input, cacheRead, output] = [4, 0.4, 20];
+  else if (name.includes("gpt-5.3-codex") || name.includes("gpt-5.2-codex") || name === "gpt-5.2")
+    [input, cacheRead, output] = [1.75, 0.175, 14];
+  const codex = name.includes("gpt-");
+  const freshInput = codex ? Math.max(0, tokens.input - tokens.cacheRead - tokens.cacheWrite) : tokens.input;
+  return {
+    ...tokens,
+    inputCost: (freshInput * input) / 1_000_000,
+    cacheReadCost: (tokens.cacheRead * cacheRead) / 1_000_000,
+    cacheWriteCost: (tokens.cacheWrite * input * 1.25) / 1_000_000,
+    outputCost: (tokens.output * output) / 1_000_000,
+  };
 }
 export function classifyToolCall(name: string, input?: string | null): ToolCallType {
   const tool = name.trim(),
@@ -291,6 +407,23 @@ export function traceSeries(root: WorkNode): TraceSeries {
     prices.push({ ...point, value: cost });
   });
   return { context, cacheRead: cache, cost: prices };
+}
+export function traceMarkers(root: WorkNode): readonly TraceMarker[] {
+  const calls = modelCalls(root);
+  const indexAt = (at: number | null) => {
+    if (at === null) return calls.length;
+    const next = calls.findIndex((call) => call.startedAt !== null && call.startedAt >= at);
+    return next < 0 ? calls.length : next + 1;
+  };
+  const markers: TraceMarker[] = [];
+  const visit = (node: WorkNode) => {
+    if (node.kind === "run") markers.push({ index: indexAt(node.startedAt), kind: "attempt", label: node.name });
+    if (node.kind === "session") markers.push({ index: indexAt(node.startedAt), kind: "session", label: node.name });
+    for (const at of node.compactionAt ?? []) markers.push({ index: indexAt(at), kind: "compacted", label: "compacted" });
+    node.children.forEach(visit);
+  };
+  root.children.forEach(visit);
+  return markers.filter((marker) => marker.index > 0);
 }
 export function typeSummary(root: WorkNode): readonly TypeSummary[] {
   const calls = modelCalls(root),

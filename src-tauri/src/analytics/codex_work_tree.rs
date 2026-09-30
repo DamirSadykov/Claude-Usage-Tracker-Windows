@@ -100,6 +100,7 @@ pub fn build_codex_work_tree_in_interval(
         agent_type: None,
         fork: false,
         compacted: false,
+        compaction_at: Vec::new(),
     };
     for turn in &tree.turns {
         tree.input_tokens += turn.input_tokens;

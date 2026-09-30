@@ -74,12 +74,36 @@ pub struct RunStep {
     parent_session: Option<String>,
     #[serde(default)]
     review: Option<RunReview>,
+    #[serde(default)]
+    attempt: Option<u32>,
+    #[serde(default)]
+    result: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
-struct RunReview {
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunReview {
     #[serde(default)]
-    session: Option<String>,
+    pub session: Option<String>,
+    #[serde(default)]
+    pub counts: Option<ReviewCounts>,
+    #[serde(default)]
+    pub approved: Option<bool>,
+    #[serde(default)]
+    pub findings: Option<Vec<serde_json::Value>>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewCounts {
+    #[serde(default)]
+    pub critical: u32,
+    #[serde(default)]
+    pub high: u32,
+    #[serde(default)]
+    pub medium: u32,
+    #[serde(default)]
+    pub low: u32,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -89,6 +113,8 @@ pub struct TaskWorkAttempt {
     pub started_at: String,
     pub ended_at: String,
     pub events: Vec<RunEvent>,
+    pub review: Option<RunReview>,
+    pub result: Option<String>,
     pub sessions: Vec<TaskWorkSession>,
 }
 
@@ -107,6 +133,12 @@ pub struct RunEvent {
     pub limit: Option<u32>,
     #[serde(default)]
     pub route: Option<String>,
+    #[serde(default)]
+    pub counts: Option<ReviewCounts>,
+    #[serde(default)]
+    pub approved: Option<bool>,
+    #[serde(default)]
+    pub findings: Option<Vec<serde_json::Value>>,
 }
 
 fn deserialize_task<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -211,6 +243,9 @@ pub fn build_task_work_tree(
                         .filter(|event| event.attempt == Some(number))
                         .cloned()
                         .collect(),
+                    review: review_for_attempt(run_steps, task_number, number)
+                        .or_else(|| review_from_events(&events, number)),
+                    result: result_for_attempt(run_steps, task_number, number),
                     sessions: Vec::new(),
                 });
                 if block.from < entry.started_at {
@@ -225,6 +260,31 @@ pub fn build_task_work_tree(
         }
         sessions.push(session);
     }
+    for event in events.iter().filter(|event| event.kind == "step_start") {
+        let Some(number) = event.attempt else {
+            continue;
+        };
+        attempts.entry(number).or_insert_with(|| TaskWorkAttempt {
+            number,
+            started_at: event.ts.clone(),
+            ended_at: events
+                .iter()
+                .filter(|candidate| candidate.attempt == Some(number))
+                .map(|candidate| candidate.ts.as_str())
+                .max()
+                .unwrap_or(event.ts.as_str())
+                .to_string(),
+            events: events
+                .iter()
+                .filter(|candidate| candidate.attempt == Some(number))
+                .cloned()
+                .collect(),
+            review: review_for_attempt(run_steps, task_number, number)
+                .or_else(|| review_from_events(&events, number)),
+            result: result_for_attempt(run_steps, task_number, number),
+            sessions: Vec::new(),
+        });
+    }
     let mut attempts: Vec<_> = attempts.into_values().collect();
     attempts.sort_by(|a, b| {
         a.started_at
@@ -236,6 +296,61 @@ pub fn build_task_work_tree(
         sessions,
         attempts,
     }
+}
+
+fn review_for_attempt(run_steps: &[RunStep], task_number: u32, attempt: u32) -> Option<RunReview> {
+    run_steps
+        .iter()
+        .rev()
+        .find(|step| run_step_matches(step, task_number) && step.attempt == Some(attempt))
+        .and_then(|step| {
+            step.review.clone().map(|mut review| {
+                if review.counts.is_none() {
+                    review.counts = Some(counts_from_findings(review.findings.as_deref()));
+                }
+                review
+            })
+        })
+}
+
+fn counts_from_findings(findings: Option<&[serde_json::Value]>) -> ReviewCounts {
+    let mut counts = ReviewCounts {
+        critical: 0,
+        high: 0,
+        medium: 0,
+        low: 0,
+    };
+    for finding in findings.unwrap_or_default() {
+        match finding.get("level").and_then(serde_json::Value::as_str) {
+            Some("critical") => counts.critical += 1,
+            Some("high") => counts.high += 1,
+            Some("medium") => counts.medium += 1,
+            Some("low") => counts.low += 1,
+            _ => {}
+        }
+    }
+    counts
+}
+
+fn result_for_attempt(run_steps: &[RunStep], task_number: u32, attempt: u32) -> Option<String> {
+    run_steps
+        .iter()
+        .rev()
+        .find(|step| run_step_matches(step, task_number) && step.attempt == Some(attempt))
+        .and_then(|step| step.result.clone())
+}
+
+fn review_from_events(events: &[RunEvent], attempt: u32) -> Option<RunReview> {
+    events
+        .iter()
+        .rev()
+        .find(|event| event.kind == "review" && event.attempt == Some(attempt))
+        .map(|event| RunReview {
+            session: None,
+            counts: event.counts.clone(),
+            approved: event.approved,
+            findings: event.findings.clone(),
+        })
 }
 
 fn context_for_block(
@@ -365,6 +480,9 @@ fn tree_for_block(
 }
 
 fn slice_tree(mut tree: WorkTree, interval: &WorkTreeInterval) -> WorkTree {
+    tree.compaction_at
+        .retain(|timestamp| in_interval(timestamp, interval));
+    tree.compacted = !tree.compaction_at.is_empty();
     tree.turns
         .retain(|turn| in_interval(&turn.timestamp, interval));
     for turn in &mut tree.turns {
@@ -546,6 +664,9 @@ mod tests {
             attempt: Some(2),
             limit: Some(3),
             route: None,
+            counts: None,
+            approved: None,
+            findings: None,
         }];
         assert!(task_matches(&events[0], 5));
         assert_eq!(attempt_at(&events, "2026-01-01T00:00:02Z"), Some(2));
@@ -566,6 +687,44 @@ mod tests {
     }
 
     #[test]
+    fn carries_event_review_outcome_to_an_attempt_without_a_transcript() {
+        let events = vec![
+            RunEvent {
+                ts: "2026-01-01T00:00:01Z".into(),
+                task: "t#5".into(),
+                kind: "step_start".into(),
+                attempt: Some(2),
+                limit: Some(3),
+                route: None,
+                counts: None,
+                approved: None,
+                findings: None,
+            },
+            RunEvent {
+                ts: "2026-01-01T00:00:02Z".into(),
+                task: "t#5".into(),
+                kind: "review".into(),
+                attempt: Some(2),
+                limit: Some(3),
+                route: None,
+                counts: Some(ReviewCounts {
+                    critical: 0,
+                    high: 0,
+                    medium: 2,
+                    low: 0,
+                }),
+                approved: Some(true),
+                findings: Some(vec![serde_json::json!({"level": "medium"})]),
+            },
+        ];
+        let tree = build_task_work_tree("task", 5, &[], &events, &[], &HashMap::new(), None, None);
+        let review = tree.attempts[0].review.as_ref().unwrap();
+        assert_eq!(review.approved, Some(true));
+        assert_eq!(review.counts.as_ref().unwrap().medium, 2);
+        assert_eq!(review.findings.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
     fn runner_context_uses_run_journal_for_worker_and_reviewer() {
         let worker = RunStep {
             task: "42".into(),
@@ -574,7 +733,12 @@ mod tests {
             parent_session: Some("parent-session".into()),
             review: Some(RunReview {
                 session: Some("review-session".into()),
+                counts: None,
+                approved: None,
+                findings: None,
             }),
+            attempt: None,
+            result: None,
         };
         let task_numbers =
             HashMap::from([("task".to_string(), 42), ("parent-task".to_string(), 17)]);
@@ -638,6 +802,39 @@ mod tests {
         assert_eq!(steps[0].task, "42");
         assert_eq!(steps[0].start_mode, "fresh");
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn derives_review_counts_and_result_from_a_run_step() {
+        let steps = vec![RunStep {
+            task: "5".into(),
+            session: None,
+            start_mode: String::new(),
+            parent_session: None,
+            review: Some(RunReview {
+                session: None,
+                counts: None,
+                approved: Some(false),
+                findings: Some(vec![
+                    serde_json::json!({"level": "high"}),
+                    serde_json::json!({"level": "medium"}),
+                ]),
+            }),
+            attempt: Some(1),
+            result: Some("done".into()),
+        }];
+        let review = review_for_attempt(&steps, 5, 1).unwrap();
+        assert_eq!(
+            review.counts,
+            Some(ReviewCounts {
+                critical: 0,
+                high: 1,
+                medium: 1,
+                low: 0
+            })
+        );
+        assert_eq!(result_for_attempt(&steps, 5, 1).as_deref(), Some("done"));
+        assert_eq!(review.approved, Some(false));
     }
 
     #[test]

@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   aggregateTree,
+  attemptReview,
+  attemptReviewSummary,
   classifyToolCall,
   contextLabels,
   contextTokens,
@@ -12,7 +14,9 @@ import {
   pathTo,
   nodeType,
   traceSeries,
+  traceMarkers,
   treeView,
+  tokenCosts,
   typeSummary,
   type WorkNode,
 } from "./workTree";
@@ -41,6 +45,43 @@ describe("tool classification", () => {
     expect(classifyToolCall("apply_patch")).toBe("edit");
     expect(classifyToolCall("Agent")).toBe("agent");
     expect(classifyToolCall("WebSearch")).toBe("web");
+  });
+});
+
+describe("attempt reviews", () => {
+  it("normalizes review findings and summarizes them in severity order", () => {
+    const review = attemptReview({
+      counts: { high: 3, medium: "nope" },
+      findings: [
+        { level: "low", file: "a.ts", line: 8, text: "Low", evidence: "proof" },
+        { level: "critical", file: "b.ts", line: 2, text: "Critical" },
+        { level: "future", text: "Unknown level" },
+        { level: "high", file: "ignored.ts" },
+        null,
+      ],
+    });
+    expect(review?.findings).toEqual([
+      { level: "low", file: "a.ts", line: 8, text: "Low", evidence: "proof" },
+      { level: "critical", file: "b.ts", line: 2, text: "Critical", evidence: null },
+      { level: null, file: null, line: null, text: "Unknown level", evidence: null },
+    ]);
+    expect(attemptReviewSummary("failed", review)).toEqual({
+      passed: false,
+      counts: { critical: 0, high: 3, medium: 0, low: 0 },
+      findings: [
+        { level: "critical", file: "b.ts", line: 2, text: "Critical", evidence: null },
+        { level: "low", file: "a.ts", line: 8, text: "Low", evidence: "proof" },
+        { level: null, file: null, line: null, text: "Unknown level", evidence: null },
+      ],
+    });
+  });
+
+  it("derives counts from findings when the review omitted them", () => {
+    const review = attemptReview({ findings: [{ level: "high", text: "One" }, { level: "high", text: "Two" }] });
+    expect(attemptReviewSummary("done", review)).toMatchObject({
+      passed: true,
+      counts: { critical: 0, high: 2, medium: 0, low: 0 },
+    });
   });
 });
 
@@ -162,6 +203,26 @@ describe("model call nodes", () => {
   });
 });
 
+describe("token costs", () => {
+  it("prices every token rate with the selected model's rates", () => {
+    expect(tokenCosts("claude-sonnet-4", { input: 1_000_000, cacheRead: 1_000_000, cacheWrite: 1_000_000, output: 1_000_000 })).toMatchObject({
+      inputCost: 3,
+      cacheReadCost: 0.3,
+      cacheWriteCost: 3.75,
+      outputCost: 15,
+    });
+  });
+
+  it("does not charge Codex cached tokens again as fresh input", () => {
+    expect(tokenCosts("gpt-5.6-terra", { input: 1_000_000, cacheRead: 300_000, cacheWrite: 100_000, output: 1_000_000 })).toMatchObject({
+      inputCost: 1.2,
+      cacheReadCost: 0.06,
+      cacheWriteCost: 0.25,
+      outputCost: 12,
+    });
+  });
+});
+
 describe("trace views", () => {
   const first = modelCallNode({
     id: "one",
@@ -202,6 +263,19 @@ describe("trace views", () => {
     expect(filterTree(root, new Set(["edit"]))?.children.map((node) => node.id)).toEqual(["two"]);
     expect(treeView(root, { types: new Set(["read"]), headersOnly: true })?.children.map((node) => node.id)).toEqual([
       "one",
+    ]);
+  });
+  it("positions attempt, session and compaction markers against model calls", () => {
+    const marked = {
+      ...container([first, second]),
+      children: [{ ...first, startedAt: 10, compactionAt: [15] }, { ...second, startedAt: 20 }],
+    };
+    const session = { ...marked, id: "session-marked", kind: "session" as const, name: "session", startedAt: 10 };
+    const attempt = { ...marked, id: "attempt", kind: "run" as const, name: "Attempt 1", startedAt: 10, children: [session] };
+    expect(traceMarkers({ ...container([attempt]), children: [attempt] })).toEqual([
+      { index: 1, kind: "attempt", label: "Attempt 1" },
+      { index: 1, kind: "session", label: "session" },
+      { index: 2, kind: "compacted", label: "compacted" },
     ]);
   });
   it("removes tool rows in headings-only mode but preserves subagent branches", () => {

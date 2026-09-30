@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { BoardChange } from "../contracts/board";
 import type { BoardRow } from "./boardStore";
-import { buildBoardTree, visibleBoardTreeRows, type BoardTreeRow } from "./boardTree";
+import { boardTreeSummary, buildBoardTree, visibleBoardTreeRows, type BoardTreeRow } from "./boardTree";
 import { defaultTodoFilters } from "./todoFilter";
 
 const row = (overrides: Partial<BoardTreeRow> = {}): BoardTreeRow => ({
@@ -39,7 +39,8 @@ describe("buildBoardTree", () => {
     expect(app.children[0]).toMatchObject({ kind: "legacy", id: "root", title: "Old root", closed: true });
     expect(app.children[0].children.map((node) => node.id)).toEqual(["member"]);
     expect(canonical).toMatchObject({ kind: "group", title: "canonical", cost: 4 });
-    expect(canonical.children.map((node) => node.id)).toEqual(["alias"]);
+    expect(canonical.children).toMatchObject([{ kind: "ungrouped", progress: { done: 0, total: 1 }, cost: 4 }]);
+    expect(canonical.children[0].children.map((node) => node.id)).toEqual(["alias"]);
   });
 
   it("filters tasks through projectTodos while retaining their non-empty parent", () => {
@@ -53,6 +54,16 @@ describe("buildBoardTree", () => {
     expect(tree).toHaveLength(1);
     expect(tree[0].children.map((node) => node.id)).toEqual(["c-1"]);
     expect(tree[0].children[0].children.map((node) => node.id)).toEqual(["queue"]);
+  });
+});
+
+describe("boardTreeSummary", () => {
+  it("counts task leaves once, including tasks in the without-change group", () => {
+    const tree = buildBoardTree([
+      row({ id: "open", change_id: "c-1", cost: 1.25 }),
+      row({ id: "done", status: "done", cost: 2.5 }),
+    ], [change()], { ...defaultTodoFilters(), showDone: true });
+    expect(boardTreeSummary(tree)).toEqual({ active: 1, total: 2, cost: 3.75 });
   });
 });
 

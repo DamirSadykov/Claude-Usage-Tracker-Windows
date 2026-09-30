@@ -24,8 +24,18 @@ const SHAPE: &[(u32, i64, &[(&str, &str, &str, i64)])] = &[
         902,
         60,
         &[
-            ("demo-a1", "general-purpose", "экспортер: модель и запись", 22),
-            ("demo-a2", "general-purpose", "правка по замечаниям ревью", 15),
+            (
+                "demo-a1",
+                "general-purpose",
+                "экспортер: модель и запись",
+                22,
+            ),
+            (
+                "demo-a2",
+                "general-purpose",
+                "правка по замечаниям ревью",
+                15,
+            ),
         ],
     ),
     (
@@ -57,7 +67,11 @@ fn main() {
         dir.display()
     );
     let board = todos::load(&dir.join("todos.json"));
-    let numbers: HashMap<String, u32> = board.todos.iter().map(|x| (x.id.clone(), x.number)).collect();
+    let numbers: HashMap<String, u32> = board
+        .todos
+        .iter()
+        .map(|x| (x.id.clone(), x.number))
+        .collect();
     let events = task_sessions::load(&dir.join("task-sessions.jsonl"));
     let blocks = task_sessions::blocks(&events, &HashMap::new());
     let db = dir.join("usage_stats.db");
@@ -94,7 +108,8 @@ fn main() {
         let mut i = 0i64;
         let mut push = |i: &mut i64, agent: Option<(&str, &str)>, count: i64| {
             for k in 0..count {
-                let ts = from + chrono::Duration::seconds((span * *i as f64 / *messages as f64) as i64);
+                let ts =
+                    from + chrono::Duration::seconds((span * *i as f64 / *messages as f64) as i64);
                 rows.push(CcUsageRow {
                     message_id: match agent {
                         Some((a, _)) => format!("demo-{number}-{a}-{k}"),
@@ -137,7 +152,11 @@ fn main() {
     let n = stats.cc_upsert(&rows).unwrap();
     let a = stats.cc_agent_upsert(&agents).unwrap();
     println!("инстанс: {}", dir.display());
-    println!("блоков в журнале: {}, засеяно сообщений: {n} из {}, агентов: {a}", blocks.len(), rows.len());
+    println!(
+        "блоков в журнале: {}, засеяно сообщений: {n} из {}, агентов: {a}",
+        blocks.len(),
+        rows.len()
+    );
     if !skipped.is_empty() {
         println!("без сообщений (так и задумано): {skipped:?}");
     }

@@ -1,287 +1,33 @@
 <script setup lang="ts">
 import { nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import {
-  BarController,
-  BarElement,
-  CategoryScale,
-  Chart,
-  Legend,
-  LineController,
-  LineElement,
-  LinearScale,
-  PointElement,
-  Tooltip,
-  type ActiveElement,
-  type ChartEvent,
-  type TooltipItem,
-} from "chart.js";
-import { traceSeries, typeSummary, type ToolCallType, type TracePoint, type WorkNode } from "./workTree";
-
-Chart.register(
-  BarController,
-  BarElement,
-  CategoryScale,
-  LineController,
-  LineElement,
-  LinearScale,
-  PointElement,
-  Tooltip,
-  Legend,
-);
-
+import { BarController, BarElement, CategoryScale, Chart, Legend, LineController, LineElement, LinearScale, PointElement, Tooltip, type ActiveElement, type ChartEvent } from "chart.js";
+import { traceMarkers, traceSeries, type ToolCallType, type WorkNode } from "./workTree";
+Chart.register(BarController, BarElement, CategoryScale, LineController, LineElement, LinearScale, PointElement, Tooltip, Legend);
 const props = defineProps<{ root: WorkNode | null }>();
 const emit = defineEmits<{ select: [nodeId: string] }>();
 const { t } = useI18n();
-const contextCanvas = ref<HTMLCanvasElement | null>(null);
-const costCanvas = ref<HTMLCanvasElement | null>(null);
-let contextChart: Chart | null = null;
-let costChart: Chart | null = null;
-
-function color(token: string, fallback: string): string {
-  return (
-    getComputedStyle(contextCanvas.value ?? document.documentElement)
-      .getPropertyValue(token)
-      .trim() || fallback
-  );
+const canvas = ref<HTMLCanvasElement | null>(null);
+let chart: Chart | null = null;
+function color(token: string) { return getComputedStyle(canvas.value ?? document.documentElement).getPropertyValue(token).trim(); }
+function typeColor(type: ToolCallType | "text") { return color(({ read: "--accent", edit: "--ok", shell: "--warn", agent: "--high", web: "--accent-2", other: "--text-3", text: "--text-3" } as const)[type]); }
+function data() {
+  const series = props.root ? traceSeries(props.root) : { context: [], cacheRead: [], cost: [] };
+  return { labels: series.context.map((point) => String(point.index)), datasets: [
+    { type: "bar" as const, label: t("workTraceContext"), data: series.context.map((point) => point.value), backgroundColor: series.context.map((point) => typeColor(point.type)), borderRadius: 3, yAxisID: "tokens" },
+    { type: "line" as const, label: t("workTraceCacheRead"), data: series.cacheRead.map((point) => point.value), borderColor: color("--accent-2"), borderDash: [5, 4], borderWidth: 1.5, pointRadius: 0, tension: .15, yAxisID: "tokens" },
+    { type: "line" as const, label: t("workTraceCostCumulative"), data: series.cost.map((point) => point.value), borderColor: color("--high"), borderWidth: 2, pointRadius: 1.5, tension: .15, yAxisID: "cost" },
+  ] };
 }
-function typeColor(type: ToolCallType | "text"): string {
-  const colors: Record<ToolCallType | "text", [string, string]> = {
-    read: ["--accent", "#4cc2ff"],
-    edit: ["--ok", "#6ccb5f"],
-    shell: ["--warn", "#ffc107"],
-    agent: ["--high", "#d97757"],
-    web: ["--accent-2", "#3aa0ff"],
-    other: ["--text-3", "#9aa0aa"],
-    text: ["--text-3", "#9aa0aa"],
-  };
-  const [token, fallback] = colors[type];
-  return color(token, fallback);
-}
-function labels(points: readonly TracePoint[]) {
-  return points.map((point) => String(point.index));
-}
-function series() {
-  return props.root ? traceSeries(props.root) : { context: [], cacheRead: [], cost: [] };
-}
-function contextData() {
-  const value = series();
-  return {
-    labels: labels(value.context),
-    datasets: [
-      {
-        type: "bar" as const,
-        label: t("workTraceContext"),
-        data: value.context.map((point) => point.value),
-        backgroundColor: value.context.map((point) => typeColor(point.type)),
-        borderRadius: 3,
-        yAxisID: "context",
-      },
-      {
-        type: "line" as const,
-        label: t("workTraceCacheRead"),
-        data: value.cacheRead.map((point) => point.value),
-        borderColor: color("--accent-2", "#3aa0ff"),
-        backgroundColor: color("--accent-2", "#3aa0ff"),
-        borderWidth: 2,
-        pointRadius: 2,
-        tension: 0.2,
-        yAxisID: "cache",
-      },
-    ],
-  };
-}
-function costData() {
-  const value = series();
-  return {
-    labels: labels(value.cost),
-    datasets: [
-      {
-        label: t("workTraceCostCumulative"),
-        data: value.cost.map((point) => point.value),
-        borderColor: color("--high", "#d97757"),
-        backgroundColor: color("--high", "#d97757"),
-        borderWidth: 2,
-        pointRadius: 2,
-        tension: 0.2,
-        fill: true,
-        yAxisID: "context",
-      },
-    ],
-  };
-}
-function options(withCacheAxis: boolean) {
-  return {
-    responsive: true,
-    maintainAspectRatio: false,
-    interaction: { mode: "index" as const, intersect: false },
-    plugins: {
-      legend: { display: true, labels: { color: color("--text-3", "#9aa0aa"), boxWidth: 8 } },
-      ...(withCacheAxis
-        ? {}
-        : {
-            tooltip: {
-              callbacks: {
-                label: (item: TooltipItem<"line">) => `${t("workTraceCostTotal")}: ${formatCost(item.parsed.y ?? 0)}`,
-                afterLabel: (item: TooltipItem<"line">) => {
-                  const points = series().cost,
-                    step = (points[item.dataIndex]?.value ?? 0) - (points[item.dataIndex - 1]?.value ?? 0);
-                  return `${t("workTraceCostStep")}: ${formatCost(step)}`;
-                },
-              },
-            },
-          }),
-    },
-    scales: {
-      x: {
-        grid: { color: color("--stroke", "rgba(128,128,128,.16)") },
-        ticks: { color: color("--text-3", "#9aa0aa") },
-      },
-      context: {
-        type: "linear" as const,
-        position: "left" as const,
-        beginAtZero: true,
-        grid: { color: color("--stroke", "rgba(128,128,128,.16)") },
-        ticks: {
-          color: color("--text-3", "#9aa0aa"),
-          ...(withCacheAxis ? {} : { callback: (value: string | number) => `$${value}` }),
-        },
-      },
-      ...(withCacheAxis
-        ? {
-            cache: {
-              type: "linear" as const,
-              position: "right" as const,
-              beginAtZero: true,
-              grid: { drawOnChartArea: false },
-              ticks: { color: color("--text-3", "#9aa0aa") },
-            },
-          }
-        : {}),
-    },
-    onClick: (_event: ChartEvent, elements: readonly ActiveElement[]) => {
-      const bar = elements.find((element) => element.datasetIndex === 0);
-      const point = series().context[bar?.index ?? -1];
-      if (point) emit("select", point.nodeId);
-    },
-  };
-}
-function renderCharts() {
-  if (!contextCanvas.value || !costCanvas.value) return;
-  const context = contextData(),
-    cost = costData();
-  if (contextChart) {
-    contextChart.data = context;
-    contextChart.options = options(true);
-    contextChart.update();
-  } else contextChart = new Chart(contextCanvas.value, { type: "bar", data: context, options: options(true) });
-  if (costChart) {
-    costChart.data = cost;
-    costChart.options = options(false);
-    costChart.update();
-  } else costChart = new Chart(costCanvas.value, { type: "line", data: cost, options: options(false) });
-}
-function formatCost(value: number) {
-  return `$${value >= 1 ? value.toFixed(2) : value.toFixed(4)}`;
-}
-function percent(value: number) {
-  return new Intl.NumberFormat(undefined, { style: "percent", maximumFractionDigits: 1 }).format(value);
-}
-
-onMounted(() => {
-  void nextTick(renderCharts);
-});
-watch(
-  () => props.root,
-  () => {
-    void nextTick(renderCharts);
-  },
-  { deep: true },
-);
-onBeforeUnmount(() => {
-  contextChart?.destroy();
-  costChart?.destroy();
-  contextChart = null;
-  costChart = null;
-});
+const markers = { id: "trace-markers", afterDraw(current: Chart) {
+  const entries = props.root ? traceMarkers(props.root) : [], { ctx, chartArea, scales } = current;
+  for (const marker of entries) { const x = scales.x.getPixelForValue(marker.index - 1); ctx.save(); ctx.strokeStyle = marker.kind === "attempt" ? color("--high") : marker.kind === "compacted" ? color("--warn") : color("--text-3"); ctx.setLineDash(marker.kind === "session" ? [2, 3] : [5, 3]); ctx.beginPath(); ctx.moveTo(x, chartArea.top); ctx.lineTo(x, chartArea.bottom); ctx.stroke(); ctx.restore(); }
+} };
+function options() { return { responsive: true, maintainAspectRatio: false, interaction: { mode: "index" as const, intersect: false }, plugins: { legend: { labels: { color: color("--text-3"), boxWidth: 8 } } }, scales: {
+  x: { grid: { color: color("--stroke") }, ticks: { color: color("--text-3") } }, tokens: { type: "linear" as const, position: "left" as const, beginAtZero: true, grid: { color: color("--stroke") }, ticks: { color: color("--text-3") } }, cost: { type: "linear" as const, position: "right" as const, beginAtZero: true, grid: { drawOnChartArea: false }, ticks: { color: color("--text-3"), callback: (value: string | number) => `$${value}` } },
+}, onClick: (_event: ChartEvent, elements: readonly ActiveElement[]) => { const element = elements.find((entry) => entry.datasetIndex === 0), node = props.root && traceSeries(props.root).context[element?.index ?? -1]; if (node) emit("select", node.nodeId); } }; }
+function render() { if (!canvas.value) return; if (chart) { chart.data = data(); chart.options = options(); chart.update(); } else chart = new Chart(canvas.value, { type: "bar", data: data(), options: options(), plugins: [markers] }); }
+onMounted(() => void nextTick(render)); watch(() => props.root, () => void nextTick(render), { deep: true }); onBeforeUnmount(() => { chart?.destroy(); chart = null; });
 </script>
-
-<template>
-  <section class="work-trace-charts">
-    <div class="work-trace-chart"><canvas ref="contextCanvas"></canvas></div>
-    <div class="work-trace-chart"><canvas ref="costCanvas"></canvas></div>
-    <table v-if="root && typeSummary(root).length" class="work-trace-summary">
-      <thead>
-        <tr>
-          <th>{{ t("workTraceType") }}</th>
-          <th>{{ t("workTraceNodes") }}</th>
-          <th>{{ t("metricCost") }}</th>
-          <th>{{ t("workTraceShare") }}</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr v-for="item in typeSummary(root)" :key="item.type">
-          <td><i :style="{ background: typeColor(item.type) }"></i>{{ t(`workTraceType_${item.type}`) }}</td>
-          <td>{{ item.nodes }}</td>
-          <td>{{ formatCost(item.cost) }}</td>
-          <td>{{ percent(item.share) }}</td>
-        </tr>
-      </tbody>
-    </table>
-  </section>
-</template>
-
-<style scoped>
-.work-trace-charts {
-  display: grid;
-  gap: 10px;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(170px, 0.55fr);
-}
-.work-trace-chart {
-  background: var(--node-bg);
-  border: 1px solid var(--stroke-strong);
-  border-radius: var(--r-ctl);
-  height: 180px;
-  min-width: 0;
-  padding: 8px;
-}
-.work-trace-summary {
-  align-self: stretch;
-  border-collapse: collapse;
-  font-size: 12px;
-  width: 100%;
-}
-.work-trace-summary th {
-  color: var(--text-3);
-  font-weight: 500;
-  text-align: right;
-}
-.work-trace-summary td,
-.work-trace-summary th {
-  border-bottom: 1px solid var(--stroke);
-  padding: 5px 4px;
-}
-.work-trace-summary td {
-  font-family: var(--mono, monospace);
-  text-align: right;
-}
-.work-trace-summary td:first-child,
-.work-trace-summary th:first-child {
-  text-align: left;
-}
-.work-trace-summary i {
-  border-radius: 50%;
-  display: inline-block;
-  height: 7px;
-  margin-right: 5px;
-  width: 7px;
-}
-@media (max-width: 760px) {
-  .work-trace-charts {
-    grid-template-columns: 1fr;
-  }
-  .work-trace-summary {
-    max-width: 360px;
-  }
-}
-</style>
+<template><section class="work-trace-charts"><div class="work-trace-chart"><canvas ref="canvas" /></div></section></template>
+<style scoped>.work-trace-chart { background: var(--node-bg); border: 1px solid var(--stroke-strong); border-radius: var(--r-ctl); height: 230px; padding: 8px; }</style>

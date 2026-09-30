@@ -717,7 +717,7 @@ function resetView() {
                             <span
                                 class="lanes-more-action"
                                 @click="emit('open', lane.id)"
-                                >открыть в доске</span
+                                >открыть в дереве</span
                             >
                         </div>
                     </LaneFrame>
