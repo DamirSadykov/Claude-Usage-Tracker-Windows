@@ -6,6 +6,7 @@ pub mod corrections;
 pub mod domain;
 pub mod memory;
 pub mod project_groups;
+pub mod restart_point;
 pub mod stats;
 pub mod status;
 pub mod usage;
