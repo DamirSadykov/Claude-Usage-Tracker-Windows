@@ -1246,6 +1246,12 @@ const ADD_USAGE =
 // status defaults to backlog. Appends and writes atomically.
 function cmdAdd(args) {
   const { positional, flags } = parseArgs(args);
+  if (flags.change) {
+    fail(
+      "refusing: `todos add --change` no longer creates legacy change roots.\n" +
+        '  cli change new "<title>"',
+    );
+  }
   const subject = String(positional[0] ?? flags.subject ?? "").trim();
   if (!subject) fail(ADD_USAGE);
   refuseIfSubjectTooLong(subject, "<task>");
@@ -1295,7 +1301,6 @@ function cmdAdd(args) {
     status,
     priority,
     kind,
-    change: Boolean(flags.change),
     scheduled: typeof flags.scheduled === "string" ? flags.scheduled : null,
     plan: typeof flags.plan === "string" ? flags.plan : "",
     project: target,
@@ -1333,9 +1338,6 @@ export function newTodo(data, fields = {}) {
     // Omit the field entirely when unset, mirroring todos.rs (skip_serializing_if).
     ...(fields.priority ? { priority: fields.priority } : {}),
     ...(fields.kind ? { kind: fields.kind } : {}),
-    // Change root (t#255, renamed at t#345): the aggregator of a change — it
-    // depends_on all its children and carries the delta in description.
-    ...(fields.change ? { change: true } : {}),
     scheduled_for: typeof fields.scheduled === "string" ? fields.scheduled : null,
     plan: typeof fields.plan === "string" ? fields.plan : "",
     // Omit project/from when absent (global / same-project), mirroring the Rust
@@ -2237,7 +2239,7 @@ function cmdPipeline(args = []) {
       "A->B means A waits for B. STATUS (kanban column) and PIPELINE STATE (blocked or\n" +
       "ready, derived from the edges) are orthogonal; KIND decides who closes a node.\n\n" +
       "COMMANDS\n" +
-      '  todos add "<subject>" [--project <name> | --global] [--kind auto|manual] [--change]\n' +
+      '  todos add "<subject>" [--project <name> | --global] [--kind auto|manual]\n' +
       "  todos dep add <task> <depends-on>    the edge: <task> waits for <depends-on>\n" +
       "  todos dep list <task>                its deps + dependents\n" +
       "  todos produces add <task> <path>     what the step promises to produce\n" +

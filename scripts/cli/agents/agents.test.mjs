@@ -31,10 +31,10 @@ describe("lifecycle duty map", () => {
 
   it("uses the starter duty map when no settings file exists", () => {
     expect(readAgentConfig()).toEqual(emptyAgentConfig());
-    expect(resolveDuty("worker")).toMatchObject({ duty: "worker", mode: "always", provider: "anthropic", model: "sonnet" });
+    expect(resolveDuty("worker")).toMatchObject({ duty: "worker", mode: "always", provider: "anthropic", model: "claude-sonnet-5-5" });
     expect(resolveDuty("critic")).toMatchObject({ mode: "session", provider: "openai", model: "gpt-5.6-terra" });
     expect(resolveDuty("architect")).toMatchObject({ mode: "agent", provider: "openai", model: "gpt-5.6-terra" });
-    expect(resolveDuty("review")).toMatchObject({ mode: "agent", provider: "anthropic", model: "opus" });
+    expect(resolveDuty("review")).toMatchObject({ mode: "agent", provider: "anthropic", model: "claude-opus-5-5" });
   });
 
   it("keeps `enabled` and `runsAsAgent` apart for a session critic", () => {
@@ -53,12 +53,32 @@ describe("lifecycle duty map", () => {
       },
     });
     expect(resolveDuty("architect")).toMatchObject({ duty: "architect", provider: "openai", model: "gpt-5.6-sol", enabled: true });
-    expect(resolveDuty("worker")).toMatchObject({ duty: "worker", provider: "anthropic", model: "sonnet" });
+    expect(resolveDuty("worker")).toMatchObject({ duty: "worker", provider: "anthropic", model: "claude-sonnet-5-5" });
   });
 
   it("rejects a provider/model mismatch and keeps the valid family default", () => {
     saveAgentConfig({ version: 4, duties: { worker: { mode: "always", provider: "openai", model: "opus" } } });
-    expect(resolveDuty("worker")).toMatchObject({ provider: "anthropic", model: "sonnet" });
+    expect(resolveDuty("worker")).toMatchObject({ provider: "anthropic", model: "claude-sonnet-5-5" });
+  });
+
+  it("migrates a legacy Anthropic alias in a duty to its explicit model id", () => {
+    saveAgentConfig({ version: 4, duties: { worker: { mode: "always", provider: "anthropic", model: "haiku" } } });
+    expect(readAgentConfig().duties.worker.model).toBe("claude-haiku-4-5-20251001");
+  });
+
+  it("migrates a legacy Anthropic alias in a route to its explicit model id", () => {
+    saveAgentConfig({
+      version: 4,
+      routes: { high: { worker: { provider: "anthropic", model: "opus" } } },
+    });
+    expect(resolveDuty("worker", undefined, { risk: "high" })).toMatchObject({
+      provider: "anthropic", model: "claude-opus-5-5", route: { applied: true, risk: "high" },
+    });
+  });
+
+  it("falls back to the starter profile for an unknown model", () => {
+    saveAgentConfig({ version: 4, duties: { worker: { mode: "always", provider: "anthropic", model: "claude-unknown" } } });
+    expect(resolveDuty("worker")).toMatchObject({ provider: "anthropic", model: "claude-sonnet-5-5" });
   });
 
   it("refuses a mode the duty does not offer and falls back to the starter one", () => {
@@ -151,7 +171,7 @@ describe("lifecycle duty map", () => {
     });
     const resolved = resolveDuty("worker", undefined, { risk: "high" });
     expect(resolved.provider).toBe("anthropic");
-    expect(resolved.model).toBe("opus");
+    expect(resolved.model).toBe("claude-opus-5-5");
     expect(resolved.reasoning_effort).toBeUndefined();
     expect(resolved.input_cost_per_million).toBeUndefined();
     expect(resolved.output_cost_per_million).toBeUndefined();
@@ -164,7 +184,7 @@ describe("lifecycle duty map", () => {
       routes: { high: { worker: { provider: "openai", model: "gpt-5.6-sol" } } },
     });
     const resolved = resolveDuty("worker");
-    expect(resolved).toMatchObject({ provider: "anthropic", model: "sonnet" });
+    expect(resolved).toMatchObject({ provider: "anthropic", model: "claude-sonnet-5-5" });
     expect(resolved.route).toBeUndefined();
   });
 
@@ -175,7 +195,7 @@ describe("lifecycle duty map", () => {
       routes: { high: { review: { provider: "openai", model: "opus" } } },
     });
     const resolved = resolveDuty("review", undefined, { risk: "high" });
-    expect(resolved).toMatchObject({ provider: "anthropic", model: "opus", route: { applied: false, risk: "high" } });
+    expect(resolved).toMatchObject({ provider: "anthropic", model: "claude-opus-5-5", route: { applied: false, risk: "high" } });
     expect(resolved.route.note).toMatch(/invalid/);
   });
 
@@ -186,7 +206,7 @@ describe("lifecycle duty map", () => {
       routes: { high: { worker: { provider: "openai", model: "gpt-5.6-sol" } } },
     });
     const resolved = resolveDuty("review", undefined, { risk: "high" });
-    expect(resolved).toMatchObject({ provider: "anthropic", model: "opus", route: { applied: false, risk: "high" } });
+    expect(resolved).toMatchObject({ provider: "anthropic", model: "claude-opus-5-5", route: { applied: false, risk: "high" } });
     expect(resolved.route.note).toMatch(/no route configured for review/);
   });
 
@@ -201,7 +221,7 @@ describe("lifecycle duty map", () => {
       routes: { high: { worker: { provider: "openai", model: "gpt-5.6-luna" } } },
     });
     expect(resolveDuty("architect")).toMatchObject({ duty: "architect", provider: "openai", model: "gpt-5.6-sol", enabled: true });
-    expect(resolveDuty("worker")).toMatchObject({ duty: "worker", provider: "anthropic", model: "sonnet" });
+    expect(resolveDuty("worker")).toMatchObject({ duty: "worker", provider: "anthropic", model: "claude-sonnet-5-5" });
   });
 
   it("defaults the critic to the main session and round-trips its mode", () => {

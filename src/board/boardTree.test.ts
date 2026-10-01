@@ -81,6 +81,54 @@ describe("buildBoardTree", () => {
       closed: false,
     });
   });
+
+  it("builds a flat, newest-first change list with the project on each change", () => {
+    const tree = buildBoardTree([
+      row({ id: "old", change_id: "c-1", project: "first" }),
+      row({ id: "new", change_id: "c-2", project: "second" }),
+      row({ id: "legacy", number: 3, subject: "Legacy", change: true, created_at: "2026-09-04", project: "third" }),
+      row({ id: "closed", change_id: "c-3", project: "fourth" }),
+    ], [
+      change({ id: "c-1", number: 1, created_at: "2026-09-01", updated_at: "2026-09-30" }),
+      change({ id: "c-2", number: 2, created_at: "2026-09-03", updated_at: "2026-09-01" }),
+      change({ id: "c-3", number: 4, created_at: "2026-09-05", closed_at: "2026-09-06" }),
+    ], defaultTodoFilters(), undefined, { flat: true });
+
+    expect(tree.map((node) => [node.id, node.project])).toEqual([
+      ["legacy", "third"], ["c-2", "second"], ["c-1", "first"], ["c-3", "fourth"],
+    ]);
+    expect(tree.every((node) => node.kind === "change" || node.kind === "legacy")).toBe(true);
+  });
+
+  it("finds flat changes by title and c-number, revealing all members on a change match", () => {
+    const filters = { ...defaultTodoFilters(), query: "release notes" };
+    const tree = buildBoardTree([
+      row({ id: "matching-title-member", subject: "Unrelated task", change_id: "c-1" }),
+      row({ id: "other-change-member", subject: "release notes task", change_id: "c-2" }),
+      row({ id: "hidden", change_id: "c-3" }),
+    ], [
+      change({ id: "c-1", number: 71, title: "Release notes" }),
+      change({ id: "c-2", number: 72, title: "Other change" }),
+      change({ id: "c-3", number: 73, title: "Hidden change" }),
+    ], filters, undefined, { flat: true });
+
+    expect(tree.map((node) => node.id)).toEqual(["c-2", "c-1"]);
+    expect(tree.find((node) => node.id === "c-1")?.children.map((node) => node.id)).toEqual(["matching-title-member"]);
+
+    const byNumber = buildBoardTree([
+      row({ id: "number-member", subject: "Unrelated", change_id: "c-1" }),
+    ], [change({ id: "c-1", number: 71, title: "Other change" })],
+    { ...defaultTodoFilters(), query: "c#71" }, undefined, { flat: true });
+    expect(byNumber.map((node) => node.id)).toEqual(["c-1"]);
+  });
+
+  it("keeps the project filter when a flat change matches only by title", () => {
+    const tree = buildBoardTree([
+      row({ id: "foreign", subject: "Unrelated", change_id: "c-1", project: "other" }),
+    ], [change({ id: "c-1", number: 71, title: "Release notes", project: "other" })],
+    { ...defaultTodoFilters(), query: "release", project: "mine" }, undefined, { flat: true });
+    expect(tree).toEqual([]);
+  });
 });
 
 describe("boardTreeSummary", () => {

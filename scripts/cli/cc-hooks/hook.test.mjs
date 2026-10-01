@@ -383,10 +383,10 @@ describe("cli.mjs hook (stdin payload)", () => {
     expect(resumeOut).not.toContain("──────── WORKFLOW · this session");
     expect(resumeOut).toContain("workflow — critic:");
     expect(resumeOut.split("\n").filter((l) => l.startsWith("workflow —"))).toHaveLength(1);
-    expect(startupOut).toContain("anthropic/sonnet");
-    expect(resumeOut).toContain("anthropic/sonnet");
-    expect(startupOut).toContain("anthropic/opus");
-    expect(resumeOut).toContain("anthropic/opus");
+    expect(startupOut).toContain("anthropic/claude-sonnet-5-5");
+    expect(resumeOut).toContain("anthropic/claude-sonnet-5-5");
+    expect(startupOut).toContain("anthropic/claude-opus-5-5");
+    expect(resumeOut).toContain("anthropic/claude-opus-5-5");
   });
 
   it("prints the cross-project note on startup but drops it on resume", () => {

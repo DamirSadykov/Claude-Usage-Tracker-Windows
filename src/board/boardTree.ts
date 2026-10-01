@@ -19,6 +19,7 @@ export interface BoardTreeNode {
   cost: number;
   children: readonly BoardTreeNode[];
   closed: boolean;
+  project?: string;
 }
 
 export interface BoardTreeRow extends BoardRow {
@@ -35,6 +36,10 @@ export interface BoardTreeSummary {
   active: number;
   total: number;
   cost: number;
+}
+
+export interface BoardTreeOptions {
+  flat?: boolean;
 }
 
 const taskSort = (left: BoardTreeRow, right: BoardTreeRow) => left.number - right.number || left.id.localeCompare(right.id);
@@ -68,6 +73,7 @@ function membersNode(
   rows: readonly BoardTreeRow[],
   closed: boolean,
   allMembers: readonly BoardTreeRow[] = rows,
+  project?: string,
 ): BoardTreeNode {
   const children = [...rows].sort(taskSort).map(taskNode);
   return {
@@ -80,7 +86,16 @@ function membersNode(
     cost: rows.reduce((total, row) => total + costOf(row), 0),
     children,
     closed: closed || (allMembers.length > 0 && allMembers.every(closedTask)),
+    project,
   };
+}
+
+function changeMatchesQuery(change: Pick<BoardChange, "number" | "title">, query: string): boolean {
+  const normalized = query.trim().toLocaleLowerCase();
+  if (!normalized) return false;
+  if (change.title.toLocaleLowerCase().includes(normalized)) return true;
+  const numberQuery = normalized.match(/^(?:c#|#)?(\d+)$/)?.[1];
+  return !!numberQuery && String(change.number).includes(numberQuery);
 }
 
 export function buildBoardTree(
@@ -88,6 +103,7 @@ export function buildBoardTree(
   changes: readonly BoardChange[],
   filters: TodoFilters,
   indexes?: Pick<BoardIndexes, "search">,
+  options: BoardTreeOptions = {},
 ): readonly BoardTreeNode[] {
   const visible = projectTodos(rows, filters, indexes).visible;
   const changeById = new Map(changes.map((change) => [change.id, change]));
@@ -100,6 +116,22 @@ export function buildBoardTree(
       if (row.status !== "done" || !row.change_id) continue;
       const change = changeById.get(row.change_id);
       if (change && !change.closed_at) visibleIds.add(row.id);
+    }
+  }
+
+  const visibleWithoutQueryIds = new Set(visibleIds);
+  if (options.flat && filters.query.trim()) {
+    const withoutQuery = { ...filters, query: "" };
+    const rowsWithoutQuery = projectTodos(rows, withoutQuery, indexes).visible;
+    visibleWithoutQueryIds.clear();
+    rowsWithoutQuery.forEach((row) => visibleWithoutQueryIds.add(row.id));
+    if (!withoutQuery.showDone && !withoutQuery.status) {
+      const includingDone = projectTodos(rows, { ...withoutQuery, showDone: true }, indexes).visible;
+      for (const row of includingDone) {
+        if (row.status !== "done" || !row.change_id) continue;
+        const change = changeById.get(row.change_id);
+        if (change && !change.closed_at) visibleWithoutQueryIds.add(row.id);
+      }
     }
   }
 
@@ -127,28 +159,41 @@ export function buildBoardTree(
     groups.set(project, members);
   }
 
-  const changeNodes: Array<{ node: BoardTreeNode; activity: string; project: string }> = [];
+  const changeNodes: Array<{ node: BoardTreeNode; activity: string; created: string; project: string }> = [];
   for (const change of changes) {
-    const members = memberRows.get(change.id) ?? [];
-    if (!members.length) continue;
+    const titleMatch = options.flat && changeMatchesQuery(change, filters.query);
+    const members = titleMatch
+      ? (allMemberRows.get(change.id) ?? []).filter((row) => visibleWithoutQueryIds.has(row.id))
+      : memberRows.get(change.id) ?? [];
+    const project = members[0]?.filterProject ?? change.project ?? members[0]?.project ?? "";
+    if (!members.length && (!titleMatch || (filters.project && project !== filters.project))) continue;
     changeNodes.push({
-      node: membersNode("change", change.id, change.number, change.title, members, !!change.closed_at, allMemberRows.get(change.id)),
+      node: membersNode("change", change.id, change.number, change.title, members, !!change.closed_at, allMemberRows.get(change.id), project),
       activity: change.updated_at ?? members.reduce((latest, row) => latest > activityOf(row) ? latest : activityOf(row), ""),
-      project: members[0].filterProject ?? change.project ?? members[0].project ?? "",
+      created: change.created_at ?? "",
+      project,
     });
   }
   for (const legacy of legacyById.values()) {
-    const members = memberRows.get(legacy.id) ?? [];
-    if (!members.length && !visibleIds.has(legacy.id)) continue;
+    const titleMatch = options.flat && changeMatchesQuery({ number: legacy.number, title: legacy.subject }, filters.query);
+    const members = titleMatch
+      ? (allMemberRows.get(legacy.id) ?? []).filter((row) => visibleWithoutQueryIds.has(row.id))
+      : memberRows.get(legacy.id) ?? [];
+    const project = legacy.filterProject ?? legacy.project ?? "";
+    if (!members.length && !visibleIds.has(legacy.id) && (!titleMatch || (filters.project && project !== filters.project))) continue;
     const allRows = members.length ? members : [legacy];
     changeNodes.push({
-      node: membersNode("legacy", legacy.id, legacy.number, legacy.subject, allRows, closedTask(legacy), allMemberRows.get(legacy.id)),
+      node: membersNode("legacy", legacy.id, legacy.number, legacy.subject, allRows, closedTask(legacy), allMemberRows.get(legacy.id), project),
       activity: activityOf(legacy),
-      project: legacy.filterProject ?? legacy.project ?? "",
+      created: legacy.created_at,
+      project,
     });
   }
   changeNodes.sort((left, right) => Number(left.node.closed) - Number(right.node.closed)
-    || right.activity.localeCompare(left.activity) || (right.node.number ?? 0) - (left.node.number ?? 0));
+    || (options.flat ? right.created.localeCompare(left.created) : right.activity.localeCompare(left.activity))
+    || (right.node.number ?? 0) - (left.node.number ?? 0));
+
+  if (options.flat) return changeNodes.map((entry) => entry.node);
 
   const projects = new Set<string>([...groups.keys(), ...changeNodes.map((entry) => entry.project)]);
   const projectNodes = [...projects].map((project) => {

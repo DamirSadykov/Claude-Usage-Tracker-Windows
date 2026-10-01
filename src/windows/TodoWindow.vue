@@ -198,7 +198,16 @@ const treeRows = computed<BoardTreeRow[]>(() => boardStore.rows.value.map((row) 
   cost: taskCosts.value.get(row.id)?.cost,
   filterProject: row.project ? canonicalOf(row.project) ?? row.project : null,
 })));
-const tree = computed(() => buildBoardTree(treeRows.value, changes.value, filters.value, boardStore.indexes.value));
+const TREE_FLAT_STORAGE_KEY = "todo-tree:flat";
+function readTreeFlat(): boolean {
+  try { return localStorage.getItem(TREE_FLAT_STORAGE_KEY) === "true"; }
+  catch { return false; }
+}
+const flatTree = ref(readTreeFlat());
+watch(flatTree, (value) => {
+  try { localStorage.setItem(TREE_FLAT_STORAGE_KEY, String(value)); } catch {}
+});
+const tree = computed(() => buildBoardTree(treeRows.value, changes.value, filters.value, boardStore.indexes.value, { flat: flatTree.value }));
 const selectedTreeNode = ref<BoardTreeNode | null>(null);
 const selectedChange = computed(() => {
   const node = selectedTreeNode.value;
@@ -1723,6 +1732,7 @@ onUnmounted(() => {
 
     <div v-else class="tw-tree-layout" :style="{ '--tree-width': `${detailTab === 'trace' ? 300 : treeWidth}px` }">
       <TodoTree
+        v-model:flat="flatTree"
         :tree="tree"
         :selected-id="selectedTreeNode?.id"
         :searching="Boolean(filters.query.trim())"

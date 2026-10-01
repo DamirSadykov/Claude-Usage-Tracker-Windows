@@ -334,6 +334,9 @@ const providerNames = Object.keys(agentProviderManifest.providers) as AgentProfi
 const providerModels = Object.fromEntries(
   providerNames.map((provider) => [provider, [...agentProviderManifest.providers[provider].models]]),
 ) as Record<AgentProfileForm["provider"], string[]>;
+const providerAliases = Object.fromEntries(
+  providerNames.map((provider) => [provider, (agentProviderManifest.providers[provider] as { aliases?: Record<string, string> }).aliases ?? {}]),
+) as Record<AgentProfileForm["provider"], Record<string, string>>;
 const providerLabels = Object.fromEntries(
   providerNames.map((provider) => [provider, agentProviderManifest.providers[provider].label]),
 ) as Record<AgentProfileForm["provider"], string>;
@@ -349,7 +352,7 @@ const cleanMode = dutyMode.cleanMode as (duty: AgentProfileForm["duty"], value: 
 function normalizeAgentProfile(value: Record<string, unknown> | undefined, fallback: AgentProfileForm): AgentProfileForm {
   if (!value) return { ...fallback };
   const provider = String(value.provider ?? "").trim().toLowerCase();
-  const model = String(value.model ?? "").trim();
+  const model = providerAliases[provider as AgentProfileForm["provider"]]?.[String(value.model ?? "").trim()] ?? String(value.model ?? "").trim();
   if ((provider !== "anthropic" && provider !== "openai") || !providerModels[provider].includes(model)) {
     return { ...fallback };
   }
@@ -977,6 +980,7 @@ onUnmounted(() => {
 });
 
 function handleSave() {
+  void saveAgentProfiles();
   const errPct = goalOrNull(localGoalErrorRatePct.value);
   saveState.value = "saving";
   if (saveResetTimer) { clearTimeout(saveResetTimer); saveResetTimer = null; }

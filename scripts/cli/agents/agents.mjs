@@ -25,6 +25,12 @@ export const PROVIDER_MODELS = Object.fromEntries(
     [...config.models],
   ]),
 );
+export const PROVIDER_ALIASES = Object.fromEntries(
+  Object.entries(AGENT_PROVIDER_MANIFEST.providers).map(([provider, config]) => [
+    provider,
+    { ...config.aliases },
+  ]),
+);
 export const STARTER_DUTIES = structuredClone(AGENT_PROVIDER_MANIFEST.duties);
 // WHO performs a duty, one field per duty, values declared per duty in the
 // manifest. `off` — the step does not happen. `session` — the main session does
@@ -39,6 +45,11 @@ export const DUTY_MODES = Object.fromEntries(DUTIES.map((duty) => [duty, dutyMod
 export const dutyModes = dutyMode.dutyModes;
 export const starterMode = dutyMode.starterMode;
 export const cleanMode = dutyMode.cleanMode;
+
+function normalizeModel(provider, value) {
+  const model = String(value || "").trim();
+  return PROVIDER_ALIASES[provider]?.[model] || model;
+}
 
 export function agentsPath(appData) {
   return appDataFile("agents.json", appData);
@@ -68,7 +79,7 @@ function normalizeRoutes(raw) {
       if (!value || typeof value !== "object" || Array.isArray(value)) continue;
       const route = {
         provider: String(value.provider || "").trim().toLowerCase(),
-        model: String(value.model || "").trim(),
+        model: normalizeModel(String(value.provider || "").trim().toLowerCase(), value.model),
       };
       const reasoningEffort = String(value.reasoning_effort || "").trim();
       if (reasoningEffort) route.reasoning_effort = reasoningEffort;
@@ -82,7 +93,7 @@ function normalizeRoutes(raw) {
 function cleanProfile(value, duty) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const provider = String(value.provider || "").trim().toLowerCase();
-  const model = String(value.model || "").trim();
+  const model = normalizeModel(provider, value.model);
   if (!PROVIDERS.includes(provider) || !PROVIDER_MODELS[provider].includes(model)) return null;
   const out = { mode: cleanMode(duty, value.mode) || starterMode(duty), provider, model };
   for (const key of ["role", "instructions", "reasoning_effort"]) {

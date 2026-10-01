@@ -734,6 +734,13 @@ describe("declaration commands", () => {
   beforeEach(() => seed([todo(1), todo(2), todo(3, { project: "other-board" })]));
   afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
+  it("add refuses the retired --change legacy-root flag and creates no task", () => {
+    const out = refuse("add", "old root", "--change");
+    expect(out).toContain("todos add --change");
+    expect(out).toContain('cli change new "<title>"');
+    expect(loadBoard(file).todos).toHaveLength(3);
+  });
+
   it("produces add declares outputs and produces list reads them back", () => {
     run("produces", "add", "1", "scripts/cli/board/todos.mjs");
     run("produces", "add", "#1", "scripts/cli/board/todos.test.mjs");
