@@ -225,6 +225,10 @@ function cmdExport(args) {
     const desc = typeof t.description === "string" ? t.description.replace(/\s+/g, " ").trim() : "";
     const change = (t.change_id && changes.get(t.change_id)) || (typeof t.change === "string" ? t.change : null);
     const row = { number: t.number ?? null, subject: t.subject ?? "", status };
+    const needs = (Array.isArray(t.depends_on) ? t.depends_on : [])
+      .map((id) => todos.find((candidate) => candidate.id === id)?.number)
+      .filter(Number.isInteger);
+    if (needs.length) row.needs = needs;
     if (t.priority) row.priority = t.priority;
     if (t.project) row.project = t.project;
     if (t.scheduled_for) row.scheduled_for = String(t.scheduled_for).slice(0, 10);
@@ -311,6 +315,39 @@ function boardByNumber() {
   );
 }
 
+function hasDependencyPath(from, target, byId) {
+  const seen = new Set();
+  const stack = [from.id];
+  while (stack.length) {
+    const id = stack.pop();
+    if (id === target.id) return true;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const task = byId.get(id);
+    for (const dependency of Array.isArray(task?.depends_on) ? task.depends_on : []) {
+      if (!seen.has(dependency)) stack.push(dependency);
+    }
+  }
+  return false;
+}
+
+function withoutGraphLinks(items, byNumber) {
+  const byId = new Map([...byNumber.values()].filter((task) => typeof task.id === "string").map((task) => [task.id, task]));
+  let dropped = 0;
+  const kept = items.filter((item) => {
+    if (item.kind !== "link") return true;
+    const number = byNumber.get(item.number);
+    const related = byNumber.get(item.related);
+    const connected =
+      number && related &&
+      (hasDependencyPath(number, related, byId) || hasDependencyPath(related, number, byId));
+    if (!connected) return true;
+    dropped++;
+    return false;
+  });
+  return { items: kept, dropped };
+}
+
 // Validate one agent digest (a whole one or one part's): scalar types, items
 // shape; task identity is canonicalized from the board by number. Agent output
 // is advisory, so a stale subject or an id copied from another task must never
@@ -366,12 +403,14 @@ function digestFromDir(dir) {
   facts.sort((a, b) => FACT_KINDS.indexOf(a.kind) - FACT_KINDS.indexOf(b.kind));
   const count = (k) => facts.filter((f) => f.kind === k).length;
   const parts = FACT_KINDS.filter((k) => count(k)).map((k) => `${count(k)} ${FACT_LABELS[k]}`);
-  const links = rest.filter((it) => it.kind === "link").length;
+  const filtered = withoutGraphLinks(rest, byNumber);
+  const links = filtered.items.filter((it) => it.kind === "link").length;
   if (links) parts.push(`${links} связей`);
   return {
     headline: parts.length ? parts.join(" · ") : "Всё в порядке",
     summary: summaries.join("\n\n"),
-    items: [...facts, ...rest],
+    items: [...facts, ...filtered.items],
+    droppedLinks: filtered.dropped,
   };
 }
 
@@ -385,9 +424,11 @@ function cmdPublish(args) {
   const { flags } = parseArgs(args);
   let input;
   let items;
+  let droppedLinks = 0;
   if (typeof flags.dir === "string") {
     input = digestFromDir(flags.dir);
     items = input.items;
+    droppedLinks = input.droppedLinks;
   } else {
     const raw = readInput(flags);
     try {
@@ -422,6 +463,7 @@ function cmdPublish(args) {
   process.stdout.write(
     `ok: published digest (${items.length} item(s)) -> ${file}\n`,
   );
+  if (typeof flags.dir === "string") process.stdout.write(`отброшено связей по графу: ${droppedLinks}\n`);
 }
 
 function cmdShow(args) {

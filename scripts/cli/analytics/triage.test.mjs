@@ -122,6 +122,14 @@ describe("triage export: facts and trimming", () => {
     expect(t.excerpt).toHaveLength(160);
   });
 
+  it("includes dependency numbers as needs and omits an empty needs", () => {
+    writeBoard([task(1), task(2, { depends_on: ["id-1"] }), task(3, { depends_on: [] })]);
+    const tasks = flat().tasks;
+    expect(tasks.find((t) => t.number === 2).needs).toEqual([1]);
+    expect(tasks.find((t) => t.number === 1)).not.toHaveProperty("needs");
+    expect(tasks.find((t) => t.number === 3)).not.toHaveProperty("needs");
+  });
+
   it("drops old done and undated backlog, keeps recent done and dated backlog", () => {
     writeBoard([
       task(1, { status: "done", updated_at: ts("2026-09-25") }),
@@ -270,6 +278,38 @@ describe("triage publish --dir", () => {
     writePart(units[0].digest, { items: [{ kind: "link", number: 1, subject: "s" }] });
     expect(() => call(["publish", "--dir", exportDir()])).toThrow("exit 1");
     expect(err).toContain("related");
+  });
+
+  it("drops links connected by direct dependency edges and reports the count", () => {
+    writeBoard([task(1), task(2, { depends_on: ["id-1"] })]);
+    const { units } = exportBoard();
+    writePart(units[0].digest, { items: [{ kind: "link", number: 2, subject: "task 2", related: 1 }] });
+    call(["publish", "--dir", exportDir()]);
+    expect(JSON.parse(readFileSync(digestFile(), "utf8")).items).toEqual([]);
+    expect(out).toContain("отброшено связей по графу: 1");
+  });
+
+  it("drops links connected by a transitive dependency path in either direction", () => {
+    writeBoard([task(1), task(2, { depends_on: ["id-1"] }), task(3, { depends_on: ["id-2"] })]);
+    const { units } = exportBoard();
+    writePart(units[0].digest, {
+      items: [
+        { kind: "link", number: 3, subject: "task 3", related: 1 },
+        { kind: "link", number: 1, subject: "task 1", related: 3 },
+      ],
+    });
+    call(["publish", "--dir", exportDir()]);
+    expect(JSON.parse(readFileSync(digestFile(), "utf8")).items).toEqual([]);
+    expect(out).toContain("отброшено связей по графу: 2");
+  });
+
+  it("keeps a useful link inside one change when no dependency path exists", () => {
+    writeBoard([task(1, { change_id: "c1" }), task(2, { change_id: "c1" })], [{ id: "c1", title: "same change" }]);
+    const { units } = exportBoard();
+    writePart(units[0].digest, { items: [{ kind: "link", number: 2, subject: "task 2", related: 1, note: "учесть результат" }] });
+    call(["publish", "--dir", exportDir()]);
+    expect(JSON.parse(readFileSync(digestFile(), "utf8")).items).toMatchObject([{ kind: "link", number: 2, related: 1 }]);
+    expect(out).toContain("отброшено связей по графу: 0");
   });
 });
 

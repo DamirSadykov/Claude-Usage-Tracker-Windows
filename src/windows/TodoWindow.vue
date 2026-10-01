@@ -870,9 +870,10 @@ async function loadTriageDigest() {
   }
 }
 
-// Display order: most urgent finding first, advisory suggestions last. The kinds
-// mirror triage.rs::KINDS; the order here is a UI choice.
-const TRIAGE_KIND_ORDER = ["overdue", "stale", "no_priority", "link", "suggestion"] as const;
+// Display the actionable context first; mechanical facts remain available below.
+// The kinds mirror triage.rs::KINDS; the order here is a UI choice.
+const TRIAGE_KIND_ORDER = ["link", "suggestion", "overdue", "stale", "no_priority"] as const;
+const TRIAGE_FACT_KINDS = new Set(["overdue", "stale", "no_priority"]);
 const TRIAGE_KIND_LABEL: Record<string, string> = {
   link: "triageKindLink",
   overdue: "triageKindOverdue",
@@ -899,6 +900,21 @@ const triageGroups = computed<{ kind: string; items: DigestItem[] }[]>(() => {
   return out;
 });
 
+const collapsedTriageKinds = ref<Set<string>>(new Set(TRIAGE_FACT_KINDS));
+function triageGroupIsFact(kind: string): boolean {
+  return TRIAGE_FACT_KINDS.has(kind);
+}
+function triageGroupExpanded(kind: string): boolean {
+  return !triageGroupIsFact(kind) || !collapsedTriageKinds.value.has(kind);
+}
+function toggleTriageGroup(kind: string) {
+  if (!triageGroupIsFact(kind)) return;
+  const next = new Set(collapsedTriageKinds.value);
+  if (next.has(kind)) next.delete(kind);
+  else next.add(kind);
+  collapsedTriageKinds.value = next;
+}
+
 const triageHeadline = computed(() => {
   const h = triageDigest.value?.headline?.trim();
   if (h) return h;
@@ -910,6 +926,12 @@ const triageHeadline = computed(() => {
 function triageKindLabel(kind: string): string {
   const key = TRIAGE_KIND_LABEL[kind];
   return key ? t(key) : kind;
+}
+
+function triageGroupToggleLabel(kind: string): string {
+  return t(triageGroupExpanded(kind) ? "triageGroupCollapse" : "triageGroupExpand", {
+    group: triageKindLabel(kind),
+  });
 }
 
 // Empty/garbage timestamp → "" (mirrors fmtTime) so a hand-edited digest shows
@@ -1612,12 +1634,26 @@ onUnmounted(() => {
                   {{ t("triageCardClean") }}
                 </div>
                 <div v-for="g in triageGroups" :key="g.kind" class="tw-triage-group">
-                  <div class="tw-triage-group-head" :class="`k-${g.kind}`">
+                  <button
+                    v-if="triageGroupIsFact(g.kind)"
+                    type="button"
+                    class="tw-triage-group-head tw-triage-group-toggle"
+                    :class="[`k-${g.kind}`, { collapsed: !triageGroupExpanded(g.kind) }]"
+                    :aria-expanded="triageGroupExpanded(g.kind)"
+                    :aria-label="triageGroupToggleLabel(g.kind)"
+                    @click="toggleTriageGroup(g.kind)"
+                  >
+                    <span class="tw-triage-group-caret" aria-hidden="true"></span>
+                    <span class="tw-triage-dot"></span>
+                    <span>{{ triageKindLabel(g.kind) }}</span>
+                    <span class="tw-triage-count">{{ g.items.length }}</span>
+                  </button>
+                  <div v-else class="tw-triage-group-head" :class="`k-${g.kind}`">
                     <span class="tw-triage-dot"></span>
                     <span>{{ triageKindLabel(g.kind) }}</span>
                     <span class="tw-triage-count">{{ g.items.length }}</span>
                   </div>
-                  <ul class="tw-triage-list">
+                  <ul v-if="triageGroupExpanded(g.kind)" class="tw-triage-list">
                     <li v-for="(it, i) in g.items" :key="i" class="tw-triage-item">
                       <div class="tw-triage-line">
                         <a
@@ -3793,6 +3829,32 @@ onUnmounted(() => {
   font-weight: 600;
   letter-spacing: 0.02em;
   color: var(--text-2);
+}
+.tw-triage-group-toggle {
+  width: fit-content;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.tw-triage-group-toggle:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+.tw-triage-group-caret {
+  flex: 0 0 10px;
+  color: var(--text-3);
+  font-size: 12px;
+  text-align: center;
+}
+.tw-triage-group-caret::before {
+  content: "\25be";
+}
+.tw-triage-group-toggle.collapsed .tw-triage-group-caret::before {
+  content: "\25b8";
 }
 .tw-triage-dot {
   width: 7px;

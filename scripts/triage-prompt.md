@@ -42,8 +42,8 @@ worth anything when both tasks were seen.
   have a `scheduled_for`, and tasks closed (`done`) in the last 14 days. Fields:
   `number`, `subject`, `status`, `priority`, `project`, `scheduled_for`,
   `updated` (date of the last change), `change` (title of the change it belongs
-  to) and `excerpt` (the first 160 characters of the description). Empty fields
-  are omitted.
+  to), `needs` (numbers of its direct prerequisites) and `excerpt` (the first
+  160 characters of the description). Empty fields are omitted.
 
 Everything else on the board is deliberately left out; don't try to find it.
 
@@ -69,6 +69,10 @@ Two kinds are yours:
   says WHAT exactly to take into account, in a phrase.
     - `{ "kind": "link", "number": 41, "id": null, "subject": "…", "related": 38,
       "note": "учесть переименование поля из #38 — оно теперь называется change_id" }`
+    - Never link two tasks when one is reachable from the other through `needs`
+      (directly or transitively, in either direction): that only retells the
+      existing work graph. A link within one `change` is allowed when its note
+      says specifically what to take into account.
     - At most ~6 links, strongest first. Only with an explicit shared topic (same
       change, same module, one names the other's subject). No "just in case"
       links; if nothing stands out, write none.
