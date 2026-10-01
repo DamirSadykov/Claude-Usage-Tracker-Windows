@@ -669,7 +669,7 @@ interface TriageSchedule {
 }
 const schedEnabled = ref(false);
 const schedTime = ref("08:00");
-const schedModel = ref("haiku");
+const schedModel = ref("claude-haiku-4-5-20251001");
 const schedLastRun = ref<string | null>(null);
 const schedLastError = ref<string | null>(null);
 const triageRunning = ref(false);
@@ -679,7 +679,7 @@ async function loadTriageSchedule() {
     const s = await invoke<TriageSchedule>("get_triage_schedule");
     schedEnabled.value = s.enabled;
     schedTime.value = s.time || "08:00";
-    schedModel.value = s.model || "haiku";
+    schedModel.value = s.model || "claude-haiku-4-5-20251001";
     schedLastRun.value = s.last_run;
     schedLastError.value = s.last_error;
   } catch {
@@ -1914,9 +1914,9 @@ function handleSave() {
             v-model="schedModel"
             @change="saveTriageSchedule"
           >
-            <option value="haiku">Haiku</option>
-            <option value="sonnet">Sonnet</option>
-            <option value="opus">Opus</option>
+            <option value="claude-haiku-4-5-20251001">Haiku</option>
+            <option value="claude-sonnet-5-5">Sonnet</option>
+            <option value="claude-opus-5-5">Opus</option>
           </select>
         </div>
         <div class="budget-suggest" style="margin-top: 10px">

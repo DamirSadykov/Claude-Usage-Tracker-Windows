@@ -74,6 +74,7 @@ export interface DigestItem {
     id?: string;
     subject: string;
     note: string;
+    related?: number;
 }
 
 export interface TriageDigest {

@@ -7,11 +7,12 @@
 //! (we gate on "last completed run date != today", not on an exact tick).
 //!
 //! The pass is deterministic on both ends, with the LLM only in the middle:
-//!   1. WE export the whole board (`cli.mjs todos list --all --json`) to a staging file.
-//!   2. A HEADLESS `claude -p` reads that file and WRITES a digest JSON — its only
-//!      tools are `Read` and `Write` (no shell, no network), so it cannot touch the
-//!      board and cannot stall on an interactive permission prompt.
-//!   3. WE publish the digest the agent wrote (`cli.mjs triage publish`).
+//!   1. WE export compact, ready-fact extracts into a staging directory.
+//!   2. A HEADLESS `claude -p` reads each worthwhile part and writes its part digest;
+//!      its only tools are `Read` and `Write` (no shell, no network), so it cannot
+//!      touch the board or stall on an interactive permission prompt.
+//!   3. WE publish the directory (`cli.mjs triage publish --dir`), assembling facts
+//!      and every successfully written part digest.
 //! Steps 1 and 3 are plain CLI calls we make ourselves, so a weak/cheap model that
 //! reliably reads-a-file-and-writes-a-file is enough — the fragile "remember to run
 //! the publish command" step is no longer the model's job. The existing triage
@@ -22,19 +23,24 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
-/// The triage prompt template, baked into the binary. `<CLI>` and `<STAGING>` are
-/// substituted with real absolute paths at run time. Mirrors scripts/triage-prompt.md.
+/// The triage prompt template, baked into the binary. Its part-specific placeholders
+/// are substituted with absolute paths and unit details at run time.
 const PROMPT_TEMPLATE: &str = include_str!("../../../scripts/triage-prompt.md");
 
 /// Models offered for the nightly run. Haiku is the default — a daily automated
-/// job kept cheap. Keep in lockstep with the model `<select>` in TodoWindow.vue.
-const MODELS: [&str; 3] = ["haiku", "sonnet", "opus"];
+/// job kept cheap. Explicit ids, as in the agent profiles. Keep in lockstep with
+/// the model `<select>` in SettingsPanel.vue.
+const MODELS: [&str; 3] = [
+    "claude-haiku-4-5-20251001",
+    "claude-sonnet-5-5",
+    "claude-opus-5-5",
+];
 
 fn default_time() -> String {
     "08:00".to_string()
 }
 fn default_model() -> String {
-    "haiku".to_string()
+    MODELS[0].to_string()
 }
 
 /// User-facing config + last-run bookkeeping, persisted next to the board as
@@ -117,10 +123,12 @@ pub fn reset_prompt(data_dir: &Path) -> Result<(), String> {
 
 /// Read the config; a missing or malformed file yields defaults.
 pub fn load(data_dir: &Path) -> ScheduleConfig {
-    std::fs::read_to_string(config_path(data_dir))
+    let mut cfg: ScheduleConfig = std::fs::read_to_string(config_path(data_dir))
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    cfg.model = normalize_model(&cfg.model);
+    cfg
 }
 
 /// Write the config atomically (temp + rename), matching the rest of the app.
@@ -144,13 +152,16 @@ pub fn normalize_time(t: &str) -> Option<String> {
     Some(format!("{h:02}:{m:02}"))
 }
 
-/// Snap a requested model to a known one, defaulting to haiku.
+/// Snap a requested model to a known id; the old `haiku/sonnet/opus` aliases map
+/// to their ids, anything else falls back to the default.
 pub fn normalize_model(m: &str) -> String {
     let m = m.trim().to_lowercase();
-    if MODELS.contains(&m.as_str()) {
-        m
-    } else {
-        default_model()
+    match m.as_str() {
+        "haiku" => MODELS[0].to_string(),
+        "sonnet" => MODELS[1].to_string(),
+        "opus" => MODELS[2].to_string(),
+        _ if MODELS.contains(&m.as_str()) => m,
+        _ => default_model(),
     }
 }
 
@@ -206,7 +217,7 @@ fn claude_command(claude: &Path) -> Command {
     }
 }
 
-/// Locate `node` to run our own `cli.mjs` calls (board export + publish). Prefer
+/// Locate `node` to run our own `cli.mjs` calls (extract export + publish). Prefer
 /// PATH via `where`; fall back to a bare `node` (let the OS resolve it). None only
 /// if even that can't be constructed — in practice `node` is always present, since
 /// the same `cli.mjs` powers the session hook.
@@ -228,7 +239,7 @@ fn resolve_node() -> PathBuf {
 }
 
 /// Run `node <cli_path> <args…>` to completion, capturing output. Used for the two
-/// deterministic CLI steps (export the board, publish the digest) that bracket the
+/// deterministic CLI steps (export the extract, publish the digest) that bracket the
 /// headless agent run.
 fn run_node(node: &Path, cli_path: &str, args: &[&str]) -> Result<std::process::Output, String> {
     let mut cmd = Command::new(node);
@@ -292,25 +303,41 @@ fn append_log(log: &Path, msg: &str) {
     }
 }
 
-/// Run ONE triage pass, blocking until done (call from a worker thread). Three
-/// deterministic steps bracket the LLM (see the module doc): WE export the board,
-/// a headless `claude -p` (tools: Read+Write only) reads it and writes a digest to
-/// a staging file, then WE publish that digest. `cli_path` is the absolute cc
+/// The small, stable portion of `units.json` the scheduler needs.  Keeping this
+/// deliberately narrower than the CLI's export format means adding diagnostics
+/// to the index cannot make an installed scheduler reject an otherwise valid run.
+#[derive(Debug, Deserialize)]
+struct TriageUnitsIndex {
+    units: Vec<TriageUnit>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TriageUnit {
+    name: String,
+    #[serde(default)]
+    projects: Vec<String>,
+    file: String,
+    digest: String,
+    agent: bool,
+}
+
+fn read_units_index(path: &Path) -> Result<TriageUnitsIndex, String> {
+    let body = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    serde_json::from_str(&body).map_err(|e| format!("cannot parse {}: {e}", path.display()))
+}
+
+/// Run ONE triage pass, blocking until done (call from a worker thread). The CLI
+/// first exports parts, then one agent reviews each worthwhile part, and finally
+/// the CLI assembles every available part digest. `cli_path` is the absolute cc
 /// `cli.mjs`. Every run is appended to `triage-runs.log` beside the board.
 pub fn run_triage(home: &Path, data_dir: &Path, cli_path: &str, model: &str) -> Result<(), String> {
-    let claude = resolve_claude(home)
-        .ok_or_else(|| "claude CLI not found (looked in ~/.local/bin and PATH)".to_string())?;
     let node = resolve_node();
 
-    // Staging dir isolated from the board, so a stray Write can't reach todos.json.
-    // The agent's whole world is these two files: it READS `board.json` and WRITES
-    // `triage-staging.json`.
+    // Staging dir isolated from the board. Each agent gets exactly one exported
+    // part to read and one adjacent digest file to write.
     let staging_dir = data_dir.join("triage-tmp");
     std::fs::create_dir_all(&staging_dir).map_err(|e| e.to_string())?;
-    let board = staging_dir.join("board.json");
-    let staging = staging_dir.join("triage-staging.json");
-    let board_s = board.to_string_lossy().replace('\\', "/");
-    let staging_s = staging.to_string_lossy().replace('\\', "/");
     let staging_dir_s = staging_dir.to_string_lossy().replace('\\', "/");
 
     let log = data_dir.join("triage-runs.log");
@@ -322,87 +349,162 @@ pub fn run_triage(home: &Path, data_dir: &Path, cli_path: &str, model: &str) -> 
         &format!("\n===== triage run {stamp} (model={model}) ====="),
     );
 
-    // Step 1 — export the board for the agent to read. Deterministic; if this fails
-    // there's nothing to triage, so bail before spending a model call. `--all` spans
-    // every project: `run_node` doesn't set a cwd, so a bare `list` would filter by
-    // the app process's working dir (not a project name) and export an empty board.
-    let board_out = run_node(&node, cli_path, &["todos", "list", "--all", "--json"])?;
+    // Step 1 — export compact, manually grouped parts. `--today` pins the
+    // deterministic facts; without this index there is nothing to review.
+    let board_out = run_node(
+        &node,
+        cli_path,
+        &[
+            "triage",
+            "export",
+            "--today",
+            &today,
+            "--out-dir",
+            &staging_dir_s,
+        ],
+    )?;
     if !board_out.status.success() {
         let err = String::from_utf8_lossy(&board_out.stderr);
         append_log(&log, &format!("[board export failed] {err}"));
         return Err(format!(
-            "failed to export board (todos list): {}",
+            "failed to export board (triage export): {}",
             err.trim()
         ));
     }
-    std::fs::write(&board, &board_out.stdout)
-        .map_err(|e| format!("failed to write board.json: {e}"))?;
-    // Old digest from a previous run must not be mistaken for this run's output.
-    let _ = std::fs::remove_file(&staging);
+    append_log(&log, &String::from_utf8_lossy(&board_out.stdout));
 
-    // Step 2 — the headless agent: Read board.json, Write the digest. Read+Write are
-    // its ONLY tools, so it can't mutate the board and never hits an interactive
-    // permission prompt (the failure mode of giving it a shell command to run).
-    // Use the user's custom prompt if they set one in settings, else the baked
-    // template. Placeholders are substituted the same way regardless.
+    let index = read_units_index(&staging_dir.join("units.json"))?;
+    // Do this ourselves as well as relying on export's cleanup: a stale digest
+    // must never be publishable if export's cleanup changes in a future CLI.
+    for entry in std::fs::read_dir(&staging_dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        if entry.file_type().map_err(|e| e.to_string())?.is_file()
+            && entry
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".digest.json")
+        {
+            std::fs::remove_file(entry.path()).map_err(|e| e.to_string())?;
+        }
+    }
+
     let (template, _is_custom) = load_prompt(data_dir);
-    let prompt = template
-        .replace("<BOARD>", &board_s)
-        .replace("<STAGING>", &staging_s)
-        .replace("<TODAY>", &today);
+    let agent_total = index.units.iter().filter(|u| u.agent).count();
+    let claude = if agent_total > 0 {
+        resolve_claude(home)
+    } else {
+        None
+    };
+    let mut agent_successes = 0;
+    let mut undiscarded = Vec::new();
+    for unit in index.units.into_iter().filter(|u| u.agent) {
+        let Some(claude) = claude.as_deref() else {
+            append_log(
+                &log,
+                &format!(
+                    "[unit {} failed] claude CLI not found (looked in ~/.local/bin and PATH)",
+                    unit.name
+                ),
+            );
+            continue;
+        };
+        let board = staging_dir.join(&unit.file);
+        let digest = staging_dir.join(&unit.digest);
+        let board_s = board.to_string_lossy().replace('\\', "/");
+        let digest_s = digest.to_string_lossy().replace('\\', "/");
+        let unit_label = if unit.projects.is_empty() {
+            unit.name.clone()
+        } else {
+            format!("{} (проекты: {})", unit.name, unit.projects.join(", "))
+        };
+        let prompt = template
+            .replace("<BOARD>", &board_s)
+            .replace("<STAGING>", &digest_s)
+            .replace("<TODAY>", &today)
+            .replace("<UNIT>", &unit_label);
 
-    let mut cmd = claude_command(&claude);
-    cmd.args([
-        "-p",
-        "--model",
-        model,
-        "--add-dir",
-        &staging_dir_s,
-        "--allowedTools",
-        "Read",
-        "Write",
-    ])
-    // Neutral cwd: the prompt uses absolute paths, and running outside any repo
-    // avoids a project SessionStart hook injecting unrelated phase context.
-    .current_dir(data_dir)
-    .stdin(std::process::Stdio::piped())
-    .stdout(std::process::Stdio::piped())
-    .stderr(std::process::Stdio::piped());
-    no_window(&mut cmd);
+        let mut cmd = claude_command(claude);
+        cmd.args([
+            "-p",
+            "--model",
+            model,
+            "--add-dir",
+            &staging_dir_s,
+            "--allowedTools",
+            "Read",
+            "Write",
+        ])
+        .current_dir(data_dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+        no_window(&mut cmd);
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("failed to launch claude: {e}"))?;
-    // The prompt (~a few KB) fits the OS pipe buffer, so write-then-wait can't
-    // deadlock. Dropping stdin closes it so `claude -p` starts.
-    if let Some(mut sin) = child.stdin.take() {
-        use std::io::Write;
-        let _ = sin.write_all(prompt.as_bytes());
+        let outcome = (|| -> Result<(), String> {
+            let mut child = cmd
+                .spawn()
+                .map_err(|e| format!("failed to launch claude: {e}"))?;
+            if let Some(mut sin) = child.stdin.take() {
+                use std::io::Write;
+                sin.write_all(prompt.as_bytes())
+                    .map_err(|e| e.to_string())?;
+            }
+            let out = child.wait_with_output().map_err(|e| e.to_string())?;
+            append_log(&log, &String::from_utf8_lossy(&out.stdout));
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if !stderr.trim().is_empty() {
+                append_log(&log, &format!("[{} stderr] {stderr}", unit.name));
+            }
+            if !out.status.success() {
+                return Err(format!(
+                    "claude exited with code {}",
+                    out.status.code().unwrap_or(-1)
+                ));
+            }
+            if !digest.is_file() {
+                return Err(format!("agent produced no digest ({})", unit.digest));
+            }
+            Ok(())
+        })();
+        match outcome {
+            Ok(()) => {
+                agent_successes += 1;
+                append_log(
+                    &log,
+                    &format!("----- {} published for assembly -----", unit.name),
+                );
+            }
+            Err(err) => {
+                if digest.is_file() {
+                    if let Err(remove_err) = std::fs::remove_file(&digest) {
+                        undiscarded.push(unit.name.clone());
+                        append_log(
+                            &log,
+                            &format!(
+                                "[unit {} failed] could not discard {}: {remove_err}",
+                                unit.name,
+                                digest.display()
+                            ),
+                        );
+                    }
+                }
+                append_log(&log, &format!("[unit {} failed] {err}", unit.name));
+            }
+        }
     }
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
-    append_log(&log, &String::from_utf8_lossy(&out.stdout));
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    if !stderr.trim().is_empty() {
-        append_log(&log, &format!("[stderr] {stderr}"));
-    }
-    let code = out.status.code().unwrap_or(-1);
-    append_log(&log, &format!("----- agent exit {code} -----"));
-    if !out.status.success() {
+
+    if !undiscarded.is_empty() {
         return Err(format!(
-            "claude exited with code {code} (see triage-runs.log)"
+            "failed parts left digests that could not be removed ({}); not publishing",
+            undiscarded.join(", ")
         ));
     }
-    if !staging.exists() {
-        return Err("agent produced no digest (triage-staging.json missing)".to_string());
-    }
 
-    // Step 3 — publish the digest the agent wrote. `triage publish` validates the
-    // shape and atomically swaps it into triage-digest.json; the watcher takes it
-    // from there. A bad/empty digest fails here with a clear message.
+    // Step 3 — assemble facts plus all part digests that made it through step 2.
     let pub_out = run_node(
         &node,
         cli_path,
-        &["triage", "publish", "--file", &staging_s],
+        &["triage", "publish", "--dir", &staging_dir_s],
     )?;
     append_log(&log, &String::from_utf8_lossy(&pub_out.stdout));
     let pub_err = String::from_utf8_lossy(&pub_out.stderr);
@@ -411,7 +513,11 @@ pub fn run_triage(home: &Path, data_dir: &Path, cli_path: &str, model: &str) -> 
     }
     if pub_out.status.success() {
         append_log(&log, "----- published -----");
-        Ok(())
+        if agent_total > 0 && agent_successes == 0 {
+            Err("all triage agent parts failed (see triage-runs.log)".to_string())
+        } else {
+            Ok(())
+        }
     } else {
         Err(format!("triage publish failed: {}", pub_err.trim()))
     }
@@ -434,10 +540,16 @@ mod tests {
 
     #[test]
     fn normalize_model_snaps_to_known() {
-        assert_eq!(normalize_model("Sonnet"), "sonnet");
-        assert_eq!(normalize_model("opus"), "opus");
-        assert_eq!(normalize_model("gpt"), "haiku");
-        assert_eq!(normalize_model(""), "haiku");
+        assert_eq!(normalize_model("claude-opus-5-5"), "claude-opus-5-5");
+        assert_eq!(normalize_model("gpt"), "claude-haiku-4-5-20251001");
+        assert_eq!(normalize_model(""), "claude-haiku-4-5-20251001");
+    }
+
+    #[test]
+    fn normalize_model_translates_old_aliases() {
+        assert_eq!(normalize_model("haiku"), "claude-haiku-4-5-20251001");
+        assert_eq!(normalize_model("Sonnet"), "claude-sonnet-5-5");
+        assert_eq!(normalize_model("opus"), "claude-opus-5-5");
     }
 
     #[test]
@@ -459,7 +571,7 @@ mod tests {
         let cfg = ScheduleConfig {
             enabled: true,
             time: "07:15".into(),
-            model: "sonnet".into(),
+            model: "claude-sonnet-5-5".into(),
             last_run: Some("2026-06-24".into()),
             last_error: None,
         };
@@ -467,7 +579,7 @@ mod tests {
         let back = load(&dir);
         assert!(back.enabled);
         assert_eq!(back.time, "07:15");
-        assert_eq!(back.model, "sonnet");
+        assert_eq!(back.model, "claude-sonnet-5-5");
         assert_eq!(back.last_run.as_deref(), Some("2026-06-24"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -479,6 +591,39 @@ mod tests {
         let cfg = load(&dir);
         assert!(!cfg.enabled);
         assert_eq!(cfg.time, "08:00");
-        assert_eq!(cfg.model, "haiku");
+        assert_eq!(cfg.model, "claude-haiku-4-5-20251001");
+    }
+
+    #[test]
+    fn units_index_reads_only_scheduler_fields() {
+        let dir = std::env::temp_dir().join("cut_triage_units_index_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("units.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "today": "2026-10-01",
+                "units": [{
+                    "name": "Core",
+                    "projects": ["tracker", "cli"],
+                    "file": "unit-1.json",
+                    "digest": "unit-1.digest.json",
+                    "agent": true,
+                    "tasks": 3,
+                    "facts": 1
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        let index = read_units_index(&path).unwrap();
+        assert_eq!(index.units.len(), 1);
+        let unit = &index.units[0];
+        assert_eq!(unit.name, "Core");
+        assert_eq!(unit.projects, ["tracker", "cli"]);
+        assert_eq!(unit.file, "unit-1.json");
+        assert_eq!(unit.digest, "unit-1.digest.json");
+        assert!(unit.agent);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

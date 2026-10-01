@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 /// are facts the triage agent surfaced about the board; `suggestion` is an
 /// advisory move it proposed (the agent never applies it — the board is the
 /// user's). Mirrors triage.mjs::KINDS.
-pub const KINDS: [&str; 4] = ["stale", "overdue", "no_priority", "suggestion"];
+pub const KINDS: [&str; 5] = ["stale", "overdue", "no_priority", "suggestion", "link"];
 
 /// One line in the digest: a finding or a suggestion, loosely tied back to a
 /// todo by `number`/`id` (either may be absent for a board-wide note).
@@ -33,6 +33,8 @@ pub struct DigestItem {
     pub subject: String,
     #[serde(default)]
     pub note: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub related: Option<u32>,
 }
 
 fn default_version() -> u32 {
@@ -110,6 +112,19 @@ mod tests {
         assert_eq!(d.items[1].number, None);
         assert!(KINDS.contains(&d.items[1].kind.as_str()));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn link_item_carries_related_and_old_items_omit_it() {
+        let link: DigestItem = serde_json::from_str(
+            r#"{"kind":"link","number":5,"subject":"y","note":"n","related":3}"#,
+        )
+        .unwrap();
+        assert!(KINDS.contains(&link.kind.as_str()));
+        assert_eq!(link.related, Some(3));
+        let old: DigestItem = serde_json::from_str(r#"{"kind":"stale","subject":"s"}"#).unwrap();
+        assert_eq!(old.related, None);
+        assert!(!serde_json::to_string(&old).unwrap().contains("related"));
     }
 
     #[test]

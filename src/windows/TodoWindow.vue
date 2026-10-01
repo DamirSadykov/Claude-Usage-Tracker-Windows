@@ -872,8 +872,9 @@ async function loadTriageDigest() {
 
 // Display order: most urgent finding first, advisory suggestions last. The kinds
 // mirror triage.rs::KINDS; the order here is a UI choice.
-const TRIAGE_KIND_ORDER = ["overdue", "stale", "no_priority", "suggestion"] as const;
+const TRIAGE_KIND_ORDER = ["overdue", "stale", "no_priority", "link", "suggestion"] as const;
 const TRIAGE_KIND_LABEL: Record<string, string> = {
+  link: "triageKindLink",
   overdue: "triageKindOverdue",
   stale: "triageKindStale",
   no_priority: "triageKindNoPriority",
@@ -1626,6 +1627,8 @@ onUnmounted(() => {
                           >#{{ it.number }}</a
                         ><span v-else-if="it.number != null" class="tw-triage-num"
                           >#{{ it.number }}</span
+                        ><span v-if="it.kind === 'link' && it.related != null" class="tw-triage-num"
+                          > ← #{{ it.related }}</span
                         ><span class="tw-triage-subject">{{ it.subject }}</span>
                       </div>
                       <div v-if="it.note" class="tw-triage-note">{{ it.note }}</div>
@@ -3806,6 +3809,9 @@ onUnmounted(() => {
 }
 .tw-triage-group-head.k-no_priority .tw-triage-dot {
   background: var(--text-3);
+}
+.tw-triage-group-head.k-link .tw-triage-dot {
+  background: var(--success, #4ade80);
 }
 .tw-triage-group-head.k-suggestion .tw-triage-dot {
   background: var(--accent);

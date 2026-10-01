@@ -406,13 +406,25 @@ describe("runChange — gates", () => {
     const h = harness();
     const r = await go(data, "1", h.effects);
 
-    expect(h.calls.steps).toEqual([2, 3]);
+    expect(h.calls.steps).toEqual([2]);
+    expect(h.calls.reviews).toEqual([2]);
     expect(statusOf(r, 3)).toBe("review");
     expect(statusOf(r, 4)).toBe("queue");
     expect(r.stop.kind).toBe("gate");
     expect(r.stop.task.number).toBe(3);
     expect(r.stop.status).toBe("review");
     expect(r.stop.reason).toMatch(/kind manual/);
+  });
+
+  it("a manual node with produces still goes to the executor and the reviewer", async () => {
+    const data = board(changeRoot(1, [2]), task(2, { produces: ["docs/a.md"] }));
+    const h = harness();
+    const r = await go(data, "1", h.effects);
+
+    expect(h.calls.steps).toEqual([2]);
+    expect(h.calls.reviews).toEqual([2]);
+    expect(statusOf(r, 2)).toBe("review");
+    expect(r.stop.kind).toBe("gate");
   });
 
   it("treats an auto node WITHOUT a declared verify as a gate, not as auto", async () => {
