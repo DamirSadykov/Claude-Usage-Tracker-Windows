@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
+import ProjectAutocomplete from "../kernel/ProjectAutocomplete.vue";
 import { isNotDoneFilter, type TodoFilterField, type TodoFilters } from "./todoFilter";
 
 type FilterKey = TodoFilterField | "date";
@@ -12,7 +13,7 @@ const open = ref<FilterKey | "">("");
 let timer: ReturnType<typeof setTimeout> | undefined;
 const value = computed({ get: () => props.modelValue, set: (next) => emit("update:modelValue", next) });
 const searchEl = ref<HTMLInputElement | null>(null);
-const projectEl = ref<HTMLButtonElement | null>(null);
+const projectEl = ref<InstanceType<typeof ProjectAutocomplete> | null>(null);
 const toggle = (key: FilterKey) => { open.value = open.value === key ? "" : key; };
 const set = (key: keyof TodoFilters, next: string | boolean) => { value.value = { ...value.value, [key]: next }; };
 const clear = (key: keyof TodoFilters) => set(key, typeof value.value[key] === "boolean" ? false : "");
@@ -43,7 +44,7 @@ defineExpose({ focusSearch: () => searchEl.value?.focus(), focusProject: () => p
   <div class="tw-filters">
     <div class="tw-search"><input ref="searchEl" v-model="queryInput" class="tw-search-input" :placeholder="t('todoSearch')" @keydown.esc="clearQuery" /><button v-if="queryInput" class="tw-search-clear" type="button" :title="t('todoSearchClear')" @click="clearQuery">×</button></div>
     <div class="tw-filter-menu"><button class="tw-filter-chip" :class="{ active: hasStatusFilter }" type="button" @click="toggle('status')">{{ hasStatusFilter ? `${t('todoStatus')}: ${displayedStatusLabel}` : `+ ${t('todoFilterStatus')}` }}<span v-if="hasStatusFilter" class="tw-filter-clear" @click.stop="clearStatus">×</span></button><div v-if="open === 'status'" class="tw-filter-options"><button type="button" @click="showAllStatuses">{{ t('todoFilterStatus') }}</button><button v-for="[status, label] in statusOptions" :key="status" type="button" @click="select('status', status)">{{ label }}</button></div></div>
-    <div class="tw-filter-menu"><button ref="projectEl" class="tw-filter-chip" :class="{ active: !!value.project }" type="button" @click="toggle('project')">{{ value.project || `+ ${t('todoProject')}` }}<span v-if="value.project" class="tw-filter-clear" @click.stop="clear('project')">×</span></button><div v-if="open === 'project'" class="tw-filter-options"><button v-for="project in projects" :key="project" type="button" @click="select('project', project)">{{ project }}</button></div></div>
+    <ProjectAutocomplete ref="projectEl" class="tw-project-filter" :model-value="value.project" :options="projects" :placeholder="t('allProjects')" :max-suggestions="projects.length" clearable commit-on="select" width="150px" @update:model-value="set('project', $event)" />
     <div class="tw-filter-menu"><button class="tw-filter-chip" :class="{ active: !!value.priority }" type="button" @click="toggle('priority')">{{ priorityLabel ? `${t('todoPriority')}: ${priorityLabel}` : `+ ${t('todoPriority')}` }}<span v-if="priorityLabel" class="tw-filter-clear" @click.stop="clear('priority')">×</span></button><div v-if="open === 'priority'" class="tw-filter-options"><button v-for="[priority, label] in priorityOptions" :key="priority" type="button" @click="select('priority', priority)">{{ label }}</button></div></div>
     <div class="tw-filter-menu"><button class="tw-filter-chip" :class="{ active: !!value.createdBy }" type="button" @click="toggle('createdBy')">{{ authorLabel ? `${t('todoFilterAuthor')}: ${authorLabel}` : `+ ${t('todoFilterAuthor')}` }}<span v-if="authorLabel" class="tw-filter-clear" @click.stop="clear('createdBy')">×</span></button><div v-if="open === 'createdBy'" class="tw-filter-options"><button type="button" @click="select('createdBy', 'user')">{{ t('todoAuthorYou') }}</button><button type="button" @click="select('createdBy', 'claude')">{{ t('todoAuthorClaude') }}</button></div></div>
     <div class="tw-filter-menu"><button class="tw-filter-chip" :class="{ active: !!value.change }" type="button" @click="toggle('change')">{{ changeLabel ? `${t('todoFilterChange')}: ${changeLabel}` : `+ ${t('todoFilterChange')}` }}<span v-if="changeLabel" class="tw-filter-clear" @click.stop="clear('change')">×</span></button><div v-if="open === 'change'" class="tw-filter-options"><button type="button" @click="select('change', 'change')">{{ t('todoFilterChanges') }}</button><button type="button" @click="select('change', 'task')">{{ t('todoFilterTasks') }}</button></div></div>
@@ -56,6 +57,8 @@ defineExpose({ focusSearch: () => searchEl.value?.focus(), focusProject: () => p
 .tw-filter-menu { position: relative; }
 .tw-filter-chip { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; padding: 4px 8px; border: 1px dashed var(--stroke-strong); border-radius: var(--r-ctl); background: transparent; color: var(--text-3); font: 11px/1 var(--segoe); cursor: pointer; }
 .tw-filter-chip.active { border-style: solid; border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
+.tw-project-filter :deep(.pa-input) { padding: 4px 8px; border-radius: var(--r-ctl); font: 11px/1 var(--segoe); }
+.tw-project-filter :deep(.pa-input.clearable) { padding-right: 22px; }
 .tw-filter-clear { font-size: 15px; line-height: 10px; }
 .tw-search-clear { padding: 0 2px; border: 0; background: transparent; color: var(--text-3); font-size: 15px; line-height: 1; cursor: pointer; }
 .tw-search-clear:hover { color: var(--text); }

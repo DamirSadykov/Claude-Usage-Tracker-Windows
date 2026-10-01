@@ -190,6 +190,7 @@ const projects = computed(() => {
   for (const p of knownProjects.value) set.add(p);
   return [...set].sort();
 });
+const taskProjects = computed(() => [...new Set(todos.value.flatMap((t) => t.project ? [canonicalOf(t.project) ?? t.project] : []))].sort());
 
 
 const treeRows = computed<BoardTreeRow[]>(() => boardStore.rows.value.map((row) => ({
@@ -1628,7 +1629,7 @@ onUnmounted(() => {
         </div>
       </div>
       <div class="tw-spacer"></div>
-      <TodoFiltersBar v-if="viewMode === 'board'" ref="filtersBarRef" v-model="filters" :projects="projects" />
+      <TodoFiltersBar v-if="viewMode === 'board'" ref="filtersBarRef" v-model="filters" :projects="taskProjects" />
       <div v-else class="tw-search">
         <input ref="searchInputRef" v-model="search" class="tw-search-input" :placeholder="t('graphSearch')" @keydown.enter="onSearchEnter" @keydown.esc="search = ''" />
       </div>
