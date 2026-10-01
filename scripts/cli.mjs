@@ -24,6 +24,7 @@ const AREAS = {
   triage: "./cli/analytics/triage.mjs",
   corrections: "./cli/analytics/corrections.mjs",
   "task-cost": "./cli/analytics/task-cost.mjs",
+  trace: "./cli/analytics/trace.mjs",
   agents: "./cli/agents/agents.mjs",
   spec: "./cli/spec/spec.mjs",
   hook: "./cli/cc-hooks/hook.mjs",
@@ -88,6 +89,7 @@ function usage(code) {
       "  triage  <…>   publish/read the nightly-triage digest (publish / show / clear)\n" +
       "  corrections <…> user-corrections outcome metric, layer 1 (scan / label-template / eval)\n" +
       "  task-cost <…> session->task attribution for tokens-per-task (scan / publish)\n" +
+      "  trace     <…> restart-point reports and restart calibration\n" +
       "  agents  <…>   model/provider profiles used by autonomous task runs\n" +
       "  spec    <…>   spec registry (t#339): domains / show / refs / lint over docs/specs\n" +
       "  hook [--host claude|codex]  SessionStart context for an AI CLI\n" +

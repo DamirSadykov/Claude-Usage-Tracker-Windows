@@ -254,6 +254,7 @@ describe("trace views", () => {
         { index: 1, nodeId: "one", type: "read", value: 1 },
         { index: 2, nodeId: "two", type: "edit", value: 4 },
       ],
+      restartTailOverpayment: [],
     });
   });
   it("summarizes types and filters model calls while keeping their ancestors", () => {
@@ -293,6 +294,47 @@ describe("trace views", () => {
         ],
       },
     ]);
+  });
+  it("marks only the median restart scenario and charts its tail overpayment", () => {
+    const restartPoint = {
+      observed: { calls: 2, ctx: [10, 30], cached: [3, 13], firstEditCall: 1, ctxAtFirstEdit: 10, firstCachedShare: .3 },
+      scenarios: [
+        { rho: .25, k: 1, saveUsd: 1, savePct: 10, lastPositiveK: 1 },
+        { rho: .38, k: 1, saveUsd: .5, savePct: 5, lastPositiveK: 1 },
+        { rho: .64, k: null, saveUsd: 0, savePct: 0, lastPositiveK: null },
+      ],
+      modelVersion: 1,
+    };
+    const session = { ...container([first, second]), id: "restart-session", kind: "session" as const, name: "session", startedAt: 10, restartPoint };
+    expect(traceMarkers({ ...container([session]), children: [session] })[0].parts).toContainEqual(
+      { kind: "restart", attempt: null, role: null, restart: { rho: .38, p25SavePct: 10, medianSavePct: 5, p75SavePct: 0 } },
+    );
+    expect(traceSeries(session).restartTailOverpayment).toHaveLength(1);
+  });
+  it("does not invent a restart marker when the median scenario has no k", () => {
+    const session = {
+      ...container([first]), id: "no-restart", kind: "session" as const, name: "session", startedAt: 10,
+      restartPoint: { observed: { calls: 1, ctx: [10], cached: [3], firstEditCall: null, ctxAtFirstEdit: null, firstCachedShare: .3 }, scenarios: [{ rho: .38, k: null, saveUsd: 0, savePct: 0, lastPositiveK: null }], modelVersion: 1 },
+    };
+    expect(traceMarkers({ ...container([session]), children: [session] }).some((marker) => marker.kind === "restart")).toBe(false);
+  });
+  it("uses only parent turns for restart k and charges each tail call at its model read tariff", () => {
+    const subagent = container([modelCallNode({ id: "subagent-call", model: "gpt-5.6-terra", tokenBreakdown: { cacheRead: 999 } })]);
+    const parentFirst = modelCallNode({ id: "parent-first", model: "gpt-5.6-terra", calls: [{ id: "agent", name: "Agent", subagent }] });
+    const parentSecond = modelCallNode({ id: "parent-second", model: "gpt-5.6-terra", tokenBreakdown: { cacheRead: 0 } });
+    const parentThird = modelCallNode({ id: "parent-third", model: "gpt-5.6-terra", tokenBreakdown: { cacheRead: 0 } });
+    const session = {
+      ...container([parentFirst, parentSecond, parentThird]), id: "parent-session", kind: "session" as const, name: "session", startedAt: 10,
+      restartPoint: {
+        observed: { calls: 3, ctx: [1_000, 2_000, 3_000], cached: [0, 0, 0], firstEditCall: 1, ctxAtFirstEdit: 1_000, firstCachedShare: 0 },
+        scenarios: [{ rho: .38, k: 2, saveUsd: 0, savePct: 0, lastPositiveK: 2 }], modelVersion: 1,
+      },
+    };
+    expect(traceMarkers({ ...container([session]), children: [session] }).find((marker) => marker.parts.some((part) => part.kind === "restart"))?.index).toBe(3);
+    const tail = traceSeries(session).restartTailOverpayment;
+    expect(tail).toHaveLength(1);
+    expect(tail[0]?.nodeId).toBe("parent-third");
+    expect(tail[0]?.value).toBeCloseTo(.000064);
   });
   it("exports the design color table for every trace type", () => {
     expect(TRACE_TYPE_COLORS).toEqual({ read: "#4cc2ff", edit: "#6ccb5f", shell: "#b388ff", text: "#8a8a8a", agent: "#f0a0c8", web: "#e79878", other: "var(--text-4)" });

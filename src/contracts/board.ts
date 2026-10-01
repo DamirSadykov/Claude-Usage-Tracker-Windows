@@ -144,6 +144,46 @@ export interface WorkTurn {
   calls: WorkToolCall[];
 }
 
+/** Scenario output calculated by Rust for one candidate clean-agent restart. */
+export interface RestartScenario {
+  rho: number;
+  k: number | null;
+  saveUsd: number;
+  savePct: number;
+  lastPositiveK: number | null;
+}
+
+/** Observed transcript facts and model-versioned restart scenarios. */
+export interface RestartPoint {
+  observed: {
+    calls: number;
+    ctx: number[];
+    cached: number[];
+    firstEditCall: number | null;
+    ctxAtFirstEdit: number | null;
+    firstCachedShare: number | null;
+  };
+  scenarios: RestartScenario[];
+  modelVersion: number;
+}
+
+export interface TaskWorkContext {
+  mode: "fresh" | "fork" | "continued" | "unknown";
+  parentTask?: number | null;
+  parentSession?: string | null;
+  role?: "worker" | "review" | null;
+}
+
+export interface TaskWorkSession {
+  session: string;
+  from: string;
+  to: string;
+  source: string;
+  tree: WorkTree;
+  context: TaskWorkContext;
+  restartPoint: RestartPoint;
+}
+
 export interface TaskWorkAttempt {
   number: number;
   startedAt: string;
