@@ -3,7 +3,12 @@
   "providers": {
     "anthropic": {
       "label": "Anthropic",
-      "models": ["opus", "sonnet", "haiku"]
+      "models": ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-4-5-20251001"],
+      "aliases": {
+        "opus": "claude-opus-5-5",
+        "sonnet": "claude-sonnet-5-5",
+        "haiku": "claude-haiku-4-5-20251001"
+      }
     },
     "openai": {
       "label": "OpenAI",
@@ -36,7 +41,7 @@
     "worker": {
       "mode": "always",
       "provider": "anthropic",
-      "model": "sonnet",
+      "model": "claude-sonnet-5-5",
       "role": "worker",
       "reasoning_effort": "",
       "instructions": "Implement the declared task. Stay inside its scope and satisfy its concrete outputs and checks."
@@ -44,7 +49,7 @@
     "review": {
       "mode": "agent",
       "provider": "anthropic",
-      "model": "opus",
+      "model": "claude-opus-5-5",
       "role": "reviewer",
       "reasoning_effort": "",
       "instructions": "Act as the reviewer. Inspect correctness, regressions, tests and maintainability. Report concrete findings before the summary."

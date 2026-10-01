@@ -343,7 +343,7 @@ describe("runChange — lifecycle review", () => {
       },
       reviewStep: async ({ workerResult }) => {
         order.push(`review:${workerResult}`);
-        return { approved: true, ok: true, model: "opus", sessionId: "review-2", costUsd: 0 };
+        return { approved: true, ok: true, model: "claude-opus-5-5", sessionId: "review-2", costUsd: 0 };
       },
       runVerify: async () => {
         order.push("verify");
@@ -352,7 +352,7 @@ describe("runChange — lifecycle review", () => {
     });
     const r = await go(data, "1", h.effects);
     expect(order).toEqual(["worker", "review:implemented", "verify"]);
-    expect(r.steps[0].review).toMatchObject({ approved: true, model: "opus", session: "review-2" });
+    expect(r.steps[0].review).toMatchObject({ approved: true, model: "claude-opus-5-5", session: "review-2" });
   });
 
   // A reviewer reads the board as the step left it — in the agent-driven mode

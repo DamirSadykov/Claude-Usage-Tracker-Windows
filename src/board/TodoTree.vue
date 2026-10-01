@@ -7,11 +7,13 @@ const props = withDefaults(defineProps<{
   tree: readonly BoardTreeNode[];
   selectedId?: string | null;
   searching?: boolean;
+  flat?: boolean;
 }>(), { selectedId: null, searching: false });
 
 const emit = defineEmits<{
   select: [node: BoardTreeNode];
   "update:selectedId": [id: string | null];
+  "update:flat": [value: boolean];
   open: [node: BoardTreeNode];
 }>();
 
@@ -79,13 +81,13 @@ function toggle(node: BoardTreeNode): void {
 }
 
 function expandAll(): void {
-  const next = expandSelectedAncestors(props.tree, selectedId.value, new Set());
+  const next = expandSelectedAncestors(props.tree, selectedId.value, collapsedOutsideTree());
   collapsed.value = next;
   persistCollapsed(next);
 }
 
 function collapseAll(): void {
-  const next = new Set<string>();
+  const next = collapsedOutsideTree();
   const visit = (node: BoardTreeNode) => {
     if (node.kind !== "group" && node.children.length) next.add(node.id);
     node.children.forEach(visit);
@@ -94,6 +96,16 @@ function collapseAll(): void {
   const visibleSelection = expandSelectedAncestors(props.tree, selectedId.value, next);
   collapsed.value = visibleSelection;
   persistCollapsed(visibleSelection);
+}
+
+function collapsedOutsideTree(): Set<string> {
+  const visibleIds = new Set<string>();
+  const visit = (node: BoardTreeNode) => {
+    visibleIds.add(node.id);
+    node.children.forEach(visit);
+  };
+  props.tree.forEach(visit);
+  return new Set([...collapsed.value].filter((id) => !visibleIds.has(id)));
 }
 
 function toggleFromCaret(event: MouseEvent, node: BoardTreeNode): void {
@@ -218,6 +230,7 @@ watch(rows, () => scrollSelected(selectedId.value), { flush: "post" });
     <div class="todo-tree-actions">
       <button type="button" @click="expandAll">{{ t('todoTreeExpandAll') }}</button>
       <button type="button" @click="collapseAll">{{ t('todoTreeCollapseAll') }}</button>
+      <label class="todo-tree-flat"><input type="checkbox" :checked="flat" @change="emit('update:flat', ($event.target as HTMLInputElement).checked)">{{ t('todoTreeOnlyChanges') }}</label>
     </div>
     <div class="todo-tree-head">
       <span>{{ t('todoTreeColumns') }}</span><span>{{ t('todoTreeDone') }}</span><span>{{ t('todoTreeCost') }}</span>
@@ -234,7 +247,7 @@ watch(rows, () => scrollSelected(selectedId.value), { flush: "post" });
         @dblclick="open(row.node)"
       >
         <span class="todo-tree-toggle" :class="{ empty: !row.node.children.length, collapsed: shownCollapsed.has(row.node.id) }" @click="toggleFromCaret($event, row.node)"></span>
-        <span class="todo-tree-title"><span v-if="row.node.status" class="todo-tree-status" :class="statusClass(row.node.status)"></span><span v-if="row.node.number !== null" class="todo-tree-number">{{ row.node.kind === 'change' || row.node.kind === 'legacy' ? 'c#' : '#' }}{{ row.node.number }}</span>{{ row.node.kind === 'ungrouped' ? t('todoTreeWithoutChange') : row.node.title }}</span>
+        <span class="todo-tree-title"><span v-if="row.node.status" class="todo-tree-status" :class="statusClass(row.node.status)"></span><span v-if="row.node.number !== null" class="todo-tree-number">{{ row.node.kind === 'change' || row.node.kind === 'legacy' ? 'c#' : '#' }}{{ row.node.number }}</span>{{ row.node.kind === 'ungrouped' ? t('todoTreeWithoutChange') : row.node.title }}<small v-if="flat && (row.node.kind === 'change' || row.node.kind === 'legacy') && row.node.project" class="todo-tree-project">{{ row.node.project }}</small></span>
         <span v-if="row.node.kind !== 'task' && row.node.kind !== 'ungrouped'" class="todo-tree-progress" :class="{ complete: row.node.progress.done === row.node.progress.total }">{{ row.node.progress.done }}/{{ row.node.progress.total }}</span>
         <span v-else></span>
         <span v-if="row.node.kind !== 'ungrouped'" class="todo-tree-cost">{{ cost(row.node.cost) }}</span>
@@ -252,6 +265,8 @@ watch(rows, () => scrollSelected(selectedId.value), { flush: "post" });
 .todo-tree-actions { border-bottom: 1px solid var(--stroke); display: flex; gap: 6px; padding: 7px 10px; }
 .todo-tree-actions button { background: transparent; border: 1px solid var(--stroke); border-radius: 3px; color: var(--text-3); cursor: pointer; font: 600 10px var(--segoe); padding: 3px 6px; }
 .todo-tree-actions button:hover { background: var(--card-bg-hover); color: var(--text); }
+.todo-tree-flat { align-items: center; color: var(--text-3); cursor: pointer; display: inline-flex; font: 600 10px var(--segoe); gap: 4px; margin-left: auto; white-space: nowrap; }
+.todo-tree-flat input { accent-color: var(--accent); margin: 0; }
 .todo-tree-head { border-bottom: 1px solid var(--stroke); color: var(--text-4); display: grid; font-size: 10px; font-weight: 600; gap: 6px; grid-template-columns: minmax(0, 1fr) 62px 54px; letter-spacing: .09em; line-height: 1; padding: 8px 14px 7px 30px; text-transform: uppercase; }
 .todo-tree-head span:not(:first-child) { text-align: right; }
 .todo-tree-rows { flex: 1; min-height: 0; overflow: auto; padding: 4px 0; }
@@ -272,6 +287,7 @@ watch(rows, () => scrollSelected(selectedId.value), { flush: "post" });
 .todo-tree-status.status-done { background: var(--success); }
 .todo-tree-status.status-backlog { border: 1.5px dashed var(--text-4); }
 .todo-tree-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.todo-tree-project { color: var(--text-4); font: 400 10px var(--mono); margin-left: 7px; }
 .todo-tree-number { color: var(--text-3); font-family: var(--mono); margin-right: 5px; }
 .todo-tree-row.selected .todo-tree-number { color: var(--accent); }
 .todo-tree-progress, .todo-tree-cost { color: var(--text-4); font-family: var(--mono); font-size: 11px; font-variant-numeric: tabular-nums; text-align: right; }

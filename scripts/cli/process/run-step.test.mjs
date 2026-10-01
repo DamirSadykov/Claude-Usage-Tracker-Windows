@@ -899,7 +899,7 @@ describe("executeReview", () => {
       task: taskOf(data, "id-3"), workerResult: "implemented", cwd: tmp,
       claudeBin: [process.execPath, fakeClaude],
     });
-    expect(r).toMatchObject({ ok: true, approved: true, provider: "anthropic", model: "opus" });
+    expect(r).toMatchObject({ ok: true, approved: true, provider: "anthropic", model: "claude-opus-5-5" });
     const seen = JSON.parse(readFileSync(echo, "utf8"));
     expect(seen.argv).toContain("Read");
     expect(seen.argv).not.toContain("Edit");
@@ -940,7 +940,7 @@ describe("executeStep/executeReview · risk routing (t#741)", () => {
     const t = taskOf(data, "id-3");
     t.risk = "high";
     const r = await executeStep({ task: t, board: data, cwd: tmp, claudeBin: [process.execPath, fakeClaude] });
-    expect(r).toMatchObject({ ok: true, provider: "anthropic", model: "sonnet", route: { applied: false, risk: "high" } });
+    expect(r).toMatchObject({ ok: true, provider: "anthropic", model: "claude-sonnet-5-5", route: { applied: false, risk: "high" } });
     expect(r.route.note).toMatch(/no route configured for worker/);
   });
 
@@ -955,7 +955,7 @@ describe("executeStep/executeReview · risk routing (t#741)", () => {
     const t = taskOf(data, "id-3");
     const r = await executeStep({ task: t, board: data, cwd: tmp, claudeBin: [process.execPath, fakeClaude] });
     expect(r.provider).toBe("anthropic");
-    expect(r.model).toBe("sonnet");
+    expect(r.model).toBe("claude-sonnet-5-5");
     expect(r.route).toBeNull();
   });
 
@@ -989,7 +989,7 @@ describe("executeStep/executeReview · risk routing (t#741)", () => {
     process.env.FAKE_MODE = "review-approve";
     const r = await executeReview({ task: t, workerResult: "implemented", cwd: tmp, claudeBin: [process.execPath, fakeClaude] });
     expect(r).toMatchObject({
-      duty: "review", provider: "anthropic", model: "opus",
+      duty: "review", provider: "anthropic", model: "claude-opus-5-5",
       route: { applied: false, risk: "high" },
     });
     expect(r.route.note).toMatch(/invalid/);
