@@ -1740,8 +1740,8 @@ pub struct ImportReport {
 }
 
 /// Parse an exported board. Accepts both the canonical `{version, todos}` envelope
-/// and a bare `[...]` array — the latter is what `cc-todos todos list --json` (and
-/// the nightly triage export) emit, so a file the user already has on disk imports
+/// and a bare `[...]` array — the latter is what `cc-todos todos list --json` emits,
+/// so a file the user already has on disk imports
 /// without them having to know which shape it is.
 pub fn parse_import(content: &str) -> Result<TodoFile, String> {
     let value: serde_json::Value =

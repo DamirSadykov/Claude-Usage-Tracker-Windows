@@ -381,9 +381,9 @@ export function architectDecision(input, invoke = invokeDutySync) {
   // Hooks fail open on unavailable CLIs/auth/timeouts; the deterministic format
   // guard above still ran and remains authoritative.
   if (!result || result.skipped || !result.ok) return null;
-  const verdicts = [...String(result.text || "").matchAll(/^\s*VERDICT:\s*(approve|issue)\s*$/gim)];
+  const verdicts = [...String(result.text || "").matchAll(/^[\s*_`]*VERDICT:[\s*_`]*(approve|issue)[\s*_`]*$/gim)];
   if (verdicts.at(-1)?.[1]?.toLowerCase() !== "issue") return null;
-  const reason = String(result.text || "").replace(/^\s*VERDICT:.*$/gim, "").trim().slice(0, 4000);
+  const reason = String(result.text || "").replace(/^[\s*_`]*VERDICT:.*$/gim, "").trim().slice(0, 4000);
   return deny([
     "PLAN REFUSED — the configured architect model found unmet obligations.",
     "",

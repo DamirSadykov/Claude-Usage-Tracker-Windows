@@ -1031,6 +1031,8 @@ describe("clampOutput / parseClaudeResult", () => {
 
   it("requires an explicit approving review verdict", () => {
     expect(parseReviewVerdict("looks good\nVERDICT: approve")).toEqual({ approved: true, verdict: "approve", findings: [] });
+    expect(parseReviewVerdict("looks good\n\n**VERDICT: approve**")).toEqual({ approved: true, verdict: "approve", findings: [] });
+    expect(parseReviewVerdict("looks good\n**VERDICT:** `approve`")).toEqual({ approved: true, verdict: "approve", findings: [] });
     expect(parseReviewVerdict("finding\nVERDICT: issue")).toEqual({ approved: false, verdict: "issue", findings: [{ level: "high", file: null, line: null, text: "finding", evidence: null }] });
     expect(parseReviewVerdict("looks good but omitted the contract line"))
       .toEqual({ approved: false, verdict: "issue", findings: [{ level: "high", file: null, line: null, text: "looks good but omitted the contract line", evidence: null }] });

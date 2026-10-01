@@ -810,7 +810,7 @@ export function buildReviewPrompt({ task, workerResult = "", execution, appData,
 
 export function parseReviewVerdict(text) {
   const source = String(text || "");
-  const matches = [...source.matchAll(/^\s*VERDICT:\s*(approve|issue)\s*$/gim)];
+  const matches = [...source.matchAll(/^[\s*_`]*VERDICT:[\s*_`]*(approve|issue)[\s*_`]*$/gim)];
   const verdict = matches.at(-1)?.[1]?.toLowerCase() || "issue";
   const findings = [];
   for (const match of source.matchAll(/^\s*-\s*\[(critical|high|medium|low)\]\s*(?:(\S+):(\d+)\s*)?(?:—|--)\s*(.*)\s*$/gim)) {
@@ -826,7 +826,7 @@ export function parseReviewVerdict(text) {
     findings.push({ level, file, line, text, evidence });
   }
   if (!findings.length && verdict === "issue") {
-    const legacy = source.replace(/^\s*VERDICT:\s*(approve|issue)\s*$/gim, "").trim();
+    const legacy = source.replace(/^[\s*_`]*VERDICT:[\s*_`]*(approve|issue)[\s*_`]*$/gim, "").trim();
     findings.push({ level: "high", file: null, line: null, text: legacy, evidence: null });
   }
   return { approved: verdict === "approve", verdict, findings };

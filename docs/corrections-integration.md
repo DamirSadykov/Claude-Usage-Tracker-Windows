@@ -145,6 +145,5 @@ definitions live in [corrections-contract.md](./corrections-contract.md).
 ## Refresh & automation
 
 `corrections-metrics.json` is only as fresh as the last `publish`. To keep the
-card current, run `corrections publish` on a schedule (e.g. from the nightly
-task-triage job) or after sessions of interest. The app reads the file on window
-focus.
+card current, run `corrections publish` on a schedule or after sessions of
+interest. The app reads the file on window focus.

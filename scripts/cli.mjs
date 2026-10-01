@@ -3,7 +3,6 @@
 // LAZILY so adding an area never bloats this file or the startup cost:
 //
 //   node cli.mjs todos  <…>    → ./cli/board/todos.mjs       (mutate the todo list)
-//   node cli.mjs triage <…>    → ./cli/analytics/triage.mjs  (publish the nightly digest)
 //   node cli.mjs spec   <…>    → ./cli/spec/spec.mjs         (spec registry, t#339)
 //   node cli.mjs hook          → ./cli/cc-hooks/hook.mjs     (SessionStart hook)
 //   node cli.mjs stop-hook     → ./cli/cc-hooks/stop-hook.mjs (Stop hook: HANDOFF guard)
@@ -21,7 +20,6 @@ import path from "node:path";
 const AREAS = {
   todos: "./cli/board/todos.mjs",
   change: "./cli/board/change.mjs",
-  triage: "./cli/analytics/triage.mjs",
   corrections: "./cli/analytics/corrections.mjs",
   "task-cost": "./cli/analytics/task-cost.mjs",
   trace: "./cli/analytics/trace.mjs",
@@ -86,7 +84,6 @@ function usage(code) {
     "cli - Claude Usage Tracker\n\n" +
       "  todos   <…>   mutate the todo list (add / set / comment / list / …)\n" +
       "  change  <…>   changes as records (new / list / show / close); a task points at one\n" +
-      "  triage  <…>   publish/read the nightly-triage digest (publish / show / clear)\n" +
       "  corrections <…> user-corrections outcome metric, layer 1 (scan / label-template / eval)\n" +
       "  task-cost <…> session->task attribution for tokens-per-task (scan / publish)\n" +
       "  trace     <…> restart-point reports and restart calibration\n" +

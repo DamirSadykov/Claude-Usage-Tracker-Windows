@@ -1621,7 +1621,7 @@ function cmdList(args) {
 
   if (args.includes("--json")) {
     // Preserve the raw-array contract for automation that did not request a
-    // page (notably the nightly triage exporter). A caller asking for paging
+    // page. A caller asking for paging
     // gets the metadata required to continue safely.
     process.stdout.write(JSON.stringify(
       paginated ? { items, page, limit, total, pages, scope: scopeLabel } : todos,

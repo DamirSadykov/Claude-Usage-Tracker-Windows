@@ -153,8 +153,8 @@ Who signals the auto→manual handback depends on who drove the auto segment:
   fire a `PushNotification` for the walked-away case. That's this section.
 - **A headless/scheduled runner** drove it (the future unattended slice) → there's no
   session to await the user, so the *runner* emits the parked signal (e.g. a
-  `pipeline-parked.json` the tracker watches → desktop alert), the same shape as the
-  nightly-triage digest. Not built yet; it belongs with the runner.
+  `pipeline-parked.json` the tracker watches → desktop alert). Not built yet; it
+  belongs with the runner.
 
 The gate itself is identical either way — a `manual` node the pipeline never crosses
 on its own.

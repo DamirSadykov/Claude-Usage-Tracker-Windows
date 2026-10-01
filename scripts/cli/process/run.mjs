@@ -178,6 +178,11 @@ export function isGate(t) {
   return !declaredVerify(t);
 }
 
+export function hasNoMachineWork(t) {
+  if (!t || t.kind === "auto") return false;
+  return !(Array.isArray(t.produces) && t.produces.some(Boolean));
+}
+
 export function gateReason(t) {
   if (!t || t.kind !== "auto")
     return "kind manual — the human moves review -> done, dependents stay blocked by design";
@@ -1136,6 +1141,15 @@ function downgradeUntouchedRetryFindings(review, context) {
 async function runOne(ctx, task, wave = []) {
   const begun = await beginStep(ctx, task, wave);
   if (begun.kind === "retry-exhausted" || begun.kind === "red-base-failed") return begun;
+
+  if (hasNoMachineWork(task)) {
+    await moveTo(ctx, task, "review");
+    return finishAttempt(ctx, task, {
+      ...resultBase(ctx, task, {}, null, null, null, null, null),
+      kind: "gate",
+      reason: gateReason(task),
+    });
+  }
 
   let result;
   try {

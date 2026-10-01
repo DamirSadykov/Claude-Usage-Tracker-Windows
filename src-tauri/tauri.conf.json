@@ -61,7 +61,6 @@
       "../scripts/cli/spec/board-ritual.mjs": "scripts/cli/spec/board-ritual.mjs",
       "../scripts/cli/board/change.mjs": "scripts/cli/board/change.mjs",
       "../scripts/cli/board/change-migrate.mjs": "scripts/cli/board/change-migrate.mjs",
-      "../scripts/cli/analytics/triage.mjs": "scripts/cli/analytics/triage.mjs",
       "../scripts/cli/analytics/corrections.mjs": "scripts/cli/analytics/corrections.mjs",
       "../scripts/cli/analytics/task-cost.mjs": "scripts/cli/analytics/task-cost.mjs",
       "../scripts/cli/analytics/trace.mjs": "scripts/cli/analytics/trace.mjs",

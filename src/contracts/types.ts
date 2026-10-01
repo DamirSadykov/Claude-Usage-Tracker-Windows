@@ -68,23 +68,6 @@ export interface ForecastData {
     extra_usage: TierForecast | null;
 }
 
-export interface DigestItem {
-    kind: string;
-    number?: number;
-    id?: string;
-    subject: string;
-    note: string;
-}
-
-export interface TriageDigest {
-    version: number;
-    generated_at: string;
-    project?: string | null;
-    headline: string;
-    summary: string;
-    items: DigestItem[];
-}
-
 export interface CorrectionsTotals {
     sessions: number;
     assistant_turns: number;
