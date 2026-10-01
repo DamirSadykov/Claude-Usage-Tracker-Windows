@@ -11,7 +11,6 @@ mod tests {
         ("board", &["kernel", "contracts"]),
         ("task_cost", &["kernel", "contracts", "board", "analytics"]),
         ("spec", &["kernel"]),
-        ("triage", &["kernel", "board"]),
         ("external", &["kernel"]),
     ];
 

@@ -96,7 +96,7 @@ export const domains: SpecDomain[] = [
             { slug: "handoff", title: "Handoff-батон", part: "требования", remote: false, anchors: [] },
             { slug: "changes", title: "Change: дельта к спеке", part: "устройство", remote: false, anchors: [] },
             { slug: "plan-mode", title: "Ритуал формирования задач", part: "устройство", remote: false, anchors: [] },
-            { slug: "triage", title: "Триаж", part: "устройство", remote: false, anchors: [] },
+            { slug: "attention", title: "Внимание: механические находки", part: "требования", remote: false, anchors: [] },
             { slug: "cost", title: "Стоимость задач", part: "устройство", remote: false, anchors: [] },
             {
                 slug: "spec-registry",

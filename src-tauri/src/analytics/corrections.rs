@@ -5,7 +5,7 @@
 //! ambiguous split, and writes `corrections-metrics.json`. The tracker only ever
 //! READS that file to show a card — so this module is load-only; the CLI owns the
 //! schema and the atomic temp+rename write, exactly as it owns todos.json and the
-//! triage digest.
+//! other app-owned JSON files.
 //!
 //! JSON is snake_case to match the app's wire format. The shape mirrors
 //! scripts/cli/analytics/corrections.mjs::cmdPublish and docs/corrections-contract.md.
@@ -108,7 +108,7 @@ pub struct CorrectionsMetrics {
 /// Read the metrics file. A missing or malformed file yields `None` (nothing to
 /// surface) rather than an error — the card must stay usable whether or not a
 /// `publish` has run, and a half-written file should be ignored, not crash.
-/// Mirrors the forgiving read in triage.rs.
+/// Uses the same forgiving-read behavior as other app data loaders.
 pub fn load(path: &Path) -> Option<CorrectionsMetrics> {
     let raw = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&raw).ok()

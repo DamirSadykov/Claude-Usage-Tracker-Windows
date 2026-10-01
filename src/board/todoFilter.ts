@@ -7,6 +7,7 @@ export interface TodoFilters {
   status: string;
   project: string;
   priority: string;
+  attention: "" | "overdue" | "stale" | "no_priority";
   createdBy: string;
   change: "" | "change" | "task";
   createdFrom: string;
@@ -18,7 +19,7 @@ export interface TodoFilters {
 export type TodoFilterField = keyof Omit<TodoFilters, "query">;
 
 export const defaultTodoFilters = (): TodoFilters => ({
-  status: "", project: "", priority: "", createdBy: "", change: "",
+  status: "", project: "", priority: "", attention: "", createdBy: "", change: "",
   createdFrom: "", createdTo: "", query: "", showDone: false,
 });
 
@@ -54,8 +55,34 @@ const emptyColumns = <T>(): Record<TodoStatus, T[]> => ({
 
 function datePart(value: string | null | undefined): string { return (value ?? "").slice(0, 10); }
 
+export interface AttentionCounts {
+  overdue: number;
+  stale: number;
+  no_priority: number;
+}
+
+const ACTIVE_STATUSES = new Set(["queue", "in_progress", "review"]);
+
+export function localToday(now = new Date()): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+}
+
+function daysBefore(day: string, days: number): string {
+  const date = new Date(`${day}T00:00:00Z`);
+  date.setUTCDate(date.getUTCDate() - days);
+  return Number.isNaN(date.getTime()) ? "" : date.toISOString().slice(0, 10);
+}
+
+function attentionMatches(row: FilterableTodoRow, attention: TodoFilters["attention"], today: string): boolean {
+  if (!attention) return true;
+  if (attention === "overdue") return row.status !== "done" && !!row.scheduled_for && datePart(row.scheduled_for) < today;
+  if (attention === "stale") return ACTIVE_STATUSES.has(row.status) && datePart(row.updated_at) < daysBefore(today, 14);
+  return ACTIVE_STATUSES.has(row.status) && !row.priority;
+}
+
 export function projectTodos<T extends FilterableTodoRow>(
-  rows: readonly T[], filters: TodoFilters, indexes?: Pick<BoardIndexes, "search">,
+  rows: readonly T[], filters: TodoFilters, indexes?: Pick<BoardIndexes, "search">, today = localToday(),
 ): TodoProjection<T> {
   const columns = emptyColumns<T>();
   const visible: T[] = [];
@@ -66,6 +93,7 @@ export function projectTodos<T extends FilterableTodoRow>(
     if (filters.status && row.status !== filters.status) continue;
     if (filters.project && (row.filterProject ?? row.project) !== filters.project) continue;
     if (filters.priority && row.priority !== filters.priority) continue;
+    if (!attentionMatches(row, filters.attention, today)) continue;
     if (filters.createdBy && row.created_by !== filters.createdBy) continue;
     if (filters.change && (filters.change === "change") !== !!row.change) continue;
     const created = datePart(row.created_at);
@@ -92,4 +120,16 @@ export function projectTodos<T extends FilterableTodoRow>(
     });
   }
   return { columns, visible };
+}
+
+/** Counts attention rules after every other active filter, without self-filtering. */
+export function countAttention<T extends FilterableTodoRow>(
+  rows: readonly T[], filters: TodoFilters, today: string, indexes?: Pick<BoardIndexes, "search">,
+): AttentionCounts {
+  const visible = projectTodos(rows, { ...filters, attention: "" }, indexes, today).visible;
+  return {
+    overdue: visible.filter((row) => attentionMatches(row, "overdue", today)).length,
+    stale: visible.filter((row) => attentionMatches(row, "stale", today)).length,
+    no_priority: visible.filter((row) => attentionMatches(row, "no_priority", today)).length,
+  };
 }
