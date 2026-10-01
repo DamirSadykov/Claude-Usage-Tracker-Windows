@@ -499,6 +499,50 @@ describe("runChange — issue, transition and the retry limit", () => {
     expect(statusOf(r, 3)).toBe("review");
   });
 
+  it("parks an issue over its node budget before it can retry", async () => {
+    const data = board(changeRoot(1, [2]), auto(2, { retry_limit: 3, budget_usd: 1 }));
+    const h = harness({
+      reconcile: async () => ({ outcome: "issue", outcome_reason: "verify:issue" }),
+      stepCost: async () => 2,
+    });
+    const r = await go(data, "1", h.effects);
+
+    expect(h.calls.steps).toEqual([2]);
+    expect(r.stop.kind).toBe("budget");
+    expect(statusOf(r, 2)).toBe("review");
+  });
+
+  it("continues retrying issues within its node budget", async () => {
+    const data = board(changeRoot(1, [2]), auto(2, { retry_limit: 3, budget_usd: 10 }));
+    const h = harness({
+      reconcile: async () => ({ outcome: "issue", outcome_reason: "verify:issue" }),
+      stepCost: async () => 2,
+    });
+    const r = await go(data, "1", h.effects);
+
+    expect(h.calls.steps).toEqual([2, 2, 2]);
+    expect(r.stop.kind).toBe("retry");
+  });
+
+  it("does not reopen an on-issue target when the issuing node is over budget", async () => {
+    const data = board(
+      changeRoot(1, [2, 3]),
+      auto(2),
+      auto(3, { depends_on: deps(2), retry_limit: 3, budget_usd: 1, on_issue: "id-2" }),
+    );
+    const h = harness({
+      reconcile: async ({ task: t }) => t.number === 3
+        ? { outcome: "issue", outcome_reason: "verify:issue" }
+        : { outcome: "ok", outcome_reason: "verify:ok" },
+      stepCost: async () => 2,
+    });
+    const r = await go(data, "1", h.effects);
+
+    expect(r.stop.kind).toBe("budget");
+    expect(statusOf(r, 2)).toBe("done");
+    expect(r.transitions).toEqual([]);
+  });
+
   it("prints and records a retry decision card with the final verify tail and limit plus two", async () => {
     const data = board(changeRoot(1, [2]), auto(2, { retry_limit: 1, budget_usd: 5 }));
     const comments = [];

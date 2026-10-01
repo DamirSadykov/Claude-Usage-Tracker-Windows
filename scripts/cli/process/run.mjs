@@ -640,6 +640,20 @@ async function moveTo(ctx, task, status) {
   return { ok: true };
 }
 
+async function parkNodeBudgetOverrun(ctx, task, { review = false } = {}) {
+  const own = ctx.nodeSpent.get(task.id) || 0;
+  if (typeof task.budget_usd !== "number" || own <= task.budget_usd) return false;
+  if (review) {
+    await moveTo(ctx, task, "review");
+    ctx.parked.add(task.id);
+  }
+  park(ctx, "budget", task, `node budget overrun — $${round(own)} spent against a declared $${task.budget_usd}`, {
+    spent: round(own),
+    budget: task.budget_usd,
+  });
+  return true;
+}
+
 async function recordBaton(ctx, task, text) {
   if (!String(text ?? "").trim()) return "missing";
   try {
@@ -1412,6 +1426,10 @@ export async function applyResult(ctx, r, { dry, log }) {
     return record;
   }
   if (r.kind === "issue") {
+    if (await parkNodeBudgetOverrun(ctx, r.task, { review: true })) {
+      record.status = r.task.status;
+      return record;
+    }
     const before = ctx.stop;
     await applyIssue(ctx, r);
     if (ctx.stop && ctx.stop !== before) ctx.parked.add(r.task.id);
@@ -1425,13 +1443,7 @@ export async function applyResult(ctx, r, { dry, log }) {
   // budget is LEFT); a node ceiling is about the node's own overrun, so it
   // fires only when the step actually spent past it — a step that costs
   // exactly what it declared stayed inside its budget.
-  const own = ctx.nodeSpent.get(r.task.id) || 0;
-  if (typeof r.task.budget_usd === "number" && own > r.task.budget_usd) {
-    park(ctx, "budget", r.task, `node budget overrun — $${round(own)} spent against a declared $${r.task.budget_usd}`, {
-      spent: round(own),
-      budget: r.task.budget_usd,
-    });
-  }
+  await parkNodeBudgetOverrun(ctx, r.task);
   return record;
 }
 
