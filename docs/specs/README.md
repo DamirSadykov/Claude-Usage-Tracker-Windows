@@ -109,7 +109,7 @@ location: local
 
 part: инварианты
 refs: usage-tracker#forecast
-updated: 2026-08-03 · change: t#347
+updated: 2026-08-03 · change: спека как носитель состояния — от жанра руками к механике трекера
 
 Перевод в `done` отклоняется, пока не закрыт хотя бы один прямой
 prerequisite …
