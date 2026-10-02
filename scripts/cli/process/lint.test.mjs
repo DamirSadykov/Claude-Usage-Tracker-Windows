@@ -175,6 +175,36 @@ describe("todos lint checks the recorded graph", () => {
     expect(out).toMatch(/#1: red declared on a manual node — a gate never runs it/);
   });
 
+  it("requires flow for auto C# work, with an explained n/a escape hatch", () => {
+    board(task(1, { kind: "auto", produces: ["src/Notifier.cs"] }));
+    let result = lint();
+    expect(result.code).toBe(1);
+    expect(result.out).toMatch(/#1: auto step produces a \.cs file but has no flow/);
+
+    board(task(1, { kind: "auto", produces: ["src/Notifier.cs"], flow: "n/a" }));
+    result = lint();
+    expect(result.code).toBe(1);
+    expect(result.out).toMatch(/#1: flow: n\/a needs a reason/);
+
+    board(task(1, { kind: "auto", verify: "npm test", produces: ["src/Notifier.cs"], flow: "n/a generated code has no method body" }));
+    result = lint();
+    expect(result.code).toBe(0);
+    expect(result.out).toMatch(/nothing violates/);
+
+    board(task(1, { kind: "auto", produces: ["src/Notifier.cs"], flow: "placeholder" }));
+    result = lint();
+    expect(result.code).toBe(1);
+    expect(result.out).toMatch(/#1: flow must be a method delta, a list of them, or flow: n\/a <reason>/);
+    const delta = (method) => ({ file: "src/Notifier.cs", method, change: [], preserve: "all" });
+    board(task(1, { kind: "auto", verify: "npm test", produces: ["src/Notifier.cs"], flow: [delta("SendSms"), delta("SendEmail")] }));
+    result = lint();
+    expect(result.code).toBe(0);
+    expect(result.out).toMatch(/nothing violates/);
+
+    board(task(1, { kind: "auto", verify: "npm test", produces: ["src/Notifier.cs"], flow: [] }));
+    expect(lint().code).toBe(1);
+  });
+
   it("errors on a risk other than high, and stays quiet on high", () => {
     board(task(1, { risk: "medium" }));
     expect(lint().out).toMatch(/#1: invalid risk "medium" — the only accepted value is "high"/);
