@@ -809,6 +809,46 @@ describe("runChange — the red gate's verdict", () => {
   });
 });
 
+describe("runChange — flow gate", () => {
+  it("retries a flow issue and sends its reason to the task comment", async () => {
+    const data = board(changeRoot(1, [2], { budget_usd: 10 }), auto(2, { retry_limit: 2, step_base: "base", flow: { file: "src/Notifier.cs", method: "Send" } }));
+    const h = harness({ flowGate: async () => ({ status: "issue", reason: "missing guard", coverage: [], unchecked: [], duration_ms: 7 }) });
+    const r = await go(data, "1", h.effects);
+    expect(h.calls.verifies).toEqual([]);
+    expect(r.stop.kind).toBe("retry");
+    expect(r.board.todos.find((t) => t.number === 2).comments[0].body).toContain("flow\nmissing guard");
+  });
+
+  it("parks flow cannot without retrying or running verify", async () => {
+    const data = board(changeRoot(1, [2], { budget_usd: 10 }), auto(2, { retry_limit: 2, step_base: "base", flow: { file: "src/Notifier.cs", method: "Send" } }));
+    const h = harness({ flowGate: async () => ({ status: "cannot", reason: "executable missing", coverage: [], unchecked: [], duration_ms: 4 }) });
+    const r = await go(data, "1", h.effects);
+    expect(h.calls.steps).toEqual([2]);
+    expect(h.calls.verifies).toEqual([]);
+    expect(r.stop).toMatchObject({ kind: "flow-cannot", reason: "executable missing" });
+    expect(statusOf(r, 2)).toBe("review");
+  });
+
+  it("records flow measurements and prints unchecked produces", async () => {
+    const data = board(changeRoot(1, [2], { budget_usd: 10 }), auto(2, { step_base: "base", flow: { file: "src/Notifier.cs", method: "Send" } }));
+    const h = harness({ flowGate: async () => ({ status: "pass", reason: null, coverage: ["other method"], unchecked: [{ file: "docs/note.md" }], duration_ms: 9 }) });
+    const r = await go(data, "1", h.effects, { log: () => {} });
+    expect(r.steps[0].flow).toMatchObject({ status: "pass", duration_ms: 9, unchecked: [{ file: "docs/note.md" }] });
+    expect(runRecordOf(r).steps[0].flow.status).toBe("pass");
+    expect(formatRunReport(r)).toContain("не проверено: docs/note.md");
+  });
+
+  it("skips flow for an absent or n/a declaration and reaches verify", async () => {
+    for (const flow of [undefined, "n/a no C# method body"]) {
+      const data = board(changeRoot(1, [2], { budget_usd: 10 }), auto(2, { step_base: "base", flow }));
+      const h = harness({ flowGate: async () => { throw new Error("must not run"); } });
+      const r = await go(data, "1", h.effects);
+      expect(h.calls.verifies).toEqual(["npm test"]);
+      expect(r.steps[0].flow ?? null).toBeNull();
+    }
+  });
+});
+
 describe("runChange — neighbour damage ends a step as issue before review", () => {
   it("parks scope damage after the one high-route retry instead of queuing another attempt", async () => {
     const data = board(changeRoot(1, [2], { budget_usd: 10 }), auto(2, {
@@ -1220,6 +1260,29 @@ describe("beginStep", () => {
     expect(statuses).toEqual([[2, "in_progress"]]);
     expect(t.status).toBe("in_progress");
     expect(ctx.attempts.get(t.id)).toBe(1);
+  });
+
+  it("journals the flow declaration, including an explicit n/a when it is absent", async () => {
+    const appData = mkdtempSync(path.join(os.tmpdir(), "run-flow-events-"));
+    const previous = process.env.APPDATA;
+    process.env.APPDATA = appData;
+    try {
+      const makeCtx = (t) => ({
+        attempts: new Map(), dry: false, events: true, runId: "flow-test", root: task(1, { change: true }), data: board(t), cwd: process.cwd(), timeoutMs: undefined,
+        effects: { setStatus: async () => {}, stepBase: async () => ({ ok: true, sha: "base" }), priorChanges: async () => ({ ok: true }) },
+      });
+      const flowing = auto(2, { flow: { file: "src/Notifier.cs", method: "Send" } });
+      const absent = auto(3);
+      await beginStep(makeCtx(flowing), flowing);
+      await beginStep(makeCtx(absent), absent);
+      const events = readFileSync(path.join(appData, "com.claude-usage-tracker.app", "run-events.jsonl"), "utf8")
+        .trim().split("\n").map((line) => JSON.parse(line));
+      expect(events.map((event) => event.flow)).toEqual([{ file: "src/Notifier.cs", method: "Send" }, "n/a"]);
+    } finally {
+      if (previous === undefined) delete process.env.APPDATA;
+      else process.env.APPDATA = previous;
+      rmSync(appData, { recursive: true, force: true });
+    }
   });
 });
 

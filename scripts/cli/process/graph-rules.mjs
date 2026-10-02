@@ -28,6 +28,15 @@
 import { normalizeLimit } from "../kernel/board-io.mjs";
 
 const blank = (v) => v === undefined || v === null || String(v).trim() === "";
+const csOutput = (n) => (n.produces || []).some((path) => /\.cs$/i.test(String(path).trim()));
+const flowNaReason = (flow) => {
+  if (typeof flow !== "string") return null;
+  const match = /^n\/a(?:\s+(.*))?$/i.exec(flow.trim());
+  return match ? String(match[1] || "").trim() : null;
+};
+const flowSpec = (spec) => spec !== null && typeof spec === "object" && !Array.isArray(spec);
+export const flowDeclared = (flow) =>
+  flowSpec(flow) || (Array.isArray(flow) && flow.length > 0 && flow.every(flowSpec));
 
 // A reference is a step key in a file and a task id on a board, and a raw uuid in
 // a message tells the reader nothing. The caller says how to name one; a caller
@@ -193,6 +202,22 @@ export const NODE_RULES = [
       !blank(n.red) && n.kind !== "auto"
         ? `${n.label}: red declared on a manual node — a gate never runs it`
         : null,
+  },
+  {
+    id: "cs-without-flow",
+    severity: "error",
+    when: "open",
+    check: (n) => {
+      if (n.kind !== "auto" || !csOutput(n)) return null;
+      if (blank(n.flow))
+        return `${n.label}: auto step produces a .cs file but has no flow — declare flow or flow: n/a <reason>`;
+      if (typeof n.flow === "string") {
+        if (!/^n\/a\b/i.test(n.flow.trim()))
+          return `${n.label}: flow must be a method delta, a list of them, or flow: n/a <reason>`;
+        return flowNaReason(n.flow) ? null : `${n.label}: flow: n/a needs a reason`;
+      }
+      return flowDeclared(n.flow) ? null : `${n.label}: flow must be a method delta, a list of them, or flow: n/a <reason>`;
+    },
   },
   {
     // The reconciliation (t#304) is what turns a promise into an artefact of an

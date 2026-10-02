@@ -155,7 +155,7 @@ export function buildEnterContext() {
     "`measure` (each: `what`, `how`), `steps` with `title`,",
     "`task` (this step IS task #N already on the board), `why`, `needs`,",
     "`produces`, `verify`, `retry`, `on-issue`, `kind`, `budget`, `red`, `red-tests`,",
-    "`risk`.",
+    "`risk`, `flow` (method delta for a step that produces `*.cs`; `n/a <reason>` when it cannot apply).",
     "",
     "Prose does not disappear, it moves INSIDE: `vision` is the paragraph on what",
     "should exist and why; each step's `why` is what that step rests on and where",
