@@ -181,6 +181,25 @@ describe("apply refuses an invalid graph", () => {
     expect(errors.join(" ")).toMatch(/red-tests declared without red/);
   });
 
+  it("requires flow for an auto step that produces C#, but accepts an explained n/a", () => {
+    const missing = check(
+      ["steps:", "  1:", "    title: A", "    kind: auto", "    produces: [src/Notifier.cs]"].join("\n"),
+    );
+    expect(missing.errors.join(" ")).toMatch(/produces a \.cs file but has no flow/);
+    const blankNa = check(
+      ["steps:", "  1:", "    title: A", "    kind: auto", "    produces: [src/Notifier.cs]", "    flow: n/a"].join("\n"),
+    );
+    expect(blankNa.errors.join(" ")).toMatch(/flow: n\/a needs a reason/);
+    const explained = check(
+      ["steps:", "  1:", "    title: A", "    kind: auto", "    produces: [src/Notifier.cs]", "    flow: n/a generated file only"].join("\n"),
+    );
+    expect(explained.errors).toEqual([]);
+    const scalar = check(
+      ["steps:", "  1:", "    title: A", "    kind: auto", "    produces: [src/Notifier.cs]", "    flow: placeholder"].join("\n"),
+    );
+    expect(scalar.errors.join(" ")).toMatch(/flow must be a method delta, a list of them, or flow: n\/a <reason>/);
+  });
+
   it("only WARNS when a red-tests path is not also in produces", () => {
     const { errors, warnings } = check(
       [
@@ -342,6 +361,32 @@ describe("apply records the graph", () => {
     expect(two.depends_on).toContain(one.id);
     expect(three.depends_on).toContain(two.id);
     expect(two.on_issue).toBe(one.id);
+  });
+
+  it("keeps a flow object on the task when it applies the plan", () => {
+    writeFileSync(
+      path.join(dir, "flow.yaml"),
+      [
+        "change: CHANGE: flow",
+        "steps:",
+        "  1:",
+        "    title: Меняю метод",
+        "    kind: auto",
+        "    produces: [src/Notifier.cs]",
+        "    flow:",
+        "      file: src/Notifier.cs",
+        "      method: SendSms",
+        "      change: [insert: ValidatePhone]",
+        "      preserve: all",
+      ].join("\n"),
+    );
+    say(path.join(dir, "flow.yaml"), "--go");
+    expect(board().todos[0].flow).toEqual({
+      file: "src/Notifier.cs",
+      method: "SendSms",
+      change: ["insert: ValidatePhone"],
+      preserve: "all",
+    });
   });
 
   // §15: the loop lives on the run layer. A back edge in depends_on would break

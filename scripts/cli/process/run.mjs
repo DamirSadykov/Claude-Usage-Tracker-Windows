@@ -95,6 +95,9 @@ import {
 } from "./red-gate.mjs";
 import { bestAttempt, blockingCount, restoreCheckpoint } from "./checkpoint.mjs";
 import { appendRunEvent, runEventsPath, watchRunEvents } from "./run-events.mjs";
+import { runFlowGate } from "./flow-gate.mjs";
+import { flowDeclared } from "./graph-rules.mjs";
+import { readSettings } from "../kernel/settings.mjs";
 
 export const DEFAULT_PARALLEL_LIMIT = 1;
 
@@ -153,6 +156,7 @@ function touchesFinding(ranges, line) {
 const num = (t) => (t && t.number != null ? `#${t.number}` : t ? t.id : "?");
 const declaredVerify = (t) => (t && t.verify && String(t.verify).trim()) || "";
 const declaredRed = (t) => (t && t.red && String(t.red).trim()) || "";
+const declaredFlow = (t) => flowDeclared(t?.flow);
 
 function fail(msg) {
   process.stderr.write(msg + "\n");
@@ -266,6 +270,7 @@ export function simulationEffects() {
     priorChanges: async () => ({ ok: true, changes: null }),
     ownChanges: async () => ({ ok: true, skip: true }),
     redGate: async () => ({ ok: true, field: "failed-on-base", reason: null }),
+    flowGate: async () => ({ status: "pass", reason: null, coverage: [], unchecked: [], duration_ms: 0 }),
     stepCost: async ({ task }) =>
       typeof task.budget_usd === "number" ? task.budget_usd : null,
   };
@@ -460,6 +465,11 @@ export function liveEffects({ cwd } = {}) {
       }
       return runRedGate({ task, cwd, timeoutMs, appDataDir: redGateDir(), runCmd: mod.runVerify });
     },
+    flowGate: async ({ task, cwd, timeoutMs }) => {
+      const settings = readSettings();
+      const exe = settings.flowcheckExe || "";
+      return runFlowGate({ task, cwd, timeoutMs, exe });
+    },
     // What a step really cost lives in the tracker's blocks (SQLite, Rust side),
     // but the headless run already reports its own total — `executeStep` returns
     // it as `costUsd` (from `total_cost_usd` of the JSON result). Read that name,
@@ -538,6 +548,7 @@ export function runRecordOf(report, { inherit = false } = {}) {
       result: s.result,
       verify: s.verify ?? null,
       red: s.red ?? null,
+      flow: s.flow ?? null,
       cost_usd: typeof s.cost_usd === "number" ? s.cost_usd : null,
       session: s.session || null,
       requested_mode: s.requested_mode || null,
@@ -744,7 +755,14 @@ export async function beginStep(ctx, task, wave = []) {
   }
 
   await moveTo(ctx, task, "in_progress");
-  emitRunEvent(ctx, { task: task.number, kind: "step_start", attempt, limit, route: task._runner_high_route_used ? "high" : null });
+  emitRunEvent(ctx, {
+    task: task.number,
+    kind: "step_start",
+    attempt,
+    limit,
+    route: task._runner_high_route_used ? "high" : null,
+    flow: task.flow ?? "n/a",
+  });
   return {
     task,
     kind: "begin",
@@ -1024,6 +1042,32 @@ export async function finishStep(ctx, task, { result, review, baton, cost, ownCh
       });
     }
     base.red = gate.field ?? null;
+  }
+
+  if (declaredFlow(task)) {
+    let flow;
+    try {
+      flow = typeof ctx.effects.flowGate === "function"
+        ? await ctx.effects.flowGate({ task, cwd: ctx.cwd, timeoutMs: ctx.timeoutMs })
+        : { status: "pass", reason: null, coverage: [], unchecked: [], duration_ms: 0 };
+    } catch (err) {
+      flow = { status: "cannot", reason: `flow gate crashed: ${(err && err.message) || err}`, coverage: [], unchecked: [], duration_ms: 0 };
+    }
+    base.flow = flow;
+    emitRunEvent(ctx, {
+      task: task.number, kind: "flow", attempt, limit, status: flow.status,
+      reason: flow.reason || null, coverage: flow.coverage || [], unchecked: flow.unchecked || [], duration_ms: flow.duration_ms ?? null,
+    });
+    if (flow.status === "cannot") {
+      return finishAttempt(ctx, task, { ...base, kind: "flow-cannot", reason: flow.reason || "flowcheck cannot inspect this change" });
+    }
+    if (flow.status !== "pass") {
+      await recordIssueComment(ctx, task, { attempt, limit, source: "flow", text: clampChars(flow.reason || "flowcheck found a flow issue", 6000) });
+      return finishAttempt(ctx, task, {
+        ...base, kind: "issue", routeEscalated: task._runner_high_route_attempt === attempt,
+        reason: flow.reason || "flowcheck found a flow issue",
+      });
+    }
   }
 
   const verdictRun = await ctx.effects.runVerify({
@@ -1390,6 +1434,7 @@ export async function applyResult(ctx, r, { dry, log }) {
     gate: r.kind === "gate",
     verify: r.verify ?? null,
     red: r.red ?? null,
+    flow: r.flow ?? null,
     outcome: r.kind === "done" ? "ok" : r.kind === "issue" ? "issue" : null,
     result: r.kind,
     reason: r.reason || null,
@@ -1411,6 +1456,13 @@ export async function applyResult(ctx, r, { dry, log }) {
   if (r.kind === "red-base-failed") {
     ctx.parked.add(r.task.id);
     park(ctx, "red-base", r.task, r.reason);
+    return record;
+  }
+  if (r.kind === "flow-cannot") {
+    ctx.parked.add(r.task.id);
+    await moveTo(ctx, r.task, "review");
+    park(ctx, "flow-cannot", r.task, r.reason, { flow: r.flow ?? null });
+    record.status = r.task.status;
     return record;
   }
   if (r.kind === "retry-exhausted") {
@@ -1596,7 +1648,10 @@ function formatStepLine(s, dry) {
         ? " · baton REFUSED by the board"
         : " · NO baton — it wrote no ## HANDOFF";
   const route = s.route ? ` · ${s.route.note}` : "";
-  return `  wave ${s.wave}  #${s.task.number} ${s.task.subject} — ${verb}${attempt}${cost}${baton}${route}\n`;
+  const unchecked = Array.isArray(s.flow?.unchecked) && s.flow.unchecked.length
+    ? `\n    не проверено: ${s.flow.unchecked.map((u) => u.file || u.method || u.reason).filter(Boolean).join(", ")}`
+    : "";
+  return `  wave ${s.wave}  #${s.task.number} ${s.task.subject} — ${verb}${attempt}${cost}${baton}${route}${unchecked}\n`;
 }
 
 // All four stops print the SAME shape: the node, the reason, "pipeline parked",
