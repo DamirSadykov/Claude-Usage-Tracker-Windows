@@ -1,12 +1,13 @@
 use crate::flow::{lang, Change, FlowNode, ResultRow, Spec, TopStep};
 use lang::LanguageSpec;
+use std::collections::HashSet;
 
 const FOLD_AFTER: usize = 3;
 const MAX_DIAGRAM_CHARS: usize = 45_000;
 
 fn label(step: &str) -> String {
-    step.split_once(':')
-        .map(|(_, value)| value)
+    step.strip_prefix("call:")
+        .or_else(|| step.strip_prefix("read:"))
         .unwrap_or(step)
         .replace('"', "&quot;")
         .replace('<', "&lt;")
@@ -45,6 +46,39 @@ fn named_in_delta(spec: &Spec, step: &str) -> bool {
         .flatten()
         .any(|name| matches(step, name))
     })
+}
+
+fn named_at(spec: &Spec, node: &FlowNode, occurrences: &mut [usize]) -> bool {
+    let mut named = false;
+    for (index, change) in spec.change.iter().enumerate() {
+        let anchor = change.before.as_ref().or(change.after.as_ref());
+        let is_anchor = anchor.is_some_and(|name| matches(&node.text, name));
+        if is_anchor {
+            occurrences[index] += 1;
+            named |= change.nth.is_none_or(|nth| nth == occurrences[index]);
+        }
+        named |= [change.insert.as_ref(), change.remove_call.as_ref()]
+            .into_iter()
+            .flatten()
+            .any(|name| matches(&node.text, name));
+    }
+    named
+}
+
+fn focus_nodes(spec: &Spec, nodes: &[FlowNode]) -> HashSet<usize> {
+    fn visit(spec: &Spec, nodes: &[FlowNode], occurrences: &mut [usize], out: &mut HashSet<usize>) {
+        for node in nodes {
+            if node.kind == "call" && (node.changed || named_at(spec, node, occurrences)) {
+                out.insert(node as *const FlowNode as usize);
+            }
+            for branch in &node.branches {
+                visit(spec, &branch.nodes, occurrences, out);
+            }
+        }
+    }
+    let mut out = HashSet::new();
+    visit(spec, nodes, &mut vec![0; spec.change.len()], &mut out);
+    out
 }
 
 fn calls<'a>(spec: &Spec, steps: Option<&'a Vec<TopStep>>) -> Vec<&'a TopStep> {
@@ -190,12 +224,15 @@ fn plan(spec: &Spec, row: &ResultRow, prefix: &str) -> String {
     graph
 }
 
-fn contains_focus(spec: &Spec, node: &FlowNode) -> bool {
-    (node.kind == "call" && (node.changed || named_in_delta(spec, &node.text)))
-        || node
-            .branches
-            .iter()
-            .any(|branch| branch.nodes.iter().any(|node| contains_focus(spec, node)))
+fn contains_focus(focuses: &HashSet<usize>, node: &FlowNode) -> bool {
+    node.changed
+        || focuses.contains(&(node as *const FlowNode as usize))
+        || node.branches.iter().any(|branch| {
+            branch
+                .nodes
+                .iter()
+                .any(|node| contains_focus(focuses, node))
+        })
 }
 
 fn call_names(nodes: &[FlowNode], out: &mut Vec<String>) {
@@ -248,6 +285,38 @@ fn result_node(
     id
 }
 
+fn is_returning_guard(node: &FlowNode) -> bool {
+    node.kind == "branch" && contains_exit(node)
+}
+
+fn contains_exit(node: &FlowNode) -> bool {
+    node.kind == "exit"
+        || node
+            .branches
+            .iter()
+            .any(|branch| branch.nodes.iter().any(contains_exit))
+}
+
+fn fold_label(count: usize) -> String {
+    if count == 1 {
+        "… 1 call".into()
+    } else {
+        format!("… {count} calls")
+    }
+}
+
+fn exit_label(text: &str) -> String {
+    const LIMIT: usize = 40;
+    let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.chars().count() <= LIMIT {
+        text
+    } else if let Some(open) = text.find('(').filter(|&open| open < LIMIT) {
+        format!("{}(…)", &text[..open])
+    } else {
+        format!("{}…", text.chars().take(LIMIT - 1).collect::<String>())
+    }
+}
+
 fn result_nodes(
     spec: &Spec,
     language: &LanguageSpec,
@@ -258,10 +327,73 @@ fn result_nodes(
     serial: &mut usize,
     graph: &mut String,
     passing: bool,
+    focuses: &HashSet<usize>,
+    stop_after_focus: bool,
+    collapse_guards: bool,
 ) -> Option<String> {
     let mut previous = previous;
-    for current in nodes {
-        let focus = contains_focus(spec, current);
+    let mut folded_calls = 0usize;
+    let flush_fold = |previous: &mut Option<String>,
+                      folded_calls: &mut usize,
+                      serial: &mut usize,
+                      graph: &mut String| {
+        if *folded_calls > 0 {
+            let id = result_node(
+                prefix,
+                serial,
+                &fold_label(*folded_calls),
+                "fold",
+                "box",
+                graph,
+            );
+            if let Some(last) = previous.as_ref() {
+                graph.push_str(&format!("  {last} --> {id}\n"));
+            }
+            *previous = Some(id);
+            *folded_calls = 0;
+        }
+    };
+    let mut at = 0;
+    let mut rendered_focus = false;
+    while at < nodes.len() {
+        let current = &nodes[at];
+        let focus = contains_focus(focuses, current);
+        if stop_after_focus && rendered_focus && !focus && current.kind != "exit" {
+            flush_fold(&mut previous, &mut folded_calls, serial, graph);
+            let id = result_node(prefix, serial, "… remainder method", "fold", "box", graph);
+            if let Some(last) = previous.as_ref() {
+                graph.push_str(&format!("  {last} --> {id}\n"));
+            }
+            previous = Some(id);
+            break;
+        }
+        rendered_focus |= focus;
+        if collapse_guards && !rendered_focus && !focus && is_returning_guard(current) {
+            let mut guards = 1;
+            while at + guards < nodes.len()
+                && !contains_focus(focuses, &nodes[at + guards])
+                && is_returning_guard(&nodes[at + guards])
+            {
+                guards += 1;
+            }
+            if guards > 1 {
+                flush_fold(&mut previous, &mut folded_calls, serial, graph);
+                let id = result_node(
+                    prefix,
+                    serial,
+                    &format!("{} guards with return", guards),
+                    "fold",
+                    "box",
+                    graph,
+                );
+                if let Some(last) = previous.as_ref() {
+                    graph.push_str(&format!("  {last} --> {id}\n"));
+                }
+                previous = Some(id);
+                at += guards;
+                continue;
+            }
+        }
         if current.kind == "call" {
             let visible = focus
                 && (!matches_builtin_call(&current.text, language)
@@ -271,9 +403,20 @@ fn result_nodes(
                     || current.changed
                     || named_in_delta(spec, &current.text));
             if !visible {
+                if !current.changed && nodes.get(at + 1).is_none_or(|next| next.kind != "exit") {
+                    folded_calls += 1;
+                }
+                at += 1;
                 continue;
             }
+            flush_fold(&mut previous, &mut folded_calls, serial, graph);
             let class = if spec
+                .change
+                .iter()
+                .any(|change| removed(change, &current.text))
+            {
+                "removed"
+            } else if spec
                 .change
                 .iter()
                 .any(|c| c.insert.as_ref().is_some_and(|x| matches(&current.text, x)))
@@ -283,66 +426,139 @@ fn result_nodes(
                 } else {
                     "extra"
                 }
-            } else if focus {
-                "ctx"
+            } else if current.changed {
+                "extra"
             } else {
-                "fold"
+                "ctx"
             };
             let id = result_node(prefix, serial, &current.text, class, "box", graph);
             if let Some(last) = previous {
                 graph.push_str(&format!("  {last} --> {id}\n"));
             }
             previous = Some(id);
+            if class == "removed" {
+                if let Some(replacement) =
+                    spec.change.iter().find_map(|change| change.insert.as_ref())
+                {
+                    let replacement =
+                        result_node(prefix, serial, replacement, "extra", "box", graph);
+                    graph.push_str(&format!(
+                        "  {} --> {replacement}\n",
+                        previous.as_ref().unwrap()
+                    ));
+                    previous = Some(replacement);
+                }
+            }
+        } else if current.kind == "try" {
+            for branch in &current.branches {
+                previous = result_nodes(
+                    spec,
+                    language,
+                    head_calls,
+                    &branch.nodes,
+                    previous,
+                    prefix,
+                    serial,
+                    graph,
+                    passing,
+                    focuses,
+                    false,
+                    false,
+                );
+            }
         } else if !current.branches.is_empty() {
-            if !focus {
+            if !focus && collapse_guards && !contains_exit(current) {
+                let mut inner = Vec::new();
+                call_names(std::slice::from_ref(current), &mut inner);
+                folded_calls += inner.len();
+                at += 1;
                 continue;
             }
-            let id = result_node(
-                prefix,
-                serial,
-                &current.text,
-                if focus { "ctx" } else { "fold" },
-                "diamond",
-                graph,
-            );
+            flush_fold(&mut previous, &mut folded_calls, serial, graph);
+            if !focus && collapse_guards {
+                let id = result_node(prefix, serial, &current.text, "fold", "diamond", graph);
+                if let Some(last) = previous.as_ref() {
+                    graph.push_str(&format!("  {last} --> {id}\n"));
+                }
+                if current
+                    .branches
+                    .iter()
+                    .any(|branch| branch.nodes.iter().any(|node| node.kind == "exit"))
+                {
+                    let exit = result_node(prefix, serial, "return", "exit", "exit", graph);
+                    graph.push_str(&format!("  {id} --> {exit}\n"));
+                }
+                previous = Some(id);
+                at += 1;
+                continue;
+            }
+            let id = result_node(prefix, serial, &current.text, "ctx", "diamond", graph);
             if let Some(last) = previous.clone() {
                 graph.push_str(&format!("  {last} --> {id}\n"));
             }
+            let mut continuation = None;
             for branch in &current.branches {
+                let first_serial = *serial;
                 let branch_last = result_nodes(
                     spec,
                     language,
                     head_calls,
                     &branch.nodes,
-                    Some(id.clone()),
+                    None,
                     prefix,
                     serial,
                     graph,
                     passing,
+                    focuses,
+                    false,
+                    false,
                 );
                 if let Some(last) = branch_last {
-                    if branch.nodes.iter().any(|n| n.kind == "exit") {
-                        graph.push_str(&format!("  {id} -->|{}| {last}\n", label(&branch.kind)));
+                    let first = format!("{prefix}{first_serial}");
+                    graph.push_str(&format!("  {id} -->|{}| {first}\n", label(&branch.kind)));
+                    let exits = branch.nodes.iter().any(contains_exit);
+                    if !exits {
+                        continuation = Some(last);
                     }
                 }
             }
-            previous = Some(id);
+            previous = continuation.or(Some(id));
         } else if current.kind == "exit" {
-            let id = result_node(prefix, serial, &current.text, "exit", "exit", graph);
+            flush_fold(&mut previous, &mut folded_calls, serial, graph);
+            let id = result_node(
+                prefix,
+                serial,
+                &exit_label(&current.text),
+                "exit",
+                "exit",
+                graph,
+            );
             if let Some(last) = previous {
                 graph.push_str(&format!("  {last} --> {id}\n"));
             }
             previous = Some(id);
         }
+        at += 1;
     }
+    flush_fold(&mut previous, &mut folded_calls, serial, graph);
     previous
 }
 
 fn result(spec: &Spec, row: &ResultRow, prefix: &str) -> String {
     let language = lang::for_file(&spec.file).expect("flow spec has a supported file");
-    let tree = row.head_tree.as_ref().or(row.base_tree.as_ref());
+    let render_base = spec
+        .change
+        .iter()
+        .any(|change| change.remove_call.is_some());
+    let tree = if render_base {
+        row.base_tree.as_ref().or(row.head_tree.as_ref())
+    } else {
+        row.head_tree.as_ref().or(row.base_tree.as_ref())
+    };
     let mut head_calls = Vec::new();
-    if let Some(tree) = tree {
+    if let Some(tree) = row.head_tree.as_ref() {
+        call_names(&tree.nodes, &mut head_calls);
+    } else if let Some(tree) = tree {
         call_names(&tree.nodes, &mut head_calls);
     } else {
         head_calls = calls(spec, row.head_top.as_ref())
@@ -353,6 +569,7 @@ fn result(spec: &Spec, row: &ResultRow, prefix: &str) -> String {
     let mut graph = String::from("flowchart TD\n");
     let mut serial = 0usize;
     if let Some(tree) = tree {
+        let focuses = focus_nodes(spec, &tree.nodes);
         result_nodes(
             spec,
             language,
@@ -363,9 +580,17 @@ fn result(spec: &Spec, row: &ResultRow, prefix: &str) -> String {
             &mut serial,
             &mut graph,
             row.status == "pass",
+            &focuses,
+            true,
+            true,
         );
         for closure in &tree.closures {
-            if closure.nodes.iter().any(|node| contains_focus(spec, node)) {
+            let closure_focuses = focus_nodes(spec, &closure.nodes);
+            if closure
+                .nodes
+                .iter()
+                .any(|node| contains_focus(&closure_focuses, node))
+            {
                 graph.push_str(&format!(
                     "  subgraph {prefix}closure{serial} [\"{}\"]\n",
                     label(&closure.name)
@@ -380,13 +605,67 @@ fn result(spec: &Spec, row: &ResultRow, prefix: &str) -> String {
                     &mut serial,
                     &mut graph,
                     row.status == "pass",
+                    &closure_focuses,
+                    true,
+                    true,
                 );
                 graph.push_str("  end\n");
             }
         }
-        let exits = graph.matches(":::exit").count();
-        for _ in exits..2 {
-            let _ = result_node(prefix, &mut serial, "return", "exit", "exit", &mut graph);
+        if let Some(base_tree) = &row.base_tree {
+            fn removed_nodes<'a>(nodes: &'a [FlowNode], spec: &Spec, out: &mut Vec<&'a FlowNode>) {
+                for node in nodes {
+                    if node.kind == "call"
+                        && spec.change.iter().any(|change| removed(change, &node.text))
+                    {
+                        out.push(node);
+                    }
+                    for branch in &node.branches {
+                        removed_nodes(&branch.nodes, spec, out);
+                    }
+                }
+            }
+            let mut removed_calls = Vec::new();
+            removed_nodes(&base_tree.nodes, spec, &mut removed_calls);
+            for closure in &base_tree.closures {
+                removed_nodes(&closure.nodes, spec, &mut removed_calls);
+            }
+            for node in removed_calls {
+                if render_base {
+                    continue;
+                }
+                if !head_calls.iter().any(|head| matches(head, &node.text)) {
+                    let old = result_node(
+                        prefix,
+                        &mut serial,
+                        &node.text,
+                        "removed",
+                        "box",
+                        &mut graph,
+                    );
+                    if let Some(change) = spec
+                        .change
+                        .iter()
+                        .find(|change| removed(change, &node.text))
+                    {
+                        if let Some(replacement) = change
+                            .insert
+                            .as_ref()
+                            .or_else(|| spec.change.iter().find_map(|c| c.insert.as_ref()))
+                        {
+                            let new = result_node(
+                                prefix,
+                                &mut serial,
+                                replacement,
+                                "extra",
+                                "box",
+                                &mut graph,
+                            );
+                            graph.push_str(&format!("  {old} --> {new}\n"));
+                        }
+                    }
+                }
+            }
         }
     } else {
         for call in head_calls.iter().filter(|call| named_in_delta(spec, call)) {
@@ -401,7 +680,7 @@ fn result(spec: &Spec, row: &ResultRow, prefix: &str) -> String {
             let _ = result_node(
                 prefix,
                 &mut serial,
-                &format!("… {} calls", head_calls.len()),
+                &fold_label(head_calls.len()),
                 "fold",
                 "box",
                 &mut graph,

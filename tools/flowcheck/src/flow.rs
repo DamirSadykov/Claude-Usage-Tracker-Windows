@@ -152,6 +152,12 @@ impl Source {
             .split_whitespace()
             .collect()
     }
+    fn display_text(&self, n: Node) -> String {
+        String::from_utf8_lossy(&self.bytes[n.byte_range()])
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
     fn walk<'a>(&self, node: Node<'a>, out: &mut Vec<Node<'a>>) {
         out.push(node);
         let mut c = node.walk();
@@ -400,13 +406,13 @@ impl Source {
                 for child in n.named_children(&mut cursor) {
                     out.extend(visit(s, child, changed, closures));
                 }
-                out.push(node("exit", s.text(n), Vec::new()));
+                out.push(node("exit", s.display_text(n), Vec::new()));
                 return out;
             }
             if s.lang.branch_kinds.contains(&n.kind()) {
                 let text = branch_body(n, &["condition", "value"])
-                    .map(|x| s.text(x))
-                    .unwrap_or_else(|| s.text(n));
+                    .map(|x| s.display_text(x))
+                    .unwrap_or_else(|| s.display_text(n));
                 let mut branches = Vec::new();
                 if n.kind().contains("switch") || n.kind().contains("match") {
                     fn cases<'a>(s: &Source, n: Node<'a>, out: &mut Vec<Node<'a>>) {
@@ -447,8 +453,8 @@ impl Source {
             }
             if s.lang.loop_kinds.contains(&n.kind()) {
                 let text = branch_body(n, &["condition", "value"])
-                    .map(|x| s.text(x))
-                    .unwrap_or_else(|| s.text(n));
+                    .map(|x| s.display_text(x))
+                    .unwrap_or_else(|| s.display_text(n));
                 let nodes = branch_body(n, &["body", "consequence"])
                     .map(|x| visit(s, x, changed, closures))
                     .unwrap_or_default();

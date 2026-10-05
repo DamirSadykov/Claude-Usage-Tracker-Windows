@@ -45,6 +45,16 @@ fn row(base: Vec<String>, head: Vec<String>, status: &str) -> flow::ResultRow {
     }
 }
 
+fn mermaid_nodes(diagram: &str) -> usize {
+    diagram
+        .lines()
+        .filter(|line| {
+            let line = line.trim_start();
+            line.contains("[\"") || line.contains("{\"") || line.contains("([\"")
+        })
+        .count()
+}
+
 static REPOS: AtomicUsize = AtomicUsize::new(0);
 
 fn temp_repo() -> PathBuf {
@@ -214,7 +224,7 @@ fn long_finish_step_is_folded_below_mermaid_limit() {
     assert!(got.len() < 45_000, "{}", got.len());
     assert!(got.contains("… 1536 calls"));
     assert!(!got.contains("steps"));
-    assert!(got.matches("[\"").count() <= 2, "too many nodes: {got}");
+    assert!(mermaid_nodes(&got) <= 2, "too many nodes: {got}");
     assert_eq!(got.matches("```mermaid").count(), 1);
 }
 
@@ -277,35 +287,93 @@ fn real_finish_step_is_a_small_top_level_diagram() {
     let row = flow::check_method(&spec, &repo, &base, Some(&head), true);
     let got = render::markdown("result", &[spec], &[row]);
     assert!(got.len() < 45_000, "{}", got.len());
-    assert!(got.matches("[\"").count() <= 16, "too many nodes: {got}");
+    assert!(mermaid_nodes(&got) <= 16, "too many nodes: {got}");
     assert!(got.contains("declaredFlow(task)"), "{got}");
     assert!(got.contains("recordFlowDiagram\"]:::ok"), "{got}");
     assert!(got.matches(":::exit").count() >= 2, "{got}");
     assert!(!got.contains("steps"), "{got}");
+    let order = [
+        "declaredFlow(task)",
+        "recordFlowDiagram",
+        "flow.status === &quot;cannot&quot;",
+        "flow.status !== &quot;pass&quot;",
+    ];
+    let mut at = 0;
+    for text in order {
+        at = got[at..]
+            .find(text)
+            .map(|next| at + next)
+            .expect("ordered node");
+        at += text.len();
+    }
+    assert!(got.matches("finishAttempt").count() >= 2, "{got}");
+    assert!(!got.contains("{\"try") && !got.contains("[\"try"), "{got}");
     let _ = fs::remove_dir_all(repo);
 }
 
 #[test]
-fn run_flow_gate_hides_builtin_calls() {
+fn run_flow_gate_shows_replaced_call_and_hides_builtins() {
     let repo = temp_repo();
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture/js/flow-gate.mjs");
     fs::copy(&fixture, repo.join("scripts/cli/process/flow-gate.mjs")).unwrap();
     let base = commit(&repo);
     fs::write(
         repo.join("scripts/cli/process/flow-gate.mjs"),
-        fs::read_to_string(&fixture).unwrap().replace(
-            "const started = Date.now();",
-            "const started = Date.now() + 1;",
-        ),
+        fs::read_to_string(&fixture)
+            .unwrap()
+            .replace("unsupportedProduces", "nonCsProduces"),
     )
     .unwrap();
     let head = commit(&repo);
     fs::copy(&fixture, repo.join("scripts/cli/process/flow-gate.mjs")).unwrap();
-    let spec: flow::Spec = serde_yaml::from_str("file: scripts/cli/process/flow-gate.mjs\nmethod: runFlowGate\nchange:\n  - insert: started\n    before: finish\npreserve: all\n").unwrap();
+    let spec: flow::Spec = serde_yaml::from_str("file: scripts/cli/process/flow-gate.mjs\nmethod: runFlowGate\nchange:\n  - remove-call: unsupportedProduces\n  - insert: nonCsProduces\n    before: finish\npreserve: all\n").unwrap();
     let row = flow::check_method(&spec, &repo, &base, Some(&head), true);
     let got = render::markdown("result", &[spec], &[row]);
-    assert!(got.matches("[\"").count() <= 32, "too many nodes: {got}");
-    assert!(!got.contains("Array.isArray"), "{got}");
+    assert!(mermaid_nodes(&got) <= 32, "too many nodes: {got}");
     assert!(!got.contains("JSON.stringify"), "{got}");
+    assert!(got.contains("unsupportedProduces"), "{got}");
+    assert!(got.contains("nonCsProduces"), "{got}");
+    assert!(got.contains(" --> "), "{got}");
     let _ = fs::remove_dir_all(repo);
+}
+
+#[test]
+fn notifier_after_send_results_keep_the_guard_and_send_for_csharp_and_js() {
+    for (source, base_name, head_name, method, validate, send) in [
+        (
+            "Notifier.cs",
+            "Notifier.base.cs",
+            "Notifier.m4_after_send.cs",
+            "SendSms",
+            "ValidatePhone",
+            "Send",
+        ),
+        (
+            "Notifier.js",
+            "js/Notifier.base.js",
+            "js/Notifier.m4_after_send.js",
+            "Notifier.sendSms",
+            "validatePhone",
+            "send",
+        ),
+    ] {
+        let repo = temp_repo();
+        fs::create_dir_all(repo.join("src")).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture");
+        fs::copy(fixture.join(base_name), repo.join("src").join(source)).unwrap();
+        let base = commit(&repo);
+        fs::copy(fixture.join(head_name), repo.join("src").join(source)).unwrap();
+        let head = commit(&repo);
+        fs::copy(fixture.join(base_name), repo.join("src").join(source)).unwrap();
+        let spec: flow::Spec = serde_yaml::from_str(&format!(
+            "file: src/{source}\nmethod: {method}\nchange:\n  - insert: {validate}\n    before: {send}\n    guard: returns-bool\npreserve: all\n"
+        ))
+        .unwrap();
+        let row = flow::check_method(&spec, &repo, &base, Some(&head), true);
+        let got = render::markdown("result", &[spec], &[row]);
+        assert!(got.contains(validate), "{got}");
+        assert!(got.contains(send), "{got}");
+        assert!(got.contains(":::exit"), "{got}");
+        let _ = fs::remove_dir_all(repo);
+    }
 }
