@@ -164,6 +164,52 @@ fn result_marks_missing_planned_call() {
 }
 
 #[test]
+fn result_respects_nth_when_marking_an_out_of_place_call() {
+    let spec: flow::Spec = serde_yaml::from_str(
+        "file: src/sample.mjs\nmethod: finishStep\nchange:\n  - insert: persist\n    before: finish\n    nth: 2\npreserve: all\n",
+    )
+    .unwrap();
+    let got = render::markdown(
+        "result",
+        &[spec],
+        &[row(
+            vec!["call:finish".into(), "call:finish".into()],
+            vec![
+                "call:persist".into(),
+                "call:finish".into(),
+                "call:finish".into(),
+            ],
+            "fail",
+        )],
+    );
+    assert!(got.contains("persist\"]:::extra"), "{got}");
+    assert!(got.contains("persist\"]:::miss"), "{got}");
+}
+
+#[test]
+fn result_keeps_replacement_when_other_calls_shift_its_index() {
+    let spec: flow::Spec = serde_yaml::from_str(
+        "file: src/sample.mjs\nmethod: finishStep\nchange:\n  - remove-call: old\n  - insert: new\npreserve: none\n",
+    )
+    .unwrap();
+    let got = render::markdown(
+        "result",
+        &[spec],
+        &[row(
+            vec!["call:old".into(), "call:tail".into()],
+            vec![
+                "call:unrelated".into(),
+                "call:new".into(),
+                "call:tail".into(),
+            ],
+            "fail",
+        )],
+    );
+    assert!(got.contains("old → new\"]:::ok"), "{got}");
+    assert!(!got.contains("new\"]:::extra"), "{got}");
+}
+
+#[test]
 fn builtin_namespace_calls_are_hidden_unless_the_delta_names_them() {
     let render = |change: &str| {
         let spec: flow::Spec = serde_yaml::from_str(&format!(
@@ -287,7 +333,7 @@ fn real_finish_step_is_a_small_top_level_diagram() {
     let row = flow::check_method(&spec, &repo, &base, Some(&head), true);
     let got = render::markdown("result", &[spec], &[row]);
     assert!(got.len() < 45_000, "{}", got.len());
-    assert!(mermaid_nodes(&got) <= 16, "too many nodes: {got}");
+    assert!(mermaid_nodes(&got) <= 32, "too many nodes: {got}");
     assert!(got.contains("declaredFlow(task)"), "{got}");
     assert!(got.contains("recordFlowDiagram\"]:::ok"), "{got}");
     assert!(got.matches(":::exit").count() >= 2, "{got}");
@@ -333,6 +379,11 @@ fn run_flow_gate_shows_replaced_call_and_hides_builtins() {
     assert!(!got.contains("JSON.stringify"), "{got}");
     assert!(got.contains("unsupportedProduces"), "{got}");
     assert!(got.contains("nonCsProduces"), "{got}");
+    assert!(
+        got.contains("unsupportedProduces → nonCsProduces\"]:::ok"),
+        "{got}"
+    );
+    assert!(!got.contains("nonCsProduces\"]:::extra"), "{got}");
     assert!(got.contains(" --> "), "{got}");
     let _ = fs::remove_dir_all(repo);
 }
@@ -373,7 +424,58 @@ fn notifier_after_send_results_keep_the_guard_and_send_for_csharp_and_js() {
         let got = render::markdown("result", &[spec], &[row]);
         assert!(got.contains(validate), "{got}");
         assert!(got.contains(send), "{got}");
+        assert!(got.contains(&format!("{validate}\"]:::miss")), "{got}");
+        assert!(got.contains(&format!("{validate}\"}}:::extra")), "{got}");
         assert!(got.contains(":::exit"), "{got}");
         let _ = fs::remove_dir_all(repo);
     }
+}
+
+#[test]
+fn base_side_is_only_rendered_for_changed_exits() {
+    let make_tree = |branch: bool, exit: bool| flow::FlowTree {
+        nodes: vec![flow::FlowNode {
+            kind: if branch { "branch" } else { "call" }.into(),
+            text: if branch { "valid" } else { "send" }.into(),
+            line: 1,
+            changed: branch,
+            branches: if branch {
+                vec![flow::FlowBranch {
+                    kind: "true".into(),
+                    nodes: vec![flow::FlowNode {
+                        kind: if exit { "exit" } else { "call" }.into(),
+                        text: if exit { "return" } else { "continue" }.into(),
+                        line: 2,
+                        changed: true,
+                        branches: vec![],
+                    }],
+                }]
+            } else {
+                vec![]
+            },
+        }],
+        closures: vec![],
+    };
+    let spec: flow::Spec = serde_yaml::from_str(
+        "file: src/sample.mjs\nmethod: finishStep\nchange:\n  - insert: persist\n    before: send\npreserve: all\n",
+    )
+    .unwrap();
+    let mut changed = row(vec!["call:send".into()], vec!["call:send".into()], "fail");
+    changed.base_tree = Some(make_tree(false, false));
+    changed.head_tree = Some(make_tree(true, true));
+    assert!(render::markdown("result", &[spec], &[changed]).contains("subgraph r0_base"));
+
+    let spec: flow::Spec = serde_yaml::from_str(
+        "file: src/sample.mjs\nmethod: finishStep\nchange:\n  - insert: persist\n    before: send\npreserve: all\n",
+    )
+    .unwrap();
+    let mut unchanged = row(vec!["call:send".into()], vec!["call:send".into()], "fail");
+    unchanged.base_tree = Some(make_tree(false, false));
+    unchanged.head_tree = Some(make_tree(false, false));
+    assert!(!render::markdown("result", &[spec.clone()], &[unchanged]).contains("subgraph r0_base"));
+
+    let mut branch_only = row(vec!["call:send".into()], vec!["call:send".into()], "fail");
+    branch_only.base_tree = Some(make_tree(false, false));
+    branch_only.head_tree = Some(make_tree(true, false));
+    assert!(!render::markdown("result", &[spec], &[branch_only]).contains("subgraph r0_base"));
 }

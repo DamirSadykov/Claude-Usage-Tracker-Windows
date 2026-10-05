@@ -1,4 +1,4 @@
-use crate::flow::{lang, Change, FlowNode, ResultRow, Spec, TopStep};
+use crate::flow::{lang, Change, FlowNode, FlowTree, ResultRow, Spec, TopStep};
 use lang::LanguageSpec;
 use std::collections::HashSet;
 
@@ -249,22 +249,111 @@ fn call_names(nodes: &[FlowNode], out: &mut Vec<String>) {
 fn expected_at(spec: &Spec, head: &[String], name: &str) -> bool {
     spec.change.iter().any(|change| {
         change.insert.as_deref() == Some(name) && {
-            let at = head.iter().position(|call| matches(call, name));
             let anchor = change.before.as_ref().or(change.after.as_ref());
-            match (at, anchor) {
-                (Some(at), Some(anchor)) => head.iter().enumerate().any(|(a, call)| {
-                    matches(call, anchor)
-                        && if change.before.is_some() {
-                            at + 1 == a
+            match anchor {
+                Some(anchor) => {
+                    let anchors: Vec<_> = head
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(at, call)| matches(call, anchor).then_some(at))
+                        .collect();
+                    let anchors = match change.nth {
+                        Some(nth) => anchors
+                            .get(nth.saturating_sub(1))
+                            .copied()
+                            .into_iter()
+                            .collect(),
+                        None => anchors,
+                    };
+                    anchors.into_iter().any(|anchor_at| {
+                        let insert_at = if change.before.is_some() {
+                            anchor_at.checked_sub(1)
                         } else {
-                            a + 1 == at
-                        }
-                }),
-                (Some(_), None) => true,
-                _ => false,
+                            anchor_at.checked_add(1).filter(|at| *at < head.len())
+                        };
+                        insert_at.is_some_and(|at| matches(&head[at], name))
+                    })
+                }
+                None => head.iter().any(|call| matches(call, name)),
             }
         }
     })
+}
+
+fn replacements(spec: &Spec, base: &[String], head: &[String]) -> Vec<(String, String)> {
+    let mut lcs = vec![vec![0usize; head.len() + 1]; base.len() + 1];
+    for base_at in (0..base.len()).rev() {
+        for head_at in (0..head.len()).rev() {
+            lcs[base_at][head_at] = if matches(&base[base_at], &head[head_at]) {
+                lcs[base_at + 1][head_at + 1] + 1
+            } else {
+                lcs[base_at + 1][head_at].max(lcs[base_at][head_at + 1])
+            };
+        }
+    }
+    let mut base_slots = vec![None; base.len()];
+    let mut head_slots = vec![None; head.len()];
+    let (mut base_at, mut head_at, mut slot) = (0, 0, 0);
+    while base_at < base.len() && head_at < head.len() {
+        if matches(&base[base_at], &head[head_at]) {
+            base_slots[base_at] = Some(slot);
+            head_slots[head_at] = Some(slot);
+            base_at += 1;
+            head_at += 1;
+            slot += 1;
+        } else if lcs[base_at + 1][head_at] >= lcs[base_at][head_at + 1] {
+            base_slots[base_at] = Some(slot);
+            base_at += 1;
+        } else {
+            head_slots[head_at] = Some(slot);
+            head_at += 1;
+        }
+    }
+    while base_at < base.len() {
+        base_slots[base_at] = Some(slot);
+        base_at += 1;
+    }
+    while head_at < head.len() {
+        head_slots[head_at] = Some(slot);
+        head_at += 1;
+    }
+    spec.change
+        .iter()
+        .filter_map(|change| change.insert.as_ref())
+        .filter_map(|insert| {
+            let new_at = head.iter().position(|call| matches(call, insert))?;
+            let slot = head_slots[new_at]?;
+            spec.change
+                .iter()
+                .filter_map(|change| change.remove_call.as_ref())
+                .find(|remove| {
+                    base.iter()
+                        .position(|call| matches(call, remove))
+                        .and_then(|at| base_slots[at])
+                        == Some(slot)
+                })
+                .map(|remove| (remove.clone(), insert.clone()))
+        })
+        .collect()
+}
+
+fn structure(nodes: &[FlowNode], out: &mut Vec<String>) {
+    for node in nodes {
+        if node.kind == "exit" || (node.kind == "branch" && contains_exit(node)) {
+            out.push(format!("{}:{}", node.kind, node.text));
+        }
+        for branch in &node.branches {
+            structure(&branch.nodes, out);
+        }
+    }
+}
+
+fn structure_changed(base: &FlowTree, head: &FlowTree) -> bool {
+    let mut base_shape = Vec::new();
+    let mut head_shape = Vec::new();
+    structure(&base.nodes, &mut base_shape);
+    structure(&head.nodes, &mut head_shape);
+    base_shape != head_shape
 }
 
 fn result_node(
@@ -330,6 +419,7 @@ fn result_nodes(
     focuses: &HashSet<usize>,
     stop_after_focus: bool,
     collapse_guards: bool,
+    replacements: &[(String, String)],
 ) -> Option<String> {
     let mut previous = previous;
     let mut folded_calls = 0usize;
@@ -410,7 +500,12 @@ fn result_nodes(
                 continue;
             }
             flush_fold(&mut previous, &mut folded_calls, serial, graph);
-            let class = if spec
+            let replacement = replacements
+                .iter()
+                .find(|(_, new)| matches(&current.text, new));
+            let class = if replacement.is_some() {
+                "ok"
+            } else if spec
                 .change
                 .iter()
                 .any(|change| removed(change, &current.text))
@@ -431,24 +526,14 @@ fn result_nodes(
             } else {
                 "ctx"
             };
-            let id = result_node(prefix, serial, &current.text, class, "box", graph);
+            let text = replacement
+                .map(|(old, new)| format!("{old} → {new}"))
+                .unwrap_or_else(|| current.text.clone());
+            let id = result_node(prefix, serial, &text, class, "box", graph);
             if let Some(last) = previous {
                 graph.push_str(&format!("  {last} --> {id}\n"));
             }
             previous = Some(id);
-            if class == "removed" {
-                if let Some(replacement) =
-                    spec.change.iter().find_map(|change| change.insert.as_ref())
-                {
-                    let replacement =
-                        result_node(prefix, serial, replacement, "extra", "box", graph);
-                    graph.push_str(&format!(
-                        "  {} --> {replacement}\n",
-                        previous.as_ref().unwrap()
-                    ));
-                    previous = Some(replacement);
-                }
-            }
         } else if current.kind == "try" {
             for branch in &current.branches {
                 previous = result_nodes(
@@ -464,6 +549,7 @@ fn result_nodes(
                     focuses,
                     false,
                     false,
+                    replacements,
                 );
             }
         } else if !current.branches.is_empty() {
@@ -492,7 +578,15 @@ fn result_nodes(
                 at += 1;
                 continue;
             }
-            let id = result_node(prefix, serial, &current.text, "ctx", "diamond", graph);
+            let planned = spec.change.iter().find_map(|change| {
+                change
+                    .insert
+                    .as_ref()
+                    .filter(|insert| current.changed && current.text.contains(insert.as_str()))
+            });
+            let class = if planned.is_some() { "extra" } else { "ctx" };
+            let text = planned.unwrap_or(&current.text);
+            let id = result_node(prefix, serial, text, class, "diamond", graph);
             if let Some(last) = previous.clone() {
                 graph.push_str(&format!("  {last} --> {id}\n"));
             }
@@ -512,6 +606,7 @@ fn result_nodes(
                     focuses,
                     false,
                     false,
+                    replacements,
                 );
                 if let Some(last) = branch_last {
                     let first = format!("{prefix}{first_serial}");
@@ -546,18 +641,13 @@ fn result_nodes(
 
 fn result(spec: &Spec, row: &ResultRow, prefix: &str) -> String {
     let language = lang::for_file(&spec.file).expect("flow spec has a supported file");
-    let render_base = spec
-        .change
-        .iter()
-        .any(|change| change.remove_call.is_some());
-    let tree = if render_base {
-        row.base_tree.as_ref().or(row.head_tree.as_ref())
-    } else {
-        row.head_tree.as_ref().or(row.base_tree.as_ref())
-    };
+    let tree = row.head_tree.as_ref().or(row.base_tree.as_ref());
     let mut head_calls = Vec::new();
     if let Some(tree) = row.head_tree.as_ref() {
         call_names(&tree.nodes, &mut head_calls);
+        for closure in &tree.closures {
+            call_names(&closure.nodes, &mut head_calls);
+        }
     } else if let Some(tree) = tree {
         call_names(&tree.nodes, &mut head_calls);
     } else {
@@ -568,6 +658,19 @@ fn result(spec: &Spec, row: &ResultRow, prefix: &str) -> String {
     }
     let mut graph = String::from("flowchart TD\n");
     let mut serial = 0usize;
+    let mut base_calls = Vec::new();
+    if let Some(base_tree) = &row.base_tree {
+        call_names(&base_tree.nodes, &mut base_calls);
+        for closure in &base_tree.closures {
+            call_names(&closure.nodes, &mut base_calls);
+        }
+    } else {
+        base_calls = calls(spec, row.base_top.as_ref())
+            .into_iter()
+            .map(|step| step.key.clone())
+            .collect();
+    }
+    let replacements = replacements(spec, &base_calls, &head_calls);
     if let Some(tree) = tree {
         let focuses = focus_nodes(spec, &tree.nodes);
         result_nodes(
@@ -583,6 +686,7 @@ fn result(spec: &Spec, row: &ResultRow, prefix: &str) -> String {
             &focuses,
             true,
             true,
+            &replacements,
         );
         for closure in &tree.closures {
             let closure_focuses = focus_nodes(spec, &closure.nodes);
@@ -608,73 +712,48 @@ fn result(spec: &Spec, row: &ResultRow, prefix: &str) -> String {
                     &closure_focuses,
                     true,
                     true,
+                    &replacements,
                 );
                 graph.push_str("  end\n");
             }
         }
-        if let Some(base_tree) = &row.base_tree {
-            fn removed_nodes<'a>(nodes: &'a [FlowNode], spec: &Spec, out: &mut Vec<&'a FlowNode>) {
-                for node in nodes {
-                    if node.kind == "call"
-                        && spec.change.iter().any(|change| removed(change, &node.text))
-                    {
-                        out.push(node);
-                    }
-                    for branch in &node.branches {
-                        removed_nodes(&branch.nodes, spec, out);
-                    }
-                }
-            }
-            let mut removed_calls = Vec::new();
-            removed_nodes(&base_tree.nodes, spec, &mut removed_calls);
-            for closure in &base_tree.closures {
-                removed_nodes(&closure.nodes, spec, &mut removed_calls);
-            }
-            for node in removed_calls {
-                if render_base {
-                    continue;
-                }
-                if !head_calls.iter().any(|head| matches(head, &node.text)) {
-                    let old = result_node(
-                        prefix,
-                        &mut serial,
-                        &node.text,
-                        "removed",
-                        "box",
-                        &mut graph,
-                    );
-                    if let Some(change) = spec
-                        .change
-                        .iter()
-                        .find(|change| removed(change, &node.text))
-                    {
-                        if let Some(replacement) = change
-                            .insert
-                            .as_ref()
-                            .or_else(|| spec.change.iter().find_map(|c| c.insert.as_ref()))
-                        {
-                            let new = result_node(
-                                prefix,
-                                &mut serial,
-                                replacement,
-                                "extra",
-                                "box",
-                                &mut graph,
-                            );
-                            graph.push_str(&format!("  {old} --> {new}\n"));
-                        }
-                    }
-                }
+        if let (Some(base_tree), Some(head_tree)) = (&row.base_tree, &row.head_tree) {
+            if structure_changed(base_tree, head_tree) {
+                graph.push_str(&format!("  subgraph {prefix}base [\"base\"]\n"));
+                let base_focuses = focus_nodes(spec, &base_tree.nodes);
+                result_nodes(
+                    spec,
+                    language,
+                    &head_calls,
+                    &base_tree.nodes,
+                    None,
+                    &format!("{prefix}base_"),
+                    &mut serial,
+                    &mut graph,
+                    row.status == "pass",
+                    &base_focuses,
+                    true,
+                    true,
+                    &[],
+                );
+                graph.push_str("  end\n");
             }
         }
     } else {
         for call in head_calls.iter().filter(|call| named_in_delta(spec, call)) {
-            let class = if row.status == "pass" || expected_at(spec, &head_calls, call) {
+            let replacement = replacements.iter().find(|(_, new)| matches(call, new));
+            let class = if replacement.is_some()
+                || row.status == "pass"
+                || expected_at(spec, &head_calls, call)
+            {
                 "ok"
             } else {
                 "extra"
             };
-            let _ = result_node(prefix, &mut serial, call, class, "box", &mut graph);
+            let text = replacement
+                .map(|(old, new)| format!("{old} → {new}"))
+                .unwrap_or_else(|| call.clone());
+            let _ = result_node(prefix, &mut serial, &text, class, "box", &mut graph);
         }
         if !head_calls.is_empty() && serial == 0 {
             let _ = result_node(
@@ -689,12 +768,17 @@ fn result(spec: &Spec, row: &ResultRow, prefix: &str) -> String {
     }
     for change in &spec.change {
         if let Some(insert) = &change.insert {
-            if !expected_at(spec, &head_calls, insert) {
+            if !expected_at(spec, &head_calls, insert)
+                && !replacements
+                    .iter()
+                    .any(|(_, replacement)| replacement == insert)
+            {
                 let id = result_node(prefix, &mut serial, insert, "miss", "box", &mut graph);
                 if let Some(anchor) = change.before.as_ref().or(change.after.as_ref()) {
                     if let Some(anchor_id) = graph
                         .lines()
-                        .find(|line| line.contains(&format!("\"{}\"", label(anchor))))
+                        .filter(|line| line.contains(&format!("\"{}\"", label(anchor))))
+                        .nth(change.nth.unwrap_or(1).saturating_sub(1))
                         .and_then(|line| line.split_whitespace().next())
                     {
                         graph.push_str(&format!("  {id} -.-> {anchor_id}\n"));
