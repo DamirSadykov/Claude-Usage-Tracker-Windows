@@ -75,6 +75,18 @@ pub struct ResultRow {
     pub base_steps: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub head_steps: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_top: Option<Vec<TopStep>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head_top: Option<Vec<TopStep>>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TopStep {
+    pub kind: String,
+    pub key: String,
+    pub line: usize,
+    pub changed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -790,6 +802,60 @@ fn subsequence_missing(need: &[String], have: &[String]) -> Vec<String> {
     missing
 }
 
+fn changed_lines(
+    repo: &Path,
+    base: &str,
+    head: Option<&str>,
+    file: &str,
+) -> (HashSet<usize>, HashSet<usize>) {
+    let mut command = Command::new("git");
+    command.args(["diff", "--unified=0", base]);
+    if let Some(head) = head {
+        command.arg(head);
+    }
+    let output = command.args(["--", file]).current_dir(repo).output();
+    let Ok(output) = output else {
+        return (HashSet::new(), HashSet::new());
+    };
+    let mut base_lines = HashSet::new();
+    let mut head_lines = HashSet::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Some(hunk) = line.strip_prefix("@@ ") else {
+            continue;
+        };
+        let Some((ranges, _)) = hunk.split_once(" @@") else {
+            continue;
+        };
+        let mut ranges = ranges.split_whitespace();
+        let range = |value: Option<&str>| -> Option<(usize, usize)> {
+            let value = value?.strip_prefix(['-', '+'])?;
+            let (start, count) = value.split_once(',').unwrap_or((value, "1"));
+            Some((start.parse().ok()?, count.parse().ok()?))
+        };
+        let Some((base_start, base_count)) = range(ranges.next()) else {
+            continue;
+        };
+        let Some((head_start, head_count)) = range(ranges.next()) else {
+            continue;
+        };
+        base_lines.extend(base_start..base_start + base_count);
+        head_lines.extend(head_start..head_start + head_count);
+    }
+    (base_lines, head_lines)
+}
+
+fn top_steps(steps: Vec<Step>, changed: &HashSet<usize>) -> Vec<TopStep> {
+    steps
+        .into_iter()
+        .map(|step| TopStep {
+            kind: step.kind.into(),
+            key: step.key,
+            line: step.line,
+            changed: changed.contains(&step.line),
+        })
+        .collect()
+}
+
 pub fn check_method(
     spec: &Spec,
     repo: &Path,
@@ -802,6 +868,9 @@ pub fn check_method(
         let ht = load_source(repo, head, &spec.file)?;
         let bm = bt.find_method(&spec.method, spec.params.as_deref())?;
         let hm = ht.find_method(&spec.method, spec.params.as_deref())?;
+        let (base_changed, head_changed) = changed_lines(repo, base, head, &spec.file);
+        let btop = bt.steps(bm);
+        let htop = ht.steps(hm);
         let hsteps = ht.steps(hm);
         let bsteps = bt.flow(bm, 2, &mut HashSet::new());
         let hflow = ht.flow(hm, 2, &mut HashSet::new());
@@ -972,6 +1041,8 @@ pub fn check_method(
             depth_limited: ht.depth_limited(hm, 2, &mut HashSet::new()),
             base_steps: verbose.then(|| bsteps.iter().map(key).collect()),
             head_steps: verbose.then(|| hflow.iter().map(key).collect()),
+            base_top: verbose.then(|| top_steps(btop, &base_changed)),
+            head_top: verbose.then(|| top_steps(htop, &head_changed)),
         })
     })();
     answer.unwrap_or_else(|e| ResultRow {
@@ -982,6 +1053,8 @@ pub fn check_method(
         depth_limited: Vec::new(),
         base_steps: None,
         head_steps: None,
+        base_top: None,
+        head_top: None,
     })
 }
 fn find_node_by_id<'a>(s: &'a Source, method: Node<'a>, node_id: usize) -> Option<Node<'a>> {
