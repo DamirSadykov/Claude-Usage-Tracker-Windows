@@ -126,6 +126,51 @@ fn plan_keeps_delta_and_omits_field_reads() {
 }
 
 #[test]
+fn plan_strikes_a_standalone_removed_call() {
+    let spec: flow::Spec = serde_yaml::from_str(
+        "file: src/sample.mjs\nmethod: finishStep\nchange:\n  - remove-call: old\npreserve: all\n",
+    )
+    .unwrap();
+    let got = render::markdown(
+        "plan",
+        &[spec],
+        &[row(vec!["call:old".into()], vec![], "pass")],
+    );
+    assert!(got.contains("<s>old</s>"), "{got}");
+}
+
+#[test]
+fn plan_counts_nth_across_the_method_and_closures() {
+    let spec: flow::Spec = serde_yaml::from_str(
+        "file: src/sample.mjs\nmethod: finishStep\nchange:\n  - insert: added\n    before: anchor\n    nth: 2\npreserve: all\n",
+    )
+    .unwrap();
+    let mut rendered = row(vec![], vec![], "pass");
+    rendered.base_tree = Some(flow::FlowTree {
+        nodes: vec![flow::FlowNode {
+            kind: "call".into(),
+            text: "anchor".into(),
+            line: 1,
+            changed: false,
+            branches: vec![],
+        }],
+        closures: vec![flow::ClosureTree {
+            name: "later".into(),
+            nodes: vec![flow::FlowNode {
+                kind: "call".into(),
+                text: "anchor".into(),
+                line: 2,
+                changed: false,
+                branches: vec![],
+            }],
+        }],
+    });
+    let got = render::markdown("plan", &[spec], &[rendered]);
+    assert_eq!(got.matches("added").count(), 1, "{got}");
+    assert!(got.contains("subgraph p0_closure"), "{got}");
+}
+
+#[test]
 fn result_marks_planned_calls_ok() {
     let got = render::markdown(
         "result",
@@ -331,6 +376,27 @@ fn real_finish_step_is_a_small_top_level_diagram() {
     .unwrap();
     let spec: flow::Spec = serde_yaml::from_str("file: scripts/cli/process/run.mjs\nmethod: finishStep\nchange:\n  - insert: recordFlowDiagram\n    before: emitRunEvent\n    nth: 2\npreserve: all\n").unwrap();
     let row = flow::check_method(&spec, &repo, &base, Some(&head), true);
+    let plan = render::markdown(
+        "plan",
+        std::slice::from_ref(&spec),
+        std::slice::from_ref(&row),
+    );
+    assert_eq!(plan.matches("recordFlowDiagram").count(), 1, "{plan}");
+    let declared = plan
+        .find("declaredFlow(task)")
+        .expect("declared flow guard");
+    let record = plan.find("recordFlowDiagram").expect("planned call");
+    assert!(declared < record, "{plan}");
+    let declared_id = plan[..declared]
+        .rsplit('\n')
+        .next()
+        .and_then(|line| line.split_whitespace().next())
+        .and_then(|node| node.split('{').next())
+        .expect("declared flow node id");
+    let then_edge = plan
+        .find(&format!("{declared_id} -->|then|"))
+        .expect("declared flow then edge");
+    assert!(record < then_edge, "{plan}");
     let got = render::markdown("result", &[spec], &[row]);
     assert!(got.len() < 45_000, "{}", got.len());
     assert!(mermaid_nodes(&got) <= 32, "too many nodes: {got}");
@@ -426,6 +492,19 @@ fn notifier_after_send_results_keep_the_guard_and_send_for_csharp_and_js() {
         ))
         .unwrap();
         let row = flow::check_method(&spec, &repo, &base, Some(&head), true);
+        if source == "Notifier.cs" {
+            let plan = render::markdown(
+                "plan",
+                std::slice::from_ref(&spec),
+                std::slice::from_ref(&row),
+            );
+            let guard = plan
+                .find("ValidatePhone (returns-bool)?")
+                .expect("guard diamond");
+            let send_at = plan.rfind("Send").expect("send");
+            assert!(guard < send_at, "{plan}");
+            assert!(plan.contains(":::exit"), "{plan}");
+        }
         let got = render::markdown("result", &[spec], &[row]);
         assert!(got.contains(validate), "{got}");
         assert!(got.contains(send), "{got}");

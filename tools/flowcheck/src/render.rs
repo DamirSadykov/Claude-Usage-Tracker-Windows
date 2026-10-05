@@ -2,7 +2,6 @@ use crate::flow::{lang, Change, FlowNode, FlowTree, ResultRow, Spec, TopStep};
 use lang::LanguageSpec;
 use std::collections::HashSet;
 
-const FOLD_AFTER: usize = 3;
 const MAX_DIAGRAM_CHARS: usize = 45_000;
 
 fn label(step: &str) -> String {
@@ -81,6 +80,26 @@ fn focus_nodes(spec: &Spec, nodes: &[FlowNode]) -> HashSet<usize> {
     out
 }
 
+fn plan_focus_nodes(spec: &Spec, tree: &FlowTree) -> HashSet<usize> {
+    let mut occurrences = vec![0; spec.change.len()];
+    let mut out = HashSet::new();
+    fn visit(spec: &Spec, nodes: &[FlowNode], occurrences: &mut [usize], out: &mut HashSet<usize>) {
+        for node in nodes {
+            if node.kind == "call" && (node.changed || named_at(spec, node, occurrences)) {
+                out.insert(node as *const FlowNode as usize);
+            }
+            for branch in &node.branches {
+                visit(spec, &branch.nodes, occurrences, out);
+            }
+        }
+    }
+    visit(spec, &tree.nodes, &mut occurrences, &mut out);
+    for closure in &tree.closures {
+        visit(spec, &closure.nodes, &mut occurrences, &mut out);
+    }
+    out
+}
+
 fn calls<'a>(spec: &Spec, steps: Option<&'a Vec<TopStep>>) -> Vec<&'a TopStep> {
     let language = lang::for_file(&spec.file).expect("flow spec has a supported file");
     steps
@@ -107,119 +126,269 @@ fn removed(change: &Change, step: &str) -> bool {
         .is_some_and(|target| matches(step, target))
 }
 
-fn insertions_at<'a>(changes: &'a [Change], step: &str, before: bool) -> Vec<&'a Change> {
-    changes
-        .iter()
-        .filter(|change| {
-            change.insert.is_some()
-                && if before {
-                    change
-                        .before
-                        .as_ref()
-                        .is_some_and(|anchor| matches(step, anchor))
+fn plan_changes_at(spec: &Spec, step: &str, occurrences: &mut [usize]) -> (Vec<usize>, Vec<usize>) {
+    let mut before = Vec::new();
+    let mut after = Vec::new();
+    for (index, change) in spec.change.iter().enumerate() {
+        let anchor = change.before.as_ref().or(change.after.as_ref());
+        if anchor.is_some_and(|anchor| matches(step, anchor)) {
+            occurrences[index] += 1;
+            if change.nth.is_none_or(|nth| nth == occurrences[index]) && change.insert.is_some() {
+                if change.before.is_some() {
+                    before.push(index);
                 } else {
-                    change
-                        .after
-                        .as_ref()
-                        .is_some_and(|anchor| matches(step, anchor))
+                    after.push(index);
                 }
-        })
-        .collect()
-}
-
-fn planned_nodes(spec: &Spec, row: &ResultRow) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    for step in calls(spec, row.base_top.as_ref()) {
-        for change in insertions_at(&spec.change, &step.key, true) {
-            out.push((change.insert.clone().unwrap(), "insert".into()));
-        }
-        out.push((
-            step.key.clone(),
-            if spec.change.iter().any(|c| removed(c, &step.key)) {
-                "removed"
-            } else {
-                "base"
-            }
-            .into(),
-        ));
-        for change in insertions_at(&spec.change, &step.key, false) {
-            out.push((change.insert.clone().unwrap(), "insert".into()));
-        }
-    }
-    for change in &spec.change {
-        if let Some(insert) = &change.insert {
-            if !out.iter().any(|(text, _)| text == insert) {
-                out.push((insert.clone(), "insert".into()));
             }
         }
     }
-    out
+    (before, after)
 }
 
-fn fold(nodes: Vec<(String, String)>) -> Vec<(String, String)> {
-    let mut folded = Vec::new();
-    let mut plain = Vec::new();
-    let flush = |plain: &mut Vec<(String, String)>, folded: &mut Vec<(String, String)>| {
-        if plain.len() > FOLD_AFTER {
-            folded.push((format!("… {} steps", plain.len()), "fold".into()));
-        } else {
-            folded.append(plain);
+fn plan_nodes(
+    spec: &Spec,
+    nodes: &[FlowNode],
+    focuses: &HashSet<usize>,
+    occurrences: &mut [usize],
+    rendered: &mut [bool],
+    previous: Option<String>,
+    prefix: &str,
+    serial: &mut usize,
+    graph: &mut String,
+) -> Option<String> {
+    let mut previous = previous;
+    let mut folded = 0usize;
+    let flush = |previous: &mut Option<String>,
+                 folded: &mut usize,
+                 serial: &mut usize,
+                 graph: &mut String| {
+        if *folded > 0 {
+            let id = result_node(prefix, serial, &fold_label(*folded), "fold", "box", graph);
+            if let Some(last) = previous.as_ref() {
+                graph.push_str(&format!("  {last} --> {id}\n"));
+            }
+            *previous = Some(id);
+            *folded = 0;
         }
     };
-    for node in nodes {
-        if node.1 == "base" {
-            plain.push(node);
+    let emit_insert = |change_at: usize,
+                       previous: &mut Option<String>,
+                       serial: &mut usize,
+                       graph: &mut String,
+                       rendered: &mut [bool]| {
+        let change = &spec.change[change_at];
+        let text = change.insert.as_ref().unwrap();
+        let shape = if change.guard.as_deref().unwrap_or("none") == "none" {
+            "box"
         } else {
-            flush(&mut plain, &mut folded);
-            folded.push(node);
+            "diamond"
+        };
+        let display = if shape == "diamond" {
+            format!("{text} ({})?", change.guard.as_deref().unwrap())
+        } else {
+            text.clone()
+        };
+        let class = if shape == "diamond" {
+            "guard"
+        } else {
+            "insert"
+        };
+        let id = result_node(prefix, serial, &display, class, shape, graph);
+        if let Some(last) = previous.as_ref() {
+            graph.push_str(&format!("  {last} --> {id}\n"));
+        }
+        if shape == "diamond" {
+            let exit = result_node(prefix, serial, "return", "exit", "exit", graph);
+            graph.push_str(&format!("  {id} -->|exit| {exit}\n"));
+        }
+        *previous = Some(id);
+        rendered[change_at] = true;
+    };
+    for current in nodes {
+        if current.kind == "call" {
+            let (before, after) = plan_changes_at(spec, &current.text, occurrences);
+            let changed = !before.is_empty()
+                || !after.is_empty()
+                || spec
+                    .change
+                    .iter()
+                    .any(|change| removed(change, &current.text));
+            if !contains_focus(focuses, current) && !changed {
+                folded += 1;
+                continue;
+            }
+            flush(&mut previous, &mut folded, serial, graph);
+            let removed = spec
+                .change
+                .iter()
+                .any(|change| removed(change, &current.text));
+            let replacement = before.iter().chain(&after).copied().find(|change_at| {
+                removed && spec.change[*change_at].guard.as_deref().unwrap_or("none") == "none"
+            });
+            if let Some(change_at) = replacement {
+                let text = format!(
+                    "{} → {}",
+                    current.text,
+                    spec.change[change_at].insert.as_ref().unwrap()
+                );
+                let id = result_node(prefix, serial, &text, "insert", "box", graph);
+                if let Some(last) = previous.as_ref() {
+                    graph.push_str(&format!("  {last} --> {id}\n"));
+                }
+                previous = Some(id);
+                rendered[change_at] = true;
+                continue;
+            }
+            for change in &before {
+                emit_insert(*change, &mut previous, serial, graph, rendered);
+            }
+            let id = if removed {
+                let id = format!("{prefix}{serial}");
+                *serial += 1;
+                graph.push_str(&format!(
+                    "  {id}[\"<s>{}</s>\"]:::removed\n",
+                    label(&current.text)
+                ));
+                id
+            } else {
+                result_node(prefix, serial, &current.text, "ctx", "box", graph)
+            };
+            if let Some(last) = previous.as_ref() {
+                graph.push_str(&format!("  {last} --> {id}\n"));
+            }
+            previous = Some(id);
+            for change in &after {
+                emit_insert(*change, &mut previous, serial, graph, rendered);
+            }
+        } else if !current.branches.is_empty() {
+            if !contains_focus(focuses, current) {
+                let mut calls = Vec::new();
+                call_names(std::slice::from_ref(current), &mut calls);
+                for call in &calls {
+                    plan_changes_at(spec, call, occurrences);
+                }
+                folded += calls.len();
+                continue;
+            }
+            flush(&mut previous, &mut folded, serial, graph);
+            let id = result_node(prefix, serial, &current.text, "ctx", "diamond", graph);
+            if let Some(last) = previous.as_ref() {
+                graph.push_str(&format!("  {last} --> {id}\n"));
+            }
+            let mut continuation = None;
+            for branch in &current.branches {
+                let first_serial = *serial;
+                let last = plan_nodes(
+                    spec,
+                    &branch.nodes,
+                    focuses,
+                    occurrences,
+                    rendered,
+                    None,
+                    prefix,
+                    serial,
+                    graph,
+                );
+                if let Some(last) = last {
+                    graph.push_str(&format!(
+                        "  {id} -->|{}| {prefix}{first_serial}\n",
+                        label(&branch.kind)
+                    ));
+                    if !branch.nodes.iter().any(contains_exit) {
+                        continuation = Some(last);
+                    }
+                }
+            }
+            previous = continuation.or(Some(id));
+        } else if current.kind == "exit" {
+            flush(&mut previous, &mut folded, serial, graph);
+            let id = result_node(
+                prefix,
+                serial,
+                &exit_label(&current.text),
+                "exit",
+                "exit",
+                graph,
+            );
+            if let Some(last) = previous.as_ref() {
+                graph.push_str(&format!("  {last} --> {id}\n"));
+            }
+            previous = Some(id);
         }
     }
-    flush(&mut plain, &mut folded);
-    folded
-}
-
-fn chain(nodes: Vec<(String, String)>, prefix: &str) -> String {
-    let mut graph = String::new();
-    let mut previous = None;
-    for (index, (text, class)) in fold(nodes).iter().enumerate() {
-        let id = format!("{prefix}{index}");
-        graph.push_str(&node(&id, text, class));
-        if let Some(previous) = previous {
-            graph.push_str(&format!("  {previous} --> {id}\n"));
-        }
-        previous = Some(id);
-    }
-    graph
+    flush(&mut previous, &mut folded, serial, graph);
+    previous
 }
 
 fn plan(spec: &Spec, row: &ResultRow, prefix: &str) -> String {
     let mut graph = String::from("flowchart TD\n");
-    let nodes = planned_nodes(spec, row);
-    let mut previous: Option<String> = None;
-    for (index, (text, class)) in fold(nodes).iter().enumerate() {
-        let id = format!("{prefix}{index}");
-        let guard = spec.change.iter().find(|change| {
-            change.insert.as_ref() == Some(text)
-                && change.guard.as_deref().unwrap_or("none") != "none"
-        });
-        if let Some(change) = guard {
-            graph.push_str(&format!(
-                "  {id}{{\"{} ({})?\"}}:::guard\n",
-                label(text),
-                change.guard.as_deref().unwrap()
-            ));
-        } else if class == "removed" {
-            graph.push_str(&format!("  {id}[\"<s>{}</s>\"]:::removed\n", label(text)));
-        } else {
-            graph.push_str(&node(&id, text, class));
+    let mut serial = 0;
+    let mut rendered = vec![false; spec.change.len()];
+    let mut occurrences = vec![0; spec.change.len()];
+    if let Some(tree) = &row.base_tree {
+        let focuses = plan_focus_nodes(spec, tree);
+        plan_nodes(
+            spec,
+            &tree.nodes,
+            &focuses,
+            &mut occurrences,
+            &mut rendered,
+            None,
+            prefix,
+            &mut serial,
+            &mut graph,
+        );
+        for closure in &tree.closures {
+            if closure_changed(&focuses, &closure.nodes) {
+                graph.push_str(&format!(
+                    "  subgraph {prefix}closure{serial} [\"{}\"]\n",
+                    label(&closure.name)
+                ));
+                plan_nodes(
+                    spec,
+                    &closure.nodes,
+                    &focuses,
+                    &mut occurrences,
+                    &mut rendered,
+                    None,
+                    prefix,
+                    &mut serial,
+                    &mut graph,
+                );
+                graph.push_str("  end\n");
+            }
         }
-        if let Some(previous) = previous {
-            graph.push_str(&format!("  {previous} --> {id}\n"));
+    } else if let Some(steps) = row.base_top.as_ref() {
+        let nodes: Vec<_> = calls(spec, Some(steps))
+            .into_iter()
+            .map(|step| FlowNode {
+                kind: "call".into(),
+                text: step.key.clone(),
+                line: step.line,
+                changed: step.changed,
+                branches: vec![],
+            })
+            .collect();
+        let focuses = focus_nodes(spec, &nodes);
+        plan_nodes(
+            spec,
+            &nodes,
+            &focuses,
+            &mut occurrences,
+            &mut rendered,
+            None,
+            prefix,
+            &mut serial,
+            &mut graph,
+        );
+    }
+    for (index, change) in spec.change.iter().enumerate() {
+        if let Some(insert) = change.insert.as_ref().filter(|_| !rendered[index]) {
+            let id = result_node(prefix, &mut serial, insert, "insert", "box", &mut graph);
+            if serial > 1 {
+                graph.push_str(&format!("  {prefix}{} --> {id}\n", serial - 2));
+            }
         }
-        if guard.is_some() {
-            graph.push_str(&format!("  {id} -->|exit| {id}x[\"return\"]:::exit\n"));
-        }
-        previous = Some(id);
     }
     graph
 }
@@ -791,7 +960,7 @@ fn result(spec: &Spec, row: &ResultRow, prefix: &str) -> String {
 }
 
 fn classes() -> &'static str {
-    "  classDef base fill:#f3f4f6,stroke:#9ca3af,color:#6b7280\n  classDef fold fill:#f9fafb,stroke:#d1d5db,color:#6b7280,stroke-dasharray: 4 3\n  classDef insert fill:#dcfce7,stroke:#22c55e,color:#166534\n  classDef guard fill:#dcfce7,stroke:#22c55e,color:#166534\n  classDef removed fill:#f3f4f6,stroke:#9ca3af,color:#6b7280\n  classDef ok fill:#dcfce7,stroke:#22c55e,color:#166534\n  classDef miss fill:#fee2e2,stroke:#ef4444,color:#991b1b,stroke-dasharray: 4 3\n  classDef extra fill:#fef3c7,stroke:#f59e0b,color:#92400e\n  classDef ctx fill:#eff6ff,stroke:#60a5fa,color:#1d4ed8\n  classDef exit fill:#fff7ed,stroke:#f97316,color:#9a3412\n"
+    "  classDef base fill:#f3f4f6,stroke:#9ca3af,color:#6b7280\n  classDef fold fill:#f9fafb,stroke:#d1d5db,color:#6b7280,stroke-dasharray: 4 3\n  classDef insert fill:#dcfce7,stroke:#22c55e,color:#166534\n  classDef guard fill:#dcfce7,stroke:#22c55e,color:#166534\n  classDef removed fill:#f3f4f6,stroke:#9ca3af,color:#6b7280,text-decoration:line-through\n  classDef ok fill:#dcfce7,stroke:#22c55e,color:#166534\n  classDef miss fill:#fee2e2,stroke:#ef4444,color:#991b1b,stroke-dasharray: 4 3\n  classDef extra fill:#fef3c7,stroke:#f59e0b,color:#92400e\n  classDef ctx fill:#eff6ff,stroke:#60a5fa,color:#1d4ed8\n  classDef exit fill:#fff7ed,stroke:#f97316,color:#9a3412\n"
 }
 
 fn diagram_parts(diagram: String) -> Vec<String> {
