@@ -1,0 +1,1 @@
+class Notifier { sendSms(text) { const phone = this.getPhone(); if (this.validatePhone(phone) || text != null) { this.send(phone, text); } } getPhone() { return ""; } send() {} validatePhone() { return true; } }

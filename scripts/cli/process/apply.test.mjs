@@ -181,11 +181,11 @@ describe("apply refuses an invalid graph", () => {
     expect(errors.join(" ")).toMatch(/red-tests declared without red/);
   });
 
-  it("requires flow for an auto step that produces C#, but accepts an explained n/a", () => {
+  it("requires flow for an auto step that produces configured code, but accepts an explained n/a", () => {
     const missing = check(
       ["steps:", "  1:", "    title: A", "    kind: auto", "    produces: [src/Notifier.cs]"].join("\n"),
     );
-    expect(missing.errors.join(" ")).toMatch(/produces a \.cs file but has no flow/);
+    expect(missing.errors.join(" ")).toMatch(/produces configured flow-language code but has no flow/);
     const blankNa = check(
       ["steps:", "  1:", "    title: A", "    kind: auto", "    produces: [src/Notifier.cs]", "    flow: n/a"].join("\n"),
     );
@@ -198,6 +198,12 @@ describe("apply refuses an invalid graph", () => {
       ["steps:", "  1:", "    title: A", "    kind: auto", "    produces: [src/Notifier.cs]", "    flow: placeholder"].join("\n"),
     );
     expect(scalar.errors.join(" ")).toMatch(/flow must be a method delta, a list of them, or flow: n\/a <reason>/);
+  });
+
+  it("requires flow for Rust and TS/JS only when those languages are configured", () => {
+    const doc = readDocument(["steps:", "  1:", "    title: A", "    kind: auto", "    produces: [src/notify.rs, src/view.tsx, scripts/check.cjs]"].join("\n"));
+    expect(validate(doc, { languages: ["rs", "ts", "js"] }).errors.join(" ")).toMatch(/configured flow-language code but has no flow/);
+    expect(validate(doc, { languages: ["cs"] }).errors).toEqual([]);
   });
 
   it("only WARNS when a red-tests path is not also in produces", () => {

@@ -24,6 +24,7 @@ export const SETTINGS_KEYS = [
   "matchPlanCli",
   "specRoot",
   "specRepos",
+  "flowLanguages",
 ];
 
 // The Roaming base that holds the app's data dir. Windows: %APPDATA%, with a
@@ -153,4 +154,13 @@ export function specRepoPath(repoKey, appData) {
   const repos = specRepos(appData);
   const v = repos[repoKey];
   return typeof v === "string" && v.trim() ? v.trim() : "";
+}
+
+const FLOW_LANGUAGES = new Set(["cs", "rs", "ts", "js"]);
+export function flowLanguages(project, appData) {
+  const all = readSettings(appData).flowLanguages;
+  const configured = all && typeof all === "object" && !Array.isArray(all) ? all[String(project || "")] : null;
+  if (!Array.isArray(configured)) return ["cs"];
+  const selected = [...new Set(configured.filter((value) => typeof value === "string" && FLOW_LANGUAGES.has(value)))];
+  return selected.length ? selected : ["cs"];
 }

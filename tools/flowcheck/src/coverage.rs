@@ -1,7 +1,10 @@
-use crate::flow::Spec;
+use crate::flow::{
+    lang::{self, LanguageSpec},
+    Spec,
+};
 use serde::Serialize;
 use std::{collections::HashSet, fs, path::Path, process::Command};
-use tree_sitter::{Language, Node, Parser, Tree};
+use tree_sitter::{Node, Parser, Tree};
 
 #[derive(Debug, Serialize, Clone, PartialEq, Eq)]
 pub struct Unchecked {
@@ -29,17 +32,18 @@ pub struct Report {
 struct Source {
     bytes: Vec<u8>,
     tree: Tree,
+    lang: &'static LanguageSpec,
 }
 
 impl Source {
-    fn parse(bytes: Vec<u8>) -> Result<Self, String> {
+    fn parse(bytes: Vec<u8>, lang: &'static LanguageSpec) -> Result<Self, String> {
         let mut parser = Parser::new();
-        let language: Language = tree_sitter_c_sharp::LANGUAGE.into();
+        let language = (lang.grammar)();
         parser.set_language(&language).map_err(|e| e.to_string())?;
         let tree = parser
             .parse(&bytes, None)
-            .ok_or_else(|| "could not parse C# source".to_string())?;
-        Ok(Self { bytes, tree })
+            .ok_or_else(|| "could not parse source".to_string())?;
+        Ok(Self { bytes, tree, lang })
     }
 
     fn text(&self, n: Node) -> String {
@@ -49,20 +53,17 @@ impl Source {
     }
 
     fn methods(&self) -> Vec<Node<'_>> {
-        fn visit<'a>(n: Node<'a>, out: &mut Vec<Node<'a>>) {
-            if matches!(
-                n.kind(),
-                "method_declaration" | "constructor_declaration" | "local_function_statement"
-            ) {
+        fn visit<'a>(source: &Source, n: Node<'a>, out: &mut Vec<Node<'a>>) {
+            if source.lang.method_kinds.contains(&n.kind()) {
                 out.push(n);
             }
             let mut cursor = n.walk();
             for child in n.children(&mut cursor) {
-                visit(child, out);
+                visit(source, child, out);
             }
         }
         let mut out = Vec::new();
-        visit(self.tree.root_node(), &mut out);
+        visit(self, self.tree.root_node(), &mut out);
         out
     }
 
@@ -80,7 +81,7 @@ impl Source {
 
     fn normalized(&self, node: Node) -> String {
         fn append(source: &Source, node: Node, out: &mut String) {
-            if node.kind() == "comment" {
+            if node.kind() == source.lang.comment_kind {
                 return;
             }
             if node.child_count() == 0 {
@@ -231,7 +232,7 @@ pub fn inspect(specs: &[Spec], repo: &Path, base: &str, head: Option<&str>) -> R
         Ok(names) => files.extend(
             String::from_utf8_lossy(&names)
                 .lines()
-                .filter(|name| name.ends_with(".cs"))
+                .filter(|name| lang::supported_file(name))
                 .map(str::to_owned),
         ),
         Err(e) => report.unchecked.push(Unchecked {
@@ -243,6 +244,13 @@ pub fn inspect(specs: &[Spec], repo: &Path, base: &str, head: Option<&str>) -> R
     }
     for file in &files {
         let file = file.as_str();
+        let language = match lang::for_file(file) {
+            Ok(language) => language,
+            Err(reason) => {
+                report.cannot.push(format!("{file}: {reason}"));
+                continue;
+            }
+        };
         if let Some(reason) = na_for(specs, file, None)
             .filter(|_| specs.iter().any(|s| s.file == file && s.method.is_empty()))
         {
@@ -277,7 +285,10 @@ pub fn inspect(specs: &[Spec], repo: &Path, base: &str, head: Option<&str>) -> R
                 continue;
             }
         };
-        let (base_src, head_src) = match (Source::parse(base_bytes), Source::parse(head_bytes)) {
+        let (base_src, head_src) = match (
+            Source::parse(base_bytes, language),
+            Source::parse(head_bytes, language),
+        ) {
             (Ok(b), Ok(h)) => (b, h),
             (Err(e), _) | (_, Err(e)) => {
                 report.unchecked.push(Unchecked {

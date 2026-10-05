@@ -1,0 +1,1 @@
+struct Notifier; impl Notifier { fn send_sms(&self,id:u32,text:&str)->Result<(),()> { let p=self.get_phone(id)?; match self.validate_phone(&p) { Err(_)=>return Ok(()), Ok(_)=>{} } self.send(&p,text); Ok(()) } fn get_phone(&self,_:u32)->Result<String,()>{Ok("1".into())} fn validate_phone(&self,_:&str)->Result<(),()>{Ok(())} fn send(&self,_:&str,_:&str){} }

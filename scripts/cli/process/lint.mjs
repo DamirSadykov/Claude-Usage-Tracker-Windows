@@ -23,6 +23,7 @@ import { readFileSync } from "node:fs";
 import { boardPath, loadBoard, isDone, isChangeRoot } from "../board/todos.mjs";
 import { collectChange } from "./run.mjs";
 import { checkGraph, splitFindings } from "./graph-rules.mjs";
+import { flowLanguages } from "../kernel/settings.mjs";
 
 const USAGE =
   "usage: cli todos lint [<change>] [--json]\n" +
@@ -62,7 +63,7 @@ const boardNode = (t) => ({
 // A reference resolves against the WHOLE board, not against the linted scope: a
 // dep edge leaving a change points at a real task, and only a reference that
 // matches nothing anywhere is the dangling one (the task was deleted).
-export function boardGraph(data, tasks) {
+export function boardGraph(data, tasks, languages = ["cs"]) {
   const known = new Set((data.todos || []).filter(Boolean).map((t) => t.id));
   return {
     changes: [
@@ -100,6 +101,7 @@ export function boardGraph(data, tasks) {
       return t ? `#${t.number}` : `"${ref}"`;
     },
     lineCount: workspaceLineCount,
+    flowLanguages: languages,
   };
 }
 
@@ -140,7 +142,8 @@ export function scopeOf(data, change) {
 
 export function lint(data, change) {
   const scope = scopeOf(data, change);
-  const findings = checkGraph(boardGraph(data, scope.tasks));
+  const project = path.basename(process.cwd().replace(/[\\/]+$/, ""));
+  const findings = checkGraph(boardGraph(data, scope.tasks, flowLanguages(project)));
   return { scope, findings, ...splitFindings(findings) };
 }
 

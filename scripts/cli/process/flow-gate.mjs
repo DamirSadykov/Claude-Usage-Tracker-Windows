@@ -3,17 +3,17 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { flowDeclared } from "./graph-rules.mjs";
+import { flowDeclared, supportedFlowExtensions } from "./graph-rules.mjs";
 
 const tailLines = (value, count = 60) => {
   const lines = String(value ?? "").trim().split(/\r?\n/);
   return lines.length <= count ? lines.join("\n") : lines.slice(-count).join("\n");
 };
 
-const nonCsProduces = (task) => (Array.isArray(task?.produces) ? task.produces : [])
+const unsupportedProduces = (task) => (Array.isArray(task?.produces) ? task.produces : [])
   .map((file) => String(file || "").trim().replace(/\\/g, "/"))
-  .filter((file) => file && !/\.cs$/i.test(file))
-  .map((file) => ({ kind: "non-csharp-produce", file, method: null, reason: "flowcheck does not inspect non-C# produces" }));
+  .filter((file) => file && !supportedFlowExtensions.some((extension) => file.toLowerCase().endsWith(extension)))
+  .map((file) => ({ kind: "unsupported-produce", file, method: null, reason: "flowcheck does not inspect this file type" }));
 
 function runExe(exe, args, cwd, timeoutMs) {
   return new Promise((resolve) => {
@@ -25,7 +25,7 @@ function runExe(exe, args, cwd, timeoutMs) {
 
 export async function runFlowGate({ task, cwd, timeoutMs, exe, runCmd = runExe }) {
   const started = Date.now();
-  const finish = (status, extra = {}) => ({ status, duration_ms: Date.now() - started, coverage: [], unchecked: nonCsProduces(task), ...extra });
+  const finish = (status, extra = {}) => ({ status, duration_ms: Date.now() - started, coverage: [], unchecked: unsupportedProduces(task), ...extra });
   if (!flowDeclared(task?.flow))
     return finish("cannot", { reason: "flow gate requires a method delta or a list of them" });
   if (!task?.step_base) return finish("cannot", { reason: "flow declared but no step_base was recorded before the step ran" });
@@ -40,7 +40,7 @@ export async function runFlowGate({ task, cwd, timeoutMs, exe, runCmd = runExe }
     const output = [result?.stdout, result?.stderr].filter((v) => String(v || "").trim()).join("\n");
     let parsed = {};
     try { parsed = JSON.parse(result?.stdout || "{}"); } catch {}
-    const unchecked = [...(Array.isArray(parsed.unchecked) ? parsed.unchecked : []), ...nonCsProduces(task)];
+    const unchecked = [...(Array.isArray(parsed.unchecked) ? parsed.unchecked : []), ...unsupportedProduces(task)];
     const coverage = parsed?.coverage?.findings ?? parsed?.coverage ?? [];
     const code = Number(result?.code);
     if (code === 0) return finish("pass", { reason: null, coverage, unchecked });

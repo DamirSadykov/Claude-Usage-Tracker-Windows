@@ -175,11 +175,11 @@ describe("todos lint checks the recorded graph", () => {
     expect(out).toMatch(/#1: red declared on a manual node — a gate never runs it/);
   });
 
-  it("requires flow for auto C# work, with an explained n/a escape hatch", () => {
+  it("requires flow for auto code in the configured languages, with an explained n/a escape hatch", () => {
     board(task(1, { kind: "auto", produces: ["src/Notifier.cs"] }));
     let result = lint();
     expect(result.code).toBe(1);
-    expect(result.out).toMatch(/#1: auto step produces a \.cs file but has no flow/);
+    expect(result.out).toMatch(/#1: auto step produces configured flow-language code but has no flow/);
 
     board(task(1, { kind: "auto", produces: ["src/Notifier.cs"], flow: "n/a" }));
     result = lint();
@@ -203,6 +203,19 @@ describe("todos lint checks the recorded graph", () => {
 
     board(task(1, { kind: "auto", verify: "npm test", produces: ["src/Notifier.cs"], flow: [] }));
     expect(lint().code).toBe(1);
+  });
+
+  it("uses flowLanguages for this project, including Rust and TS/JS extension families", () => {
+    const project = path.basename(process.cwd());
+    writeFileSync(path.join(dir, "com.claude-usage-tracker.app", "settings.json"), JSON.stringify({
+      flowLanguages: { [project]: ["rs", "ts", "js"] },
+    }));
+    board(task(1, { kind: "auto", produces: ["src/notify.rs", "src/ui.tsx", "scripts/check.mjs"] }));
+    expect(lint().out).toMatch(/configured flow-language code but has no flow/);
+    board(task(1, { kind: "auto", produces: ["src/notify.rs"], flow: "n/a generated binding" }));
+    expect(lint().code).toBe(0);
+    board(task(1, { kind: "auto", produces: ["src/ignored.py"] }));
+    expect(lint().code).toBe(0);
   });
 
   it("errors on a risk other than high, and stays quiet on high", () => {

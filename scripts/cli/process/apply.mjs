@@ -28,7 +28,7 @@
 //       budget: 2
 //       red: <cmd>               # MUST fail on the base commit — proves red-tests catches the bug
 //       red-tests: [path, ...]   # the regression test file(s) red is proved against
-//       flow: <delta|[delta]|n/a why>   # C# method-flow delta(s), or why this step has none
+//       flow: <delta|[delta]|n/a why>   # method-flow delta(s), or why this step has none
 //       risk: high               # routes worker/review to agents.json's routes.high, when configured
 //
 // Nothing here writes to the board directly: every task, edge and declaration
@@ -59,6 +59,7 @@ import { createChange, findChangeByTitle, changeAddress } from "../board/change.
 import { parseYamlSubset } from "../kernel/yaml-subset.mjs";
 import { withBoardLock } from "../kernel/board-lock.mjs";
 import path from "node:path";
+import { flowLanguages } from "../kernel/settings.mjs";
 
 const USAGE =
   "usage: cli todos apply <file> [--go] [--force] [--json]\n" +
@@ -226,7 +227,7 @@ export function readDocument(text) {
 // done), so the rules about the past never fire, and a reference may point at a
 // step of this file OR at a task already on the board — a plan is allowed to
 // hang off what is already there.
-function documentGraph(doc, onBoard, lineCount) {
+function documentGraph(doc, onBoard, lineCount, languages) {
   const ids = new Set(doc.steps.map((s) => s.id));
   return {
     changes: doc.change ? [{ label: `change "${doc.change}"`, budget: doc.budget }] : [],
@@ -254,6 +255,7 @@ function documentGraph(doc, onBoard, lineCount) {
     resolves: (ref) => ids.has(ref) || onBoard(ref),
     unknownRef: (ref) => `"${ref}", which is neither a step of this file nor a task on the board`,
     lineCount,
+    flowLanguages: languages,
   };
 }
 
@@ -269,9 +271,10 @@ export function workspaceLineCount(file) {
 
 export function validate(
   doc,
-  { onBoard = () => false, inheritsChange = false, requireChange = false, lineCount = workspaceLineCount } = {},
+  { onBoard = () => false, inheritsChange = false, requireChange = false, lineCount = workspaceLineCount, languages } = {},
 ) {
-  const { errors, warnings } = splitFindings(checkGraph(documentGraph(doc, onBoard, lineCount)));
+  const selectedLanguages = languages || flowLanguages(path.basename(process.cwd().replace(/[\\/]+$/, "")));
+  const { errors, warnings } = splitFindings(checkGraph(documentGraph(doc, onBoard, lineCount, selectedLanguages)));
   if (!doc.steps.length) errors.push("no steps: the file declares nothing to record");
   // A file that only CONTINUES existing tasks needs no group of its own — the
   // one-step plan bound by `task: <N>` is the format's own normal case. A file

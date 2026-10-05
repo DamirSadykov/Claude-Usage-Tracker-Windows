@@ -5,7 +5,12 @@ use std::{
     path::Path,
     process::Command,
 };
-use tree_sitter::{Language, Node, Parser, Tree};
+use tree_sitter::{Node, Parser, Tree};
+
+#[path = "lang.rs"]
+pub mod lang;
+
+use lang::LanguageSpec;
 
 #[path = "extra.rs"]
 mod extra;
@@ -82,18 +87,19 @@ struct Step {
 struct Source {
     bytes: Vec<u8>,
     tree: Tree,
+    lang: &'static LanguageSpec,
 }
 impl Source {
-    fn parse(bytes: Vec<u8>) -> Result<Self, Cannot> {
+    fn parse(bytes: Vec<u8>, lang: &'static LanguageSpec) -> Result<Self, Cannot> {
         let mut parser = Parser::new();
-        let language: Language = tree_sitter_c_sharp::LANGUAGE.into();
+        let language = (lang.grammar)();
         parser
             .set_language(&language)
             .map_err(|e| Cannot(e.to_string()))?;
         let tree = parser
             .parse(&bytes, None)
-            .ok_or_else(|| Cannot("could not parse C# source".into()))?;
-        Ok(Self { bytes, tree })
+            .ok_or_else(|| Cannot("could not parse source".into()))?;
+        Ok(Self { bytes, tree, lang })
     }
     fn text(&self, n: Node) -> String {
         String::from_utf8_lossy(&self.bytes[n.byte_range()])
@@ -111,12 +117,7 @@ impl Source {
         let mut v = Vec::new();
         self.walk(self.tree.root_node(), &mut v);
         v.into_iter()
-            .filter(|n| {
-                matches!(
-                    n.kind(),
-                    "method_declaration" | "constructor_declaration" | "local_function_statement"
-                )
-            })
+            .filter(|n| self.lang.method_kinds.contains(&n.kind()))
             .collect()
     }
     fn find_method(&self, name: &str, params: Option<&str>) -> Result<Node<'_>, Cannot> {
@@ -124,8 +125,12 @@ impl Source {
             .methods()
             .into_iter()
             .filter(|m| {
-                m.child_by_field_name("name")
-                    .map(|n| self.text(n) == name)
+                self.method_name(*m)
+                    .map(|method_name| {
+                        method_name == name
+                            || (!name.contains(['.', ':'])
+                                && method_name.rsplit(['.', ':']).next() == Some(name))
+                    })
                     .unwrap_or(false)
                     && params
                         .map(|p| {
@@ -156,15 +161,80 @@ impl Source {
         }
         Ok(method)
     }
+    fn method_name(&self, method: Node) -> Option<String> {
+        let name = method.child_by_field_name("name");
+        let bare = name.map(|n| self.text(n));
+        if self
+            .lang
+            .extensions
+            .iter()
+            .any(|x| ["ts", "tsx", "js", "mjs", "cjs"].contains(x))
+        {
+            let bare = bare.or_else(|| {
+                let parent = method.parent()?;
+                if parent.kind() == "variable_declarator"
+                    && parent.child_by_field_name("value") == Some(method)
+                {
+                    parent.child_by_field_name("name").map(|n| self.text(n))
+                } else if parent.kind() == "pair"
+                    && parent.child_by_field_name("value") == Some(method)
+                {
+                    parent.child_by_field_name("key").map(|n| self.text(n))
+                } else {
+                    None
+                }
+            })?;
+            if method.kind() == "method_definition" {
+                let mut node = method;
+                while let Some(parent) = node.parent() {
+                    if parent.kind() == "class_declaration" {
+                        if let Some(class) = parent.child_by_field_name("name") {
+                            return Some(format!("{}.{}", self.text(class), bare));
+                        }
+                    }
+                    node = parent;
+                }
+            }
+            return Some(bare);
+        }
+        let bare = bare?;
+        if !self.lang.extensions.contains(&"rs") {
+            return Some(bare);
+        }
+        let mut node = method;
+        while let Some(parent) = node.parent() {
+            if parent.kind() == "impl_item" {
+                if let Some(ty) = parent.child_by_field_name("type") {
+                    return Some(format!("{}::{bare}", self.text(ty)));
+                }
+            }
+            if parent.kind() == "trait_item" {
+                if let Some(ty) = parent.child_by_field_name("name") {
+                    return Some(format!("{}::{bare}", self.text(ty)));
+                }
+            }
+            node = parent;
+        }
+        Some(bare)
+    }
     fn callee(&self, node: Node) -> String {
-        let mut t = node
+        if self.lang.new_expression_kind == Some(node.kind()) {
+            return node
+                .child_by_field_name("constructor")
+                .map(|n| format!("new:{}", self.text(n)))
+                .unwrap_or_default();
+        }
+        if self.lang.macro_invocation_kind == Some(node.kind()) {
+            return node
+                .child_by_field_name("macro")
+                .map(|n| format!("{}!", self.text(n)))
+                .unwrap_or_default();
+        }
+        let t = node
             .child_by_field_name("function")
             .map(|n| self.text(n))
             .unwrap_or_default();
-        if let Some(i) = t.find('<') {
-            t.truncate(i);
-        }
-        t.strip_prefix("this.").unwrap_or(&t).to_string()
+        lang::callee_name(&t)
     }
     fn steps(&self, method: Node) -> Vec<Step> {
         fn visit(s: &Source, n: Node, out: &mut Vec<Step>) {
@@ -172,7 +242,10 @@ impl Source {
             for x in n.children(&mut c) {
                 visit(s, x, out);
             }
-            if n.kind() == "invocation_expression" {
+            if n.kind() == s.lang.invocation_kind
+                || s.lang.macro_invocation_kind == Some(n.kind())
+                || s.lang.new_expression_kind == Some(n.kind())
+            {
                 out.push(Step {
                     kind: "call",
                     key: s.callee(n),
@@ -180,15 +253,17 @@ impl Source {
                     node_id: n.id(),
                 });
             }
-            if n.kind() == "member_access_expression" {
+            if n.kind() == s.lang.member_access_kind {
                 let p = n.parent();
-                if p.map(|x| x.kind() == "member_access_expression")
+                if p.map(|x| x.kind() == s.lang.member_access_kind)
                     .unwrap_or(false)
                 {
                     return;
                 }
                 if p.map(|x| {
-                    x.kind() == "invocation_expression"
+                    (x.kind() == s.lang.invocation_kind
+                        || s.lang.macro_invocation_kind == Some(x.kind())
+                        || s.lang.new_expression_kind == Some(x.kind()))
                         && x.child_by_field_name("function") == Some(n)
                 })
                 .unwrap_or(false)
@@ -216,14 +291,15 @@ impl Source {
         let mut ns = Vec::new();
         self.walk(method, &mut ns);
         ns.into_iter()
-            .filter_map(|n| match n.kind() {
-                "parameter" | "variable_declarator" | "foreach_statement" | "catch_declaration" => {
+            .filter_map(|n| {
+                if self.lang.local_kinds.contains(&n.kind()) {
                     n.child_by_field_name("name")
                         .or_else(|| n.child_by_field_name("left"))
-                        .filter(|x| x.kind() == "identifier")
+                        .filter(|x| x.kind() == self.lang.identifier_kind)
                         .map(|x| self.text(x))
+                } else {
+                    None
                 }
-                _ => None,
             })
             .collect()
     }
@@ -232,8 +308,8 @@ impl Source {
         let local = self.locals(method);
         let mut by: HashMap<String, Vec<Node>> = HashMap::new();
         for m in self.methods() {
-            if let Some(n) = m.child_by_field_name("name") {
-                by.entry(self.text(n)).or_default().push(m);
+            if let Some(n) = self.method_name(m) {
+                by.entry(n).or_default().push(m);
             }
         }
         let mut out = Vec::new();
@@ -266,8 +342,8 @@ impl Source {
         let local = self.locals(method);
         let mut by: HashMap<String, Vec<Node>> = HashMap::new();
         for m in self.methods() {
-            if let Some(n) = m.child_by_field_name("name") {
-                by.entry(self.text(n)).or_default().push(m);
+            if let Some(n) = self.method_name(m) {
+                by.entry(n).or_default().push(m);
             }
         }
         let mut out = Vec::new();
@@ -305,8 +381,8 @@ impl Source {
         let local = self.locals(method);
         let mut by: HashMap<String, Vec<Node>> = HashMap::new();
         for m in self.methods() {
-            if let Some(n) = m.child_by_field_name("name") {
-                by.entry(self.text(n)).or_default().push(m);
+            if let Some(n) = self.method_name(m) {
+                by.entry(n).or_default().push(m);
             }
         }
         let mut out = Vec::new();
@@ -346,6 +422,7 @@ fn key(s: &Step) -> String {
     format!("{}:{}", s.kind, s.key)
 }
 fn load_source(repo: &Path, rev: Option<&str>, file: &str) -> Result<Source, Cannot> {
+    let lang = lang::for_file(file).map_err(Cannot)?;
     let bytes = match rev {
         None => {
             fs::read(repo.join(file)).map_err(|_| Cannot(format!("head: file not found {file}")))?
@@ -366,28 +443,32 @@ fn load_source(repo: &Path, rev: Option<&str>, file: &str) -> Result<Source, Can
             o.stdout
         }
     };
-    Source::parse(bytes)
+    Source::parse(bytes, lang)
 }
 
 fn is_call_to(s: &Source, n: Node, name: &str) -> bool {
-    n.kind() == "invocation_expression" && matches(&s.callee(n), name)
+    (n.kind() == s.lang.invocation_kind
+        || s.lang.macro_invocation_kind == Some(n.kind())
+        || s.lang.new_expression_kind == Some(n.kind()))
+        && matches(&s.callee(n), name)
 }
 fn contains_call(s: &Source, n: Node, name: &str, aliases: &HashSet<String>) -> bool {
     let mut nodes = Vec::new();
     s.walk(n, &mut nodes);
     nodes.into_iter().any(|x| {
-        is_call_to(s, x, name) || (x.kind() == "identifier" && aliases.contains(&s.text(x)))
+        is_call_to(s, x, name)
+            || (x.kind() == s.lang.identifier_kind && aliases.contains(&s.text(x)))
     })
 }
-fn unwrap(n: Option<Node>) -> Option<Node> {
+fn unwrap<'a>(s: &Source, n: Option<Node<'a>>) -> Option<Node<'a>> {
     let mut n = n?;
-    while n.kind() == "parenthesized_expression" {
+    while n.kind() == s.lang.parenthesized_kind {
         n = n.named_child(0)?;
     }
     Some(n)
 }
 fn is_guard_atom(s: &Source, n: Node, name: &str, aliases: &HashSet<String>) -> bool {
-    is_call_to(s, n, name) || (n.kind() == "identifier" && aliases.contains(&s.text(n)))
+    is_call_to(s, n, name) || (n.kind() == s.lang.identifier_kind && aliases.contains(&s.text(n)))
 }
 fn bool_literal(s: &Source, n: Node) -> Option<bool> {
     match s.text(n).as_str() {
@@ -397,12 +478,12 @@ fn bool_literal(s: &Source, n: Node) -> Option<bool> {
     }
 }
 fn eq_form(s: &Source, n: Node, name: &str, aliases: &HashSet<String>) -> Option<bool> {
-    if n.kind() != "binary_expression" {
+    if n.kind() != s.lang.binary_kind {
         return None;
     }
     let op = s.text(n.child_by_field_name("operator")?);
-    let l = unwrap(n.child_by_field_name("left"))?;
-    let r = unwrap(n.child_by_field_name("right"))?;
+    let l = unwrap(s, n.child_by_field_name("left"))?;
+    let r = unwrap(s, n.child_by_field_name("right"))?;
     for (a, b) in [(l, r), (r, l)] {
         if let Some(lit) = bool_literal(s, b) {
             if is_guard_atom(s, a, name, aliases) {
@@ -413,17 +494,17 @@ fn eq_form(s: &Source, n: Node, name: &str, aliases: &HashSet<String>) -> Option
     None
 }
 fn true_implies_valid(s: &Source, n: Option<Node>, name: &str, aliases: &HashSet<String>) -> bool {
-    let Some(n) = unwrap(n) else { return false };
+    let Some(n) = unwrap(s, n) else { return false };
     if is_guard_atom(s, n, name, aliases) {
         return true;
     }
-    if n.kind() == "prefix_unary_expression" {
+    if n.kind() == s.lang.prefix_unary_kind {
         return invalid_implies_true(s, n.named_child(0), name, aliases);
     }
     if let Some(v) = eq_form(s, n, name, aliases) {
         return v;
     }
-    if n.kind() == "binary_expression" {
+    if n.kind() == s.lang.binary_kind {
         let l = n.child_by_field_name("left");
         let r = n.child_by_field_name("right");
         return match s.text(n.child_by_field_name("operator").unwrap()).as_str() {
@@ -444,14 +525,14 @@ fn invalid_implies_true(
     name: &str,
     aliases: &HashSet<String>,
 ) -> bool {
-    let Some(n) = unwrap(n) else { return false };
-    if n.kind() == "prefix_unary_expression" {
+    let Some(n) = unwrap(s, n) else { return false };
+    if n.kind() == s.lang.prefix_unary_kind {
         return true_implies_valid(s, n.named_child(0), name, aliases);
     }
     if let Some(v) = eq_form(s, n, name, aliases) {
         return !v;
     }
-    if n.kind() == "binary_expression" {
+    if n.kind() == s.lang.binary_kind {
         let l = n.child_by_field_name("left");
         let r = n.child_by_field_name("right");
         return match s.text(n.child_by_field_name("operator").unwrap()).as_str() {
@@ -468,62 +549,76 @@ fn invalid_implies_true(
     }
     false
 }
-fn exits(n: Node) -> bool {
+fn exits(s: &Source, n: Node) -> bool {
     match n.kind() {
-        "return_statement" | "throw_statement" => true,
-        "block" => {
+        kind if s.lang.exit_kinds.contains(&kind) => true,
+        kind if kind == s.lang.block_kind => {
             let mut c = n.walk();
             n.named_children(&mut c)
-                .filter(|x| x.kind() != "comment")
+                .filter(|x| x.kind() != s.lang.comment_kind)
                 .last()
-                .map(exits)
+                .map(|node| exits(s, node))
                 .unwrap_or(false)
         }
-        "if_statement" => {
+        kind if kind == s.lang.conditional_kind => {
             n.child_by_field_name("consequence")
-                .map(exits)
+                .map(|node| exits(s, node))
                 .unwrap_or(false)
                 && n.child_by_field_name("alternative")
-                    .map(exits)
+                    .map(|node| exits(s, node))
                     .unwrap_or(false)
         }
+        _ if s.lang.macro_invocation_kind == Some(n.kind()) => {
+            matches!(s.callee(n).as_str(), "panic!" | "unreachable!" | "todo!")
+        }
+        _ if n.kind() == s.lang.expression_statement_kind => n
+            .named_child(0)
+            .map(|child| exits(s, child))
+            .unwrap_or(false),
         _ => false,
     }
 }
 fn top_level_call(s: &Source, stmt: Node, name: &str) -> bool {
-    if stmt.kind() == "expression_statement" {
+    if stmt.kind() == s.lang.expression_statement_kind {
         let mut e = stmt.named_child(0);
-        if e.map(|x| x.kind() == "await_expression").unwrap_or(false) {
+        if e.map(|x| x.kind() == s.lang.await_kind).unwrap_or(false) {
             e = e.and_then(|x| x.named_child(0));
         }
         return e.map(|x| is_call_to(s, x, name)).unwrap_or(false);
     }
-    stmt.kind() == "local_declaration_statement" && contains_call(s, stmt, name, &HashSet::new())
+    stmt.kind() == s.lang.local_declaration_kind && contains_call(s, stmt, name, &HashSet::new())
+}
+fn bare_call(s: &Source, stmt: Node, name: &str) -> bool {
+    if stmt.kind() != s.lang.expression_statement_kind {
+        return false;
+    }
+    let mut e = stmt.named_child(0);
+    if e.map(|x| x.kind() == s.lang.await_kind).unwrap_or(false) {
+        e = e.and_then(|x| x.named_child(0));
+    }
+    e.map(|x| is_call_to(s, x, name)).unwrap_or(false)
 }
 fn enclosing_aliases(s: &Source, node: Node, name: &str) -> HashSet<String> {
     let mut names = HashSet::new();
     let mut n = node;
     while let Some(p) = n.parent() {
-        if matches!(
-            n.kind(),
-            "method_declaration" | "constructor_declaration" | "local_function_statement"
-        ) {
+        if s.lang.method_kinds.contains(&n.kind()) {
             break;
         }
-        if p.kind() == "block" {
+        if p.kind() == s.lang.block_kind {
             let mut c = p.walk();
             for stmt in p.children(&mut c) {
                 if stmt == n {
                     break;
                 }
-                if stmt.kind() != "local_declaration_statement" {
+                if stmt.kind() != s.lang.local_declaration_kind {
                     continue;
                 }
                 let mut all = Vec::new();
                 s.walk(stmt, &mut all);
                 for d in all
                     .into_iter()
-                    .filter(|x| x.kind() == "variable_declarator")
+                    .filter(|x| x.kind() == s.lang.variable_declarator_kind)
                 {
                     if contains_call(s, d, name, &HashSet::new()) {
                         if let Some(x) = d.child_by_field_name("name").or_else(|| d.named_child(0))
@@ -541,13 +636,10 @@ fn enclosing_aliases(s: &Source, node: Node, name: &str) -> HashSet<String> {
 fn guarded(s: &Source, target: Node, name: &str, mode: &str) -> bool {
     let mut n = target;
     while let Some(p) = n.parent() {
-        if matches!(
-            n.kind(),
-            "method_declaration" | "constructor_declaration" | "local_function_statement"
-        ) {
+        if s.lang.method_kinds.contains(&n.kind()) {
             break;
         }
-        if mode == "returns-bool" && p.kind() == "if_statement" {
+        if mode == "returns-bool" && p.kind() == s.lang.conditional_kind {
             let a = enclosing_aliases(s, p, name);
             if p.child_by_field_name("consequence") == Some(n)
                 && true_implies_valid(s, p.child_by_field_name("condition"), name, &a)
@@ -560,21 +652,37 @@ fn guarded(s: &Source, target: Node, name: &str, mode: &str) -> bool {
                 return true;
             }
         }
-        if p.kind() == "block" {
+        if p.kind() == s.lang.block_kind {
             let a = enclosing_aliases(s, n, name);
+            let mut rust_alias = false;
             let mut c = p.walk();
             for stmt in p.children(&mut c) {
                 if stmt == n {
                     break;
                 }
+                if s.lang.extensions == ["rs"]
+                    && s.text(stmt).contains(&format!("{name}("))
+                    && s.text(stmt).starts_with("let")
+                {
+                    rust_alias = true;
+                }
                 if mode == "returns-bool"
-                    && stmt.kind() == "if_statement"
+                    && stmt.kind() == s.lang.conditional_kind
                     && invalid_implies_true(s, stmt.child_by_field_name("condition"), name, &a)
                     && stmt
                         .child_by_field_name("consequence")
-                        .map(exits)
+                        .map(|node| exits(s, node))
                         .unwrap_or(false)
                 {
+                    return true;
+                }
+                if mode == "returns-bool" && rust_bool_guard(s, stmt, name, rust_alias) {
+                    return true;
+                }
+                if mode == "returns-result" && rust_result_guard(s, stmt, name) {
+                    return true;
+                }
+                if mode == "throws" && bare_call(s, stmt, name) {
                     return true;
                 }
                 if mode == "none" && top_level_call(s, stmt, name) {
@@ -585,6 +693,42 @@ fn guarded(s: &Source, target: Node, name: &str, mode: &str) -> bool {
         n = p;
     }
     false
+}
+
+fn rust_bool_guard(s: &Source, stmt: Node, name: &str, alias: bool) -> bool {
+    if s.lang.extensions != ["rs"] {
+        return false;
+    }
+    let text = s.text(stmt);
+    text.starts_with("if")
+        && !text.contains("&&")
+        && text.matches("if").count() == 1
+        && (text.contains(&format!("!self.{name}("))
+            || (text.contains(&format!("{name}(")) && text.contains("==false"))
+            || (alias && text.starts_with("if!")))
+        && (text.contains("return") || text.contains("panic!"))
+}
+
+fn rust_result_guard(s: &Source, stmt: Node, name: &str) -> bool {
+    if s.lang.extensions != ["rs"] {
+        return false;
+    }
+    let text = s.text(stmt);
+    let called = text.contains(&format!("{name}(")) || text.contains(&format!("::{name}("));
+    let conditional = if stmt.kind() == s.lang.expression_statement_kind {
+        stmt.named_child(0).unwrap_or(stmt)
+    } else {
+        stmt
+    };
+    called
+        && ((text.ends_with("?;") || text.contains("else{return"))
+            || (text.starts_with("if")
+                && text.contains(".is_err()")
+                && conditional
+                    .child_by_field_name("consequence")
+                    .map(|branch| exits(s, branch))
+                    .unwrap_or(false))
+            || (text.starts_with("match") && text.contains("Err(") && text.contains("return")))
 }
 
 fn subsequence_missing(need: &[String], have: &[String]) -> Vec<String> {

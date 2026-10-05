@@ -50,6 +50,7 @@
     { "key": "releasesCache", "scope": "ui", "writer": "app", "readers": ["ui"], "default": null, "direct": true },
     { "key": "externalStatusMap", "scope": "ui", "writer": "app", "readers": ["ui"], "default": {}, "direct": true },
     { "key": "specsEnabled", "scope": "shared", "writer": "app", "readers": ["ui", "cli"], "default": false },
+    { "key": "flowLanguages", "scope": "hook", "writer": "manual", "readers": ["cli"], "default": {} },
     { "key": "taskContextPriority", "scope": "shared", "writer": "app", "readers": ["ui", "cli"], "default": "medium", "direct": true },
     { "key": "hookContextEnabled", "scope": "shared", "writer": "app", "readers": ["ui", "cli"], "default": true, "direct": true },
     { "key": "workflowContextEnabled", "scope": "shared", "writer": "app", "readers": ["ui", "cli"], "default": false, "direct": true },

@@ -49,7 +49,7 @@ steps:
     budget: <usd>
     red: <cmd>            # bug-fix gate: MUST fail on the base commit — proves red-tests catches it
     red-tests: [<path>]   # the regression test file(s) red is proved against; needs red, and vice versa
-    flow: <delta | [delta]>  # C# method-flow delta per method (file, method, params, change, preserve); a list for several methods, or `n/a <reason>`
+    flow: <delta | [delta]>  # method-flow delta per method (file, method, params, change, preserve); required for code configured in flowLanguages[<project>] (default cs), or `n/a <reason>`
     risk: high            # routes worker/review to agents.json's routes.high, when configured — the only value accepted
 ```
 
@@ -106,8 +106,10 @@ pointing at a step that does not exist; a step with neither a `title` nor a
 `task`; a `task` naming no task on the board, or one already bound to an earlier
 step; an invalid number or an unknown `kind`; `red` declared without
 `red-tests`, or `red-tests` declared without `red` — the gate needs both halves
-or neither; an `auto` step whose `produces` includes a `.cs` file without a
-`flow`, with a value that is neither a delta nor a list of deltas, or with `flow: n/a` but no reason; a `risk` other than `high`; an `out` item that is not a mapping or
+or neither; an `auto` step whose `produces` includes source code of a language
+enabled in `flowLanguages[<project>]` (default: `cs`) without a `flow`, with a
+value that is neither a delta nor a list of deltas, or with `flow: n/a` but no
+reason; a `risk` other than `high`; an `out` item that is not a mapping or
 has no `what` or `why`; a `measure` item that is not a mapping or has no `what`
 or `how`.
 

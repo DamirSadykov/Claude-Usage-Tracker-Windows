@@ -28,7 +28,19 @@
 import { normalizeLimit } from "../kernel/board-io.mjs";
 
 const blank = (v) => v === undefined || v === null || String(v).trim() === "";
-const csOutput = (n) => (n.produces || []).some((path) => /\.cs$/i.test(String(path).trim()));
+const FLOW_LANGUAGE_EXTENSIONS = {
+  cs: [".cs"],
+  rs: [".rs"],
+  ts: [".ts", ".tsx"],
+  js: [".js", ".mjs", ".cjs"],
+};
+export const supportedFlowExtensions = Object.values(FLOW_LANGUAGE_EXTENSIONS).flat();
+export const flowExtensions = (languages = ["cs"]) =>
+  [...new Set((Array.isArray(languages) ? languages : ["cs"]).flatMap((language) => FLOW_LANGUAGE_EXTENSIONS[language] || []))];
+const flowOutput = (n, languages) => {
+  const extensions = flowExtensions(languages);
+  return (n.produces || []).some((value) => extensions.some((extension) => String(value).trim().toLowerCase().endsWith(extension)));
+};
 const flowNaReason = (flow) => {
   if (typeof flow !== "string") return null;
   const match = /^n\/a(?:\s+(.*))?$/i.exec(flow.trim());
@@ -204,13 +216,13 @@ export const NODE_RULES = [
         : null,
   },
   {
-    id: "cs-without-flow",
+    id: "code-without-flow",
     severity: "error",
     when: "open",
-    check: (n) => {
-      if (n.kind !== "auto" || !csOutput(n)) return null;
+    check: (n, g) => {
+      if (n.kind !== "auto" || !flowOutput(n, g.flowLanguages)) return null;
       if (blank(n.flow))
-        return `${n.label}: auto step produces a .cs file but has no flow — declare flow or flow: n/a <reason>`;
+        return `${n.label}: auto step produces configured flow-language code but has no flow — declare flow or flow: n/a <reason>`;
       if (typeof n.flow === "string") {
         if (!/^n\/a\b/i.test(n.flow.trim()))
           return `${n.label}: flow must be a method delta, a list of them, or flow: n/a <reason>`;

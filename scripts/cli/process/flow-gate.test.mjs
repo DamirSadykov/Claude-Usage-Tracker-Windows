@@ -18,7 +18,7 @@ describe("runFlowGate", () => {
     });
     expect(result.status).toBe(status);
     expect(result.coverage).toEqual(["coverage"]);
-    expect(result.unchecked).toEqual(expect.arrayContaining([{ file: "docs/note.md", kind: "non-csharp-produce", method: null, reason: expect.any(String) }]));
+    expect(result.unchecked).toEqual(expect.arrayContaining([{ file: "docs/note.md", kind: "unsupported-produce", method: null, reason: expect.any(String) }]));
     expect(result.duration_ms).toEqual(expect.any(Number));
   });
 
@@ -66,5 +66,13 @@ describe("runFlowGate", () => {
     });
     expect(result.status).toBe("pass");
     expect(written).toEqual(flow);
+  });
+
+  it("does not mark supported Rust and TS/JS produces unchecked", async () => {
+    const result = await runFlowGate({
+      task: task({ produces: ["src/notify.rs", "src/view.tsx", "src/check.js", "docs/note.md"] }), cwd: process.cwd(), exe,
+      runCmd: async () => ({ code: 0, stdout: "{}", stderr: "" }),
+    });
+    expect(result.unchecked).toEqual([{ file: "docs/note.md", kind: "unsupported-produce", method: null, reason: expect.any(String) }]);
   });
 });
