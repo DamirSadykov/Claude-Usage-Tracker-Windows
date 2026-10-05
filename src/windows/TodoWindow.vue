@@ -395,7 +395,10 @@ type DetailTab = "overview" | "trace" | "comments";
 const detailTab = ref<DetailTab>("overview");
 type FlowTab = "plan" | "result";
 const flowTab = ref<FlowTab>("plan");
-const flowDiagram = computed(() => detail.value?.flow_diagram);
+const flowDiagram = computed<Todo["flow_diagram"]>(() => {
+  const process = detail.value?.ext?.process as { flow_diagram?: Todo["flow_diagram"] } | undefined;
+  return detail.value?.flow_diagram ?? process?.flow_diagram;
+});
 const flowPlan = computed(() => flowDiagram.value?.plan?.trim() ?? "");
 const flowResult = computed(() => flowDiagram.value?.result?.trim() ?? "");
 const hasFlowDiagram = computed(() => Boolean(flowPlan.value || flowResult.value));
