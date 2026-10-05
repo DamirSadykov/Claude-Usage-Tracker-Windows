@@ -1,29 +1,28 @@
 #!/usr/bin/env node
-/**
- * Differential oracle for the Rust flowcheck port.
- *
- * The Python implementation is deliberately treated as an executable oracle:
- * this program does not encode expected outcomes for individual cases.
- */
 import { mkdtempSync, readFileSync, readdirSync, rmSync, cpSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 
 const here = dirname(new URL(import.meta.url).pathname.replace(/^\/(.:\/)/, '$1'));
-const pilotDefault = 'D:/projects/_temp/flow-pilot';
 const args = process.argv.slice(2);
 const option = (name, fallback) => {
   const at = args.indexOf(name);
   return at === -1 ? fallback : args.at(at + 1);
 };
 if (args.includes('--help')) {
-  console.log('Usage: node tools/flowcheck/diff-oracle.mjs [--pilot PATH] [--python PATH] [--rust PATH] [--live-repo PATH]');
+  console.log('Usage: node tools/flowcheck/diff-oracle.mjs [--pilot PATH] [--python PATH] [--rust PATH] [--live-repo PATH --live-cases FILE]');
   process.exit(0);
 }
-const pilot = resolve(option('--pilot', process.env.FLOWCHECK_PILOT ?? pilotDefault));
+const pilotPath = option('--pilot', process.env.FLOWCHECK_PILOT);
+if (!pilotPath) {
+  console.error('Set FLOWCHECK_PILOT or pass --pilot with the Python pilot directory.');
+  process.exit(2);
+}
+const pilot = resolve(pilotPath);
 const python = resolve(option('--python', process.env.FLOWCHECK_PYTHON ?? join(pilot, 'gv/Scripts/python.exe')));
 const liveRepo = option('--live-repo', process.env.FLOWCHECK_LIVE_REPO);
+const liveCases = option('--live-cases', process.env.FLOWCHECK_LIVE_CASES);
 let rust = option('--rust', process.env.FLOWCHECK_RUST);
 
 function run(command, commandArgs, options = {}) {
@@ -99,13 +98,10 @@ try {
     checked += 1;
   }
 
-  const live = [
-    ['live/coupon', 'spec-coupon.yaml', '0c9d89648b^', '0c9d89648b'],
-    ['live/d3dffd872a', 'spec-d3d.yaml', 'd3dffd872a^', 'd3dffd872a'],
-  ];
-  if (!liveRepo) {
+  const live = liveCases ? JSON.parse(readFileSync(resolve(liveCases), 'utf8')).map(c => [c.label, c.spec, c.base, c.head]) : [];
+  if (!liveRepo || !live.length) {
     skipped = live.length;
-    console.log(`Live cases skipped: ${skipped} (set FLOWCHECK_LIVE_REPO or pass --live-repo).`);
+    console.log(`Live cases skipped: ${skipped} (set FLOWCHECK_LIVE_REPO and FLOWCHECK_LIVE_CASES).`);
   } else {
     const repo = resolve(liveRepo);
     for (const [label, specFile, base, head] of live) {
@@ -114,7 +110,7 @@ try {
         skipped += 1;
         continue;
       }
-      failures.push(...checkCase(label, join(pilot, specFile), repo, base, head));
+      failures.push(...checkCase(label, resolve(pilot, specFile), repo, base, head));
       checked += 1;
     }
   }
