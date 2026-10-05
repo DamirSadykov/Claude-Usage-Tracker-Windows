@@ -43,6 +43,27 @@ const COMMON: LanguageSpec = LanguageSpec {
     local_declaration_kind: "lexical_declaration",
     variable_declarator_kind: "variable_declarator",
     comment_kind: "comment",
+    builtin_calls: &[
+        "Array.*",
+        "Object.*",
+        "JSON.*",
+        "Math.*",
+        "Number.*",
+        "String.*",
+        "Boolean.*",
+        "Date.*",
+        "Promise.*",
+        "console.*",
+        "Reflect.*",
+        "Symbol.*",
+        "String",
+        "Number",
+        "Boolean",
+    ],
+    builtin_value_methods: &[
+        "map", "filter", "trim", "join", "slice", "push", "includes", "some", "every", "find",
+        "forEach", "toString",
+    ],
 };
 
 static TYPESCRIPT: LanguageSpec = LanguageSpec {

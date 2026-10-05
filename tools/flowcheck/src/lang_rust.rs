@@ -26,6 +26,31 @@ static RUST: LanguageSpec = LanguageSpec {
     local_declaration_kind: "let_declaration",
     variable_declarator_kind: "let_declaration",
     comment_kind: "line_comment",
+    builtin_calls: &[
+        "Some",
+        "Ok",
+        "Err",
+        "Box::new",
+        "Vec::new",
+        "String::from",
+        "format!",
+        "vec!",
+        "println!",
+        "eprintln!",
+        "write!",
+        "matches!",
+        "assert!",
+    ],
+    builtin_value_methods: &[
+        "clone",
+        "to_string",
+        "unwrap",
+        "iter",
+        "map",
+        "collect",
+        "as_ref",
+        "into",
+    ],
 };
 
 pub(super) fn spec() -> &'static LanguageSpec {

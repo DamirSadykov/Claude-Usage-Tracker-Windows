@@ -144,6 +144,60 @@ fn m4_after_send_still_marks_the_divergence() {
 }
 
 #[test]
+fn builtin_namespace_calls_are_hidden_unless_the_delta_names_them() {
+    let render = |change: &str| {
+        let spec: flow::Spec = serde_yaml::from_str(&format!(
+            "file: src/sample.mjs\nmethod: finishStep\nchange:\n  - {change}\npreserve: all\n"
+        ))
+        .unwrap();
+        render::markdown(
+            "result",
+            &[spec],
+            &[row(
+                vec!["call:Array.isArray".into(), "call:JSON.stringify".into()],
+                vec!["call:Array.isArray".into(), "call:JSON.stringify".into()],
+                "pass",
+            )],
+        )
+    };
+    for change in [
+        "insert: JSON.stringify",
+        "before: JSON.stringify",
+        "after: JSON.stringify",
+        "remove-call: JSON.stringify",
+    ] {
+        let got = render(change);
+        assert!(!got.contains("Array.isArray"), "{got}");
+        assert!(got.contains("JSON.stringify"), "{got}");
+    }
+}
+
+#[test]
+fn qualified_c_sharp_builtin_calls_are_hidden() {
+    let spec: flow::Spec = serde_yaml::from_str(
+        "file: src/sample.cs\nmethod: FinishStep\nchange:\n  - insert: persist\npreserve: all\n",
+    )
+    .unwrap();
+    let got = render::markdown(
+        "result",
+        &[spec],
+        &[row(
+            vec![
+                "call:System.Console.WriteLine".into(),
+                "call:persist".into(),
+            ],
+            vec![
+                "call:System.Console.WriteLine".into(),
+                "call:persist".into(),
+            ],
+            "pass",
+        )],
+    );
+    assert!(!got.contains("System.Console.WriteLine"), "{got}");
+    assert!(got.contains("persist"), "{got}");
+}
+
+#[test]
 fn long_finish_step_is_folded_below_mermaid_limit() {
     let steps: Vec<String> = (0..1536).map(|n| format!("call:helper{n}")).collect();
     let got = render::markdown("result", &[spec()], &[row(steps.clone(), steps, "pass")]);
@@ -214,5 +268,30 @@ fn real_finish_step_is_a_small_top_level_diagram() {
     assert!(got.len() < 45_000, "{}", got.len());
     assert!(got.matches("[\"").count() <= 60, "too many nodes: {got}");
     assert!(got.contains("recordFlowDiagram\"]:::insert"), "{got}");
+    let _ = fs::remove_dir_all(repo);
+}
+
+#[test]
+fn run_flow_gate_hides_builtin_calls() {
+    let repo = temp_repo();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture/js/flow-gate.mjs");
+    fs::copy(&fixture, repo.join("scripts/cli/process/flow-gate.mjs")).unwrap();
+    let base = commit(&repo);
+    fs::write(
+        repo.join("scripts/cli/process/flow-gate.mjs"),
+        fs::read_to_string(&fixture).unwrap().replace(
+            "const started = Date.now();",
+            "const started = Date.now() + 1;",
+        ),
+    )
+    .unwrap();
+    let head = commit(&repo);
+    fs::copy(&fixture, repo.join("scripts/cli/process/flow-gate.mjs")).unwrap();
+    let spec: flow::Spec = serde_yaml::from_str("file: scripts/cli/process/flow-gate.mjs\nmethod: runFlowGate\nchange:\n  - insert: started\n    before: finish\npreserve: all\n").unwrap();
+    let row = flow::check_method(&spec, &repo, &base, Some(&head), true);
+    let got = render::markdown("result", &[spec], &[row]);
+    assert!(got.matches("[\"").count() <= 32, "too many nodes: {got}");
+    assert!(!got.contains("Array.isArray"), "{got}");
+    assert!(!got.contains("JSON.stringify"), "{got}");
     let _ = fs::remove_dir_all(repo);
 }

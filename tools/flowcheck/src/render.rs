@@ -1,4 +1,5 @@
-use crate::flow::{Change, ResultRow, Spec, TopStep};
+use crate::flow::{lang, Change, ResultRow, Spec, TopStep};
+use lang::LanguageSpec;
 
 const FOLD_AFTER: usize = 3;
 const MAX_DIAGRAM_CHARS: usize = 45_000;
@@ -15,11 +16,46 @@ fn matches(step: &str, name: &str) -> bool {
     value == name || value.ends_with(&format!(".{name}"))
 }
 
-fn calls(steps: Option<&Vec<TopStep>>) -> Vec<&TopStep> {
+fn matches_builtin_call(step: &str, language: &LanguageSpec) -> bool {
+    language.builtin_calls.iter().any(|builtin| {
+        builtin.strip_suffix(".*").is_some_and(|namespace| {
+            step.starts_with(&format!("{namespace}.")) || step.contains(&format!(".{namespace}."))
+        }) || *builtin == step
+    })
+}
+
+fn is_builtin_value_method(step: &str, language: &LanguageSpec) -> bool {
+    language
+        .builtin_value_methods
+        .iter()
+        .any(|method| step == *method || step.ends_with(&format!(".{method}")))
+}
+
+fn named_in_delta(spec: &Spec, step: &str) -> bool {
+    spec.change.iter().any(|change| {
+        [
+            change.insert.as_ref(),
+            change.before.as_ref(),
+            change.after.as_ref(),
+            change.remove_call.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|name| matches(step, name))
+    })
+}
+
+fn calls<'a>(spec: &Spec, steps: Option<&'a Vec<TopStep>>) -> Vec<&'a TopStep> {
+    let language = lang::for_file(&spec.file).expect("flow spec has a supported file");
     steps
         .into_iter()
         .flatten()
-        .filter(|step| step.kind == "call")
+        .filter(|step| {
+            step.kind == "call"
+                && (!matches_builtin_call(&step.key, language)
+                    || step.changed
+                    || named_in_delta(spec, &step.key))
+        })
         .collect()
 }
 
@@ -57,7 +93,7 @@ fn insertions_at<'a>(changes: &'a [Change], step: &str, before: bool) -> Vec<&'a
 
 fn planned_nodes(spec: &Spec, row: &ResultRow) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    for step in calls(row.base_top.as_ref()) {
+    for step in calls(spec, row.base_top.as_ref()) {
         for change in insertions_at(&spec.change, &step.key, true) {
             out.push((change.insert.clone().unwrap(), "insert".into()));
         }
@@ -169,8 +205,9 @@ fn changed_range(base: &[&TopStep], head: &[&TopStep]) -> (usize, usize) {
 }
 
 fn result(spec: &Spec, row: &ResultRow, prefix: &str) -> String {
-    let base = calls(row.base_top.as_ref());
-    let head = calls(row.head_top.as_ref());
+    let language = lang::for_file(&spec.file).expect("flow spec has a supported file");
+    let base = calls(spec, row.base_top.as_ref());
+    let head = calls(spec, row.head_top.as_ref());
     let (start, end) = changed_range(&base, &head);
     let failing = row.status == "fail";
     let mut graph = format!("flowchart LR\n  subgraph {prefix}base [\"base\"]\n");
@@ -218,7 +255,11 @@ fn result(spec: &Spec, row: &ResultRow, prefix: &str) -> String {
                 "diverged"
             } else if inserted {
                 "insert"
-            } else if anchored || step.changed || (start..end).contains(&index) {
+            } else if anchored || step.changed {
+                "head"
+            } else if is_builtin_value_method(&step.key, language) {
+                "base"
+            } else if (start..end).contains(&index) {
                 "head"
             } else {
                 "base"

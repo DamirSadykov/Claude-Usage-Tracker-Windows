@@ -26,6 +26,8 @@ pub struct LanguageSpec {
     pub local_declaration_kind: &'static str,
     pub variable_declarator_kind: &'static str,
     pub comment_kind: &'static str,
+    pub builtin_calls: &'static [&'static str],
+    pub builtin_value_methods: &'static [&'static str],
 }
 
 fn c_sharp_grammar() -> Language {
@@ -62,6 +64,8 @@ static C_SHARP: LanguageSpec = LanguageSpec {
     local_declaration_kind: "local_declaration_statement",
     variable_declarator_kind: "variable_declarator",
     comment_kind: "comment",
+    builtin_calls: &["string.*", "String.*", "Math.*", "Convert.*", "Console.*"],
+    builtin_value_methods: &["ToString", "ToList", "Select", "Where", "Any"],
 };
 
 pub fn for_file(file: &str) -> Result<&'static LanguageSpec, String> {
