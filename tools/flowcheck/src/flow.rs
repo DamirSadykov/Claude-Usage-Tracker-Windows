@@ -79,6 +79,10 @@ pub struct ResultRow {
     pub base_top: Option<Vec<TopStep>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub head_top: Option<Vec<TopStep>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_tree: Option<FlowTree>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head_tree: Option<FlowTree>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -87,6 +91,35 @@ pub struct TopStep {
     pub key: String,
     pub line: usize,
     pub changed: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FlowTree {
+    pub nodes: Vec<FlowNode>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub closures: Vec<ClosureTree>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FlowNode {
+    pub kind: String,
+    pub text: String,
+    pub line: usize,
+    pub changed: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub branches: Vec<FlowBranch>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FlowBranch {
+    pub kind: String,
+    pub nodes: Vec<FlowNode>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ClosureTree {
+    pub name: String,
+    pub nodes: Vec<FlowNode>,
 }
 
 #[derive(Clone, Debug)]
@@ -299,6 +332,169 @@ impl Source {
             &mut out,
         );
         out
+    }
+    fn tree(&self, method: Node, changed: &HashSet<usize>) -> FlowTree {
+        fn body<'a>(n: Node<'a>) -> Node<'a> {
+            n.child_by_field_name("body").unwrap_or(n)
+        }
+        fn branch_body<'a>(n: Node<'a>, names: &[&str]) -> Option<Node<'a>> {
+            names.iter().find_map(|name| n.child_by_field_name(name))
+        }
+        fn closure_name(s: &Source, n: Node) -> String {
+            let mut at = n;
+            while let Some(parent) = at.parent() {
+                if parent.kind() == s.lang.variable_declarator_kind {
+                    if let Some(name) = parent.child_by_field_name("name") {
+                        return s.text(name);
+                    }
+                    if let Some(name) = parent.child_by_field_name("left") {
+                        return s.text(name);
+                    }
+                }
+                if parent.kind() == "assignment_expression" {
+                    if let Some(name) = parent.child_by_field_name("left") {
+                        return s.text(name);
+                    }
+                }
+                at = parent;
+            }
+            "<closure>".into()
+        }
+        fn visit(
+            s: &Source,
+            n: Node,
+            changed: &HashSet<usize>,
+            closures: &mut Vec<ClosureTree>,
+        ) -> Vec<FlowNode> {
+            if s.lang.closure_kinds.contains(&n.kind()) {
+                let nodes = visit(s, body(n), changed, closures);
+                closures.push(ClosureTree {
+                    name: closure_name(s, n),
+                    nodes,
+                });
+                return Vec::new();
+            }
+            let line = n.start_position().row + 1;
+            let node = |kind: &str, text: String, branches: Vec<FlowBranch>| FlowNode {
+                kind: kind.into(),
+                text,
+                line,
+                changed: changed.contains(&line),
+                branches,
+            };
+            if n.kind() == s.lang.invocation_kind
+                || s.lang.macro_invocation_kind == Some(n.kind())
+                || s.lang.new_expression_kind == Some(n.kind())
+            {
+                let mut out = Vec::new();
+                let mut cursor = n.walk();
+                for child in n.named_children(&mut cursor) {
+                    out.extend(visit(s, child, changed, closures));
+                }
+                out.push(node("call", s.callee(n), Vec::new()));
+                return out;
+            }
+            if s.lang.exit_kinds.contains(&n.kind()) {
+                let mut out = Vec::new();
+                let mut cursor = n.walk();
+                for child in n.named_children(&mut cursor) {
+                    out.extend(visit(s, child, changed, closures));
+                }
+                out.push(node("exit", s.text(n), Vec::new()));
+                return out;
+            }
+            if s.lang.branch_kinds.contains(&n.kind()) {
+                let text = branch_body(n, &["condition", "value"])
+                    .map(|x| s.text(x))
+                    .unwrap_or_else(|| s.text(n));
+                let mut branches = Vec::new();
+                if n.kind().contains("switch") || n.kind().contains("match") {
+                    fn cases<'a>(s: &Source, n: Node<'a>, out: &mut Vec<Node<'a>>) {
+                        let mut cursor = n.walk();
+                        for child in n.named_children(&mut cursor) {
+                            if s.lang.case_kinds.contains(&child.kind()) {
+                                out.push(child);
+                            } else if !s.lang.branch_kinds.contains(&child.kind())
+                                && !s.lang.closure_kinds.contains(&child.kind())
+                            {
+                                cases(s, child, out);
+                            }
+                        }
+                    }
+                    let mut direct_cases = Vec::new();
+                    cases(s, n, &mut direct_cases);
+                    for case in direct_cases {
+                        branches.push(FlowBranch {
+                            kind: s.text(case.child_by_field_name("value").unwrap_or(case)),
+                            nodes: visit(s, case, changed, closures),
+                        });
+                    }
+                } else {
+                    if let Some(then) = branch_body(n, &["consequence", "body"]) {
+                        branches.push(FlowBranch {
+                            kind: "then".into(),
+                            nodes: visit(s, then, changed, closures),
+                        });
+                    }
+                    if let Some(otherwise) = n.child_by_field_name("alternative") {
+                        branches.push(FlowBranch {
+                            kind: "else".into(),
+                            nodes: visit(s, otherwise, changed, closures),
+                        });
+                    }
+                }
+                return vec![node("branch", text, branches)];
+            }
+            if s.lang.loop_kinds.contains(&n.kind()) {
+                let text = branch_body(n, &["condition", "value"])
+                    .map(|x| s.text(x))
+                    .unwrap_or_else(|| s.text(n));
+                let nodes = branch_body(n, &["body", "consequence"])
+                    .map(|x| visit(s, x, changed, closures))
+                    .unwrap_or_default();
+                return vec![node(
+                    "loop",
+                    text,
+                    vec![FlowBranch {
+                        kind: "body".into(),
+                        nodes,
+                    }],
+                )];
+            }
+            if s.lang.try_kinds.contains(&n.kind()) {
+                let mut branches = Vec::new();
+                let mut cursor = n.walk();
+                for child in n.named_children(&mut cursor) {
+                    let kind = match child.kind() {
+                        "catch_clause" | "catch_block" => Some("catch"),
+                        "finally_clause" | "finally_block" => Some("finally"),
+                        _ if child.kind() == s.lang.block_kind => Some("try"),
+                        _ => None,
+                    };
+                    if let Some(kind) = kind {
+                        branches.push(FlowBranch {
+                            kind: kind.into(),
+                            nodes: visit(s, child, changed, closures),
+                        });
+                    }
+                }
+                return vec![node("try", "try".into(), branches)];
+            }
+            let mut out = Vec::new();
+            let mut cursor = n.walk();
+            for child in n.named_children(&mut cursor) {
+                out.extend(visit(s, child, changed, closures));
+            }
+            out
+        }
+        let mut closures = Vec::new();
+        let nodes = visit(
+            self,
+            method.child_by_field_name("body").unwrap_or(method),
+            changed,
+            &mut closures,
+        );
+        FlowTree { nodes, closures }
     }
     fn locals(&self, method: Node) -> HashSet<String> {
         let mut ns = Vec::new();
@@ -1043,6 +1239,8 @@ pub fn check_method(
             head_steps: verbose.then(|| hflow.iter().map(key).collect()),
             base_top: verbose.then(|| top_steps(btop, &base_changed)),
             head_top: verbose.then(|| top_steps(htop, &head_changed)),
+            base_tree: verbose.then(|| bt.tree(bm, &base_changed)),
+            head_tree: verbose.then(|| ht.tree(hm, &head_changed)),
         })
     })();
     answer.unwrap_or_else(|e| ResultRow {
@@ -1055,6 +1253,8 @@ pub fn check_method(
         head_steps: None,
         base_top: None,
         head_top: None,
+        base_tree: None,
+        head_tree: None,
     })
 }
 fn find_node_by_id<'a>(s: &'a Source, method: Node<'a>, node_id: usize) -> Option<Node<'a>> {

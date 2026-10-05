@@ -7,6 +7,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
 fn spec() -> flow::Spec {
@@ -37,13 +38,21 @@ fn row(base: Vec<String>, head: Vec<String>, status: &str) -> flow::ResultRow {
         depth_limited: vec![],
         base_top: Some(top(&base)),
         head_top: Some(top(&head)),
+        base_tree: None,
+        head_tree: None,
         base_steps: Some(base),
         head_steps: Some(head),
     }
 }
 
+static REPOS: AtomicUsize = AtomicUsize::new(0);
+
 fn temp_repo() -> PathBuf {
-    let path = std::env::temp_dir().join(format!("flowcheck-render-{}", std::process::id()));
+    let path = std::env::temp_dir().join(format!(
+        "flowcheck-render-{}-{}",
+        std::process::id(),
+        REPOS.fetch_add(1, Ordering::SeqCst)
+    ));
     let _ = fs::remove_dir_all(&path);
     fs::create_dir_all(path.join("scripts/cli/process")).unwrap();
     Command::new("git")
