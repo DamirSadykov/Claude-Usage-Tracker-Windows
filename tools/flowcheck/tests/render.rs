@@ -361,8 +361,6 @@ fn real_finish_step_is_a_small_top_level_diagram() {
 fn run_flow_gate_shows_replaced_call_and_hides_builtins() {
     let repo = temp_repo();
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture/js/flow-gate.mjs");
-    fs::copy(&fixture, repo.join("scripts/cli/process/flow-gate.mjs")).unwrap();
-    let base = commit(&repo);
     fs::write(
         repo.join("scripts/cli/process/flow-gate.mjs"),
         fs::read_to_string(&fixture)
@@ -370,20 +368,27 @@ fn run_flow_gate_shows_replaced_call_and_hides_builtins() {
             .replace("unsupportedProduces", "nonCsProduces"),
     )
     .unwrap();
-    let head = commit(&repo);
+    let base = commit(&repo);
     fs::copy(&fixture, repo.join("scripts/cli/process/flow-gate.mjs")).unwrap();
-    let spec: flow::Spec = serde_yaml::from_str("file: scripts/cli/process/flow-gate.mjs\nmethod: runFlowGate\nchange:\n  - remove-call: unsupportedProduces\n  - insert: nonCsProduces\n    before: finish\npreserve: all\n").unwrap();
+    let head = commit(&repo);
+    let spec: flow::Spec = serde_yaml::from_str("file: scripts/cli/process/flow-gate.mjs\nmethod: runFlowGate\nchange:\n  - remove-call: nonCsProduces\n  - insert: unsupportedProduces\n    before: finish\npreserve: all\n").unwrap();
     let row = flow::check_method(&spec, &repo, &base, Some(&head), true);
     let got = render::markdown("result", &[spec], &[row]);
     assert!(mermaid_nodes(&got) <= 32, "too many nodes: {got}");
     assert!(!got.contains("JSON.stringify"), "{got}");
-    assert!(got.contains("unsupportedProduces"), "{got}");
-    assert!(got.contains("nonCsProduces"), "{got}");
+    let closure_start = got.find("  subgraph r0_closure").expect("finish closure");
+    let closure_end = closure_start
+        + got[closure_start..]
+            .find("\n  end\n")
+            .expect("finish closure end");
+    let closure = &got[closure_start..closure_end];
+    assert!(closure.contains("[\"finish\"]"), "{got}");
     assert!(
-        got.contains("unsupportedProduces → nonCsProduces\"]:::ok"),
+        closure.contains("nonCsProduces → unsupportedProduces\"]:::ok"),
         "{got}"
     );
-    assert!(!got.contains("nonCsProduces\"]:::extra"), "{got}");
+    assert!(!got.contains("unsupportedProduces\"]:::extra"), "{got}");
+    assert!(!got[..closure_start].contains("Date.now"), "{got}");
     assert!(got.contains(" --> "), "{got}");
     let _ = fs::remove_dir_all(repo);
 }

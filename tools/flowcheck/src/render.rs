@@ -235,6 +235,10 @@ fn contains_focus(focuses: &HashSet<usize>, node: &FlowNode) -> bool {
         })
 }
 
+fn closure_changed(focuses: &HashSet<usize>, nodes: &[FlowNode]) -> bool {
+    nodes.iter().any(|node| contains_focus(focuses, node))
+}
+
 fn call_names(nodes: &[FlowNode], out: &mut Vec<String>) {
     for node in nodes {
         if node.kind == "call" {
@@ -690,11 +694,7 @@ fn result(spec: &Spec, row: &ResultRow, prefix: &str) -> String {
         );
         for closure in &tree.closures {
             let closure_focuses = focus_nodes(spec, &closure.nodes);
-            if closure
-                .nodes
-                .iter()
-                .any(|node| contains_focus(&closure_focuses, node))
-            {
+            if closure_changed(&closure_focuses, &closure.nodes) {
                 graph.push_str(&format!(
                     "  subgraph {prefix}closure{serial} [\"{}\"]\n",
                     label(&closure.name)
