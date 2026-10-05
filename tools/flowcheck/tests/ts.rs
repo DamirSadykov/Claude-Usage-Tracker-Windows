@@ -131,6 +131,69 @@ fn check_text(
     result
 }
 
+fn check_text_with_spec(
+    ext: &str,
+    base_text: &str,
+    head_text: &str,
+    spec_text: &str,
+) -> flow::ResultRow {
+    let repo = repo();
+    let file = repo.join(format!("src/Notifier.{ext}"));
+    fs::write(&file, base_text).unwrap();
+    let base = commit(&repo);
+    fs::write(&file, head_text).unwrap();
+    let spec: flow::Spec = serde_yaml::from_str(&format!(
+        "file: src/Notifier.{ext}\nmethod: N.run\nchange:\n{spec_text}\npreserve: none\n"
+    ))
+    .unwrap();
+    let result = flow::check_method(&spec, &repo, &base, None, true);
+    let _ = fs::remove_dir_all(repo);
+    result
+}
+
+#[test]
+fn nth_checks_only_the_requested_anchor_occurrence() {
+    let base = "class N { run() { emitRunEvent(); emitRunEvent(); emitRunEvent(); } emitRunEvent() {} recordFlowDiagram() {} }";
+    let head = "class N { run() { emitRunEvent(); recordFlowDiagram(); emitRunEvent(); emitRunEvent(); } emitRunEvent() {} recordFlowDiagram() {} }";
+    let result = check_text_with_spec(
+        "ts",
+        base,
+        head,
+        "  - insert: recordFlowDiagram\n    before: emitRunEvent\n    nth: 2\n    guard: none",
+    );
+    assert_eq!(result.status, "pass", "{:?}", result.problems);
+}
+
+#[test]
+fn none_and_throws_accept_a_call_as_the_only_try_statement() {
+    let base = "class N { run() { send(); } send() {} validate() {} }";
+    let head = "class N { run() { try { validate(); } catch {} send(); } send() {} validate() {} }";
+    for guard in ["none", "throws"] {
+        let result = check_text_with_spec(
+            "ts",
+            base,
+            head,
+            &format!("  - insert: validate\n    before: send\n    guard: {guard}"),
+        );
+        assert_eq!(result.status, "pass", "{guard}: {:?}", result.problems);
+    }
+}
+
+#[test]
+fn try_guard_must_be_directly_before_the_anchor() {
+    let base = "class N { run() { send(); } send() {} validate() {} audit() {} }";
+    let head = "class N { run() { try { validate(); } catch {} audit(); send(); } send() {} validate() {} audit() {} }";
+    for guard in ["none", "throws"] {
+        let result = check_text_with_spec(
+            "ts",
+            base,
+            head,
+            &format!("  - insert: validate\n    before: send\n    guard: {guard}"),
+        );
+        assert_eq!(result.status, "fail", "{guard}: {:?}", result.problems);
+    }
+}
+
 #[test]
 fn await_and_optional_calls_are_calls_and_none_guard_accepts_await() {
     let base =
@@ -197,4 +260,32 @@ fn tsx_cjs_and_js_extensions_select_the_javascript_family() {
         let result = check_text(ext, base, head, "sendSms", "none");
         assert_eq!(result.status, "pass", "{ext}: {:?}", result.problems);
     }
+}
+
+#[test]
+fn changing_an_argument_in_a_chain_preserves_its_steps() {
+    let repo = repo();
+    let file = repo.join("src/Notifier.ts");
+    fs::write(
+        &file,
+        "function sendSms(task: { produces?: string[] }) { return (Array.isArray(task?.produces) ? task.produces : []).map(value => normalize(value)).filter(value => value.length > 0); } function normalize(value: string) { return value; }",
+    )
+    .unwrap();
+    let base = commit(&repo);
+    fs::write(
+        &file,
+        "function sendSms(task: { produces?: string[] }) { return (Array.isArray(task?.produces) ? task.produces : []).map(value => normalize(value, task)).filter(value => value.length > 0); } function normalize(value: string, task?: unknown) { return value; }",
+    )
+    .unwrap();
+    let spec: flow::Spec =
+        serde_yaml::from_str("file: src/Notifier.ts\nmethod: sendSms\nchange: []\npreserve: all\n")
+            .unwrap();
+    let result = flow::check_method(&spec, &repo, &base, None, true);
+    let _ = fs::remove_dir_all(repo);
+    assert_eq!(result.status, "pass", "{:?}", result.problems);
+    assert!(result
+        .head_steps
+        .unwrap()
+        .iter()
+        .any(|step| step == "call:filter"));
 }

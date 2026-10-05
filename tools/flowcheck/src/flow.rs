@@ -39,6 +39,7 @@ pub struct Change {
     pub insert: Option<String>,
     pub before: Option<String>,
     pub after: Option<String>,
+    pub nth: Option<usize>,
     pub guard: Option<String>,
     #[serde(rename = "remove-call")]
     pub remove_call: Option<String>,
@@ -230,11 +231,11 @@ impl Source {
                 .map(|n| format!("{}!", self.text(n)))
                 .unwrap_or_default();
         }
-        let t = node
-            .child_by_field_name("function")
-            .map(|n| self.text(n))
-            .unwrap_or_default();
-        lang::callee_name(&t)
+        let Some(function) = node.child_by_field_name("function") else {
+            return String::new();
+        };
+        let receiver = self.text(function);
+        lang::callee_name(&receiver)
     }
     fn steps(&self, method: Node) -> Vec<Step> {
         fn visit(s: &Source, n: Node, out: &mut Vec<Step>) {
@@ -598,6 +599,41 @@ fn bare_call(s: &Source, stmt: Node, name: &str) -> bool {
     }
     e.map(|x| is_call_to(s, x, name)).unwrap_or(false)
 }
+
+fn call_in_single_statement_try(s: &Source, stmt: Node, name: &str, mode: &str) -> bool {
+    if stmt.kind() != "try_statement" || !matches!(mode, "none" | "throws") {
+        return false;
+    }
+    let body = stmt
+        .child_by_field_name("body")
+        .or_else(|| stmt.named_child(0));
+    let Some(body) = body else {
+        return false;
+    };
+    let mut cursor = body.walk();
+    let statements: Vec<_> = body.named_children(&mut cursor).collect();
+    if statements.len() != 1 {
+        return false;
+    }
+    if mode == "throws" {
+        bare_call(s, statements[0], name)
+    } else {
+        top_level_call(s, statements[0], name)
+    }
+}
+
+fn previous_named_sibling<'a>(block: Node<'a>, node: Node<'a>) -> Option<Node<'a>> {
+    let mut cursor = block.walk();
+    let mut previous = None;
+    for sibling in block.named_children(&mut cursor) {
+        if sibling == node {
+            return previous;
+        }
+        previous = Some(sibling);
+    }
+    None
+}
+
 fn enclosing_aliases(s: &Source, node: Node, name: &str) -> HashSet<String> {
     let mut names = HashSet::new();
     let mut n = node;
@@ -654,6 +690,12 @@ fn guarded(s: &Source, target: Node, name: &str, mode: &str) -> bool {
         }
         if p.kind() == s.lang.block_kind {
             let a = enclosing_aliases(s, n, name);
+            if previous_named_sibling(p, n)
+                .map(|stmt| call_in_single_statement_try(s, stmt, name, mode))
+                .unwrap_or(false)
+            {
+                return true;
+            }
             let mut rust_alias = false;
             let mut c = p.walk();
             for stmt in p.children(&mut c) {
@@ -864,6 +906,17 @@ pub fn check_method(
                     if targets.is_empty() {
                         problems.push(format!("call {before} not found in head"));
                     }
+                    let targets = if let Some(nth) = ch.nth {
+                        if nth == 0 || nth > targets.len() {
+                            problems
+                                .push(format!("call {before} occurrence {nth} not found in head"));
+                            Vec::new()
+                        } else {
+                            vec![targets[nth - 1]]
+                        }
+                    } else {
+                        targets
+                    };
                     for t in targets {
                         let node = find_node_by_id(&ht, hm, t.node_id).unwrap();
                         if !guarded(&ht, node, insert, ch.guard.as_deref().unwrap_or("none")) {

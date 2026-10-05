@@ -55,6 +55,11 @@ steps:
 
 Rules that are not visible in the shape:
 
+- **`nth` chooses one anchor occurrence.** In a flow `change` with `before`,
+  `nth: N` is a 1-based occurrence of that anchor call in the head method. Only
+  that occurrence is checked; without `nth`, every matching anchor remains
+  checked.
+
 - **One step = one session of work.** A step that needs two reaches the next
   session half-done; a plan that fits one session is one step (see §3).
 - **Continuing existing work? Say which task.** `task: 318` (also `#318`, `t#318`

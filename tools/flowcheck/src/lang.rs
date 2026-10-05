@@ -93,8 +93,33 @@ pub fn supported_file(file: &str) -> bool {
 
 pub fn callee_name(text: &str) -> String {
     let mut name = text.to_string();
-    if let Some(index) = name.find('<') {
-        name.truncate(index);
+    let separator = name.rfind(['.', ':']);
+    let terminal = separator.map(|index| &name[index + 1..]).unwrap_or(&name);
+    let terminal = terminal.split('<').next().unwrap_or(terminal);
+    let receiver = separator.map(|index| &name[..index]).unwrap_or("");
+    if receiver.contains(['(', '[', '{', '<']) {
+        return terminal.to_string();
+    }
+    if let Some(index) = name.rfind('<') {
+        if separator.is_none() || index > separator.unwrap() {
+            name.truncate(index);
+            name = name.trim_end_matches(['.', ':']).to_string();
+        }
     }
     name.strip_prefix("this.").unwrap_or(&name).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::callee_name;
+
+    #[test]
+    fn chained_callees_keep_only_the_last_link() {
+        assert_eq!(callee_name("items.iter().filter"), "filter");
+        assert_eq!(callee_name("(items ? left : right).map"), "map");
+        assert_eq!(callee_name("items.iter::<String>().filter"), "filter");
+        assert_eq!(callee_name("Factory<Result>.create"), "create");
+        assert_eq!(callee_name("this._client.Send"), "_client.Send");
+        assert_eq!(callee_name("items.Where(x => x.Ok).Select"), "Select");
+    }
 }
