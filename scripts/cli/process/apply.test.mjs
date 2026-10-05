@@ -106,6 +106,49 @@ describe("change brief fields in apply", () => {
   });
 });
 
+describe("flow diagrams in apply", () => {
+  it("records a plan diagram from flowcheck", () => {
+    const file = path.join(mkdtempSync(path.join(os.tmpdir(), "cut-flow-plan-")), "todos.json");
+    try {
+      const data = { version: 1, todos: [], changes: [] };
+      const doc = readDocument([
+        "change: CHANGE: flow", "steps:", "  1:", "    title: Проверка", "    produces: [src/Notifier.cs]",
+        "    flow:", "      file: src/Notifier.cs", "      method: Send",
+      ].join("\n"));
+      const calls = [];
+      const result = applyDocument(doc, {
+        go: true, project: "fixture", board: { data, file }, cwd: process.cwd(), flowcheckExe: process.execPath,
+        runFlowcheck: (_exe, args) => {
+          calls.push(args);
+          return { status: 0, stdout: JSON.stringify({ diagram: "```mermaid\nflowchart TD\n```" }), stderr: "" };
+        },
+      });
+      expect(result.ok).toBe(true);
+      expect(calls[0]).toEqual(expect.arrayContaining(["--base", "HEAD", "--diagram", "plan"]));
+      expect(data.todos[0].flow_diagram.plan).toContain("mermaid");
+    } finally {
+      rmSync(path.dirname(file), { recursive: true, force: true });
+    }
+  });
+
+  it("does not fail apply when flowcheck is unavailable", () => {
+    const file = path.join(mkdtempSync(path.join(os.tmpdir(), "cut-flow-plan-")), "todos.json");
+    try {
+      const data = { version: 1, todos: [], changes: [] };
+      const doc = readDocument([
+        "change: CHANGE: flow", "steps:", "  1:", "    title: Проверка", "    produces: [src/Notifier.cs]",
+        "    flow:", "      file: src/Notifier.cs", "      method: Send",
+      ].join("\n"));
+      const result = applyDocument(doc, { go: true, project: "fixture", board: { data, file }, flowcheckExe: "" });
+      expect(result.ok).toBe(true);
+      expect(data.todos[0].flow_diagram).toBeUndefined();
+      expect(result.notes.join("\n")).toMatch(/flowcheck executable is unavailable/);
+    } finally {
+      rmSync(path.dirname(file), { recursive: true, force: true });
+    }
+  });
+});
+
 // The rules of §15 live HERE, in code, which is the whole point of the command:
 // the exit prompt no longer has to recite them for the graph to be valid.
 describe("apply refuses an invalid graph", () => {

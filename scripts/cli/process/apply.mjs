@@ -37,7 +37,10 @@
 // `--dry-run` is the DEFAULT, mirroring `todos run` — the file is read, checked
 // and the changes printed; `--go` applies them.
 
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync, writeFileSync, rmSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import os from "node:os";
+import { randomUUID } from "node:crypto";
 import {
   boardPath,
   loadBoard,
@@ -59,7 +62,7 @@ import { createChange, findChangeByTitle, changeAddress } from "../board/change.
 import { parseYamlSubset } from "../kernel/yaml-subset.mjs";
 import { withBoardLock } from "../kernel/board-lock.mjs";
 import path from "node:path";
-import { flowLanguages } from "../kernel/settings.mjs";
+import { flowLanguages, readSettings } from "../kernel/settings.mjs";
 
 const USAGE =
   "usage: cli todos apply <file> [--go] [--force] [--json]\n" +
@@ -425,7 +428,30 @@ function capturing(fn) {
 //
 // `plan` is the human-readable diff (the dry-run listing), `created` the rows
 // that came into being, `applied` whether anything was written.
-export function applyDocument(doc, { go = false, force = false, project, board } = {}) {
+function renderPlanDiagram({ flow, exe, cwd, runCmd = spawnSync }) {
+  if (!exe || !existsSync(exe)) return { ok: false, reason: `flowcheck executable is unavailable: ${exe || "not configured"}` };
+  const specPath = path.join(os.tmpdir(), `flow-plan-${process.pid}-${randomUUID()}.json`);
+  try {
+    writeFileSync(specPath, JSON.stringify(Array.isArray(flow) ? flow : [flow]));
+    const result = runCmd(exe, ["--spec", specPath, "--repo", cwd, "--base", "HEAD", "--diagram", "plan"], {
+      cwd, encoding: "utf8", windowsHide: true, maxBuffer: 16 * 1024 * 1024,
+    });
+    const code = Number(result?.status ?? (result?.error ? 2 : 0));
+    const output = [result?.stdout, result?.stderr].filter((v) => String(v || "").trim()).join("\n");
+    let parsed = {};
+    try { parsed = JSON.parse(result?.stdout || "{}"); } catch {}
+    if (code === 2) return { ok: false, reason: output || "flowcheck cannot inspect this change" };
+    if (typeof parsed?.diagram !== "string" || !parsed.diagram.trim())
+      return { ok: false, reason: output || "flowcheck returned no plan diagram" };
+    return { ok: true, diagram: parsed.diagram };
+  } catch (err) {
+    return { ok: false, reason: `flowcheck plan render crashed: ${(err && err.message) || err}` };
+  } finally {
+    try { rmSync(specPath, { force: true }); } catch {}
+  }
+}
+
+export function applyDocument(doc, { go = false, force = false, project, board, cwd = process.cwd(), flowcheckExe, runFlowcheck } = {}) {
   const boardFile = board?.file ?? boardPath();
   const data = board?.data ?? (go ? loadBoardForWrite(boardFile) : loadBoard(boardFile));
   project = project ?? path.basename(process.cwd().replace(/[\\/]+$/, ""));
@@ -652,7 +678,22 @@ export function applyDocument(doc, { go = false, force = false, project, board }
         if (s.budget) set(t, "budget", s.budget);
         if (s.red) set(t, "red", s.red);
         if (s.redTests.length) set(t, "red-tests", s.redTests.join(","));
-        if (s.flow != null) t.flow = s.flow;
+        if (s.flow != null) {
+          t.flow = s.flow;
+          if (typeof s.flow !== "string") {
+            const rendered = renderPlanDiagram({
+              flow: s.flow,
+              exe: flowcheckExe ?? readSettings().flowcheckExe ?? "",
+              cwd,
+              runCmd: runFlowcheck,
+            });
+            if (rendered.ok) {
+              t.flow_diagram = { ...(t.flow_diagram || {}), plan: rendered.diagram };
+            } else {
+              notes.push(`flow plan #${t.number}: ${rendered.reason}`);
+            }
+          }
+        }
         if (s.risk) set(t, "risk", s.risk);
       }
       if (change) {

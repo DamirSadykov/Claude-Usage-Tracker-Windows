@@ -35,7 +35,7 @@ export async function runFlowGate({ task, cwd, timeoutMs, exe, runCmd = runExe }
   const specPath = path.join(os.tmpdir(), `flow-gate-${process.pid}-${randomUUID()}.json`);
   try {
     fs.writeFileSync(specPath, JSON.stringify(spec));
-    const args = ["--spec", specPath, "--repo", cwd, "--base", task.step_base, "--coverage", "shadow"];
+    const args = ["--spec", specPath, "--repo", cwd, "--base", task.step_base, "--coverage", "shadow", "--diagram", "result"];
     const result = await runCmd(exe, args, cwd, timeoutMs);
     const output = [result?.stdout, result?.stderr].filter((v) => String(v || "").trim()).join("\n");
     let parsed = {};
@@ -43,9 +43,10 @@ export async function runFlowGate({ task, cwd, timeoutMs, exe, runCmd = runExe }
     const unchecked = [...(Array.isArray(parsed.unchecked) ? parsed.unchecked : []), ...unsupportedProduces(task)];
     const coverage = parsed?.coverage?.findings ?? parsed?.coverage ?? [];
     const code = Number(result?.code);
-    if (code === 0) return finish("pass", { reason: null, coverage, unchecked });
-    if (code === 2) return finish("cannot", { reason: tailLines(output) || "flowcheck cannot inspect this change", coverage, unchecked });
-    return finish("issue", { reason: tailLines(output) || "flowcheck found a flow issue", coverage, unchecked });
+    const diagram = typeof parsed?.diagram === "string" ? parsed.diagram : null;
+    if (code === 0) return finish("pass", { reason: null, coverage, unchecked, diagram });
+    if (code === 2) return finish("cannot", { reason: tailLines(output) || "flowcheck cannot inspect this change", coverage, unchecked, diagram });
+    return finish("issue", { reason: tailLines(output) || "flowcheck found a flow issue", coverage, unchecked, diagram });
   } catch (err) {
     return finish("cannot", { reason: `flow gate crashed: ${(err && err.message) || err}` });
   } finally {

@@ -271,6 +271,7 @@ export function simulationEffects() {
     ownChanges: async () => ({ ok: true, skip: true }),
     redGate: async () => ({ ok: true, field: "failed-on-base", reason: null }),
     flowGate: async () => ({ status: "pass", reason: null, coverage: [], unchecked: [], duration_ms: 0 }),
+    recordFlowDiagram: async () => ({ written: false }),
     stepCost: async ({ task }) =>
       typeof task.budget_usd === "number" ? task.budget_usd : null,
   };
@@ -365,6 +366,21 @@ export function liveEffects({ cwd } = {}) {
         if (!Array.isArray(todo.comments)) todo.comments = [];
         todo.comments.push(comment);
         todo.updated_at = comment.created_at;
+        saveBoard(file, data);
+        return { written: true };
+      });
+    },
+    recordFlowDiagram: async ({ task, diagram }) => {
+      const result = typeof diagram === "string" && diagram.trim() ? diagram : null;
+      const file = appDataFile("todos.json");
+      return withBoardLock(file, () => {
+        const data = loadBoardForWrite(file);
+        const todo = data.todos.find((t) => t && t.id === task.id);
+        if (!todo) return { written: false, error: `task ${task.id} not found on the board` };
+        todo.flow_diagram = { ...(todo.flow_diagram || {}) };
+        if (result) todo.flow_diagram.result = result;
+        else delete todo.flow_diagram.result;
+        todo.updated_at = new Date().toISOString();
         saveBoard(file, data);
         return { written: true };
       });
@@ -1054,6 +1070,10 @@ export async function finishStep(ctx, task, { result, review, baton, cost, ownCh
       flow = { status: "cannot", reason: `flow gate crashed: ${(err && err.message) || err}`, coverage: [], unchecked: [], duration_ms: 0 };
     }
     base.flow = flow;
+    task.flow_diagram = { ...(task.flow_diagram || {}) };
+    if (typeof flow.diagram === "string" && flow.diagram.trim()) task.flow_diagram.result = flow.diagram;
+    else delete task.flow_diagram.result;
+    try { await ctx.effects.recordFlowDiagram?.({ task, diagram: flow.diagram }); } catch {}
     emitRunEvent(ctx, {
       task: task.number, kind: "flow", attempt, limit, status: flow.status,
       reason: flow.reason || null, coverage: flow.coverage || [], unchecked: flow.unchecked || [], duration_ms: flow.duration_ms ?? null,

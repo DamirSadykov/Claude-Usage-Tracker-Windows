@@ -13,13 +13,15 @@ describe("runFlowGate", () => {
         expect(args).toContain("--base");
         expect(args).toContain("base-sha");
         expect(args).toContain("shadow");
-        return { code, stdout: JSON.stringify({ coverage: { findings: ["coverage"] }, unchecked: [{ file: "src/Other.cs" }] }), stderr: code ? "reason" : "" };
+        expect(args).toEqual(expect.arrayContaining(["--diagram", "result"]));
+        return { code, stdout: JSON.stringify({ coverage: { findings: ["coverage"] }, unchecked: [{ file: "src/Other.cs" }], diagram: "```mermaid\\nflowchart TD\\n```" }), stderr: code ? "reason" : "" };
       },
     });
     expect(result.status).toBe(status);
     expect(result.coverage).toEqual(["coverage"]);
     expect(result.unchecked).toEqual(expect.arrayContaining([{ file: "docs/note.md", kind: "unsupported-produce", method: null, reason: expect.any(String) }]));
     expect(result.duration_ms).toEqual(expect.any(Number));
+    expect(result.diagram).toContain("mermaid");
   });
 
   it("cannot when no executable is configured", async () => {

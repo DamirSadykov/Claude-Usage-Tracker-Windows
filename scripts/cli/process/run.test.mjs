@@ -838,6 +838,36 @@ describe("runChange — flow gate", () => {
     expect(formatRunReport(r)).toContain("не проверено: docs/note.md");
   });
 
+  it("replaces the previous result diagram after every flow run", async () => {
+    const data = board(changeRoot(1, [2], { budget_usd: 10 }), auto(2, {
+      step_base: "base", flow: { file: "src/Notifier.cs", method: "Send" },
+      flow_diagram: { plan: "plan", result: "old result" },
+    }));
+    const writes = [];
+    const h = harness({
+      flowGate: async () => ({ status: "pass", reason: null, coverage: [], unchecked: [], duration_ms: 1, diagram: "new result" }),
+      recordFlowDiagram: async ({ diagram }) => { writes.push(diagram); return { written: true }; },
+    });
+    const r = await go(data, "1", h.effects);
+    expect(r.board.todos.find((t) => t.number === 2).flow_diagram).toEqual({ plan: "plan", result: "new result" });
+    expect(writes).toEqual(["new result"]);
+  });
+
+  it("clears the previous result diagram when flowcheck cannot render one", async () => {
+    const data = board(changeRoot(1, [2], { budget_usd: 10 }), auto(2, {
+      step_base: "base", flow: { file: "src/Notifier.cs", method: "Send" },
+      flow_diagram: { plan: "plan", result: "old result" },
+    }));
+    const writes = [];
+    const h = harness({
+      flowGate: async () => ({ status: "cannot", reason: "cannot inspect", coverage: [], unchecked: [], duration_ms: 1 }),
+      recordFlowDiagram: async ({ diagram }) => { writes.push(diagram); return { written: true }; },
+    });
+    const r = await go(data, "1", h.effects);
+    expect(r.board.todos.find((t) => t.number === 2).flow_diagram).toEqual({ plan: "plan" });
+    expect(writes).toEqual([undefined]);
+  });
+
   it("skips flow for an absent or n/a declaration and reaches verify", async () => {
     for (const flow of [undefined, "n/a no C# method body"]) {
       const data = board(changeRoot(1, [2], { budget_usd: 10 }), auto(2, { step_base: "base", flow }));

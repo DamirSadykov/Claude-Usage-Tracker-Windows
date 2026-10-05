@@ -3,6 +3,66 @@ mod flow;
 #[path = "../src/render.rs"]
 mod render;
 
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn temp_repo() -> PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "flowcheck-render-{}-{}-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    ));
+    fs::create_dir_all(path.join("src")).unwrap();
+    Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&path)
+        .status()
+        .unwrap();
+    path
+}
+
+fn commit(repo: &Path) -> String {
+    Command::new("git")
+        .args(["add", "."])
+        .current_dir(repo)
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args([
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "base",
+        ])
+        .current_dir(repo)
+        .status()
+        .unwrap();
+    String::from_utf8(
+        Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .into()
+}
+
 fn spec() -> flow::Spec {
     serde_yaml::from_str("file: src/Notifier.cs\nmethod: SendSms\nchange:\n  - insert: ValidatePhone\n    before: Send\n    guard: returns-bool\npreserve: all\n").unwrap()
 }
@@ -93,4 +153,50 @@ flowchart LR
   classDef diverged fill:#fee2e2,stroke:#ef4444,color:#991b1b
 ```"#
     );
+}
+
+#[test]
+fn diagram_is_mermaid_markdown_in_json_and_is_omitted_by_default() {
+    let repo = temp_repo();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture");
+    fs::copy(
+        fixture.join("Notifier.base.cs"),
+        repo.join("src/Notifier.cs"),
+    )
+    .unwrap();
+    let base = commit(&repo);
+    fs::copy(
+        fixture.join("Notifier.good.cs"),
+        repo.join("src/Notifier.cs"),
+    )
+    .unwrap();
+    let spec = repo.join("flow.yaml");
+    fs::write(
+        &spec,
+        "file: src/Notifier.cs\nmethod: SendSms\nchange:\n  - insert: ValidatePhone\n    before: Send\n    guard: returns-bool\npreserve: all\n",
+    )
+    .unwrap();
+
+    let run = |diagram: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_flowcheck"));
+        command
+            .args(["--spec"])
+            .arg(&spec)
+            .args(["--repo"])
+            .arg(&repo)
+            .args(["--base", &base]);
+        if diagram {
+            command.args(["--diagram", "plan"]);
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+
+    let with_diagram = run(true);
+    assert!(with_diagram["diagram"]
+        .as_str()
+        .is_some_and(|markdown| markdown.contains("```mermaid")));
+    assert!(run(false).get("diagram").is_none());
+    let _ = fs::remove_dir_all(repo);
 }

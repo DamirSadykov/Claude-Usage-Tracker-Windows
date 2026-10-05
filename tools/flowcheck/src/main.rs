@@ -23,12 +23,17 @@ struct Args {
     /// Render the YAML delta and checked flow as Markdown with a Mermaid diagram.
     #[arg(long, value_parser = ["plan", "result"])]
     render: Option<String>,
+    /// Include the YAML delta or checked flow as Mermaid Markdown in JSON output.
+    #[arg(long, value_parser = ["plan", "result"])]
+    diagram: Option<String>,
 }
 #[derive(Serialize)]
 struct Output {
     results: Vec<flow::ResultRow>,
     coverage: coverage::Coverage,
     unchecked: Vec<coverage::Unchecked>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagram: Option<String>,
 }
 fn main() -> ExitCode {
     let a = Args::parse();
@@ -68,7 +73,7 @@ fn main() -> ExitCode {
                 &a.repo,
                 &a.base,
                 a.head.as_deref(),
-                a.verbose || a.render.is_some(),
+                a.verbose || a.render.is_some() || a.diagram.is_some(),
             )
         })
         .collect();
@@ -104,10 +109,15 @@ fn main() -> ExitCode {
                 }),
         );
     }
+    let diagram = a
+        .diagram
+        .as_deref()
+        .map(|mode| render::markdown(mode, &specs, &rows));
     let output = Output {
         results: rows,
         coverage,
         unchecked,
+        diagram,
     };
     if let Some(mode) = &a.render {
         println!("{}", render::markdown(mode, &specs, &output.results));
