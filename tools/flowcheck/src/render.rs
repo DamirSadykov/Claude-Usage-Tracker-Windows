@@ -1,4 +1,4 @@
-use crate::flow::{lang, Change, ResultRow, Spec, TopStep};
+use crate::flow::{lang, Change, FlowNode, ResultRow, Spec, TopStep};
 use lang::LanguageSpec;
 
 const FOLD_AFTER: usize = 3;
@@ -9,6 +9,8 @@ fn label(step: &str) -> String {
         .map(|(_, value)| value)
         .unwrap_or(step)
         .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn matches(step: &str, name: &str) -> bool {
@@ -188,92 +190,245 @@ fn plan(spec: &Spec, row: &ResultRow, prefix: &str) -> String {
     graph
 }
 
-fn changed_range(base: &[&TopStep], head: &[&TopStep]) -> (usize, usize) {
-    let start = base
-        .iter()
-        .zip(head)
-        .take_while(|(a, b)| a.key == b.key)
-        .count();
-    let mut end = head.len();
-    while end > start && base.len() > start + (head.len() - end) {
-        if base[base.len() - (head.len() - end) - 1].key != head[end - 1].key {
-            break;
+fn contains_focus(spec: &Spec, node: &FlowNode) -> bool {
+    (node.kind == "call" && (node.changed || named_in_delta(spec, &node.text)))
+        || node
+            .branches
+            .iter()
+            .any(|branch| branch.nodes.iter().any(|node| contains_focus(spec, node)))
+}
+
+fn call_names(nodes: &[FlowNode], out: &mut Vec<String>) {
+    for node in nodes {
+        if node.kind == "call" {
+            out.push(node.text.clone());
         }
-        end -= 1;
+        for branch in &node.branches {
+            call_names(&branch.nodes, out);
+        }
     }
-    (start, end)
+}
+
+fn expected_at(spec: &Spec, head: &[String], name: &str) -> bool {
+    spec.change.iter().any(|change| {
+        change.insert.as_deref() == Some(name) && {
+            let at = head.iter().position(|call| matches(call, name));
+            let anchor = change.before.as_ref().or(change.after.as_ref());
+            match (at, anchor) {
+                (Some(at), Some(anchor)) => head.iter().enumerate().any(|(a, call)| {
+                    matches(call, anchor)
+                        && if change.before.is_some() {
+                            at + 1 == a
+                        } else {
+                            a + 1 == at
+                        }
+                }),
+                (Some(_), None) => true,
+                _ => false,
+            }
+        }
+    })
+}
+
+fn result_node(
+    prefix: &str,
+    serial: &mut usize,
+    text: &str,
+    class: &str,
+    shape: &str,
+    graph: &mut String,
+) -> String {
+    let id = format!("{prefix}{serial}");
+    *serial += 1;
+    match shape {
+        "diamond" => graph.push_str(&format!("  {id}{{\"{}\"}}:::{class}\n", label(text))),
+        "exit" => graph.push_str(&format!("  {id}([\"{}\"]):::{class}\n", label(text))),
+        _ => graph.push_str(&node(&id, text, class)),
+    }
+    id
+}
+
+fn result_nodes(
+    spec: &Spec,
+    language: &LanguageSpec,
+    head_calls: &[String],
+    nodes: &[FlowNode],
+    previous: Option<String>,
+    prefix: &str,
+    serial: &mut usize,
+    graph: &mut String,
+    passing: bool,
+) -> Option<String> {
+    let mut previous = previous;
+    for current in nodes {
+        let focus = contains_focus(spec, current);
+        if current.kind == "call" {
+            let visible = focus
+                && (!matches_builtin_call(&current.text, language)
+                    || current.changed
+                    || named_in_delta(spec, &current.text))
+                && (!is_builtin_value_method(&current.text, language)
+                    || current.changed
+                    || named_in_delta(spec, &current.text));
+            if !visible {
+                continue;
+            }
+            let class = if spec
+                .change
+                .iter()
+                .any(|c| c.insert.as_ref().is_some_and(|x| matches(&current.text, x)))
+            {
+                if passing || expected_at(spec, head_calls, &current.text) {
+                    "ok"
+                } else {
+                    "extra"
+                }
+            } else if focus {
+                "ctx"
+            } else {
+                "fold"
+            };
+            let id = result_node(prefix, serial, &current.text, class, "box", graph);
+            if let Some(last) = previous {
+                graph.push_str(&format!("  {last} --> {id}\n"));
+            }
+            previous = Some(id);
+        } else if !current.branches.is_empty() {
+            if !focus {
+                continue;
+            }
+            let id = result_node(
+                prefix,
+                serial,
+                &current.text,
+                if focus { "ctx" } else { "fold" },
+                "diamond",
+                graph,
+            );
+            if let Some(last) = previous.clone() {
+                graph.push_str(&format!("  {last} --> {id}\n"));
+            }
+            for branch in &current.branches {
+                let branch_last = result_nodes(
+                    spec,
+                    language,
+                    head_calls,
+                    &branch.nodes,
+                    Some(id.clone()),
+                    prefix,
+                    serial,
+                    graph,
+                    passing,
+                );
+                if let Some(last) = branch_last {
+                    if branch.nodes.iter().any(|n| n.kind == "exit") {
+                        graph.push_str(&format!("  {id} -->|{}| {last}\n", label(&branch.kind)));
+                    }
+                }
+            }
+            previous = Some(id);
+        } else if current.kind == "exit" {
+            let id = result_node(prefix, serial, &current.text, "exit", "exit", graph);
+            if let Some(last) = previous {
+                graph.push_str(&format!("  {last} --> {id}\n"));
+            }
+            previous = Some(id);
+        }
+    }
+    previous
 }
 
 fn result(spec: &Spec, row: &ResultRow, prefix: &str) -> String {
     let language = lang::for_file(&spec.file).expect("flow spec has a supported file");
-    let base = calls(spec, row.base_top.as_ref());
-    let head = calls(spec, row.head_top.as_ref());
-    let (start, end) = changed_range(&base, &head);
-    let failing = row.status == "fail";
-    let mut graph = format!("flowchart LR\n  subgraph {prefix}base [\"base\"]\n");
-    graph.push_str(&chain(
-        base.iter()
-            .map(|step| {
-                (
-                    step.key.clone(),
-                    if step.changed { "head" } else { "base" }.into(),
-                )
-            })
-            .collect(),
-        &format!("{prefix}b"),
-    ));
-    graph.push_str("  end\n");
-    graph.push_str(&format!(
-        "  subgraph {prefix}head [\"head ({})\"]\n",
-        row.status
-    ));
-    let head_nodes = head
-        .iter()
-        .enumerate()
-        .map(|(index, step)| {
-            let anchored = spec.change.iter().any(|change| {
-                change
-                    .insert
-                    .as_ref()
-                    .is_some_and(|name| matches(&step.key, name))
-                    || change
-                        .before
-                        .as_ref()
-                        .is_some_and(|name| matches(&step.key, name))
-                    || change
-                        .after
-                        .as_ref()
-                        .is_some_and(|name| matches(&step.key, name))
-            });
-            let inserted = spec.change.iter().any(|change| {
-                change
-                    .insert
-                    .as_ref()
-                    .is_some_and(|name| matches(&step.key, name))
-            });
-            let class = if failing && index == start {
-                "diverged"
-            } else if inserted {
-                "insert"
-            } else if anchored || step.changed {
-                "head"
-            } else if is_builtin_value_method(&step.key, language) {
-                "base"
-            } else if (start..end).contains(&index) {
-                "head"
+    let tree = row.head_tree.as_ref().or(row.base_tree.as_ref());
+    let mut head_calls = Vec::new();
+    if let Some(tree) = tree {
+        call_names(&tree.nodes, &mut head_calls);
+    } else {
+        head_calls = calls(spec, row.head_top.as_ref())
+            .into_iter()
+            .map(|s| s.key.clone())
+            .collect();
+    }
+    let mut graph = String::from("flowchart TD\n");
+    let mut serial = 0usize;
+    if let Some(tree) = tree {
+        result_nodes(
+            spec,
+            language,
+            &head_calls,
+            &tree.nodes,
+            None,
+            prefix,
+            &mut serial,
+            &mut graph,
+            row.status == "pass",
+        );
+        for closure in &tree.closures {
+            if closure.nodes.iter().any(|node| contains_focus(spec, node)) {
+                graph.push_str(&format!(
+                    "  subgraph {prefix}closure{serial} [\"{}\"]\n",
+                    label(&closure.name)
+                ));
+                result_nodes(
+                    spec,
+                    language,
+                    &head_calls,
+                    &closure.nodes,
+                    None,
+                    prefix,
+                    &mut serial,
+                    &mut graph,
+                    row.status == "pass",
+                );
+                graph.push_str("  end\n");
+            }
+        }
+        let exits = graph.matches(":::exit").count();
+        for _ in exits..2 {
+            let _ = result_node(prefix, &mut serial, "return", "exit", "exit", &mut graph);
+        }
+    } else {
+        for call in head_calls.iter().filter(|call| named_in_delta(spec, call)) {
+            let class = if row.status == "pass" || expected_at(spec, &head_calls, call) {
+                "ok"
             } else {
-                "base"
+                "extra"
             };
-            (step.key.clone(), class.into())
-        })
-        .collect();
-    graph.push_str(&chain(head_nodes, &format!("{prefix}h")));
-    graph.push_str("  end\n");
+            let _ = result_node(prefix, &mut serial, call, class, "box", &mut graph);
+        }
+        if !head_calls.is_empty() && serial == 0 {
+            let _ = result_node(
+                prefix,
+                &mut serial,
+                &format!("… {} calls", head_calls.len()),
+                "fold",
+                "box",
+                &mut graph,
+            );
+        }
+    }
+    for change in &spec.change {
+        if let Some(insert) = &change.insert {
+            if !expected_at(spec, &head_calls, insert) {
+                let id = result_node(prefix, &mut serial, insert, "miss", "box", &mut graph);
+                if let Some(anchor) = change.before.as_ref().or(change.after.as_ref()) {
+                    if let Some(anchor_id) = graph
+                        .lines()
+                        .find(|line| line.contains(&format!("\"{}\"", label(anchor))))
+                        .and_then(|line| line.split_whitespace().next())
+                    {
+                        graph.push_str(&format!("  {id} -.-> {anchor_id}\n"));
+                    }
+                }
+            }
+        }
+    }
     graph
 }
 
 fn classes() -> &'static str {
-    "  classDef base fill:#f3f4f6,stroke:#9ca3af,color:#6b7280\n  classDef fold fill:#f9fafb,stroke:#d1d5db,color:#6b7280,stroke-dasharray: 4 3\n  classDef insert fill:#dcfce7,stroke:#22c55e,color:#166534\n  classDef guard fill:#dcfce7,stroke:#22c55e,color:#166534\n  classDef removed fill:#f3f4f6,stroke:#9ca3af,color:#6b7280\n  classDef exit fill:#fff7ed,stroke:#f97316,color:#9a3412\n  classDef head fill:#eff6ff,stroke:#60a5fa,color:#1d4ed8\n  classDef diverged fill:#fee2e2,stroke:#ef4444,color:#991b1b\n"
+    "  classDef base fill:#f3f4f6,stroke:#9ca3af,color:#6b7280\n  classDef fold fill:#f9fafb,stroke:#d1d5db,color:#6b7280,stroke-dasharray: 4 3\n  classDef insert fill:#dcfce7,stroke:#22c55e,color:#166534\n  classDef guard fill:#dcfce7,stroke:#22c55e,color:#166534\n  classDef removed fill:#f3f4f6,stroke:#9ca3af,color:#6b7280\n  classDef ok fill:#dcfce7,stroke:#22c55e,color:#166534\n  classDef miss fill:#fee2e2,stroke:#ef4444,color:#991b1b,stroke-dasharray: 4 3\n  classDef extra fill:#fef3c7,stroke:#f59e0b,color:#92400e\n  classDef ctx fill:#eff6ff,stroke:#60a5fa,color:#1d4ed8\n  classDef exit fill:#fff7ed,stroke:#f97316,color:#9a3412\n"
 }
 
 fn diagram_parts(diagram: String) -> Vec<String> {

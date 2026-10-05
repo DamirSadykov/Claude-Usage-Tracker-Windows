@@ -116,7 +116,7 @@ fn plan_keeps_delta_and_omits_field_reads() {
 }
 
 #[test]
-fn result_marks_the_changed_head_window() {
+fn result_marks_planned_calls_ok() {
     let got = render::markdown(
         "result",
         &[spec()],
@@ -127,15 +127,15 @@ fn result_marks_the_changed_head_window() {
                 "call:persist".into(),
                 "call:finish".into(),
             ],
-            "fail",
+            "pass",
         )],
     );
-    assert!(got.contains("persist\"]:::diverged"));
-    assert!(got.contains("finish\"]:::head"));
+    assert!(got.contains("persist\"]:::ok"));
+    assert!(!got.contains("subgraph r0_base"));
 }
 
 #[test]
-fn m4_after_send_still_marks_the_divergence() {
+fn result_marks_missing_planned_call() {
     let got = render::markdown(
         "result",
         &[spec()],
@@ -149,7 +149,8 @@ fn m4_after_send_still_marks_the_divergence() {
             "fail",
         )],
     );
-    assert!(got.contains("persist\"]:::diverged"));
+    assert!(got.contains("persist\"]:::extra"));
+    assert!(got.contains("persist\"]:::miss"));
 }
 
 #[test]
@@ -211,8 +212,9 @@ fn long_finish_step_is_folded_below_mermaid_limit() {
     let steps: Vec<String> = (0..1536).map(|n| format!("call:helper{n}")).collect();
     let got = render::markdown("result", &[spec()], &[row(steps.clone(), steps, "pass")]);
     assert!(got.len() < 45_000, "{}", got.len());
-    assert!(got.contains("… 1536 steps"));
-    assert!(got.matches("[\"").count() <= 60, "too many nodes: {got}");
+    assert!(got.contains("… 1536 calls"));
+    assert!(!got.contains("steps"));
+    assert!(got.matches("[\"").count() <= 2, "too many nodes: {got}");
     assert_eq!(got.matches("```mermaid").count(), 1);
 }
 
@@ -275,8 +277,11 @@ fn real_finish_step_is_a_small_top_level_diagram() {
     let row = flow::check_method(&spec, &repo, &base, Some(&head), true);
     let got = render::markdown("result", &[spec], &[row]);
     assert!(got.len() < 45_000, "{}", got.len());
-    assert!(got.matches("[\"").count() <= 60, "too many nodes: {got}");
-    assert!(got.contains("recordFlowDiagram\"]:::insert"), "{got}");
+    assert!(got.matches("[\"").count() <= 16, "too many nodes: {got}");
+    assert!(got.contains("declaredFlow(task)"), "{got}");
+    assert!(got.contains("recordFlowDiagram\"]:::ok"), "{got}");
+    assert!(got.matches(":::exit").count() >= 2, "{got}");
+    assert!(!got.contains("steps"), "{got}");
     let _ = fs::remove_dir_all(repo);
 }
 
