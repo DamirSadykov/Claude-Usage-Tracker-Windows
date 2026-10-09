@@ -13,7 +13,7 @@ part: устройство
 refs: tasks#model
 
 - `change retro-facts c#N` детерминированно собирает факты change и сохраняет
-  полный JSON в каталоге данных приложения `retro/cN-facts.json`.
+  полный JSON в каталоге данных приложения `retro/c<N>-facts.json`.
 - Код считает задачи, статусы, привязки сессий, реплики и интервалы, контекст,
   повторные чтения, делегирования, компакты, попытки, парковки, коммиты и
   стоимость по ролям. Агент не пересчитывает эти величины.
@@ -53,7 +53,7 @@ refs: providers#routing
 
 ## labels — Метки реплик
 
-part: контракт
+part: инварианты
 
 Допустимы ровно `directive`, `approval`, `correction`, `approach_challenge`,
 `defect_report`, `side_question`, `new_task`, `ambiguous`. Различение указания,
@@ -61,11 +61,11 @@ part: контракт
 
 ## output — Отчёт и предложения
 
-part: данные
+part: устройство
 
 - Ответ агента — JSON-конверт с Markdown в `report`, массивом `episodes`, полной
   картой `signal_dispositions` и массивом `proposals`.
-  Отчёт сохраняется в каталоге данных приложения как `retro/cN-report.md`.
+  Отчёт сохраняется в каталоге данных приложения как `retro/c<N>-report.md`.
 - Эпизод хранит `expected`, `observed`, `signal_refs`, исход и `detection_gap`:
   ранний `observable`, первое распознавание (`signal` и `by`), проявление
   `reached_user` и объяснение `why_late`. Для `fixed` и `deferred` эти три
@@ -99,7 +99,7 @@ part: данные
 
 ## malformed-output — Неразбираемый ответ
 
-part: ошибки
+part: требования
 
 Если агент вернул текст, который нельзя разобрать целиком по контракту, пропустил
 хотя бы один signal disposition или сослался на отсутствующий эпизод, сырой текст
