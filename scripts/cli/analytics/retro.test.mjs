@@ -12,7 +12,7 @@ const facts = {
 
 const proposal = {
   type: "процесс",
-  addressee: "харнесс трекера",
+  addressee: "human",
   what: "добавить ранний gate",
   episode_refs: ["e1"],
   intervention: "add_check",
@@ -73,6 +73,7 @@ describe("retro agent output", () => {
     expect(parseRetroOutput(envelope({ proposals: [{ type: "совет", what: "что-то" }] }), facts)).toBe(null);
     expect(parseRetroOutput(envelope({ signal_dispositions: { s001: "e1" } }), facts)).toBe(null);
     expect(parseRetroOutput(envelope({ proposals: [{ ...proposal, episode_refs: ["e404"] }] }), facts)).toBe(null);
+    expect(parseRetroOutput(envelope({ proposals: [{ ...proposal, addressee: "владелец деплоя" }] }), facts)).toBe(null);
     expect(parseRetroOutput("обычный markdown отчёт", facts)).toBe(null);
   });
 

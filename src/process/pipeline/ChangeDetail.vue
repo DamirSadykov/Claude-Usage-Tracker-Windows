@@ -78,6 +78,17 @@ watch(() => current.value?.id, () => { changeTab.value = "overview"; });
 function proposalStatus(status: RetroProposal["status"]) {
     return t(status === "accepted" ? "changeProposalAccepted" : status === "rejected" ? "changeProposalRejected" : "changeProposalProposed");
 }
+const proposalRoleKeys: Record<string, string> = {
+  architect: "changeRoleArchitect",
+  critic: "changeRoleCritic",
+  worker: "changeRoleWorker",
+  review: "changeRoleReview",
+  human: "changeRoleHuman",
+};
+function proposalAddressee(addressee: string) {
+    const key = proposalRoleKeys[addressee];
+    return key ? t(key) : addressee;
+}
 function episodeDetectedAt(episode: NonNullable<RetroProposal["episodes"]>[number]) {
     if (!episode.detected_at) return "—";
     const timestamp = Date.parse(episode.detected_at);
@@ -181,7 +192,7 @@ const changeLinks = computed(() => {
           <article v-for="proposal in proposalRows" :key="proposal.id" class="proposal-card">
             <div class="proposal-head"><span class="proposal-type">{{ proposal.type }}</span><span class="proposal-status" :class="proposal.status || 'proposed'">{{ proposalStatus(proposal.status) }}</span></div>
             <strong>{{ proposal.what }}</strong>
-            <dl class="proposal-details"><div><dt>{{ t('changeProposalAddressee') }}</dt><dd>{{ proposal.addressee }}</dd></div><div v-if="typeof proposal.measure === 'string'"><dt>{{ t('changeProposalMeasure') }}</dt><dd>{{ proposal.measure }}</dd></div></dl>
+            <dl class="proposal-details"><div><dt>{{ t('changeProposalAddressee') }}</dt><dd>{{ proposalAddressee(proposal.addressee) }}</dd></div><div v-if="typeof proposal.measure === 'string'"><dt>{{ t('changeProposalMeasure') }}</dt><dd>{{ proposal.measure }}</dd></div></dl>
             <div v-if="typeof proposal.measure !== 'string'" class="proposal-measure">
               <div class="proposal-subheading">{{ t('changeProposalMeasure') }}</div>
               <dl><div><dt>{{ t('changeProposalObserve') }}</dt><dd>{{ proposal.measure.observe }}</dd></div><div><dt>{{ t('changeProposalSource') }}</dt><dd>{{ proposal.measure.source }}</dd></div><div><dt>{{ t('changeProposalFailsIf') }}</dt><dd>{{ proposal.measure.fails_if }}</dd></div></dl>

@@ -17,6 +17,7 @@ import { withBoardLock } from "../kernel/board-lock.mjs";
 import { collectRetroFacts, collectSessionRetroFacts } from "./retro-facts.mjs";
 
 export const PROPOSAL_TYPES = ["процесс", "инвариант проекта"];
+export const PROPOSAL_ADDRESSEES = ["architect", "critic", "worker", "review", "human"];
 export const EPISODE_OUTCOMES = ["fixed", "deferred", "open", "by_design", "insufficient"];
 export const RECOGNIZERS = ["worker", "review", "check", "user"];
 export const INTERVENTIONS = ["fulfil_requirement", "deliver_existing_rule", "add_check", "new_rule"];
@@ -25,7 +26,7 @@ export const RETRO_OUTPUT_CONTRACT = `Верни только один JSON-об
   "report": "Markdown-отчёт",
   "episodes": [{"id":"e1","expected":"…","observed":"…","signal_refs":["s001"],"outcome":"fixed|deferred|open|by_design|insufficient","detection_gap":{"observable":"s007|null","recognized":{"signal":"s007|null","by":"worker|review|check|user|null"},"reached_user":"s033|null","why_late":"…|null"}}],
   "signal_dispositions": {"s001":"e1","s002":"noise","s003":"no_data"},
-  "proposals": [{"type":"процесс|инвариант проекта","addressee":"…","what":"…","episode_refs":["e1"],"intervention":"fulfil_requirement|deliver_existing_rule|add_check|new_rule","evidence":"…","measure":{"cases":"…","baseline":"…","observe":"…","source":"…","fails_if":"…"}}]
+  "proposals": [{"type":"процесс|инвариант проекта","addressee":"architect|critic|worker|review|human","what":"…","episode_refs":["e1"],"intervention":"fulfil_requirement|deliver_existing_rule|add_check|new_rule","evidence":"…","measure":{"cases":"…","baseline":"…","observe":"…","source":"…","fails_if":"…"}}]
 }
 Все поля обязательны, кроме явно допускающих null. Допустимо не больше шести предложений.`;
 
@@ -138,7 +139,7 @@ export function parseRetroOutput(output, facts = {}) {
         source: requiredString(rawMeasure.source),
         fails_if: requiredString(rawMeasure.fails_if),
       };
-      if (!PROPOSAL_TYPES.includes(type) || !addressee || !what || episodeRefs.length === 0 ||
+      if (!PROPOSAL_TYPES.includes(type) || !PROPOSAL_ADDRESSEES.includes(addressee) || !what || episodeRefs.length === 0 ||
           episodeRefs.some((id) => !id || !episodeIds.has(id)) || !INTERVENTIONS.includes(intervention) ||
           !evidence || !measure || Object.values(measure).some((field) => !field)) {
         valid = false;

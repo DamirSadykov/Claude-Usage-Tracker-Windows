@@ -73,7 +73,9 @@ part: данные
   считается разрывом обнаружения.
 - Каждое предложение в `change.ext.retro.proposals` имеет поля `id`, `type`,
   `addressee`, `what`, `episode_refs`, краткие `episodes`, `intervention`,
-  `measure`, `evidence`, `status`. `measure` — объект с полями `cases`,
+  `measure`, `evidence`, `status`. `addressee` — одна роль: `architect`,
+  `critic`, `worker`, `review` или `human`; кто именно и где — в `what`.
+  `measure` — объект с полями `cases`,
   `baseline`, `observe`, `source`, `fails_if`; новый элемент получает
   `status: proposed`.
 - Тип `процесс` означает переносимое изменение брифа, разбиения, проверки,
