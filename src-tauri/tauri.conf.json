@@ -64,11 +64,15 @@
       "../scripts/cli/analytics/corrections.mjs": "scripts/cli/analytics/corrections.mjs",
       "../scripts/cli/analytics/task-cost.mjs": "scripts/cli/analytics/task-cost.mjs",
       "../scripts/cli/analytics/trace.mjs": "scripts/cli/analytics/trace.mjs",
+      "../scripts/cli/analytics/change-close.mjs": "scripts/cli/analytics/change-close.mjs",
+      "../scripts/cli/analytics/retro-facts.mjs": "scripts/cli/analytics/retro-facts.mjs",
+      "../scripts/cli/analytics/retro.mjs": "scripts/cli/analytics/retro.mjs",
       "../scripts/cli/process/outcome.mjs": "scripts/cli/process/outcome.mjs",
       "../scripts/cli/process/run-step.mjs": "scripts/cli/process/run-step.mjs",
       "../scripts/cli/process/run.mjs": "scripts/cli/process/run.mjs",
       "../scripts/cli/process/run-events.mjs": "scripts/cli/process/run-events.mjs",
       "../scripts/cli/process/red-gate.mjs": "scripts/cli/process/red-gate.mjs",
+      "../scripts/cli/process/flow-gate.mjs": "scripts/cli/process/flow-gate.mjs",
       "../scripts/cli/process/checkpoint.mjs": "scripts/cli/process/checkpoint.mjs",
       "../scripts/cli/process/apply.mjs": "scripts/cli/process/apply.mjs",
       "../scripts/cli/process/graph-rules.mjs": "scripts/cli/process/graph-rules.mjs",
@@ -89,7 +93,9 @@
       "../scripts/cli/agents/providers.mjs": "scripts/cli/agents/providers.mjs",
       "../scripts/cli/cc-hooks/claude-hooks.mjs": "scripts/cli/cc-hooks/claude-hooks.mjs",
       "../scripts/cli/agents/agent-providers.json": "scripts/cli/agents/agent-providers.json",
-      "../docs/plan-format.md": "docs/plan-format.md"
+      "../docs/plan-format.md": "docs/plan-format.md",
+      "../docs/plan-format-issues.md": "docs/plan-format-issues.md",
+      "../docs/plan-format-cutting.md": "docs/plan-format-cutting.md"
     },
     "icon": [
       "icons/32x32.png",

@@ -8,6 +8,9 @@ import {
 import type { AlertTiers, AlertTypes } from "./thresholds";
 import { DEFAULT_FONT_ID } from "./fontSwitch";
 
+export type FlowLanguage = "cs" | "rs" | "ts" | "js";
+export const DEFAULT_FLOW_LANGUAGES: readonly FlowLanguage[] = ["cs"];
+
 // Single read-only access layer for settings.json (issue: unify settings reads).
 //
 // Why this exists: every window (App, Settings, Todos, Analytics, Mini, …) is its

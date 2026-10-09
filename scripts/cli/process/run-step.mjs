@@ -41,6 +41,7 @@ import { resolveDuty } from "../agents/agents.mjs";
 import { specsEnabled } from "../kernel/settings.mjs";
 import {
   READ_ONLY_TOOLS,
+  resolveSpawn,
   observeCodexThread,
   parseClaudeResult,
   parseCodexResult,
@@ -142,38 +143,6 @@ function makeSink(max) {
         : head + tail;
     },
   };
-}
-
-// ── spawning ────────────────────────────────────────────────────────────────
-//
-// Windows cannot exec a `.cmd`/`.bat` shim directly (Node refuses it without a
-// shell since CVE-2024-27980), and `shell: true` would re-parse every argument.
-// So the wrapper quotes each argv element itself and hands cmd.exe a single
-// verbatim line: the arguments still cross as arguments, never as text that the
-// shell may re-split. `claude` ships as `claude.exe` today, which takes the
-// direct path below and never reaches the wrapper.
-function winQuote(s) {
-  const v = String(s);
-  if (v && !/[\s"^&|<>()%!]/.test(v)) return v;
-  return `"${v.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\*)$/, "$1$1")}"`;
-}
-
-function windowsShim(file, args) {
-  const cmdLine = [file, ...args].map(winQuote).join(" ");
-  return {
-    file: process.env.ComSpec || "cmd.exe",
-    args: ["/d", "/s", "/c", `"${cmdLine}"`],
-    opts: { windowsVerbatimArguments: true },
-  };
-}
-
-function resolveSpawn(file, args) {
-  if (process.platform !== "win32") return { file, args, opts: {} };
-  if (/\.exe$/i.test(file) || file === (process.env.ComSpec || "cmd.exe"))
-    return { file, args, opts: {} };
-  if (/\.(cmd|bat)$/i.test(file) || !path.extname(file))
-    return windowsShim(file, args);
-  return { file, args, opts: {} };
 }
 
 // A headless session spawns children (its own tools, a language server); killing

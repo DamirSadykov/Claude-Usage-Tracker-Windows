@@ -41,6 +41,7 @@ import {
 } from "../board/todoFilter";
 import { detailSiblingPages } from "../board/detailSiblings";
 import { blockingTasks, commentAttempt, commentSeverity, parseHandoff, reviewOutcome, sessionRoleCosts } from "../board/taskOverview";
+import { flowDiagramForTodo, parseFlowDiagram } from "./flowDiagram";
 
 const { t, locale } = useI18n();
 
@@ -393,6 +394,64 @@ const detail = computed(() => {
 
 type DetailTab = "overview" | "trace" | "comments";
 const detailTab = ref<DetailTab>("overview");
+type FlowTab = "plan" | "result";
+const flowTab = ref<FlowTab>("plan");
+const flowDiagram = computed<Todo["flow_diagram"]>(() => flowDiagramForTodo(detail.value));
+const flowPlan = computed(() => flowDiagram.value?.plan?.trim() ?? "");
+const flowResult = computed(() => flowDiagram.value?.result?.trim() ?? "");
+const hasFlowDiagram = computed(() => Boolean(flowPlan.value || flowResult.value));
+const flowDiagramTarget = ref<HTMLElement | null>(null);
+const flowRenderError = ref<string | null>(null);
+const flowRenderPending = ref(false);
+let flowRenderVersion = 0;
+
+async function renderFlowDiagram() {
+  const sourceMarkdown = flowTab.value === "plan" ? flowPlan.value : flowResult.value;
+  const target = flowDiagramTarget.value;
+  const sections = parseFlowDiagram(sourceMarkdown);
+  const version = ++flowRenderVersion;
+  flowRenderError.value = null;
+  flowRenderPending.value = sections.length > 0;
+  if (!target || !sections.length) {
+    flowRenderError.value = sourceMarkdown ? t("todoFlowNoMermaid") : null;
+    flowRenderPending.value = false;
+    return;
+  }
+
+  try {
+    const { default: mermaid } = await import("mermaid");
+    mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: "dark" });
+    const parts: string[] = [];
+    for (const [index, section] of sections.entries()) {
+      const heading = document.createElement("div");
+      heading.className = "tw-flow-title";
+      heading.textContent = section.title;
+      const svgs: string[] = [];
+      for (const [part, source] of section.sources.entries()) {
+        const { svg } = await mermaid.render(`flow-diagram-${version}-${index}-${part}`, source);
+        svgs.push(svg);
+      }
+      parts.push((section.title && sections.length > 1 ? heading.outerHTML : "") + svgs.join(""));
+    }
+    if (version === flowRenderVersion && flowDiagramTarget.value === target) target.innerHTML = parts.join("");
+  } catch (error) {
+    if (version === flowRenderVersion) flowRenderError.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    if (version === flowRenderVersion) flowRenderPending.value = false;
+  }
+}
+
+function selectFlowTab(tab: FlowTab) {
+  flowTab.value = tab;
+}
+
+watch([detailTab, flowTab, flowPlan, flowResult], async () => {
+  if (detailTab.value !== "overview" || !hasFlowDiagram.value) return;
+  if (flowTab.value === "plan" && !flowPlan.value) flowTab.value = "result";
+  if (flowTab.value === "result" && !flowResult.value) flowTab.value = "plan";
+  await nextTick();
+  void renderFlowDiagram();
+}, { flush: "post" });
 const detailMenuOpen = ref(false);
 const detailChange = computed<{ number: number | null; title: string } | null>(() => {
   const changeId = detail.value?.change_id;
@@ -551,6 +610,10 @@ async function openDetail(todo: { id: string }) {
   mention.value = null;
   saved.value = false;
   detailTab.value = "overview";
+  flowTab.value = "plan";
+  flowRenderVersion += 1;
+  flowRenderError.value = null;
+  flowRenderPending.value = false;
   detailMenuOpen.value = false;
   void loadOverviewWork(todo.id);
   try {
@@ -567,6 +630,7 @@ async function openDetail(todo: { id: string }) {
 }
 
 function closeDetail() {
+  flowRenderVersion += 1;
   detailId.value = null;
   detailRecord.value = null;
   detailLoading.value = false;
@@ -1636,6 +1700,21 @@ onUnmounted(() => {
             <div class="tw-overview">
               <div class="tw-overview-main">
                 <section class="tw-overview-section"><h3>{{ t('todoDescription') }}</h3><div class="tw-overview-description">{{ detail.description || t('todoNoDescription') }}</div></section>
+                <section v-if="hasFlowDiagram" class="tw-overview-section tw-flow">
+                  <h3>{{ t('todoFlow') }}</h3>
+                  <div class="tw-flow-tabs" role="tablist" :aria-label="t('todoFlow')">
+                    <button v-if="flowPlan" type="button" :class="{ active: flowTab === 'plan' }" @click="selectFlowTab('plan')">{{ t('todoFlowPlan') }}</button>
+                    <button v-if="flowResult" type="button" :class="{ active: flowTab === 'result' }" @click="selectFlowTab('result')">{{ t('todoFlowResult') }}</button>
+                  </div>
+                  <div class="tw-flow-diagram">
+                    <div v-if="flowRenderPending" class="tw-flow-pending">…</div>
+                    <div v-else-if="flowRenderError" class="tw-flow-error">
+                      <p>{{ t('todoFlowNotRendered', { error: flowRenderError }) }}</p>
+                      <details><summary>{{ t('todoFlowSource') }}</summary><pre class="tw-flow-source">{{ flowTab === 'plan' ? flowPlan : flowResult }}</pre></details>
+                    </div>
+                    <div ref="flowDiagramTarget" v-show="!flowRenderError" class="tw-flow-svg"></div>
+                  </div>
+                </section>
                 <section class="tw-overview-section"><h3>{{ t('todoHandoff') }}</h3><div v-if="overviewHandoff.parts.length" class="tw-handoff-card"><div v-for="part in overviewHandoff.parts" :key="part.part" class="tw-handoff-row"><b>{{ overviewHandoff.fallback ? t('todoHandoff') : t(`todoHandoff${part.part[0].toUpperCase()}${part.part.slice(1)}`) }}</b><span>{{ part.text }}</span></div></div><div v-else class="tw-overview-empty">{{ t('todoNoDescription') }}</div></section>
                 <section class="tw-overview-section"><h3>{{ t('todoRecentComments') }}</h3><div v-if="!overviewComments.length" class="tw-overview-empty">{{ t('todoCommentsEmpty') }}</div><ul v-else class="tw-overview-comments"><li v-for="comment in overviewComments" :key="comment.id"><div><b>{{ commentAuthorLabel(comment.author) }}</b><span v-if="comment.severity" :class="['tw-severity', comment.severity]">{{ comment.severity }}</span><span v-if="comment.attempt !== null" class="tw-attempt-chip">{{ t('todoAttempt') }} {{ comment.attempt }} / {{ overviewAttemptCount || 1 }} · {{ t('todoReview') }}</span></div><p>{{ comment.body }}</p></li></ul></section>
               </div>
@@ -2695,6 +2774,14 @@ onUnmounted(() => {
 .tw-overview-main, .tw-overview-side { display: flex; flex-direction: column; gap: 18px; min-width: 0; }
 .tw-overview-section h3, .tw-overview-card h3 { color: var(--text-2); font-size: 13px; margin: 0 0 8px; }
 .tw-overview-description { color: var(--text-2); font-size: 13.5px; line-height: 1.62; max-width: 780px; white-space: pre-wrap; }
+.tw-flow-tabs { border-bottom: 1px solid var(--stroke); display: flex; gap: 12px; }
+.tw-flow-tabs button { background: transparent; border: 0; border-bottom: 2px solid transparent; color: var(--text-3); cursor: pointer; font: 12px var(--segoe); padding: 6px 1px; }
+.tw-flow-tabs button.active { border-bottom-color: var(--accent); color: var(--text); }
+.tw-flow-diagram { background: var(--layer); border: 1px solid var(--stroke); border-radius: var(--r-card); margin-top: 8px; min-height: 48px; overflow: auto; padding: 10px; }
+.tw-flow-svg { min-width: max-content; }.tw-flow-svg svg { display: block; max-width: none; }
+.tw-flow-title { color: var(--text-2); font: 12px var(--mono); margin: 10px 0 4px; }
+.tw-flow-pending { color: var(--text-4); font-family: var(--mono); padding: 8px; }
+.tw-flow-error { color: var(--text-2); font-size: 12px; line-height: 1.5; }.tw-flow-error p { margin: 0 0 8px; }.tw-flow-error summary { color: var(--text-3); cursor: pointer; }.tw-flow-source { color: var(--text-2); font-family: var(--mono); font-size: 12px; line-height: 1.5; margin: 8px 0 0; white-space: pre-wrap; }
 .tw-handoff-card, .tw-overview-card { background: var(--layer); border: 1px solid var(--stroke); border-radius: var(--r-card); padding: 10px 12px; }
 .tw-handoff-row { display: grid; gap: 10px; grid-template-columns: 78px minmax(0, 1fr); padding: 5px 0; }
 .tw-handoff-row b { color: var(--text-3); font-size: 12px; }

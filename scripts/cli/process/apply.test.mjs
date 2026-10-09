@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { parseYamlSubset, readDocument, validate, applyDocument } from "./apply.mjs";
+import { parseYamlSubset, readDocument, validate, applyDocument, inferDocument, inferRedTests } from "./apply.mjs";
 import { loadBoard, withDeferredSave, saveBoard, setField } from "../board/todos.mjs";
 
 const cli = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "cli.mjs");
@@ -83,6 +83,7 @@ describe("change brief fields in apply", () => {
       const fixture = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "docs", "plans", "c70-change-brief-adr.yaml");
       const initial = { version: 1, todos: [], changes: [] };
       const doc = readDocument(readFileSync(fixture, "utf8"));
+      doc.steps = doc.steps.map((step) => ({ ...step, size: "M" }));
       expect(validate(doc).errors).toEqual([]);
       expect(applyDocument(doc, { go: true, project: "fixture", board: { data: initial, file } }).ok).toBe(true);
       const change = initial.changes[0];
@@ -106,14 +107,57 @@ describe("change brief fields in apply", () => {
   });
 });
 
+describe("flow diagrams in apply", () => {
+  it("records a plan diagram from flowcheck", () => {
+    const file = path.join(mkdtempSync(path.join(os.tmpdir(), "cut-flow-plan-")), "todos.json");
+    try {
+      const data = { version: 1, todos: [], changes: [] };
+      const doc = readDocument([
+        "change: CHANGE: flow", "steps:", "  1:", "    title: Проверка", "    produces: [src/Notifier.cs]",
+        "    flow:", "      file: src/Notifier.cs", "      method: Send",
+      ].join("\n"));
+      const calls = [];
+      const result = applyDocument(doc, {
+        go: true, project: "fixture", board: { data, file }, cwd: process.cwd(), flowcheckExe: process.execPath,
+        runFlowcheck: (_exe, args) => {
+          calls.push(args);
+          return { status: 0, stdout: JSON.stringify({ diagram: "```mermaid\nflowchart TD\n```" }), stderr: "" };
+        },
+      });
+      expect(result.ok).toBe(true);
+      expect(calls[0]).toEqual(expect.arrayContaining(["--base", "HEAD", "--diagram", "plan"]));
+      expect(data.todos[0].flow_diagram.plan).toContain("mermaid");
+    } finally {
+      rmSync(path.dirname(file), { recursive: true, force: true });
+    }
+  });
+
+  it("does not fail apply when flowcheck is unavailable", () => {
+    const file = path.join(mkdtempSync(path.join(os.tmpdir(), "cut-flow-plan-")), "todos.json");
+    try {
+      const data = { version: 1, todos: [], changes: [] };
+      const doc = readDocument([
+        "change: CHANGE: flow", "steps:", "  1:", "    title: Проверка", "    produces: [src/Notifier.cs]",
+        "    flow:", "      file: src/Notifier.cs", "      method: Send",
+      ].join("\n"));
+      const result = applyDocument(doc, { go: true, project: "fixture", board: { data, file }, flowcheckExe: "" });
+      expect(result.ok).toBe(true);
+      expect(data.todos[0].flow_diagram).toBeUndefined();
+      expect(result.notes.join("\n")).toMatch(/flowcheck executable is unavailable/);
+    } finally {
+      rmSync(path.dirname(file), { recursive: true, force: true });
+    }
+  });
+});
+
 // The rules of §15 live HERE, in code, which is the whole point of the command:
 // the exit prompt no longer has to recite them for the graph to be valid.
 describe("apply refuses an invalid graph", () => {
   const check = (yaml) => validate(readDocument(yaml));
 
-  it("refuses a ?issue transition with no declared retry limit", () => {
+  it("accepts a ?issue transition with no declared retry limit because apply infers 2", () => {
     const { errors } = check(["steps:", "  1:", "    title: A", "  2:", "    title: B", "    on-issue: 1"].join("\n"));
-    expect(errors.join(" ")).toMatch(/on-issue without a retry limit/);
+    expect(errors).toEqual([]);
   });
 
   it("takes the same transition once a limit is declared", () => {
@@ -141,7 +185,7 @@ describe("apply refuses an invalid graph", () => {
   });
 
   it("only WARNS on auto without a verify — a gate is a legal graph", () => {
-    const { errors, warnings } = check(["steps:", "  1:", "    title: A", "    kind: auto"].join("\n"));
+    const { errors, warnings } = check(["steps:", "  1:", "    title: A", "    kind: auto", "    size: S"].join("\n"));
     expect(errors).toEqual([]);
     expect(warnings.join(" ")).toMatch(/runs as a GATE/);
   });
@@ -159,7 +203,7 @@ describe("apply refuses an invalid graph", () => {
       { lineCount: (file) => (file === "src/large.mjs" ? 1501 : null) },
     );
     expect(errors).toEqual([]);
-    expect(warnings).toContain('step "1": шаг крупный — разрезать по produces');
+    expect(warnings).toContain('step "1": шаг крупный — разрезать по produces; см. docs/plan-format-cutting.md');
   });
 
   it("warns that parallel/budget land nowhere without a change root", () => {
@@ -167,10 +211,27 @@ describe("apply refuses an invalid graph", () => {
     expect(warnings.join(" ")).toMatch(/change/);
   });
 
-  it("refuses red declared without red-tests", () => {
+  it("infers red-tests from a test path in red", () => {
     const { errors } = check(
-      ["steps:", "  1:", "    title: A", "    kind: auto", "    red: npm run test:red"].join("\n"),
+      ["steps:", "  1:", "    title: A", "    red: npx vitest run test/a.spec.js"].join("\n"),
     );
+    expect(errors).toEqual([]);
+  });
+
+  it("infers nothing for a step bound to a board task", () => {
+    const doc = readDocument(["steps:", "  1:", "    task: 12"].join("\n"));
+    const { doc: next, inferred } = inferDocument(doc);
+    expect(inferred).toEqual([]);
+    expect(next.steps[0].kind).toBeFalsy();
+    expect(next.steps[0].retry).toBeFalsy();
+  });
+
+  it("infers red-tests only from test paths, not from produced source", () => {
+    expect(inferRedTests("node src/a.mjs && npx vitest run test/a.spec.js")).toEqual(["test/a.spec.js"]);
+  });
+
+  it("still refuses red when its command contains no inferable test path", () => {
+    const { errors } = check(["steps:", "  1:", "    title: A", "    red: npm run test:red"].join("\n"));
     expect(errors.join(" ")).toMatch(/red declared without red-tests/);
   });
 
@@ -181,6 +242,31 @@ describe("apply refuses an invalid graph", () => {
     expect(errors.join(" ")).toMatch(/red-tests declared without red/);
   });
 
+  it("requires flow for an auto step that produces configured code, but accepts an explained n/a", () => {
+    const missing = check(
+      ["steps:", "  1:", "    title: A", "    kind: auto", "    size: S", "    produces: [src/Notifier.cs]"].join("\n"),
+    );
+    expect(missing.errors.join(" ")).toMatch(/produces configured flow-language code but has no flow/);
+    const blankNa = check(
+      ["steps:", "  1:", "    title: A", "    kind: auto", "    size: S", "    produces: [src/Notifier.cs]", "    flow: n/a"].join("\n"),
+    );
+    expect(blankNa.errors.join(" ")).toMatch(/flow: n\/a needs a reason/);
+    const explained = check(
+      ["steps:", "  1:", "    title: A", "    kind: auto", "    size: S", "    produces: [src/Notifier.cs]", "    flow: n/a generated file only"].join("\n"),
+    );
+    expect(explained.errors).toEqual([]);
+    const scalar = check(
+      ["steps:", "  1:", "    title: A", "    kind: auto", "    size: S", "    produces: [src/Notifier.cs]", "    flow: placeholder"].join("\n"),
+    );
+    expect(scalar.errors.join(" ")).toMatch(/flow must be a method delta, a list of them, or flow: n\/a <reason>/);
+  });
+
+  it("requires flow for Rust and TS/JS only when those languages are configured", () => {
+    const doc = readDocument(["steps:", "  1:", "    title: A", "    kind: auto", "    size: S", "    produces: [src/notify.rs, src/view.tsx, scripts/check.cjs]"].join("\n"));
+    expect(validate(doc, { languages: ["rs", "ts", "js"] }).errors.join(" ")).toMatch(/configured flow-language code but has no flow/);
+    expect(validate(doc, { languages: ["cs"] }).errors).toEqual([]);
+  });
+
   it("only WARNS when a red-tests path is not also in produces", () => {
     const { errors, warnings } = check(
       [
@@ -188,6 +274,7 @@ describe("apply refuses an invalid graph", () => {
         "  1:",
         "    title: A",
         "    kind: auto",
+        "    size: S",
         "    red: npm run test:red",
         "    red-tests: [test/a.spec.js]",
         "    produces: [src/a.js]",
@@ -204,6 +291,7 @@ describe("apply refuses an invalid graph", () => {
         "  1:",
         "    title: A",
         "    kind: auto",
+        "    size: S",
         "    red: npm run test:red",
         "    red-tests: [test/a.spec.js]",
         "    produces: [src/a.js, test/a.spec.js]",
@@ -238,6 +326,17 @@ describe("apply refuses an invalid graph", () => {
     expect(errors).toEqual([]);
     expect(warnings).toEqual([]);
   });
+
+  it("requires size only for a new auto step and validates its vocabulary", () => {
+    const missing = check(["steps:", "  1:", "    title: A", "    verify: npm test"].join("\n"));
+    expect(missing.errors.join(" ")).toMatch(/new auto step has no size.*S \| M \| L/);
+
+    const bound = check(["steps:", "  1:", "    task: 318", "    kind: auto", "    verify: npm test"].join("\n"));
+    expect(bound.errors.join(" ")).not.toMatch(/no size/);
+
+    const invalid = check(["steps:", "  1:", "    title: A", "    size: XL"].join("\n"));
+    expect(invalid.errors.join(" ")).toMatch(/invalid size "XL".*S \| M \| L/);
+  });
 });
 
 describe("apply records the graph", () => {
@@ -264,6 +363,7 @@ describe("apply records the graph", () => {
     "    verify: npm test",
     "    retry: 3",
     "    kind: auto",
+    "    size: M",
     "    red: npm run test:red",
     "    red-tests: [tests/apply.red.spec.js]",
     "    risk: high",
@@ -335,6 +435,7 @@ describe("apply records the graph", () => {
     expect(one.verify).toBe("npm test");
     expect(one.retry_limit).toBe(3);
     expect(one.kind).toBe("auto");
+    expect(one.size).toBe("M");
     expect(one.red).toBe("npm run test:red");
     expect(one.red_tests).toEqual(["tests/apply.red.spec.js"]);
     expect(one.risk).toBe("high");
@@ -342,6 +443,61 @@ describe("apply records the graph", () => {
     expect(two.depends_on).toContain(one.id);
     expect(three.depends_on).toContain(two.id);
     expect(two.on_issue).toBe(one.id);
+  });
+
+  it("records and reports inferred kind, retry, and red-tests while explicit values win", () => {
+    writeFileSync(path.join(dir, "inferred.yaml"), [
+      "change: CHANGE: вывод полей",
+      "steps:",
+      "  1:",
+      "    title: Автоматический",
+      "    size: S",
+      "    produces: [test/inferred.test.mjs]",
+      "    verify: npx vitest run test/inferred.test.mjs",
+      "    red: npx vitest run test/inferred.test.mjs",
+      "  2:",
+      "    title: Явно ручной",
+      "    verify: npm test",
+      "    kind: manual",
+      "    retry: 4",
+      "  3:",
+      "    title: Выведенный ручной",
+    ].join("\n"));
+    const out = say(path.join(dir, "inferred.yaml"), "--go");
+    const [automatic, explicit, inferredManual] = board().todos;
+    expect(automatic).toMatchObject({ kind: "auto", retry_limit: 2, red_tests: ["test/inferred.test.mjs"] });
+    expect(explicit).toMatchObject({ retry_limit: 4 });
+    expect(explicit.kind).toBeUndefined(); // manual is the board's canonical omitted representation
+    expect(inferredManual).toMatchObject({ kind: "manual", retry_limit: 2 });
+    expect(out).toMatch(/выведено: .*1\.kind=auto.*1\.retry=2.*1\.red-tests=test\/inferred\.test\.mjs/s);
+    expect(out).not.toMatch(/2\.kind|2\.retry/);
+  });
+
+  it("keeps a flow object on the task when it applies the plan", () => {
+    writeFileSync(
+      path.join(dir, "flow.yaml"),
+      [
+        "change: CHANGE: flow",
+        "steps:",
+        "  1:",
+        "    title: Меняю метод",
+        "    kind: auto",
+        "    size: M",
+        "    produces: [src/Notifier.cs]",
+        "    flow:",
+        "      file: src/Notifier.cs",
+        "      method: SendSms",
+        "      change: [insert: ValidatePhone]",
+        "      preserve: all",
+      ].join("\n"),
+    );
+    say(path.join(dir, "flow.yaml"), "--go");
+    expect(board().todos[0].flow).toEqual({
+      file: "src/Notifier.cs",
+      method: "SendSms",
+      change: ["insert: ValidatePhone"],
+      preserve: "all",
+    });
   });
 
   // §15: the loop lives on the run layer. A back edge in depends_on would break
@@ -418,8 +574,8 @@ describe("apply records the graph", () => {
   });
 
   it("refuses the whole file when a rule is broken — nothing half-written", () => {
-    writeFileSync(path.join(dir, "bad.yaml"), ["steps:", "  1:", "    title: A", "  2:", "    title: B", "    on-issue: 1"].join("\n"));
-    expect(() => say(path.join(dir, "bad.yaml"), "--go")).toThrow(/retry limit/);
+    writeFileSync(path.join(dir, "bad.yaml"), ["steps:", "  1:", "    title: A", "    needs: [2]", "  2:", "    title: B", "    needs: [1]"].join("\n"));
+    expect(() => say(path.join(dir, "bad.yaml"), "--go")).toThrow(/cycle/);
     expect(board().todos).toEqual([]);
   });
 });
@@ -473,6 +629,15 @@ describe("a graph is written all at once or not at all", () => {
     });
     const saved = JSON.parse(readFileSync(file, "utf8")).todos[0];
     expect([saved.ext.process.verify, saved.ext.process.retry_limit]).toEqual(["npm test", 2]);
+  });
+
+  it("keeps a declared size through a board save and reload", () => {
+    const data = { todos: [{ ...row(), size: "L" }] };
+    saveBoard(file, data);
+    const raw = JSON.parse(readFileSync(file, "utf8")).todos[0];
+    expect(raw.size).toBeUndefined();
+    expect(raw.ext.process.size).toBe("L");
+    expect(loadBoard(file).todos[0].size).toBe("L");
   });
 });
 

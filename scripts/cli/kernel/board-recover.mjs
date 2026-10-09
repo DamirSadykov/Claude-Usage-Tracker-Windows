@@ -6,7 +6,7 @@ export const CURRENT = 3;
 
 const TODO_PROCESS_FIELDS = [
   "produces", "verify", "retry_limit", "on_issue", "budget_usd", "parallel_limit",
-  "outcome", "outcome_reason", "outcome_at", "handout_at", "red", "red_tests", "step_base", "risk",
+  "outcome", "outcome_reason", "outcome_at", "handout_at", "red", "red_tests", "step_base", "risk", "size",
 ];
 const CHANGE_PROCESS_FIELDS = ["spec", "budget_usd", "parallel_limit"];
 

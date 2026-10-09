@@ -14,7 +14,7 @@
 //
 //   graph = {
 //     changes: [{ label, budget }],     // group roots whose ceilings the runner reads
-//     nodes:  [{ id, label, title, needs, produces, verify, retry, budget,
+//     nodes:  [{ id, label, title, needs, produces, verify, retry, size, budget,
 //                onIssue, kind, closed, outcome }],
 //     resolves(ref) -> boolean,         // does this reference point at anything
 //     unknownRef(ref) -> string,        // ...and how to say that it does not
@@ -28,6 +28,27 @@
 import { normalizeLimit } from "../kernel/board-io.mjs";
 
 const blank = (v) => v === undefined || v === null || String(v).trim() === "";
+const FLOW_LANGUAGE_EXTENSIONS = {
+  cs: [".cs"],
+  rs: [".rs"],
+  ts: [".ts", ".tsx"],
+  js: [".js", ".mjs", ".cjs"],
+};
+export const supportedFlowExtensions = Object.values(FLOW_LANGUAGE_EXTENSIONS).flat();
+export const flowExtensions = (languages = ["cs"]) =>
+  [...new Set((Array.isArray(languages) ? languages : ["cs"]).flatMap((language) => FLOW_LANGUAGE_EXTENSIONS[language] || []))];
+const flowOutput = (n, languages) => {
+  const extensions = flowExtensions(languages);
+  return (n.produces || []).some((value) => extensions.some((extension) => String(value).trim().toLowerCase().endsWith(extension)));
+};
+const flowNaReason = (flow) => {
+  if (typeof flow !== "string") return null;
+  const match = /^n\/a(?:\s+(.*))?$/i.exec(flow.trim());
+  return match ? String(match[1] || "").trim() : null;
+};
+const flowSpec = (spec) => spec !== null && typeof spec === "object" && !Array.isArray(spec);
+export const flowDeclared = (flow) =>
+  flowSpec(flow) || (Array.isArray(flow) && flow.length > 0 && flow.every(flowSpec));
 
 // A reference is a step key in a file and a task id on a board, and a raw uuid in
 // a message tells the reader nothing. The caller says how to name one; a caller
@@ -69,12 +90,31 @@ export const NODE_RULES = [
         .map(([field, value]) => `${n.label}: invalid ${field} "${value}"`),
   },
   {
+    id: "invalid-size",
+    severity: "error",
+    when: "any",
+    check: (n) =>
+      n.size && !["S", "M", "L"].includes(n.size)
+        ? `${n.label}: invalid size "${n.size}" — accepted values: S | M | L`
+        : null,
+  },
+  {
+    id: "new-auto-without-size",
+    severity: "error",
+    when: "open",
+    check: (n) =>
+      n.newTask && n.kind === "auto" && blank(n.size)
+        ? `${n.label}: new auto step has no size — declare size: S | M | L`
+        : null,
+  },
+  {
     id: "invalid-risk",
     severity: "error",
     when: "any",
     check: (n) =>
-      n.risk && n.risk !== "high"
-        ? `${n.label}: invalid risk "${n.risk}" — the only accepted value is "high"`
+      n.risk && !["high", "sensitive"].includes(n.risk)
+        ? `${n.label}: invalid risk "${n.risk}" — the only accepted value is "high" for agent routing; ` +
+          `accepted values: "high" | "sensitive"`
         : null,
   },
   {
@@ -122,7 +162,7 @@ export const NODE_RULES = [
   },
   {
     // The canonical retry shape has the ?issue target among the node's own
-    // prerequisites (docs/plan-format.md §5), so this is a note, not a fault:
+    // prerequisites (docs/plan-format-issues.md), so this is a note, not a fault:
     // what is refused is the loop CLOSED in depends_on, and that is the cycle
     // rule below.
     id: "on-issue-is-a-dependency",
@@ -155,7 +195,7 @@ export const NODE_RULES = [
         const count = g.lineCount(p);
         return typeof count === "number" && count > 1500;
       })
-        ? `${n.label}: шаг крупный — разрезать по produces`
+        ? `${n.label}: шаг крупный — разрезать по produces; см. docs/plan-format-cutting.md`
         : null,
   },
   {
@@ -193,6 +233,22 @@ export const NODE_RULES = [
       !blank(n.red) && n.kind !== "auto"
         ? `${n.label}: red declared on a manual node — a gate never runs it`
         : null,
+  },
+  {
+    id: "code-without-flow",
+    severity: "error",
+    when: "open",
+    check: (n, g) => {
+      if (n.kind !== "auto" || !flowOutput(n, g.flowLanguages)) return null;
+      if (blank(n.flow))
+        return `${n.label}: auto step produces configured flow-language code but has no flow — declare flow or flow: n/a <reason>`;
+      if (typeof n.flow === "string") {
+        if (!/^n\/a\b/i.test(n.flow.trim()))
+          return `${n.label}: flow must be a method delta, a list of them, or flow: n/a <reason>`;
+        return flowNaReason(n.flow) ? null : `${n.label}: flow: n/a needs a reason`;
+      }
+      return flowDeclared(n.flow) ? null : `${n.label}: flow must be a method delta, a list of them, or flow: n/a <reason>`;
+    },
   },
   {
     // The reconciliation (t#304) is what turns a promise into an artefact of an

@@ -38,16 +38,20 @@ import { DSL_DOC_FIELDS, readDocument, validate } from "./apply.mjs";
 import { boardPath, loadBoard, resolveTask } from "../board/todos.mjs";
 import { invokeDutySync } from "../agents/agents.mjs";
 
-const FORMAT_DOC = path.join(
+const DOCS_DIR = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
   "..",
   "..",
   "..",
   "docs",
-  "plan-format.md",
 );
+const FORMAT_DOC = path.join(DOCS_DIR, "plan-format.md");
+const FORMAT_ISSUES_DOC = path.join(DOCS_DIR, "plan-format-issues.md");
+const FORMAT_CUTTING_DOC = path.join(DOCS_DIR, "plan-format-cutting.md");
 
 export const planFormatDoc = () => FORMAT_DOC;
+export const planFormatIssuesDoc = () => FORMAT_ISSUES_DOC;
+export const planFormatCuttingDoc = () => FORMAT_CUTTING_DOC;
 
 // --- is this text an ATTEMPT at the language? --------------------------------
 //
@@ -241,12 +245,19 @@ export function inspectPlan(text, { onBoard = () => true, inChange = () => false
 // at this point, and are labelled as not being the reason.
 // Exported for the unit tests.
 export function buildRefusal(errors, warnings = []) {
+  const failed = errors.join("\n");
+  const fieldHelp = [];
+  if (/\bout\[/.test(failed))
+    fieldHelp.push("`out` items are durable exclusions: each needs non-empty `what` and `why`; `ref` is optional.");
+  if (/\bmeasure\[/.test(failed))
+    fieldHelp.push("`measure` items describe a user-visible observation: each needs exact `what` and `how`; targets and results are optional.");
   const lines = [
     "PLAN REFUSED — it is not a valid graph file, so it never reached the user.",
     "",
     `${errors.length} error(s), from the validator \`todos apply\` runs:`,
     ...errors.map((e) => "  - " + e),
   ];
+  if (fieldHelp.length) lines.push("", "Field contract:", ...fieldHelp.map((line) => "  - " + line));
   if (warnings.length)
     lines.push(
       "",
@@ -257,7 +268,7 @@ export function buildRefusal(errors, warnings = []) {
     "",
     "Fix the plan itself and call ExitPlanMode again. Do not append a corrected",
     "copy next to the old one — the plan IS the file, and there is one of it.",
-    "The shape, the rules and a worked example:",
+    "Use §1 of the base format for field meanings and §2 for the graph shape:",
     `  ${FORMAT_DOC}`,
   );
   return lines.join("\n");
@@ -278,7 +289,7 @@ export function buildFormatRefusal() {
     "(or `task: <N>` for work already on the board), `why`, `needs`, `produces`,",
     "`verify`, `kind`. A one-step plan is a file too. The shape, the rules and a",
     "worked example:",
-    `  ${FORMAT_DOC}`,
+    `  §1 and §2: ${FORMAT_DOC}`,
     "",
     "If this plan does NOT start work — you are settling a question with the user,",
     "not opening tasks — declare that instead, on its own line at the start:",
@@ -305,7 +316,7 @@ export function buildBlankDiscussionRefusal() {
     "",
     "If the plan DOES start work, drop the declaration and write it as the graph",
     "file instead:",
-    `  ${FORMAT_DOC}`,
+    `  discussion refusal: §3; graph shape: §1 and §2 — ${FORMAT_DOC}`,
   ].join("\n");
 }
 
@@ -325,6 +336,7 @@ export function buildContradictionRefusal(steps) {
     "",
     "Drop whichever half is not this plan. If the discussion has already settled on",
     "work, it is a graph file — remove the declaration.",
+    `See §3 of the base format: ${FORMAT_DOC}`,
   ].join("\n");
 }
 

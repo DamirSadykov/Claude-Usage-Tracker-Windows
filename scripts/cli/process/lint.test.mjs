@@ -175,10 +175,64 @@ describe("todos lint checks the recorded graph", () => {
     expect(out).toMatch(/#1: red declared on a manual node — a gate never runs it/);
   });
 
-  it("errors on a risk other than high, and stays quiet on high", () => {
+  it("requires flow for auto code in the configured languages, with an explained n/a escape hatch", () => {
+    board(task(1, { kind: "auto", produces: ["src/Notifier.cs"] }));
+    let result = lint();
+    expect(result.code).toBe(1);
+    expect(result.out).toMatch(/#1: auto step produces configured flow-language code but has no flow/);
+
+    board(task(1, { kind: "auto", produces: ["src/Notifier.cs"], flow: "n/a" }));
+    result = lint();
+    expect(result.code).toBe(1);
+    expect(result.out).toMatch(/#1: flow: n\/a needs a reason/);
+
+    board(task(1, { kind: "auto", verify: "npm test", produces: ["src/Notifier.cs"], flow: "n/a generated code has no method body" }));
+    result = lint();
+    expect(result.code).toBe(0);
+    expect(result.out).toMatch(/nothing violates/);
+
+    board(task(1, { kind: "auto", produces: ["src/Notifier.cs"], flow: "placeholder" }));
+    result = lint();
+    expect(result.code).toBe(1);
+    expect(result.out).toMatch(/#1: flow must be a method delta, a list of them, or flow: n\/a <reason>/);
+    const delta = (method) => ({ file: "src/Notifier.cs", method, change: [], preserve: "all" });
+    board(task(1, { kind: "auto", verify: "npm test", produces: ["src/Notifier.cs"], flow: [delta("SendSms"), delta("SendEmail")] }));
+    result = lint();
+    expect(result.code).toBe(0);
+    expect(result.out).toMatch(/nothing violates/);
+
+    board(task(1, { kind: "auto", verify: "npm test", produces: ["src/Notifier.cs"], flow: [] }));
+    expect(lint().code).toBe(1);
+  });
+
+  it("uses flowLanguages for this project, including Rust and TS/JS extension families", () => {
+    const project = path.basename(process.cwd());
+    writeFileSync(path.join(dir, "com.claude-usage-tracker.app", "settings.json"), JSON.stringify({
+      flowLanguages: { [project]: ["rs", "ts", "js"] },
+    }));
+    board(task(1, { kind: "auto", produces: ["src/notify.rs", "src/ui.tsx", "scripts/check.mjs"] }));
+    expect(lint().out).toMatch(/configured flow-language code but has no flow/);
+    board(task(1, { kind: "auto", produces: ["src/notify.rs"], flow: "n/a generated binding" }));
+    expect(lint().code).toBe(0);
+    board(task(1, { kind: "auto", produces: ["src/ignored.py"] }));
+    expect(lint().code).toBe(0);
+  });
+
+  it("accepts high and sensitive risk, and errors on any other value", () => {
     board(task(1, { risk: "medium" }));
-    expect(lint().out).toMatch(/#1: invalid risk "medium" — the only accepted value is "high"/);
+    expect(lint().out).toMatch(/#1: invalid risk "medium".*accepted values: "high" \| "sensitive"/);
     board(task(1, { risk: "high" }));
+    expect(lint().out).toMatch(/nothing violates/);
+    board(task(1, { risk: "sensitive" }));
+    expect(lint().out).toMatch(/nothing violates/);
+  });
+
+  it("validates a recorded size but does not require one on existing graphs", () => {
+    board(task(1, { kind: "auto", verify: "npm test" }));
+    expect(lint().out).toMatch(/nothing violates/);
+    board(task(1, { size: "XL" }));
+    expect(lint().out).toMatch(/invalid size "XL".*S \| M \| L/);
+    board(task(1, { size: "L" }));
     expect(lint().out).toMatch(/nothing violates/);
   });
 
@@ -239,29 +293,22 @@ describe("todos lint checks the recorded graph", () => {
     ]);
   });
 
-  // The point of graph-rules.mjs: `apply` (a file on the way in) and `lint` (the
-  // graph already recorded) do not each carry their own wording of a rule. If
-  // one of them is ever edited in place, this test is what notices.
-  it("states a rule in the same words as apply does", () => {
+  it("infers retry on apply but keeps the legacy-board lint rule", () => {
     writeFileSync(
       path.join(dir, "graph.yaml"),
-      ["steps:", "  1:", "    title: A", "  2:", "    title: B", "    on-issue: 1"].join("\n"),
+      ["change: CHANGE: retry inference", "steps:", "  1:", "    title: A", "  2:", "    title: B", "    on-issue: 1"].join("\n"),
     );
-    let fromApply = "";
-    try {
-      execFileSync(process.execPath, [cli, "todos", "apply", path.join(dir, "graph.yaml")], {
-        encoding: "utf8",
-        env: { ...process.env, APPDATA: dir },
-        windowsHide: true,
-      });
-    } catch (e) {
-      fromApply = (e.stdout || "") + (e.stderr || "");
-    }
+    const fromApply = execFileSync(process.execPath, [cli, "todos", "apply", path.join(dir, "graph.yaml")], {
+      encoding: "utf8",
+      env: { ...process.env, APPDATA: dir },
+      windowsHide: true,
+    });
     board(task(1), task(2, { on_issue: "t1" }));
     const shared =
       "on-issue without a retry limit. A missing limit FORBIDS the transition, " +
       "it does not permit an endless one — declare retry on this node";
-    expect(fromApply).toContain(shared);
+    expect(fromApply).toContain("выведено 2  retry=2");
+    expect(fromApply).not.toContain(shared);
     expect(lint().out).toContain(shared);
   });
 });

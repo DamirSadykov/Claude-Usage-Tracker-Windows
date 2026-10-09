@@ -34,6 +34,10 @@ export interface Todo {
   change_id?: string;
   scheduled_for?: string | null;
   plan: string;
+  flow_diagram?: {
+    plan?: string;
+    result?: string;
+  };
   project?: string | null;
   from?: string | null;
   comments?: Comment[];

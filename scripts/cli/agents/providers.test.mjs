@@ -78,6 +78,18 @@ describe("providerArgv · openai", () => {
     );
     expect(args.at(-1)).toBe("-");
   });
+
+  it("does not change Codex argv when external read directories are supplied", () => {
+    const { args } = providerArgv(
+      { provider: "openai" },
+      {
+        bin: "codex",
+        sandbox: "read-only",
+        addDirs: ["C:/app-data/retro", "C:/Users/me/.claude/projects"],
+      },
+    );
+    expect(args).toEqual(["exec", "--json", "--sandbox", "read-only", "-"]);
+  });
 });
 
 describe("providerArgv · anthropic", () => {
@@ -168,6 +180,27 @@ describe("providerArgv · anthropic", () => {
       { bin: "claude", sandbox: "read-only", allowedTools: READ_ONLY_TOOLS },
     );
     expect(args).not.toContain("--session-id");
+  });
+
+  it("grants Claude read access to every external retro directory", () => {
+    const { args } = providerArgv(
+      { provider: "anthropic", model: "opus" },
+      {
+        bin: "claude",
+        sandbox: "read-only",
+        allowedTools: READ_ONLY_TOOLS,
+        addDirs: ["C:/app-data/retro", "C:/Users/me/.claude/projects"],
+      },
+    );
+    expect(args).toEqual([
+      "-p",
+      "--output-format", "json",
+      "--permission-mode", "acceptEdits",
+      "--setting-sources", "project",
+      "--add-dir", "C:/app-data/retro", "C:/Users/me/.claude/projects",
+      "--allowedTools", "Read", "Glob", "Grep",
+      "--model", "opus",
+    ]);
   });
 });
 

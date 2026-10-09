@@ -272,9 +272,12 @@ here is how you drive it:
 Plan mode is where changes COME FROM, but **the plan is not a ritual you
 transcribe by hand any more.** A plan is a YAML file in the tracker's own
 process-graph language — one step per task — documented in full in
-`docs/plan-format.md` (read it once per session, not once per plan; §4 there is
-a complete worked example). This section is the short version of how the hooks
-carry it; the invariants themselves are `tasks#plan-mode`.
+`docs/plan-format.md` (read it once per session, not once per plan; §4 has the
+graph skeleton and focused fragments). Parked-step diagnosis lives separately
+in `docs/plan-format-issues.md`, and plan/step splitting in
+`docs/plan-format-cutting.md`; each is opened only when its event occurs. This
+section is the short version of how the hooks carry them; the invariants
+themselves are `tasks#plan-mode`.
 
 The shape, in brief (full rules in `docs/plan-format.md`):
 
@@ -301,7 +304,8 @@ Three hooks, wired by the installer next to SessionStart/Stop:
 - **EnterPlanMode / a prompt sent while in plan mode** (`cli.mjs plan-hook
   enter|prompt`) points you at `docs/plan-format.md` instead of repeating the
   format inline — once per session (a marker file dedupes `enter` and `prompt`
-  firing in the same session).
+  firing in the same session). It names the two supplements and their triggers,
+  but does not ask the session to read them.
 - **PreToolUse on ExitPlanMode** (`cli.mjs plan-guard`) — **the gate that
   actually enforces the language.** It checks the plan text **before the user
   ever sees the confirmation prompt**: a text that isn't readable as the graph
@@ -316,6 +320,9 @@ Three hooks, wired by the installer next to SessionStart/Stop:
   a reason too short to name anything, or a plan mixing `discussion:` with real
   steps is refused. These are the same rules `todos apply`/`todos lint` run, so
   the wording never drifts between the three.
+- **Runner parking / cutting warning** routes the decision card to
+  `docs/plan-format-issues.md`; its “split the work” action and the lint
+  `large-step` warning route to `docs/plan-format-cutting.md`.
 - **PostToolUse on ExitPlanMode** (`cli.mjs plan-hook exit`) — **records an
   approved plan itself; there is no manual step to run.** It reads the plan
   text and the harness's approved/rejected verdict off the tool payload, runs

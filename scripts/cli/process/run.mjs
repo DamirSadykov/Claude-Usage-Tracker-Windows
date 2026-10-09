@@ -95,8 +95,18 @@ import {
 } from "./red-gate.mjs";
 import { bestAttempt, blockingCount, restoreCheckpoint } from "./checkpoint.mjs";
 import { appendRunEvent, runEventsPath, watchRunEvents } from "./run-events.mjs";
+import { runFlowGate } from "./flow-gate.mjs";
+import { flowDeclared } from "./graph-rules.mjs";
+import { readSettings } from "../kernel/settings.mjs";
+
+const PLAN_ISSUES_DOC = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "docs", "plan-format-issues.md");
+const PLAN_CUTTING_DOC = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "docs", "plan-format-cutting.md");
 
 export const DEFAULT_PARALLEL_LIMIT = 1;
+export const MIN_HISTORICAL_BUDGET_USD = 0.5;
+export const MIN_SIMILAR_BUDGET_SAMPLES = 3;
+export const MIN_SIZE_BUDGET_SAMPLES = 5;
+export const RETRY_COST_FACTOR = 2;
 
 const brief = (t) => (t ? { id: t.id, number: t.number, subject: t.subject } : null);
 
@@ -153,6 +163,8 @@ function touchesFinding(ranges, line) {
 const num = (t) => (t && t.number != null ? `#${t.number}` : t ? t.id : "?");
 const declaredVerify = (t) => (t && t.verify && String(t.verify).trim()) || "";
 const declaredRed = (t) => (t && t.red && String(t.red).trim()) || "";
+const declaredFlow = (t) => flowDeclared(t?.flow);
+const isSensitive = (t) => String(t?.risk || "").trim().toLowerCase() === "sensitive";
 
 function fail(msg) {
   process.stderr.write(msg + "\n");
@@ -169,21 +181,25 @@ function recoverRedGate(cwd) {
 
 // ── the node ─────────────────────────────────────────────────────────────────
 
-// A GATE is a node whose outcome a human confirms. Two ways to be one, and the
-// second is the invariant that matters: `kind auto` without a declared check is
-// a gate, because the authority to close comes from the check.
+// A GATE is a node whose outcome a human confirms. A sensitive node is always
+// held for an interactive session: even declared outputs and a check do not
+// authorize the headless runner to send it to a worker.
 export function isGate(t) {
   if (!t) return true;
+  if (isSensitive(t)) return true;
   if (t.kind !== "auto") return true;
   return !declaredVerify(t);
 }
 
 export function hasNoMachineWork(t) {
+  if (isSensitive(t)) return true;
   if (!t || t.kind === "auto") return false;
   return !(Array.isArray(t.produces) && t.produces.some(Boolean));
 }
 
 export function gateReason(t) {
+  if (isSensitive(t))
+    return "risk sensitive — the runner never dispatches this node; an interactive session moves it to in_progress, does the work, and closes it with verify";
   if (!t || t.kind !== "auto")
     return "kind manual — the human moves review -> done, dependents stay blocked by design";
   return "auto WITHOUT a declared verify — a node runs as a gate until a check gives it the authority to close";
@@ -251,8 +267,8 @@ export function frontierOf({ members, byId, parked = new Set() }) {
 // ── the seam ─────────────────────────────────────────────────────────────────
 
 // Dry run: the same loop, everything behind the seam simulated. A step "costs"
-// what the node DECLARED as its budget — the only number that exists before the
-// work, and the reason the plan can price itself at all.
+// its node budget — declared, or inferred from runs.jsonl when undeclared — the
+// only number that exists before the work.
 export function simulationEffects() {
   return {
     executeStep: async ({ task }) => ({ sessionId: `dry:${task.id}`, ok: true }),
@@ -266,8 +282,9 @@ export function simulationEffects() {
     priorChanges: async () => ({ ok: true, changes: null }),
     ownChanges: async () => ({ ok: true, skip: true }),
     redGate: async () => ({ ok: true, field: "failed-on-base", reason: null }),
-    stepCost: async ({ task }) =>
-      typeof task.budget_usd === "number" ? task.budget_usd : null,
+    flowGate: async () => ({ status: "pass", reason: null, coverage: [], unchecked: [], duration_ms: 0 }),
+    recordFlowDiagram: async () => ({ written: false }),
+    stepCost: async ({ budgetUsd }) => budgetUsd,
   };
 }
 
@@ -360,6 +377,21 @@ export function liveEffects({ cwd } = {}) {
         if (!Array.isArray(todo.comments)) todo.comments = [];
         todo.comments.push(comment);
         todo.updated_at = comment.created_at;
+        saveBoard(file, data);
+        return { written: true };
+      });
+    },
+    recordFlowDiagram: async ({ task, diagram }) => {
+      const result = typeof diagram === "string" && diagram.trim() ? diagram : null;
+      const file = appDataFile("todos.json");
+      return withBoardLock(file, () => {
+        const data = loadBoardForWrite(file);
+        const todo = data.todos.find((t) => t && t.id === task.id);
+        if (!todo) return { written: false, error: `task ${task.id} not found on the board` };
+        todo.flow_diagram = { ...(todo.flow_diagram || {}) };
+        if (result) todo.flow_diagram.result = result;
+        else delete todo.flow_diagram.result;
+        todo.updated_at = new Date().toISOString();
         saveBoard(file, data);
         return { written: true };
       });
@@ -460,6 +492,11 @@ export function liveEffects({ cwd } = {}) {
       }
       return runRedGate({ task, cwd, timeoutMs, appDataDir: redGateDir(), runCmd: mod.runVerify });
     },
+    flowGate: async ({ task, cwd, timeoutMs }) => {
+      const settings = readSettings();
+      const exe = settings.flowcheckExe || "";
+      return runFlowGate({ task, cwd, timeoutMs, exe });
+    },
     // What a step really cost lives in the tracker's blocks (SQLite, Rust side),
     // but the headless run already reports its own total — `executeStep` returns
     // it as `costUsd` (from `total_cost_usd` of the JSON result). Read that name,
@@ -521,6 +558,56 @@ export function readRunLog(file = runLogPath()) {
   return out;
 }
 
+const riskBucket = (value) => String(value || "").trim().toLowerCase();
+const producesCount = (task) => Array.isArray(task?.produces) ? task.produces.filter(Boolean).length : 0;
+const stepSize = (value) => ["S", "M", "L"].includes(String(value || "").trim().toUpperCase())
+  ? String(value).trim().toUpperCase()
+  : "";
+
+function percentile90(values) {
+  const sorted = values.filter((value) => Number.isFinite(value) && value >= 0).sort((a, b) => a - b);
+  if (!sorted.length) return null;
+  if (sorted.length === 1) return sorted[0];
+  const index = (sorted.length - 1) * 0.9;
+  const lo = Math.floor(index);
+  const hi = Math.ceil(index);
+  return sorted[lo] + (sorted[hi] - sorted[lo]) * (index - lo);
+}
+
+export function historicalAttemptBudget(task, records = []) {
+  const declaredSize = stepSize(task?.size);
+  const firsts = records
+    .filter((record) => record?.kind === "run")
+    .flatMap((record) => Array.isArray(record.steps) ? record.steps : [])
+    .filter((step) => Number.isFinite(step?.cost_usd) && step.cost_usd >= 0)
+    .filter((step) => !Number.isInteger(step.attempt) || step.attempt === 1);
+  if (!firsts.length) return null;
+  const ceiling = (sample) => {
+    const p90 = percentile90(sample.map((step) => step.cost_usd));
+    return p90 === null ? null : round(Math.max(MIN_HISTORICAL_BUDGET_USD, 2 * p90));
+  };
+
+  if (declaredSize) {
+    const sameSize = firsts.filter((step) => stepSize(step.size) === declaredSize);
+    if (sameSize.length >= MIN_SIZE_BUDGET_SAMPLES) return ceiling(sameSize);
+  }
+
+  const risk = riskBucket(task?.risk);
+  const count = producesCount(task);
+  const similar = firsts.filter((step) =>
+    riskBucket(step.risk) === risk &&
+    Number.isInteger(step.produces_count) &&
+    Math.abs(step.produces_count - count) <= 1
+  );
+  return ceiling(similar.length >= MIN_SIMILAR_BUDGET_SAMPLES ? similar : firsts);
+}
+
+export function historicalNodeBudget(task, records = []) {
+  if (typeof task?.budget_usd === "number") return task.budget_usd;
+  const attempt = historicalAttemptBudget(task, records);
+  return attempt === null ? null : round(attempt * Math.max(1, retryLimitOf(task) ?? 1));
+}
+
 // The record of a `--go` run: what it executed, what it cost, and — the point
 // of the whole journal — whether one pass was enough and, if not, which of the
 // four stops ate it.
@@ -538,7 +625,11 @@ export function runRecordOf(report, { inherit = false } = {}) {
       result: s.result,
       verify: s.verify ?? null,
       red: s.red ?? null,
+      flow: s.flow ?? null,
       cost_usd: typeof s.cost_usd === "number" ? s.cost_usd : null,
+      size: stepSize(s.size) || null,
+      risk: riskBucket(s.risk),
+      produces_count: Number.isInteger(s.produces_count) ? s.produces_count : 0,
       session: s.session || null,
       requested_mode: s.requested_mode || null,
       start_mode: s.start_mode || "unknown",
@@ -577,6 +668,11 @@ function park(ctx, kind, task, reason, extra = {}) {
   emitRunEvent(ctx, { task: task?.number, kind: "park", park_kind: kind, reason });
 }
 
+function deferGate(ctx, task, reason) {
+  ctx.gated.add(task.id);
+  if (!ctx.pendingGate) ctx.pendingGate = { task, reason };
+}
+
 function nodeSpend(task, current = 0) {
   const prior = (task?.attempts || []).reduce(
     (sum, attempt) => sum + (Number.isFinite(attempt?.cost_usd) ? attempt.cost_usd : 0),
@@ -593,7 +689,12 @@ export function formatDecisionCard(stop, { task = null, change = null, spent = 0
   const tail = String(last.verify_tail || "").trim();
   const findings = Array.isArray(last.findings) ? last.findings : [];
   const limit = retryLimitOf(task);
-  out.push(`node: t#${task.number}; spent: $${round(spent)}${typeof task.budget_usd === "number" ? ` of $${task.budget_usd} budget` : " (no node budget declared)"}\n`);
+  const effectiveBudget = stop.budget ?? (typeof task.budget_usd === "number" ? task.budget_usd : null);
+  const budgetLabel = effectiveBudget === null
+    ? " (no node budget available)"
+    : ` of $${effectiveBudget} ${stop.budget_source === "historical" ? "historical" : "declared"} budget`;
+  out.push(`node: t#${task.number}; spent: $${round(spent)}${budgetLabel}\n`);
+  out.push(`diagnose this parked step: ${PLAN_ISSUES_DOC}\n`);
   if (tail) out.push(`verify tail (last 20 lines):\n${tailLines(tail, 20)}\n`);
   if (findings.length) {
     out.push("last review findings:\n");
@@ -606,7 +707,7 @@ export function formatDecisionCard(stop, { task = null, change = null, spent = 0
   out.push(`  accept as is: todos set status t#${task.number} done\n`);
   out.push(`  allow more attempts: todos set retry t#${task.number} ${retry}\n`);
   out.push(`                       todos run ${changeRef} --go\n`);
-  out.push("  split the work: todos apply <new plan>\n");
+  out.push(`  split the work: todos apply <new plan> — ${PLAN_CUTTING_DOC}\n`);
   out.push(`  fix by hand: edit the files, then todos set status t#${task.number} done\n`);
   return out.join("");
 }
@@ -645,16 +746,46 @@ async function moveTo(ctx, task, status) {
   return { ok: true };
 }
 
-async function parkNodeBudgetOverrun(ctx, task, { review = false } = {}) {
+function nodeBudgetOf(ctx, task) {
+  if (ctx.nodeBudgets?.has(task.id)) return ctx.nodeBudgets.get(task.id) ?? null;
+  return typeof task.budget_usd === "number" ? task.budget_usd : null;
+}
+
+function attemptOverrun(ctx, task) {
+  const costs = ctx.attemptCosts?.get(task.id) || [];
+  if (!costs.length) return null;
+  const last = costs.at(-1);
+  if (costs.length === 1) {
+    const budget = ctx.attemptBudgets?.get(task.id) ?? null;
+    return budget !== null && last > budget
+      ? { reason: `first attempt overrun — ${round(last)} spent against a historical ${budget}`, spent: round(last), budget }
+      : null;
+  }
+  const ceiling = round(costs[0] * RETRY_COST_FACTOR);
+  return last > ceiling
+    ? { reason: `retry overrun — ${round(last)} spent against ${ceiling} (${RETRY_COST_FACTOR}× the first attempt)`, spent: round(last), budget: ceiling }
+    : null;
+}
+
+async function parkNodeBudgetOverrun(ctx, task, { review = false, exhausted = false } = {}) {
   const own = ctx.nodeSpent.get(task.id) || 0;
-  if (typeof task.budget_usd !== "number" || own <= task.budget_usd) return false;
+  const budget = nodeBudgetOf(ctx, task);
+  const attempt = exhausted ? attemptOverrun(ctx, task) : null;
+  const nodeOver = budget !== null && (exhausted ? own >= budget : own > budget);
+  if (!nodeOver && !attempt) return false;
   if (review) {
     await moveTo(ctx, task, "review");
     ctx.parked.add(task.id);
   }
-  park(ctx, "budget", task, `node budget overrun — $${round(own)} spent against a declared $${task.budget_usd}`, {
+  const source = typeof task.budget_usd === "number" ? "declared" : "historical";
+  if (!nodeOver) {
+    park(ctx, "budget", task, attempt.reason, { spent: attempt.spent, budget: attempt.budget, budget_source: "attempt" });
+    return true;
+  }
+  park(ctx, "budget", task, `node budget overrun — ${round(own)} spent against a ${source} ${budget}`, {
     spent: round(own),
-    budget: task.budget_usd,
+    budget,
+    budget_source: source,
   });
   return true;
 }
@@ -744,7 +875,14 @@ export async function beginStep(ctx, task, wave = []) {
   }
 
   await moveTo(ctx, task, "in_progress");
-  emitRunEvent(ctx, { task: task.number, kind: "step_start", attempt, limit, route: task._runner_high_route_used ? "high" : null });
+  emitRunEvent(ctx, {
+    task: task.number,
+    kind: "step_start",
+    attempt,
+    limit,
+    route: task._runner_high_route_used ? "high" : null,
+    flow: task.flow ?? "n/a",
+  });
   return {
     task,
     kind: "begin",
@@ -775,7 +913,7 @@ async function recordWork(ctx, task, result) {
   const baton = ctx.dry ? null : await recordBaton(ctx, task, result.handoff);
   let cost = null;
   try {
-    const c = await ctx.effects.stepCost({ task, sessionId: result.sessionId, result });
+    const c = await ctx.effects.stepCost({ task, sessionId: result.sessionId, result, budgetUsd: nodeBudgetOf(ctx, task) });
     if (typeof c === "number" && Number.isFinite(c)) cost = c;
   } catch {
     cost = null;
@@ -855,6 +993,7 @@ function resultBase(ctx, task, result, review, baton, cost, ownChanges, outsideC
     review: review ? {
       skipped: !!review.skipped,
       approved: !!review.approved,
+      cost_usd: typeof review.costUsd === "number" && Number.isFinite(review.costUsd) ? review.costUsd : null,
       provider: review.provider || null,
       model: review.model || null,
       session: review.sessionId || null,
@@ -874,7 +1013,7 @@ const blockingFindings = (findings) => (findings || []).filter((f) => f?.level =
 const findingKey = (f) => `${f?.file || ""}\u0000${f?.text || ""}`;
 const priorAttempts = (task) => Array.isArray(task?.attempts) ? task.attempts : [];
 
-function convergenceStop(task, base) {
+function convergenceStop(ctx, task, base) {
   const findings = blockingFindings(base.review?.findings);
   if (!findings.length) return null;
   const previous = priorAttempts(task).at(-1);
@@ -886,9 +1025,9 @@ function convergenceStop(task, base) {
     if (findings.some((f) => !known.has(findingKey(f))))
       return "резать или менять подход: на попытке 3+ появились новые critical/high";
   }
-  const budget = Number(task.budget_usd);
+  const budget = nodeBudgetOf(ctx, task);
   const spent = priorAttempts(task).reduce((sum, a) => sum + (Number.isFinite(a?.cost_usd) ? a.cost_usd : 0), 0) + (Number.isFinite(base.cost) ? base.cost : 0);
-  if (Number.isFinite(budget) && spent > budget * 0.6 && previous && findings.length >= previousBlocking.length)
+  if (budget !== null && spent > budget * 0.6 && previous && findings.length >= previousBlocking.length)
     return "порог денег: потрачено больше 60% бюджета шага, а critical/high не уменьшаются";
   return null;
 }
@@ -974,7 +1113,7 @@ export async function finishStep(ctx, task, { result, review, baton, cost, ownCh
       source: review.model ? `review ${review.model}` : "review",
       text: clampChars(review.result || review.error || "reviewer did not approve the obligations", 6000),
     });
-    const stopped = convergenceStop(task, base);
+    const stopped = convergenceStop(ctx, task, base);
     return finishAttempt(ctx, task, {
       ...base,
       kind: stopped ? "convergence" : "issue",
@@ -1026,6 +1165,36 @@ export async function finishStep(ctx, task, { result, review, baton, cost, ownCh
     base.red = gate.field ?? null;
   }
 
+  if (declaredFlow(task)) {
+    let flow;
+    try {
+      flow = typeof ctx.effects.flowGate === "function"
+        ? await ctx.effects.flowGate({ task, cwd: ctx.cwd, timeoutMs: ctx.timeoutMs })
+        : { status: "pass", reason: null, coverage: [], unchecked: [], duration_ms: 0 };
+    } catch (err) {
+      flow = { status: "cannot", reason: `flow gate crashed: ${(err && err.message) || err}`, coverage: [], unchecked: [], duration_ms: 0 };
+    }
+    base.flow = flow;
+    task.flow_diagram = { ...(task.flow_diagram || {}) };
+    if (typeof flow.diagram === "string" && flow.diagram.trim()) task.flow_diagram.result = flow.diagram;
+    else delete task.flow_diagram.result;
+    try { await ctx.effects.recordFlowDiagram?.({ task, diagram: flow.diagram }); } catch {}
+    emitRunEvent(ctx, {
+      task: task.number, kind: "flow", attempt, limit, status: flow.status,
+      reason: flow.reason || null, coverage: flow.coverage || [], unchecked: flow.unchecked || [], duration_ms: flow.duration_ms ?? null,
+    });
+    if (flow.status === "cannot") {
+      return finishAttempt(ctx, task, { ...base, kind: "flow-cannot", reason: flow.reason || "flowcheck cannot inspect this change" });
+    }
+    if (flow.status !== "pass") {
+      await recordIssueComment(ctx, task, { attempt, limit, source: "flow", text: clampChars(flow.reason || "flowcheck found a flow issue", 6000) });
+      return finishAttempt(ctx, task, {
+        ...base, kind: "issue", routeEscalated: task._runner_high_route_attempt === attempt,
+        reason: flow.reason || "flowcheck found a flow issue",
+      });
+    }
+  }
+
   const verdictRun = await ctx.effects.runVerify({
     cmd: declaredVerify(task),
     cwd: ctx.cwd,
@@ -1061,7 +1230,7 @@ export async function finishStep(ctx, task, { result, review, baton, cost, ownCh
   }
   if (outcome === "issue") {
     if (verify === "ok") await recordIssueComment(ctx, task, { attempt, limit, source: "reconcile", text: clampChars(reason, 6000) });
-    const stopped = convergenceStop(task, base);
+    const stopped = convergenceStop(ctx, task, base);
     return finishAttempt(ctx, task, { ...base, kind: stopped ? "convergence" : "issue", parkReason: stopped, routeEscalated: task._runner_high_route_attempt === attempt, verify, reason });
   }
   return finishAttempt(ctx, task, { ...base, kind: "undecided", verify, reason });
@@ -1281,7 +1450,7 @@ function isNodeParked(t) {
 // spent — a caller resuming a run from outside has no honest way to derive it,
 // and defaulting it to 0 would make that caller silently believe it has spent
 // nothing rather than visibly have no ceiling to check against.
-export function buildRunContext({ data, change, effects = {}, dry = true, cwd = process.cwd(), timeoutMs, spent, inherit = false, events = false, persistDecisionCard = false }) {
+export function buildRunContext({ data, change, effects = {}, dry = true, cwd = process.cwd(), timeoutMs, spent, inherit = false, events = false, persistDecisionCard = false, history = [] }) {
   const board = structuredClone(data ?? { version: 1, todos: [] });
   const { root, members, byId } = collectChange(board, change);
   if (!root) throw new Error(`no such task: ${change}`);
@@ -1315,7 +1484,12 @@ export function buildRunContext({ data, change, effects = {}, dry = true, cwd = 
     architectFindings: [],
     waves: [],
     spent,
+    nodeBudgets: new Map(members.map((task) => [task.id, historicalNodeBudget(task, history)])),
+    attemptBudgets: new Map(members.map((task) => [task.id, typeof task.budget_usd === "number" ? null : historicalAttemptBudget(task, history)])),
+    attemptCosts: new Map(),
     nodeSpent: new Map(),
+    gated: new Set(),
+    pendingGate: null,
     unknownCost: 0,
     stop: null,
     maxParallel: 0,
@@ -1368,6 +1542,7 @@ export async function applyResult(ctx, r, { dry, log }) {
   if (typeof r.cost === "number") {
     ctx.spent += r.cost;
     ctx.nodeSpent.set(r.task.id, (ctx.nodeSpent.get(r.task.id) || 0) + r.cost);
+    ctx.attemptCosts?.set(r.task.id, [...(ctx.attemptCosts.get(r.task.id) || []), r.cost]);
   } else if (r.kind !== "retry-exhausted") {
     ctx.unknownCost += 1;
   }
@@ -1384,12 +1559,16 @@ export async function applyResult(ctx, r, { dry, log }) {
     model: r.model || null,
     route: r.route || null,
     cost_usd: r.cost,
+    size: stepSize(r.task.size) || null,
+    risk: riskBucket(r.task.risk),
+    produces_count: producesCount(r.task),
     baton: r.baton ?? null,
     review: r.review ?? null,
     architect_findings: r.architectFindings ?? [],
     gate: r.kind === "gate",
     verify: r.verify ?? null,
     red: r.red ?? null,
+    flow: r.flow ?? null,
     outcome: r.kind === "done" ? "ok" : r.kind === "issue" ? "issue" : null,
     result: r.kind,
     reason: r.reason || null,
@@ -1405,12 +1584,19 @@ export async function applyResult(ctx, r, { dry, log }) {
 
   if (r.kind === "gate") {
     ctx.parked.add(r.task.id);
-    park(ctx, "gate", r.task, r.reason);
+    deferGate(ctx, r.task, r.reason);
     return record;
   }
   if (r.kind === "red-base-failed") {
     ctx.parked.add(r.task.id);
     park(ctx, "red-base", r.task, r.reason);
+    return record;
+  }
+  if (r.kind === "flow-cannot") {
+    ctx.parked.add(r.task.id);
+    await moveTo(ctx, r.task, "review");
+    park(ctx, "flow-cannot", r.task, r.reason, { flow: r.flow ?? null });
+    record.status = r.task.status;
     return record;
   }
   if (r.kind === "retry-exhausted") {
@@ -1440,7 +1626,7 @@ export async function applyResult(ctx, r, { dry, log }) {
     return record;
   }
   if (r.kind === "issue") {
-    if (await parkNodeBudgetOverrun(ctx, r.task, { review: true })) {
+    if (await parkNodeBudgetOverrun(ctx, r.task, { review: true, exhausted: true })) {
       record.status = r.task.status;
       return record;
     }
@@ -1477,8 +1663,9 @@ export async function runChange({
   parallelLimit,
   log = () => {},
   maxSteps,
+  history = readRunLog(),
 }) {
-  const ctx = buildRunContext({ data, change, effects, dry, cwd, timeoutMs, spent: 0, inherit, events: !dry });
+  const ctx = buildRunContext({ data, change, effects, dry, cwd, timeoutMs, spent: 0, inherit, events: !dry, history });
   const { root, members, byId } = ctx;
 
   const limit = resolveParallelLimit(root, parallelLimit);
@@ -1495,7 +1682,14 @@ export async function runChange({
     // missing edge. `ctx.parked` stays the board-derived set a run started
     // from OUTSIDE this loop would read instead (buildRunContext).
     const ready = frontierOf({ members, byId });
-    if (!ready.length) {
+    for (const t of ready) if (t.status === "review" && !ctx.gated.has(t.id)) deferGate(ctx, t, REVIEW_GATE_REASON);
+    const runnable = ready.filter((t) => !ctx.gated.has(t.id));
+    if (!runnable.length && ctx.pendingGate) {
+      ctx.parked.add(ctx.pendingGate.task.id);
+      park(ctx, "gate", ctx.pendingGate.task, ctx.pendingGate.reason);
+      break;
+    }
+    if (!runnable.length) {
       if (members.every((t) => isDone(t))) break;
       park(ctx, "empty-frontier", null, EMPTY_FRONTIER_REASON, { blocked: blockedDiagnosis(ctx) });
       break;
@@ -1504,23 +1698,14 @@ export async function runChange({
     // dispatched: whatever is running is always finished, never killed
     // mid-flight, and nothing already spent is given back.
     if (groupBudget !== null && ctx.spent >= groupBudget) {
-      park(ctx, "budget", ready[0], budgetExhaustedReason(ctx.spent, groupBudget, ready[0]), {
+      park(ctx, "budget", runnable[0], budgetExhaustedReason(ctx.spent, groupBudget, runnable[0]), {
         spent: round(ctx.spent),
         budget: groupBudget,
-        not_started: brief(ready[0]),
+        not_started: brief(runnable[0]),
       });
       break;
     }
-    // A node already sitting in `review` is the human's inbox, not work to redo:
-    // the runner parks on it exactly as it would on a fresh gate.
-    const pending = ready.find((t) => t.status === "review");
-    if (pending) {
-      ctx.parked.add(pending.id);
-      park(ctx, "gate", pending, REVIEW_GATE_REASON);
-      break;
-    }
-
-    const wave = buildWave(ready, limit);
+    const wave = buildWave(runnable, limit);
     ctx.waves.push(wave.map((t) => t.number));
     if (ctx.steps.length + wave.length > bound) {
       park(ctx, "empty-frontier", null, `runaway guard: more than ${bound} steps in one run — the graph or the seam is looping`);
@@ -1596,7 +1781,10 @@ function formatStepLine(s, dry) {
         ? " · baton REFUSED by the board"
         : " · NO baton — it wrote no ## HANDOFF";
   const route = s.route ? ` · ${s.route.note}` : "";
-  return `  wave ${s.wave}  #${s.task.number} ${s.task.subject} — ${verb}${attempt}${cost}${baton}${route}\n`;
+  const unchecked = Array.isArray(s.flow?.unchecked) && s.flow.unchecked.length
+    ? `\n    не проверено: ${s.flow.unchecked.map((u) => u.file || u.method || u.reason).filter(Boolean).join(", ")}`
+    : "";
+  return `  wave ${s.wave}  #${s.task.number} ${s.task.subject} — ${verb}${attempt}${cost}${baton}${route}${unchecked}\n`;
 }
 
 // All four stops print the SAME shape: the node, the reason, "pipeline parked",
@@ -1657,7 +1845,7 @@ export function formatRunReport(r) {
     out.push(`  refused  #${f.task.number} → ${f.status} — ${f.error}
 `);
   const spend = r.dry
-    ? `  ${r.spend.usd ? `$${r.spend.usd}` : "$0"} by DECLARED budgets${
+    ? `  ${r.spend.usd ? `$${r.spend.usd}` : "$0"} by declared or historical node budgets${
         r.spend.group_budget !== null ? ` of $${r.spend.group_budget} declared on the group` : " (no group budget declared)"
       }\n`
     : `  spent $${r.spend.usd}${

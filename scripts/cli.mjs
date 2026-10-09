@@ -44,6 +44,9 @@ const SUBCOMMANDS = {
   },
   change: {
     migrate: "./cli/board/change-migrate.mjs",
+    close: "./cli/analytics/change-close.mjs",
+    "retro-facts": "./cli/analytics/retro-facts.mjs",
+    retro: "./cli/analytics/retro.mjs",
   },
 };
 

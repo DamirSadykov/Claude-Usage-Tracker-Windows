@@ -1356,6 +1356,47 @@ async fn close_change(app: AppHandle, change: String) -> Result<String, String> 
     .map_err(|e| e.to_string())?
 }
 
+#[tauri::command]
+async fn set_change_proposal(
+    app: AppHandle,
+    change: String,
+    id: String,
+    status: String,
+    reason: String,
+) -> Result<String, String> {
+    if status != "accepted" && status != "rejected" {
+        return Err(format!("unknown proposal status {status}"));
+    }
+    let cli = cc_hook_script_path(&app)?;
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = std::process::Command::new("node");
+        cmd.arg(&cli)
+            .args(["change", "proposal", "set"])
+            .arg(change.trim())
+            .arg(id.trim())
+            .arg(&status)
+            .arg("--reason")
+            .arg(reason.trim());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000);
+        }
+        let out = cmd
+            .output()
+            .map_err(|e| format!("не удалось запустить node: {e}"))?;
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if out.status.success() {
+            Ok(stdout)
+        } else {
+            Err(if stderr.is_empty() { stdout } else { stderr })
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 // --- External-integration enrollment (plan External-integration-public-side, phase 4.2) ---
 
 /// Sealed device-key file, a sibling of todos.json (identity.rs owns the format).
@@ -3536,6 +3577,7 @@ pub fn run() {
             get_task_detail,
             board_state,
             close_change,
+            set_change_proposal,
             get_corrections_metrics,
             refresh_corrections_metrics,
             get_task_costs,

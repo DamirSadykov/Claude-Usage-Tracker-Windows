@@ -117,6 +117,17 @@ export function useChange() {
         await load();
     }
 
+    async function setProposal(id: string, status: "accepted" | "rejected", reason: string) {
+        if (!current.value || !live.value) return;
+        closeError.value = "";
+        try {
+            await invoke<string>("set_change_proposal", { change: changeAddress(current.value), id, status, reason });
+            await boardStore.reload(true);
+        } catch (e) {
+            closeError.value = String(e);
+        }
+    }
+
     async function closeChange() {
         if (!current.value || !live.value) return;
         closing.value = true;
@@ -153,6 +164,7 @@ export function useChange() {
         closing,
         closeError,
         closeChange,
+        setProposal,
         reload,
     };
 }
