@@ -16,6 +16,8 @@
 // Read-only work: inspect the repo, change nothing. The write-side list belongs
 // to the caller (run-step's DEFAULT_ALLOWED_TOOLS), which knows what a step is
 // allowed to touch.
+import path from "node:path";
+
 export const READ_ONLY_TOOLS = ["Read", "Glob", "Grep"];
 
 // The write/read distinction is the one thing a caller must not get wrong by a
@@ -54,6 +56,7 @@ export function providerArgv(profile, {
   sandbox = "read-only",
   allowedTools = READ_ONLY_TOOLS,
   permissionMode = "acceptEdits",
+  addDirs = [],
 } = {}) {
   const provider = String(profile?.provider || "").toLowerCase();
   const model = String(profile?.model || "").trim();
@@ -74,6 +77,12 @@ export function providerArgv(profile, {
   else if (session) args.push("--session-id", session);
   args.push("--output-format", "json", "--permission-mode", permissionMode);
   args.push("--setting-sources", CLAUDE_SETTING_SOURCES);
+  const readableDirs = [...new Set(
+    (Array.isArray(addDirs) ? addDirs : [addDirs])
+      .map((dir) => String(dir || "").trim())
+      .filter(Boolean),
+  )];
+  if (readableDirs.length) args.push("--add-dir", ...readableDirs);
   if (allowedTools && allowedTools.length) args.push("--allowedTools", ...allowedTools);
   if (model) args.push("--model", model);
   return { file, args };
@@ -164,4 +173,34 @@ export function observeCodexThread(onThread) {
       }
     }
   };
+}
+
+// Windows cannot exec a `.cmd`/`.bat` shim directly (Node refuses it without a
+// shell since CVE-2024-27980), and `shell: true` would re-parse every argument.
+// So the wrapper quotes each argv element itself and hands cmd.exe a single
+// verbatim line: the arguments still cross as arguments, never as text that the
+// shell may re-split. `claude` ships as `claude.exe` today, which takes the
+// direct path below and never reaches the wrapper.
+function winQuote(s) {
+  const v = String(s);
+  if (v && !/[\s"^&|<>()%!]/.test(v)) return v;
+  return `"${v.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\*)$/, "$1$1")}"`;
+}
+
+function windowsShim(file, args) {
+  const cmdLine = [file, ...args].map(winQuote).join(" ");
+  return {
+    file: process.env.ComSpec || "cmd.exe",
+    args: ["/d", "/s", "/c", `"${cmdLine}"`],
+    opts: { windowsVerbatimArguments: true },
+  };
+}
+
+export function resolveSpawn(file, args) {
+  if (process.platform !== "win32") return { file, args, opts: {} };
+  if (/\.exe$/i.test(file) || file === (process.env.ComSpec || "cmd.exe"))
+    return { file, args, opts: {} };
+  if (/\.(cmd|bat)$/i.test(file) || !path.extname(file))
+    return windowsShim(file, args);
+  return { file, args, opts: {} };
 }

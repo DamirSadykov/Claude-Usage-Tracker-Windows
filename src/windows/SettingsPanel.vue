@@ -319,7 +319,7 @@ onMounted(loadIgnoredInsights);
 // --- Global responsibility -> provider/model lifecycle map ---
 // agents.json is also consumed by the Node CLI. Tasks never select a model.
 interface AgentProfileForm {
-  duty: "critic" | "architect" | "worker" | "review";
+  duty: "critic" | "architect" | "worker" | "review" | "retro";
   provider: "anthropic" | "openai";
   model: string;
   mode: string;
@@ -340,7 +340,7 @@ const providerAliases = Object.fromEntries(
 const providerLabels = Object.fromEntries(
   providerNames.map((provider) => [provider, agentProviderManifest.providers[provider].label]),
 ) as Record<AgentProfileForm["provider"], string>;
-const agentDuties: AgentProfileForm["duty"][] = ["critic", "architect", "worker", "review"];
+const agentDuties: AgentProfileForm["duty"][] = ["critic", "architect", "worker", "review", "retro"];
 const starterAgents: AgentProfileForm[] = agentDuties.map((duty) => {
   const profile = agentProviderManifest.duties[duty];
   return { duty, ...profile, provider: profile.provider as AgentProfileForm["provider"] };
@@ -392,6 +392,10 @@ async function loadAgentProfiles() {
 function installStarterAgents() {
   agentProfiles.value = starterAgents.map((p) => ({ ...p }));
   agentConfigMsg.value = "";
+}
+
+function restoreAgentInstructions(p: AgentProfileForm) {
+  p.instructions = starterAgents.find((starter) => starter.duty === p.duty)?.instructions ?? "";
 }
 
 function dutyState(duty: AgentProfileForm["duty"]) {
@@ -1627,8 +1631,11 @@ function handleSave() {
           </div>
           <div class="field-hint">{{ t(`agentModeHint_${p.mode}`) }}</div>
           <label>
-            <span class="field-label">{{ t('agentInstructions') }}</span>
-            <textarea v-model="p.instructions" class="field-input" rows="2"></textarea>
+            <span class="field-label agent-instructions-label">
+              <span>{{ t('agentInstructions') }}</span>
+              <button v-if="p.duty === 'retro'" type="button" class="suggest-btn" @click="restoreAgentInstructions(p)">{{ t('agentInstructionsDefault') }}</button>
+            </span>
+            <textarea v-model="p.instructions" class="field-input" :rows="p.duty === 'retro' ? 12 : 2"></textarea>
           </label>
         </div>
         <div class="budget-suggest">
@@ -2171,6 +2178,13 @@ function handleSave() {
 .agent-profile .field-label {
   display: block;
   margin-bottom: 4px;
+}
+
+.agent-profile .agent-instructions-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
 }
 
 .model-chip {

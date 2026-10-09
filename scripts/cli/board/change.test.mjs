@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, readdirSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -19,6 +19,7 @@ import {
   changeProgress,
   changeStatus,
   sortedChanges,
+  changeProposals,
 } from "./change.mjs";
 import { loadBoard } from "./todos.mjs";
 
@@ -336,7 +337,10 @@ describe("cli change", () => {
     expect(refuse(["change", "close", "c#1"])).toContain("still has 1 open task");
     run(["todos", "set", "status", "1", "done"]);
     expect(run(["change", "close", "c#1"])).toContain("closed — 2 task(s) done");
-    expect(read().changes[0].closed_at).toBeTruthy();
+    const closed = read().changes[0];
+    expect(closed.closed_at).toBeTruthy();
+    expect(closed.ext.retro.facts).toMatchObject({ tasks: 2, negative_components: 0 });
+    expect(existsSync(closed.ext.retro.facts.file)).toBe(true);
   });
 
   it("отказывается закрывать change без задач", () => {
@@ -405,6 +409,52 @@ describe("cli change", () => {
     expect(
       refuse(["change", "measure", "set", "c#1", "доля заполненных", "--ok", "--off"]),
     ).toContain("cannot be used together");
+  });
+
+  it("решает предложение ретро только с причиной", () => {
+    run(["change", "new", "Ретро", "--project", "board"]);
+    const data = read();
+    data.changes[0].ext = { retro: { proposals: [{
+      id: "retro-p1",
+      type: "процесс",
+      addressee: "runner",
+      what: "проверять таблицу до цикла",
+      measure: "повторов нет",
+      status: "proposed",
+    }] } };
+    writeFileSync(board, JSON.stringify(data));
+
+    expect(refuse(["change", "proposal", "set", "c#1", "retro-p1", "accepted"]))
+      .toContain("--reason");
+    expect(run(["change", "proposal", "set", "c#1", "retro-p1", "accepted", "--reason", "добавили gate"]))
+      .toContain("proposal retro-p1 -> accepted");
+    expect(read().changes[0].ext.retro.proposals[0]).toMatchObject({
+      status: "accepted",
+      reason: "добавили gate",
+      measure: "повторов нет",
+    });
+  });
+
+  it("показывает повторы предложения между change", () => {
+    run(["change", "new", "Первый", "--project", "board"]);
+    run(["change", "new", "Второй", "--project", "board"]);
+    const data = read();
+    for (const [index, change] of data.changes.entries()) {
+      change.ext = { retro: { proposals: [{
+        id: `retro-p${index + 1}`,
+        type: "инвариант проекта",
+        addressee: "worker",
+        what: "Проверять TSV до цикла",
+        measure: "ноль повторных чтений",
+        status: "proposed",
+      }] } };
+    }
+    writeFileSync(board, JSON.stringify(data));
+
+    const out = run(["change", "proposal", "list"]);
+    expect(out).toContain("c#1 retro-p1 [proposed]");
+    expect(out).toContain("повтор: c#1, c#2");
+    expect(changeProposals(read())[0].repeated_in).toEqual(["c#1", "c#2"]);
   });
 
   it("перечисляет немигрированные корни под адресом t#N", () => {

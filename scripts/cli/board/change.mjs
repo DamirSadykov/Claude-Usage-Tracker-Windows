@@ -183,6 +183,9 @@ const USAGE =
   "       cli change list [--project <name> | --all] [--json]\n" +
   "       cli change show <c#N> [--json]\n" +
   "       cli change close <c#N>\n" +
+  "       cli change retro-facts <c#N> [--json]\n" +
+  "       cli change proposal list [--json]\n" +
+  "       cli change proposal set <c#N> <id> accepted|rejected --reason \"<why>\"\n" +
   "       cli change out add <c#N> \"<what>\" --why \"<why>\" [--ref <c#M|t#N|path>]\n" +
   "       cli change out rm <c#N> \"<what>\"\n" +
   "       cli change measure add <c#N> \"<what>\" --how \"<how>\" [--target \"<target>\"]\n" +
@@ -361,10 +364,26 @@ function cmdShow(args) {
     process.stdout.write(`  #${t.number} [${t.status}] ${t.subject}\n`);
 }
 
-function cmdClose(args) {
+export function cmdClose(args, { collectFacts = null } = {}) {
   const { positional } = parseArgs(args);
   if (!positional[0]) fail(USAGE);
   const file = boardPath();
+  const snapshot = loadBoard(file);
+  const snapshotChange = resolveOrFail(snapshot, positional[0]);
+  if (snapshotChange.legacy)
+    fail(`refusing: ${changeAddress(snapshotChange)} is still a root task — close it as a task, or migrate the board first.`);
+  const snapshotProgress = changeProgress(snapshot, snapshotChange);
+  if (snapshotProgress.total === 0)
+    fail(`refusing: ${changeAddress(snapshotChange)} has no tasks — nothing it could have finished.`);
+  if (snapshotProgress.done < snapshotProgress.total)
+    fail(
+      `refusing: ${changeAddress(snapshotChange)} still has ${snapshotProgress.total - snapshotProgress.done} open task(s).\n` +
+        `  its status is derived, so closing it means closing them: cli change show ${changeAddress(snapshotChange)}`,
+    );
+  const retro = snapshotChange.ext?.retro?.facts || !collectFacts
+    ? null
+    : collectFacts({ board: snapshot, change: snapshotChange });
+
   const { change, total, already } = withBoardLock(file, () => {
     const data = loadBoardForWrite(file);
     const c = resolveOrFail(data, positional[0]);
@@ -380,11 +399,20 @@ function cmdClose(args) {
         `refusing: ${changeAddress(c)} still has ${t - done} open task(s).\n` +
           `  its status is derived, so closing it means closing them: cli change show ${changeAddress(c)}`,
       );
-    if (c.closed_at) return { change: c, total: t, already: true };
-    c.closed_at = new Date().toISOString();
+    const already = !!c.closed_at;
+    if (retro && !c.ext?.retro?.facts) {
+      c.ext ??= {};
+      c.ext.retro ??= {};
+      c.ext.retro.facts = {
+        ...retro.summary,
+        file: retro.file,
+      };
+    }
+    if (already && !retro) return { change: c, total: t, already: true };
+    if (!already) c.closed_at = new Date().toISOString();
     c.updated_at = c.closed_at;
     saveBoard(file, data);
-    return { change: c, total: t, already: false };
+    return { change: c, total: t, already };
   });
   if (already) {
     process.stdout.write(`ok: ${changeAddress(change)} already closed at ${change.closed_at}\n`);
@@ -491,6 +519,85 @@ function cmdMeasure(args) {
   process.stdout.write(`ok: ${changeAddress(result)} measure ${action} ${JSON.stringify(what)}\n`);
 }
 
+function proposalKey(proposal) {
+  return String(proposal?.what ?? "").trim().toLocaleLowerCase();
+}
+
+export function changeProposals(data) {
+  const rows = [];
+  for (const change of changesOf(data)) {
+    const proposals = change?.ext?.retro?.proposals;
+    if (!Array.isArray(proposals)) continue;
+    for (const proposal of proposals) {
+      if (proposal && typeof proposal === "object") rows.push({ change, proposal });
+    }
+  }
+  const changesByKey = new Map();
+  for (const row of rows) {
+    const key = proposalKey(row.proposal);
+    if (!key) continue;
+    const refs = changesByKey.get(key) ?? new Set();
+    refs.add(changeAddress(row.change));
+    changesByKey.set(key, refs);
+  }
+  return rows.map((row) => ({
+    ...row,
+    repeated_in: [...(changesByKey.get(proposalKey(row.proposal)) ?? [])],
+  }));
+}
+
+function cmdProposalList(args) {
+  const { flags } = parseArgs(args);
+  const rows = changeProposals(loadBoard(boardPath()));
+  if (flags.json) {
+    process.stdout.write(JSON.stringify(rows.map(({ change, proposal, repeated_in }) => ({
+      change: changeAddress(change), ...proposal, repeated_in,
+    })), null, 2) + "\n");
+    return;
+  }
+  if (!rows.length) {
+    process.stdout.write("нет предложений по процессу\n");
+    return;
+  }
+  for (const { change, proposal, repeated_in } of rows) {
+    const repeat = repeated_in.length > 1 ? ` · повтор: ${repeated_in.join(", ")}` : "";
+    process.stdout.write(
+      `${changeAddress(change)} ${proposal.id ?? "(без id)"} [${proposal.status ?? "proposed"}] ` +
+      `${proposal.type ?? "—"} → ${proposal.addressee ?? "—"} — ${proposal.what ?? "—"}` +
+      ` · measure: ${proposal.measure ?? "—"}${repeat}\n`,
+    );
+  }
+}
+
+function cmdProposalSet(args) {
+  const { positional, flags } = parseArgs(args);
+  const [ref, id, status] = positional;
+  if (!ref || !id || !["accepted", "rejected"].includes(status) || flags.reason === undefined)
+    fail('usage: cli change proposal set <c#N> <id> accepted|rejected --reason "<why>"');
+  const reason = requiredText(flags.reason, "reason");
+  const file = boardPath();
+  const result = withBoardLock(file, () => {
+    const data = loadBoardForWrite(file);
+    const change = editableChange(data, ref);
+    const proposals = change?.ext?.retro?.proposals;
+    const proposal = Array.isArray(proposals) ? proposals.find((item) => item?.id === id) : null;
+    if (!proposal) fail(`refusing: ${changeAddress(change)} has no retro proposal ${JSON.stringify(id)}`);
+    proposal.status = status;
+    proposal.reason = reason;
+    change.updated_at = new Date().toISOString();
+    saveBoard(file, data);
+    return { change, proposal };
+  });
+  process.stdout.write(`ok: ${changeAddress(result.change)} proposal ${result.proposal.id} -> ${status}\n`);
+}
+
+function cmdProposal(args) {
+  const [action, ...rest] = args;
+  if (action === "list") return cmdProposalList(rest);
+  if (action === "set") return cmdProposalSet(rest);
+  fail(USAGE);
+}
+
 const SET_FIELDS = {
   title: (change, value) => {
     const title = String(value).trim();
@@ -567,6 +674,7 @@ export function run(args) {
   if (cmd === "close") return cmdClose(rest);
   if (cmd === "out") return cmdOut(rest);
   if (cmd === "measure") return cmdMeasure(rest);
+  if (cmd === "proposal") return cmdProposal(rest);
   if (cmd === "set") return cmdSet(rest);
   fail(`unknown command: ${cmd}\n\n${USAGE}`);
 }

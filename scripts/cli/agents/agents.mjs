@@ -9,7 +9,7 @@ import {
   readFileSync,
 } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { READ_ONLY_TOOLS, parseProviderResult, providerArgv } from "./providers.mjs";
+import { READ_ONLY_TOOLS, parseProviderResult, providerArgv, resolveSpawn } from "./providers.mjs";
 import { dutyModeReader } from "./duty-mode.mjs";
 import { appDataDir, appDataFile, writeJsonAtomic } from "../kernel/appdata.mjs";
 
@@ -18,7 +18,7 @@ export const AGENT_PROVIDER_MANIFEST = JSON.parse(
 );
 export const AGENT_CONFIG_VERSION = 4;
 export const PROVIDERS = Object.keys(AGENT_PROVIDER_MANIFEST.providers);
-export const DUTIES = ["critic", "architect", "worker", "review"];
+export const DUTIES = ["critic", "architect", "worker", "review", "retro"];
 export const PROVIDER_MODELS = Object.fromEntries(
   Object.entries(AGENT_PROVIDER_MANIFEST.providers).map(([provider, config]) => [
     provider,
@@ -208,22 +208,31 @@ export function criticRunsAsAgent(appData) {
   return resolveDuty("critic", appData).runsAsAgent;
 }
 
+export function buildDutyPrompt(profile, prompt) {
+  return [profile?.instructions, prompt].filter(Boolean).join("\n\n");
+}
+
 // Hook-safe, bounded role call. Failures are returned to the hook, whose policy
 // decides whether to fail open; credentials come from the provider CLI itself.
 export function invokeDutySync(duty, prompt, {
   cwd = process.cwd(), timeoutMs = 90_000,
+  appData,
+  addDirs = [],
   claudeBin = process.env.CLAUDE_BIN || "claude",
   codexBin = process.env.CODEX_BIN || "codex",
 } = {}) {
-  const p = resolveDuty(duty);
+  const p = resolveDuty(duty, appData);
   if (!p.runsAsAgent || !p.model) return { skipped: true, ok: true, text: "", profile: p };
   const { file, args } = providerArgv(p, {
     bin: p.provider === "openai" ? codexBin : claudeBin,
     sandbox: "read-only",
     allowedTools: READ_ONLY_TOOLS,
+    addDirs,
   });
-  const fullPrompt = [p.instructions, prompt].filter(Boolean).join("\n\n");
-  const run = spawnSync(file, args, {
+  const fullPrompt = buildDutyPrompt(p, prompt);
+  const target = resolveSpawn(file, args);
+  const run = spawnSync(target.file, target.args, {
+    ...target.opts,
     cwd, input: String(fullPrompt), encoding: "utf8", windowsHide: true,
     timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024,
     // A child CLI can use the same global lifecycle hook as an interactive
@@ -341,7 +350,7 @@ function usage() {
     "cli agents - lifecycle duty -> provider/model map\n\n" +
       "  init [--force]\n" +
       "  list [--json]\n" +
-      "  set <critic|architect|worker|review> --provider anthropic|openai --model <id> [--mode <value>]\n" +
+      `  set <${DUTIES.join("|")}> --provider anthropic|openai --model <id> [--mode <value>]\n` +
       "             [--role <name>] [--instructions <text>] [--reasoning <level>]\n" +
       `  mode <duty> <value>   who performs the duty — ${DUTIES.map((d) => `${d}: ${dutyModes(d).join("|")}`).join("; ")}\n` +
       "  hook <critic|architect|review> <on|off>   the v3 spelling of `mode`\n" +
