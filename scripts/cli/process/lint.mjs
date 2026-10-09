@@ -52,6 +52,8 @@ const boardNode = (t) => ({
   budget: typeof t.budget_usd === "number" ? String(t.budget_usd) : "",
   onIssue: t.on_issue || "",
   kind: t.kind === "auto" ? "auto" : "",
+  size: String(t.size || "").trim().toUpperCase(),
+  newTask: false,
   red: String(t.red || "").trim(),
   redTests: (Array.isArray(t.red_tests) ? t.red_tests : []).filter(Boolean),
   flow: t.flow,

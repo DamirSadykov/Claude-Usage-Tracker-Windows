@@ -15,7 +15,7 @@
 
 import { describe, it, expect } from "vitest";
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -30,6 +30,8 @@ import {
   decide,
   architectDecision,
   planFormatDoc,
+  planFormatIssuesDoc,
+  planFormatCuttingDoc,
 } from "./plan-guard.mjs";
 import { readDocument, validate } from "./apply.mjs";
 
@@ -48,6 +50,7 @@ steps:
     produces: [migrations/007_events.sql]
     verify: npm run test:webhook
     kind: auto
+    size: S
   2:
     title: Пишу обработчик очереди
     why: |
@@ -57,10 +60,9 @@ steps:
     retry: 3
     on-issue: 1
     kind: auto
+    size: M
 `;
 
-// `on-issue` with no `retry` — the one error whose sentence is long and specific
-// enough that "repeated verbatim" is a real claim about it.
 const BROKEN = `change: "CHANGE: приём вебхуков"
 vision: |
   Должен появиться приём вебхуков.
@@ -72,7 +74,7 @@ steps:
   2:
     title: Пишу обработчик очереди
     needs: [1]
-    on-issue: 1
+    on-issue: 2
     kind: manual
 `;
 
@@ -81,8 +83,11 @@ const fenced = (yaml, lang = "yaml") => "Вот план:\n\n```" + lang + "\n" 
 const exitPlan = (plan) => ({ tool_name: "ExitPlanMode", tool_input: { plan } });
 
 describe("the plan-format document", () => {
-  it("exists at the path printed by plan refusals", () => {
-    expect(existsSync(planFormatDoc())).toBe(true);
+  it("keeps every former issue/cutting heading in its routed document", () => {
+    for (const file of [planFormatDoc(), planFormatIssuesDoc(), planFormatCuttingDoc()])
+      expect(existsSync(file)).toBe(true);
+    expect(readFileSync(planFormatIssuesDoc(), "utf8")).toMatch(/^## 5\. When a runner step does not converge$/m);
+    expect(readFileSync(planFormatCuttingDoc(), "utf8")).toMatch(/^## 6\. Cutting the plan$/m);
   });
 });
 
@@ -261,7 +266,7 @@ describe("inspectPlan · the verdict", () => {
   // the caller is the one who knows. Unable to read the board → answer yes, never
   // refuse on a check that was not run.
   it("asks the caller whether an outside reference resolves", () => {
-    const hanging = BROKEN.replace("needs: [1]", "needs: [t#299]").replace("on-issue: 1", "");
+    const hanging = BROKEN.replace("needs: [1]", "needs: [t#299]").replace("on-issue: 2", "");
     expect(inspectPlan(hanging, { onBoard: () => true }).errors).toEqual([]);
     expect(inspectPlan(hanging, { onBoard: () => false }).errors).toHaveLength(1);
     expect(inspectPlan(hanging).errors).toEqual([]); // default: forgiving
@@ -289,11 +294,22 @@ describe("buildRefusal · one wording, owned by the validator", () => {
     expect(reason).toContain("REFUSED");
     expect(reason).toContain("never reached the user");
     expect(reason).toContain(planFormatDoc());
+    expect(reason).toContain("§1");
+    expect(reason).not.toContain(planFormatIssuesDoc());
+    expect(reason).not.toContain(planFormatCuttingDoc());
   });
 
   it("labels warnings as not being the reason, and omits the block when there are none", () => {
     expect(buildRefusal(["e"], ["w"])).toContain("not the reason");
     expect(buildRefusal(["e"], [])).not.toContain("not the reason");
+  });
+
+  it("puts out and measure conventions in refusals that need them", () => {
+    const reason = buildRefusal(["out[1]: why is required", "measure[1]: how is required"]);
+    expect(reason).toContain("Field contract:");
+    expect(reason).toMatch(/`out` items are durable exclusions/);
+    expect(reason).toMatch(/`measure` items describe a user-visible observation/);
+    expect(buildRefusal(["needs form a cycle"])).not.toContain("Field contract:");
   });
 
   // The two refusals t#325 added carry no rule of their own — they carry the
@@ -302,6 +318,7 @@ describe("buildRefusal · one wording, owned by the validator", () => {
   it("offers the format AND the discussion exit when the plan is not the language", () => {
     const reason = buildFormatRefusal();
     expect(reason).toContain(planFormatDoc());
+    expect(reason).toContain("§1 and §2");
     expect(reason).toContain("discussion:");
     expect(reason).toMatch(/does NOT start work/i);
     expect(reason).toMatch(/discussion: true` is refused/);
@@ -312,6 +329,8 @@ describe("buildRefusal · one wording, owned by the validator", () => {
     expect(reason).toContain("3 step(s)");
     expect(reason).toMatch(/records NOTHING/);
     expect(reason).toMatch(/opens the tasks/);
+    expect(reason).toContain("§3");
+    expect(reason).toContain(planFormatDoc());
   });
 
   it("asks for the reason, not for the format, when the declaration is bare", () => {
@@ -319,12 +338,13 @@ describe("buildRefusal · one wording, owned by the validator", () => {
     expect(reason).toMatch(/what is being/i);
     // …and still says where to go if the plan does start work after all.
     expect(reason).toContain(planFormatDoc());
+    expect(reason).toContain("§3");
   });
 
   // A warning is not a refusal: `auto` with no verify and a change with no budget
   // are accepted by `todos apply`, so the guard must accept them too.
   it("does not refuse a plan whose only findings are warnings", () => {
-    const warned = "change: \"CHANGE: X\"\nvision: |\n  Что-то.\nsteps:\n  1:\n    title: Делаю\n    kind: auto\n";
+    const warned = "change: \"CHANGE: X\"\nvision: |\n  Что-то.\nsteps:\n  1:\n    title: Делаю\n    kind: auto\n    size: S\n";
     const seen = inspectPlan(warned);
     expect(seen.errors).toEqual([]);
     expect(seen.warnings.length).toBeGreaterThan(0);

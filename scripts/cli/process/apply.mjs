@@ -29,11 +29,13 @@
 //       red: <cmd>               # MUST fail on the base commit — proves red-tests catches the bug
 //       red-tests: [path, ...]   # the regression test file(s) red is proved against
 //       flow: <delta|[delta]|n/a why>   # method-flow delta(s), or why this step has none
-//       risk: high               # routes worker/review to agents.json's routes.high, when configured
+//       risk: high | sensitive   # high routes agents; sensitive is held for an interactive session
 //
-// Nothing here writes to the board directly: every task, edge and declaration
-// goes through todos.mjs (newTodo / addDepEdge / addProduces / setField), so a
-// graph built from a file passes exactly the guards a typed command passes.
+// Tasks and edges go through todos.mjs (newTodo / addDepEdge / addProduces /
+// setField); the process-only `risk: sensitive` value is recorded here after
+// graph-rules validates it because the typed board setter has no headless route
+// for that value. A graph built from a file otherwise passes the same guards as
+// a typed command.
 // `--dry-run` is the DEFAULT, mirroring `todos run` — the file is read, checked
 // and the changes printed; `--go` applies them.
 
@@ -70,7 +72,7 @@ const USAGE =
   "       --dry-run is the DEFAULT (prints what would change); --go writes.\n" +
   "       --force overwrites a vision/plan that is already there.\n" +
   "keys:  change, vision, out, measure, plan, parallel, budget, steps{<id>: {title, needs,\n" +
-  "       produces, verify, retry, on-issue, kind, budget, red, red-tests, flow, risk,\n" +
+  "       produces, verify, retry, on-issue, kind, size, budget, red, red-tests, flow, risk,\n" +
   "       why, priority}}";
 
 function fail(msg) {
@@ -110,6 +112,7 @@ export const DSL_STEP_FIELDS = [
   "retry",
   "on-issue",
   "kind",
+  "size",
   "budget",
   "red",
   "red-tests",
@@ -122,6 +125,43 @@ export const DSL_STEP_FIELDS = [
 // is the task's DESCRIPTION, and it exists so that writing the plan AS the file
 // does not cost the prose that made it a plan (t#317).
 export const STEP_FIELDS = [...DSL_STEP_FIELDS, "why", "priority"];
+
+const RED_TEST_PATH_RE = /(?:^|[\\/])[^\s]+(?:test|spec)[^\\/\s]*\.(?:[cm]?[jt]sx?|cs|py|rb|go|java)$/i;
+
+export function inferRedTests(red) {
+  const command = String(red || "");
+  const found = [];
+  for (const match of command.matchAll(/"([^"]*)"|'([^']*)'|([^\s]+)/g)) {
+    let token = String(match[1] ?? match[2] ?? match[3] ?? "").trim();
+    token = token.replace(/^--[^=]+=|^[[(]+|[\]),;]+$/g, "");
+    if (!token || token.startsWith("-")) continue;
+    if (RED_TEST_PATH_RE.test(token)) found.push(token);
+  }
+  return [...new Set(found)];
+}
+
+export function inferDocument(doc) {
+  const inferred = [];
+  const steps = doc.steps.map((step) => {
+    const next = { ...step, redTests: [...(step.redTests || [])] };
+    if (next.task) return next;
+    if (!next.kind) {
+      next.kind = next.verify ? "auto" : "manual";
+      inferred.push({ step: next.id, field: "kind", value: next.kind });
+    }
+    if (!next.retry) {
+      next.retry = "2";
+      inferred.push({ step: next.id, field: "retry", value: "2" });
+    }
+    if (next.red && !next.redTests.length) {
+      next.redTests = inferRedTests(next.red);
+      if (next.redTests.length)
+        inferred.push({ step: next.id, field: "red-tests", value: next.redTests });
+    }
+    return next;
+  });
+  return { doc: { ...doc, steps }, inferred };
+}
 
 // `318`, `#318`, `t#318` and a uuid all name one task, so two steps naming the
 // same one in different spellings must still read as a collision.
@@ -181,6 +221,7 @@ function readSteps(raw) {
       retry: body.retry == null ? "" : String(body.retry).trim(),
       onIssue: body["on-issue"] == null ? "" : String(body["on-issue"]).trim(),
       kind: body.kind == null ? "" : String(body.kind).trim().toLowerCase(),
+      size: body.size == null ? "" : String(body.size).trim().toUpperCase(),
       budget: body.budget == null ? "" : String(body.budget).trim(),
       red: body.red == null ? "" : String(body.red).trim(),
       redTests: asList(body["red-tests"] ?? body.red_tests),
@@ -248,6 +289,8 @@ function documentGraph(doc, onBoard, lineCount, languages) {
       budget: s.budget,
       onIssue: s.onIssue,
       kind: s.kind,
+      size: s.size,
+      newTask: !s.task,
       red: s.red,
       redTests: s.redTests,
       flow: s.flow,
@@ -276,6 +319,7 @@ export function validate(
   doc,
   { onBoard = () => false, inheritsChange = false, requireChange = false, lineCount = workspaceLineCount, languages } = {},
 ) {
+  doc = inferDocument(doc).doc;
   const selectedLanguages = languages || flowLanguages(path.basename(process.cwd().replace(/[\\/]+$/, "")));
   const { errors, warnings } = splitFindings(checkGraph(documentGraph(doc, onBoard, lineCount, selectedLanguages)));
   if (!doc.steps.length) errors.push("no steps: the file declares nothing to record");
@@ -455,7 +499,12 @@ export function applyDocument(doc, { go = false, force = false, project, board, 
   const boardFile = board?.file ?? boardPath();
   const data = board?.data ?? (go ? loadBoardForWrite(boardFile) : loadBoard(boardFile));
   project = project ?? path.basename(process.cwd().replace(/[\\/]+$/, ""));
-  const { errors, warnings } = validate(doc, {
+  const declaredDoc = doc;
+  const inferredResult = inferDocument(doc);
+  doc = inferredResult.doc;
+  const wasInferred = (step, field) =>
+    inferredResult.inferred.some((item) => item.step === step && item.field === field);
+  const { errors, warnings } = validate(declaredDoc, {
     onBoard: (token) => Boolean(resolveTask(data, token)),
     inheritsChange: doc.steps.some((s) => s.task && resolveTask(data, s.task)?.change_id),
     requireChange: true,
@@ -472,6 +521,7 @@ export function applyDocument(doc, { go = false, force = false, project, board, 
       created: [],
       root: null,
       applied: false,
+      inferred: inferredResult.inferred,
     };
 
   const { record: existingChange, byStep, adopted, renamed } = matchExisting(data, doc, project);
@@ -495,12 +545,17 @@ export function applyDocument(doc, { go = false, force = false, project, board, 
     ].filter(Boolean);
     say(`= step ${s.id}  ${fmtTask(hit)}${marks.length ? `  (${marks.join("; ")})` : ""}`);
   }
+  for (const item of inferredResult.inferred) {
+    const value = Array.isArray(item.value) ? item.value.join(", ") : item.value;
+    say(`  выведено ${item.step}  ${item.field}=${value}`);
+  }
   for (const s of doc.steps) {
     for (const n of s.needs) say(`  dep    ${s.id} -> ${n}`);
     for (const p of s.produces) say(`  produces ${s.id}  ${p}`);
     if (s.verify) say(`  verify ${s.id}  ${s.verify}`);
     if (s.retry) say(`  retry  ${s.id}  <=${s.retry}`);
     if (s.kind) say(`  kind   ${s.id}  ${s.kind}`);
+    if (s.size) say(`  size   ${s.id}  ${s.size}`);
     if (s.budget) say(`  budget ${s.id}  $${s.budget}`);
     if (s.red) say(`  red    ${s.id}  ${s.red}`);
     if (s.redTests.length) say(`  red-tests ${s.id}  ${s.redTests.join(", ")}`);
@@ -528,6 +583,7 @@ export function applyDocument(doc, { go = false, force = false, project, board, 
       changeCreated: false,
       root: null,
       applied: false,
+      inferred: inferredResult.inferred,
     };
 
   // --- write ---------------------------------------------------------------
@@ -582,8 +638,14 @@ export function applyDocument(doc, { go = false, force = false, project, board, 
       }
 
       const resolveStep = (token) => tasks.get(token) || resolveTask(data, token);
-      const set = (todo, field, value) =>
-        setField({ data, file: boardFile, todo, field, value: String(value) });
+      const set = (todo, field, value) => {
+        if (field === "risk" && value === "sensitive") {
+          todo.risk = value;
+          todo.updated_at = new Date().toISOString();
+          return;
+        }
+        return setField({ data, file: boardFile, todo, field, value: String(value) });
+      };
 
       if (change) {
         if (doc.vision && (force || !String(change.delta || "").trim())) change.delta = doc.vision;
@@ -620,7 +682,7 @@ export function applyDocument(doc, { go = false, force = false, project, board, 
         // the rest of the pass. The closed node keeps what it has; only its edges,
         // which are the graph and not a promise, are still written.
         if (isDone(t)) {
-          if (s.produces.length || s.verify || s.retry || s.kind || s.budget || s.why || s.red || s.redTests.length || s.flow != null || s.risk)
+          if (s.produces.length || s.verify || s.retry || s.kind || s.size || s.budget || s.why || s.red || s.redTests.length || s.flow != null || s.risk)
             notes.push(`keep: #${t.number} is done — its declarations were left as they are`);
           continue;
         }
@@ -674,7 +736,14 @@ export function applyDocument(doc, { go = false, force = false, project, board, 
             notes.push(`ok: #${t.number} retry raised to <=${newLimit} — exhausted node returned to queue`);
           }
         }
-        if (s.kind) set(t, "kind", s.kind);
+        if (s.kind === "manual" && wasInferred(s.id, "kind")) {
+          t.kind = "manual";
+          t.updated_at = new Date().toISOString();
+        } else if (s.kind) set(t, "kind", s.kind);
+        if (s.size) {
+          t.size = s.size;
+          t.updated_at = new Date().toISOString();
+        }
         if (s.budget) set(t, "budget", s.budget);
         if (s.red) set(t, "red", s.red);
         if (s.redTests.length) set(t, "red-tests", s.redTests.join(","));
@@ -724,19 +793,24 @@ export function applyDocument(doc, { go = false, force = false, project, board, 
     changeCreated,
     root: null,
     applied: true,
+    inferred: inferredResult.inferred,
   };
 }
 
 // How a finished pass reads in one line, for whoever has to report it.
 export function summarize(result, doc) {
   const newSteps = result.created.length;
+  const inferred = (result.inferred || [])
+    .map((item) => `${item.step}.${item.field}=${Array.isArray(item.value) ? item.value.join(",") : item.value}`)
+    .join("; ");
   return (
     `${newSteps} new step(s), ${doc.steps.length - newSteps} matched (by task or subject)` +
     (result.change
       ? result.changeCreated
         ? `, change ${changeAddress(result.change)} created`
         : `, change ${changeAddress(result.change)} reused`
-      : "")
+      : "") +
+    (inferred ? `, выведено: ${inferred}` : "")
   );
 }
 

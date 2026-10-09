@@ -38,6 +38,8 @@ import {
   run,
   appendRunRecord,
   readRunLog,
+  historicalAttemptBudget,
+  historicalNodeBudget,
   runRecordOf,
   summarizeRuns,
   formatRunHistory,
@@ -101,6 +103,7 @@ function harness(overrides = {}) {
     },
     recordIssue: async () => ({ written: true }),
     recordAttempt: async () => ({ written: true, snapshot: null }),
+    recordFlowDiagram: async () => ({ written: false }),
     setStatus: async ({ task: t, status }) => {
       calls.statuses.push([t.number, status]);
     },
@@ -427,6 +430,26 @@ describe("runChange — gates", () => {
     expect(r.stop.kind).toBe("gate");
   });
 
+  it("holds a sensitive node with produces without dispatching worker or reviewer", async () => {
+    const data = board(
+      changeRoot(1, [2, 3]),
+      auto(2, { risk: "sensitive", produces: ["src/sensitive.mjs"] }),
+      auto(3, { depends_on: deps(2) }),
+    );
+    const h = harness();
+    const r = await go(data, "1", h.effects);
+
+    expect(isGate(data.todos[1])).toBe(true);
+    expect(h.calls.steps).toEqual([]);
+    expect(h.calls.reviews).toEqual([]);
+    expect(h.calls.verifies).toEqual([]);
+    expect(h.calls.reconciles).toEqual([]);
+    expect(statusOf(r, 2)).toBe("review");
+    expect(statusOf(r, 3)).toBe("queue");
+    expect(r.stop).toMatchObject({ kind: "gate", status: "review" });
+    expect(r.stop.reason).toMatch(/risk sensitive.*interactive session/);
+  });
+
   it("treats an auto node WITHOUT a declared verify as a gate, not as auto", async () => {
     const data = board(changeRoot(1, [2]), task(2, { kind: "auto" }));
     const h = harness();
@@ -449,6 +472,28 @@ describe("runChange — gates", () => {
     expect(h.calls.steps).toEqual([]);
     expect(r.stop.kind).toBe("gate");
     expect(r.stop.reason).toMatch(/already in review/);
+  });
+
+  it("keeps running an independent branch past a node waiting in review", async () => {
+    const data = board(changeRoot(1, [2, 3]), task(2, { status: "review" }), auto(3));
+    const h = harness();
+    const r = await go(data, "1", h.effects);
+
+    expect(h.calls.steps).toEqual([3]);
+    expect(statusOf(r, 3)).toBe("done");
+    expect(r.stop.kind).toBe("gate");
+    expect(r.stop.task.number).toBe(2);
+  });
+
+  it("keeps running an independent branch past a gate reached in the same run", async () => {
+    const data = board(changeRoot(1, [2, 3, 4]), task(2), auto(3), auto(4, { depends_on: deps(3) }));
+    const h = harness();
+    const r = await go(data, "1", h.effects);
+
+    expect(h.calls.steps).toEqual(expect.arrayContaining([3, 4]));
+    expect(statusOf(r, 4)).toBe("done");
+    expect(r.stop.kind).toBe("gate");
+    expect(r.stop.task.number).toBe(2);
   });
 });
 
@@ -1104,6 +1149,149 @@ describe("runChange — budget", () => {
     expect(r.stop.task.number).toBe(2);
     expect(statusOf(r, 2)).toBe("done");
   });
+
+  it("retries inside a node ceiling of the first-attempt budget times the retry limit", async () => {
+    const history = [{ kind: "run", steps: [
+      { cost_usd: 0.1, risk: "", produces_count: 0 },
+      { cost_usd: 0.1, risk: "", produces_count: 0 },
+      { cost_usd: 0.1, risk: "", produces_count: 0 },
+    ] }];
+    const data = board(changeRoot(1, [2], { budget_usd: 10 }), auto(2, { retry_limit: 3 }));
+    const h = harness({
+      reconcile: async () => ({ outcome: "issue", outcome_reason: "verify:issue" }),
+      stepCost: async () => 0.5,
+    });
+    const r = await go(data, "1", h.effects, { history });
+
+    expect(h.calls.steps).toEqual([2, 2, 2]);
+    expect(r.stop).toMatchObject({ kind: "budget", budget: 1.5, budget_source: "historical", spent: 1.5 });
+    expect(statusOf(r, 2)).toBe("review");
+  });
+
+  it("parks a failed retry that costs more than twice the first attempt", async () => {
+    const history = [{ kind: "run", steps: [
+      { cost_usd: 1, risk: "", produces_count: 0 },
+      { cost_usd: 1, risk: "", produces_count: 0 },
+      { cost_usd: 1, risk: "", produces_count: 0 },
+    ] }];
+    const costs = [0.3, 0.7];
+    const data = board(changeRoot(1, [2], { budget_usd: 10 }), auto(2, { retry_limit: 3 }));
+    const h = harness({
+      reconcile: async () => ({ outcome: "issue", outcome_reason: "verify:issue" }),
+      stepCost: async () => costs.shift(),
+    });
+    const r = await go(data, "1", h.effects, { history });
+
+    expect(h.calls.steps).toEqual([2, 2]);
+    expect(r.stop).toMatchObject({ kind: "budget", budget: 0.6, budget_source: "attempt", spent: 0.7 });
+  });
+
+  it("parks a failed first attempt over its budget before retrying, but not a finished one", async () => {
+    const history = [{ kind: "run", steps: [
+      { cost_usd: 0.3, risk: "", produces_count: 0 },
+      { cost_usd: 0.3, risk: "", produces_count: 0 },
+      { cost_usd: 0.3, risk: "", produces_count: 0 },
+    ] }];
+    const failed = await go(
+      board(changeRoot(1, [2], { budget_usd: 10 }), auto(2, { retry_limit: 3 })),
+      "1",
+      harness({ reconcile: async () => ({ outcome: "issue", outcome_reason: "verify:issue" }), stepCost: async () => 0.8 }).effects,
+      { history },
+    );
+    expect(failed.stop).toMatchObject({ kind: "budget", budget: 0.6, budget_source: "attempt", spent: 0.8 });
+
+    const finished = await go(
+      board(changeRoot(1, [2], { budget_usd: 10 }), auto(2, { retry_limit: 3 })),
+      "1",
+      harness({ stepCost: async () => 0.8 }).effects,
+      { history },
+    );
+    expect(finished.stop).toBeNull();
+  });
+
+  it("uses twice the p90 of the same-risk nearby-produces bucket for an undeclared node", () => {
+    const history = [{
+      kind: "run",
+      steps: [
+        { cost_usd: 0.1, risk: "high", produces_count: 1 },
+        { cost_usd: 0.2, risk: "high", produces_count: 2 },
+        { cost_usd: 0.4, risk: "high", produces_count: 3 },
+        { cost_usd: 9, risk: "", produces_count: 2 },
+      ],
+    }];
+
+    expect(historicalNodeBudget(auto(2, { risk: "high", produces: ["a", "b"] }), history)).toBe(0.72);
+  });
+
+  it("uses the same-size p90 of first attempts once five sized rows exist", () => {
+    const history = [{ kind: "run", steps: [
+      { cost_usd: 0.2, size: "S", attempt: 1 },
+      { cost_usd: 0.2, size: "S", attempt: 1 },
+      { cost_usd: 0.3, size: "S", attempt: 1 },
+      { cost_usd: 0.3, size: "S", attempt: 1 },
+      { cost_usd: 0.4, size: "S", attempt: 1 },
+      { cost_usd: 9, size: "S", attempt: 2 },
+      { cost_usd: 3, size: "L", attempt: 1 },
+    ] }];
+
+    expect(historicalAttemptBudget(auto(2, { size: "S" }), history)).toBe(0.72);
+    expect(historicalAttemptBudget(auto(2, { size: "L" }), history)).toBe(historicalAttemptBudget(auto(2), history));
+    expect(historicalNodeBudget(auto(2, { size: "S", retry_limit: 2 }), history)).toBe(1.44);
+  });
+
+  it("makes weak size separation visible when fixture p90(L) is under twice p90(S)", () => {
+    const history = [{ kind: "run", steps: [
+      { cost_usd: 0.4, size: "S" },
+      { cost_usd: 0.5, size: "S" },
+      { cost_usd: 0.7, size: "L" },
+      { cost_usd: 0.8, size: "L" },
+    ] }];
+    const s = historicalNodeBudget(auto(2, { size: "S" }), history);
+    const l = historicalNodeBudget(auto(3, { size: "L" }), history);
+    expect(l).toBeLessThan(2 * s);
+  });
+
+  it("widens a rare similarity bucket to every measured step and applies the floor", () => {
+    const rare = [{ kind: "run", steps: [
+      { cost_usd: 0.1, risk: "high", produces_count: 1 },
+      { cost_usd: 0.2, risk: "high", produces_count: 2 },
+      { cost_usd: 1, risk: "", produces_count: 8 },
+    ] }];
+    const cheap = [{ kind: "run", steps: [
+      { cost_usd: 0.02, risk: "", produces_count: 1 },
+      { cost_usd: 0.1, risk: "", produces_count: 2 },
+      { cost_usd: 0.2, risk: "", produces_count: 3 },
+    ] }];
+
+    expect(historicalNodeBudget(auto(2, { risk: "high", produces: ["a"] }), rare)).toBe(1.68);
+    expect(historicalNodeBudget(auto(2, { produces: ["a", "b"] }), cheap)).toBe(0.5);
+  });
+
+  it("keeps an explicit node budget first, and keeps the old no-ceiling behavior with empty history", async () => {
+    const history = [{ kind: "run", steps: [
+      { cost_usd: 0.1, risk: "", produces_count: 0 },
+      { cost_usd: 0.1, risk: "", produces_count: 0 },
+      { cost_usd: 0.1, risk: "", produces_count: 0 },
+    ] }];
+    expect(historicalNodeBudget(auto(2, { budget_usd: 3 }), history)).toBe(3);
+    expect(historicalNodeBudget(auto(2), [])).toBeNull();
+
+    const inferred = await go(
+      board(changeRoot(1, [2], { budget_usd: 10 }), auto(2)),
+      "1",
+      harness({ stepCost: async () => 0.75 }).effects,
+      { history },
+    );
+    expect(inferred.stop).toMatchObject({ kind: "budget", budget: 0.5, budget_source: "historical" });
+
+    const empty = await go(
+      board(changeRoot(1, [2], { budget_usd: 10 }), auto(2)),
+      "1",
+      harness({ stepCost: async () => 0.75 }).effects,
+      { history: [] },
+    );
+    expect(empty.stop).toBeNull();
+  });
 });
 
 // ── dry run ──────────────────────────────────────────────────────────────────
@@ -1128,7 +1316,7 @@ describe("runChange — dry run", () => {
       auto(3, { budget_usd: 3 }),
       task(4, { depends_on: deps(2, 3) }), // the gate the plan stops at
     );
-    const r = await runChange({ data, change: "1", effects: h.effects, dry: true });
+    const r = await runChange({ data, change: "1", effects: h.effects, dry: true, history: [] });
 
     expect(h.calls.steps).toEqual([]);
     expect(h.calls.statuses).toEqual([]);
@@ -1453,7 +1641,7 @@ describe("finishStep", () => {
         return { written: true, snapshot: "end-tree-sha" };
       },
     });
-    await finishStep(ctx, t, {
+    const out = await finishStep(ctx, t, {
       result: { ok: true },
       cost: 0.4,
       review: {
@@ -1470,6 +1658,7 @@ describe("finishStep", () => {
       counts: { critical: 0, high: 1, medium: 0, low: 0 },
       snapshot: null,
     })]);
+    expect(out).toMatchObject({ cost: 0.5, review: { cost_usd: 0.1 } });
     expect(t.attempts).toEqual([expect.objectContaining({ snapshot: "end-tree-sha", findings: entries[0].findings })]);
   });
 
@@ -1743,16 +1932,16 @@ describe("the runs journal", () => {
     expect(rec.stop).toEqual({ kind: "gate", task: 3, reason: "manual" });
   });
 
-  it("keeps the per-step cost and session the report printed and then dropped", () => {
+  it("keeps the total, review cost, and session for each journaled step", () => {
     const rec = runRecordOf({
       change: { number: 9, subject: "c" },
       members: [{ number: 2 }],
-      steps: [{ task: { number: 2 }, attempt: 1, result: "done", verify: "ok", cost_usd: 0.0413, session: "s-2", requested_mode: "fork", start_mode: "fork", parent_session: "s-1" }],
+      steps: [{ task: { number: 2 }, attempt: 1, result: "done", verify: "ok", cost_usd: 0.0413, size: "M", risk: "high", produces_count: 2, session: "s-2", requested_mode: "fork", start_mode: "fork", parent_session: "s-1", review: { cost_usd: 0.0113 } }],
       spend: { usd: 0.0413, unmeasured_steps: 0, group_budget: 1 },
       complete: true,
     }, { inherit: true });
 
-    expect(rec.steps[0]).toMatchObject({ task: 2, cost_usd: 0.0413, session: "s-2", verify: "ok", requested_mode: "fork", start_mode: "fork", parent_session: "s-1" });
+    expect(rec.steps[0]).toMatchObject({ task: 2, cost_usd: 0.0413, size: "M", risk: "high", produces_count: 2, session: "s-2", verify: "ok", requested_mode: "fork", start_mode: "fork", parent_session: "s-1", review: { cost_usd: 0.0113 } });
     expect(rec.inherit).toBe(true);
   });
 

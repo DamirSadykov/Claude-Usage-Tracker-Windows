@@ -14,7 +14,7 @@
 //
 //   graph = {
 //     changes: [{ label, budget }],     // group roots whose ceilings the runner reads
-//     nodes:  [{ id, label, title, needs, produces, verify, retry, budget,
+//     nodes:  [{ id, label, title, needs, produces, verify, retry, size, budget,
 //                onIssue, kind, closed, outcome }],
 //     resolves(ref) -> boolean,         // does this reference point at anything
 //     unknownRef(ref) -> string,        // ...and how to say that it does not
@@ -90,12 +90,31 @@ export const NODE_RULES = [
         .map(([field, value]) => `${n.label}: invalid ${field} "${value}"`),
   },
   {
+    id: "invalid-size",
+    severity: "error",
+    when: "any",
+    check: (n) =>
+      n.size && !["S", "M", "L"].includes(n.size)
+        ? `${n.label}: invalid size "${n.size}" — accepted values: S | M | L`
+        : null,
+  },
+  {
+    id: "new-auto-without-size",
+    severity: "error",
+    when: "open",
+    check: (n) =>
+      n.newTask && n.kind === "auto" && blank(n.size)
+        ? `${n.label}: new auto step has no size — declare size: S | M | L`
+        : null,
+  },
+  {
     id: "invalid-risk",
     severity: "error",
     when: "any",
     check: (n) =>
-      n.risk && n.risk !== "high"
-        ? `${n.label}: invalid risk "${n.risk}" — the only accepted value is "high"`
+      n.risk && !["high", "sensitive"].includes(n.risk)
+        ? `${n.label}: invalid risk "${n.risk}" — the only accepted value is "high" for agent routing; ` +
+          `accepted values: "high" | "sensitive"`
         : null,
   },
   {
@@ -143,7 +162,7 @@ export const NODE_RULES = [
   },
   {
     // The canonical retry shape has the ?issue target among the node's own
-    // prerequisites (docs/plan-format.md §5), so this is a note, not a fault:
+    // prerequisites (docs/plan-format-issues.md), so this is a note, not a fault:
     // what is refused is the loop CLOSED in depends_on, and that is the cycle
     // rule below.
     id: "on-issue-is-a-dependency",
@@ -176,7 +195,7 @@ export const NODE_RULES = [
         const count = g.lineCount(p);
         return typeof count === "number" && count > 1500;
       })
-        ? `${n.label}: шаг крупный — разрезать по produces`
+        ? `${n.label}: шаг крупный — разрезать по produces; см. docs/plan-format-cutting.md`
         : null,
   },
   {

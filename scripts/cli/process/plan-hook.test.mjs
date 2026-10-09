@@ -22,6 +22,8 @@ import {
   runMatchPlan,
   formatAlreadySent,
   planFormatDoc,
+  planFormatIssuesDoc,
+  planFormatCuttingDoc,
 } from "./plan-hook.mjs";
 import { emptyAgentConfig, saveAgentConfig } from "../agents/agents.mjs";
 
@@ -74,11 +76,8 @@ describe("buildCriticContext", () => {
   });
 });
 import {
-  CHANGE_ITEM_FIELDS,
-  DOC_FIELDS,
   DSL_DOC_FIELDS,
   DSL_STEP_FIELDS,
-  STEP_FIELDS,
   readDocument,
   validate,
 } from "./apply.mjs";
@@ -92,18 +91,17 @@ describe("buildEnterContext", () => {
     expect(ctx).toContain(planFormatDoc());
   });
 
-  it("names the keys of the language, so the shape is primed before the read", () => {
-    for (const key of ["change", "vision", "steps", "title", "why", "needs"])
-      expect(ctx).toContain(key);
-    for (const field of DSL_STEP_FIELDS) expect(ctx).toContain(field);
+  it("does not repeat the field legend in the injection", () => {
+    for (const field of DSL_STEP_FIELDS) expect(ctx).not.toContain(`\`${field}\``);
+    expect(ctx).toContain("READ THE BASE NOW");
   });
 
   // t#317: the prose is what a later session cannot reconstruct, so it has to
   // survive the move into fields — otherwise the plan becomes a filled-in form.
-  it("says where the prose goes instead of dropping it", () => {
-    expect(ctx).toMatch(/vision/);
-    expect(ctx).toMatch(/why/);
-    expect(ctx).toMatch(/risk/i);
+  it("keeps the injection and base below the measured size ceiling", () => {
+    const base = readFileSync(planFormatDoc(), "utf8");
+    expect(base.length).toBeLessThan(4_500);
+    expect(base.length + ctx.length).toBeLessThan(5_000);
   });
 
   // The guard is the point: a format that is merely asked for gets half-obeyed
@@ -124,10 +122,6 @@ describe("buildEnterContext", () => {
     expect(ctx).toMatch(/only when true/i);
   });
 
-  it("names the failure mode the plan-mode measurement found: report sections", () => {
-    expect(ctx).toContain("Контекст");
-  });
-
   // One wording, and no environment variable behind it: a hook whose text depends
   // on the environment makes every later measurement ask which text was in play.
   it("takes no argument and reads no environment", () => {
@@ -146,71 +140,68 @@ describe("buildEnterContext", () => {
 // The format itself moved out of the injections and into a file (t#314), so what
 // used to be pinned about the TEXT is now pinned about the DOCUMENT: it exists,
 // it is reachable at the path both hooks print, it teaches every key the parser
-// takes, and the example it shows really parses.
+// takes, and every YAML fragment it shows really parses.
 const YAML_BLOCK = /```yaml\r?\n([\s\S]*?)```/g;
 
 describe("the plan-format document", () => {
   const doc = readFileSync(planFormatDoc(), "utf8");
+  const issues = readFileSync(planFormatIssuesDoc(), "utf8");
+  const cutting = readFileSync(planFormatCuttingDoc(), "utf8");
 
-  it("is where both hooks say it is", () => {
-    expect(existsSync(planFormatDoc())).toBe(true);
+  it("splits the base, parked-step diagnosis and cutting guides into reachable files", () => {
+    for (const file of [planFormatDoc(), planFormatIssuesDoc(), planFormatCuttingDoc()])
+      expect(existsSync(file)).toBe(true);
     expect(buildEnterContext("directive")).toContain(planFormatDoc());
     expect(buildExitContext("")).toContain(planFormatDoc());
+    expect(doc).not.toMatch(/^## [56]\./m);
+    expect(issues).toMatch(/^## 5\. When a runner step does not converge$/m);
+    expect(cutting).toMatch(/^## 6\. Cutting the plan$/m);
+    expect(doc).toMatch(/^## 3\. Recording and refusals$/m);
   });
 
-  it("teaches every key of the language, and only keys the parser takes", () => {
-    for (const key of DSL_DOC_FIELDS) expect(doc).toContain(`${key}:`);
-    for (const key of DSL_STEP_FIELDS) expect(doc).toContain(`${key}:`);
-    expect(doc).toContain("why:");
-    const known = new Set([...DOC_FIELDS, ...STEP_FIELDS, ...Object.values(CHANGE_ITEM_FIELDS).flat()]);
-    const inYaml = [...doc.matchAll(/^\s{2,}([a-z][a-z-]*):/gm)].map((m) => m[1]);
-    expect(inYaml.length).toBeGreaterThan(8);
-    for (const key of inYaml) expect([...known]).toContain(key);
+  it("bundles all three documents at the paths the installed hooks resolve", () => {
+    const configFile = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "src-tauri", "tauri.conf.json");
+    const resources = JSON.parse(readFileSync(configFile, "utf8")).bundle.resources;
+    expect(resources["../docs/plan-format.md"]).toBe("docs/plan-format.md");
+    expect(resources["../docs/plan-format-issues.md"]).toBe("docs/plan-format-issues.md");
+    expect(resources["../docs/plan-format-cutting.md"]).toBe("docs/plan-format-cutting.md");
   });
 
-  it("carries a worked example that the real reader accepts", () => {
-    // Three blocks and no more: the shape (§1, placeholders), the one-step plan
-    // bound to an existing task (§3, t#324) and the worked example (§4). Each is
-    // a different case; a fourth would be the same thing said again.
+  it("reads only the base on entry and names supplements only at their trigger", () => {
+    const context = buildEnterContext("directive");
+    expect(context).toMatch(new RegExp(`READ THE BASE NOW[^]*${planFormatDoc().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+    expect(context).toContain(`Only if a step parks: ${planFormatIssuesDoc()}`);
+    expect(context).toContain(`Only if work must be split: ${planFormatCuttingDoc()}`);
+  });
+
+  it("teaches every language field in the flat legend", () => {
+    const legendFields = [...doc.matchAll(/^`([^`]+)` —/gm)].map((m) => m[1]);
+    expect(legendFields.sort()).toEqual([...DSL_DOC_FIELDS, ...DSL_STEP_FIELDS].sort());
+    expect(doc).toMatch(/`why` is the task's durable reasoning/);
+  });
+
+  it("keeps a connected skeleton and validates every YAML fragment after inference", () => {
     const blocks = [...doc.matchAll(YAML_BLOCK)].map((m) => m[1]);
-    expect(blocks).toHaveLength(3);
-    // The one-step case is a real file of the language, not an illustration:
-    // it parses, binds to a task, and breaks no rule.
-    const one = readDocument(blocks[1]);
-    expect(one.steps).toHaveLength(1);
-    expect(one.steps[0].task).toBeTruthy();
-    expect(validate(one, { onBoard: () => true }).errors).toEqual([]);
-    const parsed = readDocument(blocks.at(-1));
-    expect(parsed.steps.length).toBeGreaterThan(3);
-    expect(parsed.change).toBeTruthy();
-    expect(parsed.vision).toBeTruthy();
-    expect(validate(parsed).errors).toEqual([]);
-    // …and it shows the things worth showing: declarations, a gate, a loop and a
-    // parallel pair, not a list of bare titles.
-    expect(parsed.steps.some((s) => s.produces.length && s.verify)).toBe(true);
-    expect(parsed.steps.some((s) => s.kind === "manual" && !s.verify)).toBe(true);
-    expect(parsed.steps.some((s) => s.onIssue && s.retry)).toBe(true);
-    expect(parsed.parallel).toBeTruthy();
-    expect(parsed.budget).toBeTruthy();
-    const shared = parsed.steps.filter((s) => s.needs.length === 1).map((s) => s.needs[0]);
-    expect(new Set(shared).size).toBeLessThan(shared.length);
+    expect(blocks.length).toBe(2);
+    for (const block of blocks) {
+      const parsed = readDocument(block);
+      expect(parsed.steps.length).toBeGreaterThan(0);
+      expect(validate(parsed, { onBoard: () => true }).errors).toEqual([]);
+    }
+
+    const skeleton = blocks.map(readDocument).find((parsed) => parsed.steps.length === 3);
+    expect(skeleton).toBeTruthy();
+    expect(skeleton.steps.some((s) => s.needs.length === 2)).toBe(true);
+
+    const steps = blocks.flatMap((block) => readDocument(block).steps);
+    expect(steps.some((s) => s.red && !s.redTests.length)).toBe(true);
+    expect(steps.some((s) => s.task)).toBe(true);
+    expect(doc).toMatch(/^discussion: .+/m);
   });
 
-  // t#317: the prose has to be IN the example, or the example teaches that a
-  // plan is a form to fill in. Every step of it says what it rests on.
-  it("keeps the reasoning of every step in the example", () => {
-    const parsed = readDocument([...doc.matchAll(YAML_BLOCK)].at(-1)[1]);
-    expect(parsed.steps.every((s) => s.why.length > 80)).toBe(true);
-    // …and the reasoning is prose, not a restatement of the title.
-    for (const s of parsed.steps) expect(s.why).not.toBe(s.title);
-  });
-
-  // The order exists ONCE, in `needs`. The old `plan:` field held a copy of the
-  // ORDER line and rotted the moment an edge changed.
-  it("keeps the order in needs alone, with no plan field in sight", () => {
-    const parsed = readDocument([...doc.matchAll(YAML_BLOCK)].at(-1)[1]);
-    expect(parsed.plan).toBe("");
-    expect(parsed.steps.some((s) => s.needs.length)).toBe(true);
+  it("does not anchor numeric budget, retry or parallel values in YAML", () => {
+    for (const [, block] of doc.matchAll(YAML_BLOCK))
+      expect(block).not.toMatch(/^\s*(?:budget|retry|parallel):\s*(?:\$|<=)?\d/m);
   });
 
   it("names no command the CLI does not have", () => {
@@ -220,7 +211,7 @@ describe("the plan-format document", () => {
       windowsHide: true,
     });
     const found = [...doc.matchAll(/<cli> todos ([a-z][a-z-]*)/g)].map((m) => m[1]);
-    expect(found.length).toBeGreaterThan(2);
+    expect(found.length).toBeGreaterThan(0);
     for (const cmd of new Set(found)) expect(help).toContain(`  ${cmd} `);
   });
 });
@@ -623,6 +614,7 @@ describe("recordPlan", () => {
     "    title: Завожу таблицу событий",
     "    verify: npm test",
     "    kind: auto",
+    "    size: S",
     "  2:",
     "    title: Пишу обработчик",
     "    needs: [1]",
@@ -891,6 +883,7 @@ describe("the exit journal", () => {
             "    produces: [a.mjs]",
             "    verify: npm run test",
             "    kind: auto",
+            "    size: S",
             "  2:",
             "    title: Шаг два",
             "    needs: [1]",

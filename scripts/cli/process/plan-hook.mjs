@@ -41,7 +41,15 @@ import { fileURLToPath } from "node:url";
 import { matchPlanCli } from "../kernel/settings.mjs";
 import { appDataDir, appDataFile } from "../kernel/appdata.mjs";
 import { readDocument, applyDocument, summarize } from "./apply.mjs";
-import { DISCUSSION_KEY, discussionDeclaration, isReason, planCandidates, planFormatDoc } from "./plan-guard.mjs";
+import {
+  DISCUSSION_KEY,
+  discussionDeclaration,
+  isReason,
+  planCandidates,
+  planFormatDoc,
+  planFormatIssuesDoc,
+  planFormatCuttingDoc,
+} from "./plan-guard.mjs";
 import { criticRunsAsAgent, invokeDutySync } from "../agents/agents.mjs";
 
 const CLI = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "cli.mjs");
@@ -106,8 +114,10 @@ function markFormatSent(session) {
 // (scripts/cli/process → ../../../docs) and in the Tauri bundle (resources/scripts/cli/process →
 // resources/docs), because tauri.conf.json maps the file to the same shape.
 const FORMAT_DOC = planFormatDoc();
+const FORMAT_ISSUES_DOC = planFormatIssuesDoc();
+const FORMAT_CUTTING_DOC = planFormatCuttingDoc();
 
-export { planFormatDoc };
+export { planFormatDoc, planFormatIssuesDoc, planFormatCuttingDoc };
 
 // The critic is optional input before the session makes a plan, not a second
 // planner. It only spends the configured duty when the user deliberately chose
@@ -148,32 +158,16 @@ export function buildCriticContext(promptText, {
 export function buildEnterContext() {
   return [
     "──────── PLAN MODE · the plan IS the graph file ────────",
-    "This plan is written FOR YOU and the sessions after you, not as a report for",
-    "the user, and it is RECORDED in the task tracker on ExitPlanMode. So write it",
-    "as the file the tracker records — YAML, one step per task — instead of prose",
-    "that then has to be translated: `change`, `vision`, `out` (each: `what`, `why`),",
-    "`measure` (each: `what`, `how`), `steps` with `title`,",
-    "`task` (this step IS task #N already on the board), `why`, `needs`,",
-    "`produces`, `verify`, `retry`, `on-issue`, `kind`, `budget`, `red`, `red-tests`,",
-    "`risk`, `flow` (method delta for a step that produces `*.cs`; `n/a <reason>` when it cannot apply).",
-    "",
-    "Prose does not disappear, it moves INSIDE: `vision` is the paragraph on what",
-    "should exist and why; each step's `why` is what that step rests on and where",
-    "its risk shows. Those two are the parts a later session cannot reconstruct.",
-    "Report sections (Контекст / Объём / Риски) address a reader this plan does not",
-    "have — what matters in them belongs in `vision`.",
-    "",
-    "READ THE FORMAT NOW — the shape, the rules and a worked example:",
+    "Write the plan as the YAML graph file the tracker records, one step per task.",
+    "READ THE BASE NOW — it contains the field legend, inference rules and examples:",
     `  ${FORMAT_DOC}`,
-    "Reading it once covers this session. EVERY plan is REFUSED before the user ever",
-    "sees it unless it parses as this file and breaks no rule — prose included. The",
-    "format is not advice you weigh, it is the thing that gets you through.",
+    "EVERY plan is REFUSED before the user sees it if malformed.",
+    `Only if a step parks: ${FORMAT_ISSUES_DOC}`,
+    `Only if work must be split: ${FORMAT_CUTTING_DOC}`,
     "",
-    "Not starting work — settling a question with the user, weighing an approach?",
-    "Say so on the first line and the guard steps aside, recording nothing:",
+    "If this only settles a question and opens no work, start with:",
     `  ${DISCUSSION_KEY}: <what is being settled, and why it opens no task>`,
-    "The reason is required; a bare flag is refused. Declare it only when true — a",
-    "plan that ends in work is a graph file, whatever it is called.",
+    "The reason is required; use this only when true.",
   ].join("\n");
 }
 
@@ -244,7 +238,7 @@ export function buildExitContext(warnings) {
     `  2. node "${CLI}" todos apply <plan>.yaml --go    — records it`,
     "",
     "A one-step plan is a file too — one step, bound with the `task` key to the",
-    `task already on the board (§3 of the format: ${FORMAT_DOC}).`,
+    `task already on the board (the task field, §1 of the format: ${FORMAT_DOC}).`,
     "",
     "Re-applying the same file updates the graph instead of forking it.",
   ];

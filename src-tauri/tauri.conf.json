@@ -90,7 +90,9 @@
       "../scripts/cli/agents/providers.mjs": "scripts/cli/agents/providers.mjs",
       "../scripts/cli/cc-hooks/claude-hooks.mjs": "scripts/cli/cc-hooks/claude-hooks.mjs",
       "../scripts/cli/agents/agent-providers.json": "scripts/cli/agents/agent-providers.json",
-      "../docs/plan-format.md": "docs/plan-format.md"
+      "../docs/plan-format.md": "docs/plan-format.md",
+      "../docs/plan-format-issues.md": "docs/plan-format-issues.md",
+      "../docs/plan-format-cutting.md": "docs/plan-format-cutting.md"
     },
     "icon": [
       "icons/32x32.png",
