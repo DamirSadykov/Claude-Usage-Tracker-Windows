@@ -14,21 +14,22 @@ import {
   saveBoard,
 } from "../kernel/board-io.mjs";
 import { withBoardLock } from "../kernel/board-lock.mjs";
+import { uiLocale } from "../kernel/settings.mjs";
 import { collectRetroFacts, collectSessionRetroFacts } from "./retro-facts.mjs";
 
-export const PROPOSAL_TYPES = ["процесс", "инвариант проекта"];
+export const PROPOSAL_TYPES = ["process", "project_invariant"];
 export const PROPOSAL_ADDRESSEES = ["architect", "critic", "worker", "review", "human"];
 export const EPISODE_OUTCOMES = ["fixed", "deferred", "open", "by_design", "insufficient"];
 export const RECOGNIZERS = ["worker", "review", "check", "user"];
 export const INTERVENTIONS = ["fulfil_requirement", "deliver_existing_rule", "add_check", "new_rule"];
-export const RETRO_OUTPUT_CONTRACT = `Верни только один JSON-объект без markdown-ограды:
+export const RETRO_OUTPUT_CONTRACT = `Return exactly one JSON object without a markdown fence:
 {
-  "report": "Markdown-отчёт",
+  "report": "Markdown report",
   "episodes": [{"id":"e1","expected":"…","observed":"…","signal_refs":["s001"],"outcome":"fixed|deferred|open|by_design|insufficient","detection_gap":{"observable":"s007|null","recognized":{"signal":"s007|null","by":"worker|review|check|user|null"},"reached_user":"s033|null","why_late":"…|null"}}],
   "signal_dispositions": {"s001":"e1","s002":"noise","s003":"no_data"},
-  "proposals": [{"type":"процесс|инвариант проекта","addressee":"architect|critic|worker|review|human","what":"…","episode_refs":["e1"],"intervention":"fulfil_requirement|deliver_existing_rule|add_check|new_rule","evidence":"…","measure":{"cases":"…","baseline":"…","observe":"…","source":"…","fails_if":"…"}}]
+  "proposals": [{"type":"process|project_invariant","addressee":"architect|critic|worker|review|human","what":"…","episode_refs":["e1"],"intervention":"fulfil_requirement|deliver_existing_rule|add_check|new_rule","evidence":"…","measure":{"cases":"…","baseline":"…","observe":"…","source":"…","fails_if":"…"}}]
 }
-Все поля обязательны, кроме явно допускающих null. Допустимо не больше шести предложений.`;
+Every field is required unless it explicitly allows null. At most six proposals.`;
 
 function object(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : null;
@@ -167,13 +168,18 @@ function writeTextAtomic(file, text) {
   renameSync(tmp, file);
 }
 
-export function buildRetroPrompt({ factsFile, facts, change, session }) {
-  const target = change ? `${changeAddress(change)}: ${change.title}` : `Сессия ${session}`;
-  return `## Текущий объект\n\n${target}\n` +
-    `Файл детерминированных фактов: ${factsFile}\n` +
-    `Сводка фактов (для выбора аномалий):\n${JSON.stringify(facts.summary, null, 2)}\n` +
-    `Отрицательные компоненты, выделенные кодом:\n${JSON.stringify(facts.negative_components, null, 2)}\n` +
-    `Прочитай полный файл фактов и ничего не изменяй.\n\n## Контракт вывода\n\n${RETRO_OUTPUT_CONTRACT}`;
+export function retroLanguage(appData) {
+  return uiLocale(appData) === "ru" ? "Russian" : "English";
+}
+
+export function buildRetroPrompt({ factsFile, facts, change, session, language = "English" }) {
+  const target = change ? `${changeAddress(change)}: ${change.title}` : `Session ${session}`;
+  return `## Current object\n\n${target}\n` +
+    `Deterministic facts file: ${factsFile}\n` +
+    `Facts summary (to pick anomalies):\n${JSON.stringify(facts.summary, null, 2)}\n` +
+    `Negative components extracted by code:\n${JSON.stringify(facts.negative_components, null, 2)}\n` +
+    `Read the whole facts file and change nothing.\n` +
+    `Write the report and every proposal text in ${language}.\n\n## Output contract\n\n${RETRO_OUTPUT_CONTRACT}`;
 }
 
 export function retroReadDirs(factsFile) {
@@ -206,7 +212,7 @@ export function runRetro(ref, {
   const board = readBoard(file);
   const change = resolveChange(board, ref);
   const collected = collectFacts({ board, change, appData, repo });
-  const prompt = buildRetroPrompt({ factsFile: collected.file, facts: collected.facts, change });
+  const prompt = buildRetroPrompt({ factsFile: collected.file, facts: collected.facts, change, language: retroLanguage(appData) });
   const invoked = invoke("retro", prompt, {
     cwd: repo,
     appData,
@@ -261,7 +267,7 @@ export function runRetroSession(session, {
   const id = String(session || "").trim();
   if (!id || !/^[a-zA-Z0-9._-]+$/.test(id)) throw new Error("session must be a transcript GUID");
   const collected = collectFacts({ session: id, appData });
-  const prompt = buildRetroPrompt({ factsFile: collected.file, facts: collected.facts, session: id });
+  const prompt = buildRetroPrompt({ factsFile: collected.file, facts: collected.facts, session: id, language: retroLanguage(appData) });
   const invoked = invoke("retro", prompt, {
     cwd: repo,
     appData,

@@ -15,6 +15,7 @@ import {
   taskContextPriority,
   taskContextMinRank,
   taskHandoffGuard,
+  uiLocale,
   workflowContextEnabled,
 } from "./settings.mjs";
 
@@ -41,6 +42,7 @@ describe("CLI settings contract", () => {
       expect(specRoot(appData)).toBe(defaults.get("specRoot"));
       expect(specRepos(appData)).toEqual(defaults.get("specRepos"));
       expect(specRepoPath("unlisted", appData)).toBe("");
+      expect(uiLocale(appData)).toBe(defaults.get("locale"));
     } finally {
       rmSync(appData, { recursive: true, force: true });
     }

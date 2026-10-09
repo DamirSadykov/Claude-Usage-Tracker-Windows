@@ -42,7 +42,7 @@
     { "key": "keepAwakeEnabled", "scope": "ui", "writer": "app", "readers": ["ui"], "default": false },
     { "key": "systemInfoEnabled", "scope": "ui", "writer": "app", "readers": ["ui"], "default": true },
     { "key": "correctionsEnabled", "scope": "ui", "writer": "app", "readers": ["ui"], "default": false },
-    { "key": "locale", "scope": "ui", "writer": "app", "readers": ["ui"], "default": null },
+    { "key": "locale", "scope": "shared", "writer": "app", "readers": ["ui", "cli"], "default": null },
     { "key": "uiFont", "scope": "ui", "writer": "app", "readers": ["ui"], "defaultFrom": "src/fontSwitch.ts DEFAULT_FONT_ID" },
     { "key": "ignoredInsights", "scope": "ui", "writer": "app", "readers": ["ui"], "default": [], "direct": true },
     { "key": "resolverUrl", "scope": "ui", "writer": "app", "readers": ["ui"], "default": "", "direct": true },

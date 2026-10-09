@@ -25,6 +25,7 @@ export const SETTINGS_KEYS = [
   "specRoot",
   "specRepos",
   "flowLanguages",
+  "locale",
 ];
 
 // The Roaming base that holds the app's data dir. Windows: %APPDATA%, with a
@@ -61,6 +62,11 @@ const TASK_CONTEXT_PRIORITIES = ["all", "low", "medium", "high"];
 export function taskContextPriority(appData) {
   const v = readSettings(appData).taskContextPriority;
   return typeof v === "string" && TASK_CONTEXT_PRIORITIES.includes(v) ? v : "medium";
+}
+
+export function uiLocale(appData) {
+  const v = readSettings(appData).locale;
+  return v === "ru" || v === "en" ? v : null;
 }
 
 export function taskContextMinRank(appData) {

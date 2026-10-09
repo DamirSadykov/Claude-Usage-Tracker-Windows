@@ -416,7 +416,7 @@ describe("cli change", () => {
     const data = read();
     data.changes[0].ext = { retro: { proposals: [{
       id: "retro-p1",
-      type: "процесс",
+      type: "process",
       addressee: "runner",
       what: "проверять таблицу до цикла",
       measure: "повторов нет",
@@ -442,7 +442,7 @@ describe("cli change", () => {
     for (const [index, change] of data.changes.entries()) {
       change.ext = { retro: { proposals: [{
         id: `retro-p${index + 1}`,
-        type: "инвариант проекта",
+        type: "project_invariant",
         addressee: "worker",
         what: "Проверять TSV до цикла",
         measure: "ноль повторных чтений",

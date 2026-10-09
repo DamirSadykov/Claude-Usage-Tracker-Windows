@@ -11,7 +11,7 @@ const facts = {
 };
 
 const proposal = {
-  type: "процесс",
+  type: "process",
   addressee: "human",
   what: "добавить ранний gate",
   episode_refs: ["e1"],
@@ -78,12 +78,13 @@ describe("retro agent output", () => {
   });
 
   it("assembles the v5 method with facts and the code-owned output contract", () => {
-    const prompt = buildRetroPrompt({ factsFile: "C:/data/retro/c3-facts.json", facts, change });
+    const prompt = buildRetroPrompt({ factsFile: "C:/data/retro/c3-facts.json", facts, change, language: "Russian" });
+    expect(prompt).toContain("Write the report and every proposal text in Russian.");
     expect(prompt).toContain("C:/data/retro/c3-facts.json");
     expect(prompt).toContain('"negative_components": 1');
     expect(prompt).toContain('"signal_dispositions"');
     const full = buildDutyPrompt(STARTER_DUTIES.retro, prompt);
-    expect(full).toContain("Каждому сигналу дай исход");
+    expect(full).toContain("Give every signal an outcome");
     expect(full).toContain("observable");
     expect(full).toContain("reached_user");
   });
@@ -124,7 +125,7 @@ describe("runRetro", () => {
     const result = runRetro("c#3", test.options);
     expect(result).toMatchObject({ parsed: true, proposals: [{
       id: "retro-proposal-1",
-      type: "процесс",
+      type: "process",
       status: "proposed",
     }] });
     expect(test.reports).toEqual([{ file: expect.stringMatching(/retro[\\/]c3-report\.md$/), text: expect.stringContaining("# Ретро") }]);
